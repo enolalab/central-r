@@ -82,7 +82,7 @@ Central adopts per-capability Clean Architecture roles. There are no global hori
 | Scheduler | `central-scheduler` | Typed scheduling commands (ready queue, worker registration, node leases) | Claim outcomes; missed-beat ladder state | Own `domain`/`port`/`query`, `central-foundation` | Transport, adapter, framework crates; capability `app` implementations | Atomic conditional claim ports (`SKIP LOCKED`); lease fencing | Worker protocol per Phase 2 specs (b35) |
 | Retry | `central-retry` | Typed retry/decision commands | Classified retry outcomes; compensation intents | Own `domain`/`port`/`query`, `central-foundation` | Transport, adapter, framework crates; capability `app` implementations | Atomic conditional eligibility ports; timeout hierarchy; transactional `event_outbox` (b37) | Retry taxonomy per Phase 2 specs (b37) |
 | Runview | `central-runview` | Typed projection queries | DAG projections; run lineage views; fleet probes | Own `domain`/`port`/`query`, `central-eventjournal` fold types (approved edge), `central-foundation` | Transport, adapter, framework crates; mutation ports | Read-only projection queries | Run lineage per Phase 2 specs (b33/b35) |
-| Runsubmit | `central-runsubmit` | Typed run-submission commands | Run receipt; first-page node outcomes | Own `domain`/`port`/`query`, `central-task` domain/`app`/`port` types, `central-execution` domain types, `central-workflow` domain types, `central-adapter-postgres` stores (approved exception — see §6.4), `central-foundation` | Transport, framework crates; other capability `app` implementations | Orchestrates task + workflow change-sets; every task transition passes through `central-task` domain service | Run submission per Phase 2 specs |
+| Runsubmit | `central-runsubmit` | Typed run-submission commands | Run receipt; first-page node outcomes | Own `domain`/`port`/`query`, `central-task` domain/`app`/`port` types, `central-workflow` domain types, `central-foundation` | Transport, adapter, framework crates; other capability `app` implementations | Orchestrates task + workflow change-sets; every task transition passes through `central-task` domain service; store access via narrow consumer-side traits in its own `port.rs` (issue-122; see §6.4) | Run submission per Phase 2 specs |
 | Backup | `central-backup` | Typed backup/restore operator commands | Backup manifests; restore reports; operation outcomes | Own `domain`/`port`/`query`, `central-foundation` | Transport, adapter, framework crates; does not own Task/Artifact/migration/authorization rules | Exclusive advisory lock scope; consistent-point snapshot; inventory chunking | Local operator authority plus verified backup/restore evidence |
 | Infra | `central-infra` | Typed local-operator commands (init, prepare, up/down, doctor, maintenance, advisory) | Operation outcomes; status reports | Own `domain`/`port`/`query`, `central-foundation` | Transport, capability `app` implementations; direct Docker/Compose calls | Helper-protocol prepare → invoke → settle; exclusive lifecycle operations | Local operator authority per ADR 0009/0011 topology |
 
@@ -100,7 +100,7 @@ Central adopts per-capability Clean Architecture roles. There are no global hori
 ```text
 central-execution  → central-task                       (task root domain types: cancel/resume/harness-run coordination)
 central-artifact   → central-execution                  (ExecutionChangeSet completion-guard types only; one-way, no reverse import)
-central-runsubmit  → central-task, central-execution, central-workflow   (Phase 2 submission orchestration)
+central-runsubmit  → central-task, central-workflow                     (Phase 2 submission orchestration)
 central-workflow   → central-retry                      (retry-policy domain types in node-spec validation)
 central-runview    → central-eventjournal               (journal fold and lineage projection types)
 ```
@@ -157,7 +157,7 @@ Service-to-service edges never cycle. Lower capabilities (`task`, `authorization
 - Adapters classify and sanitize `sqlx`, object-store, harness, platform, and resolver errors before returning. Raw SQLSTATE detail, query text, object location, provider body, secret locator, or unbounded external message never crosses the adapter boundary.
 - Adapters may enforce stronger resource/privilege safety but cannot decide business lifecycle or create authority.
 - Repository abstractions, DI frameworks, service locators, and generic `Invoke(kind, payload)` adapters are prohibited.
-- Adapters may not be imported upward by `domain.rs`, `port.rs`, or `query.rs`; the one approved service-layer exception is `central-runsubmit` (§6.4).
+- Adapters may not be imported upward by `app.rs`, `domain.rs`, `port.rs`, or `query.rs`: no capability crate ever depends on an adapter crate. Concrete-adapter wiring exists only in `central-kernel` and `bins/*` composition (§3.3). This rule has no exceptions.
 
 **Artifact delivery rules (infrastructure contract):**
 
@@ -250,7 +250,7 @@ SR-F1 rule: adding a new privileged operation is a **binary-or-mode decision**, 
 
 | Importing crate | May import | Must not import |
 | --- | --- | --- |
-| Controller (`central-transport-http`, `bins/*`) | `central-foundation`, service-layer `app` command/result types, `query` request/projection **value types** for mapping | `query` traits, command-persistence ports, concrete adapters (except the §6.4 `central-runsubmit` exception), `sqlx`, `aws-sdk-s3`, `rustix` (outside `central-adapter-linux` + launcher bins), harness SDKs |
+| Controller (`central-transport-http`, `bins/*`) | `central-foundation`, service-layer `app` command/result types, `query` request/projection **value types** for mapping | `query` traits, command-persistence ports, concrete adapters, `sqlx`, `aws-sdk-s3`, `rustix` (outside `central-adapter-linux` + launcher bins), harness SDKs |
 | Service (`central-<cap>::app`) | Its own capability `domain`/`port`/`query`; approved cross-capability types per the §2.2/§6.4 DAG | Any transport, adapter, or framework crate; `axum`; `sqlx`; cross-capability `app` implementations not on the approved DAG |
 | Usecase (`domain.rs`) | `central-foundation`, `time`, `serde` value-type derives | `async`, `tokio`, I/O traits, service implementations, `axum`, `sqlx`, `aws-sdk-s3`, `rustix`, `prometheus-client` |
 | Usecase (`port.rs`) | `central-foundation`, its capability `domain.rs`, `trait-variant` | `app.rs` internals, `query.rs`, transport, kernel, adapters |
@@ -837,7 +837,7 @@ Every CLI controller maps to its parent Service and inward port/query contracts:
 - Migration commands → `central-backup` migration coordinator → `MigrationInspector` port / `MigrationRunner` (in `central-adapter-postgres`)
 - Backup commands → `central-backup` backup coordinator → `central-backup` port traits
 - Restore commands → `central-backup` restore coordinator → `central-backup` port traits
-- `run submit` → `central-runsubmit` submission service → `central-task`/`central-workflow`/`central-execution` contracts
+- `run submit` → `central-runsubmit` submission service → `central-task`/`central-workflow` contracts
 - `node decide` → `central-retry` decision service
 - `checkpoint *` → `central-checkpoint` service
 - `artifact read` → `central-artifact` read service
@@ -889,14 +889,12 @@ prepare attempt durably
 central-execution  → central-task          (task root domain types: cancel/resume/harness-run)
 central-artifact   → central-execution     (ExecutionChangeSet completion-guard types only)
 central-runsubmit  → central-task          (domain, app, port)
-central-runsubmit  → central-execution     (domain types)
 central-runsubmit  → central-workflow      (domain types)
-central-runsubmit  → central-adapter-postgres   (APPROVED EXCEPTION below)
 central-workflow   → central-retry         (retry-policy domain types in node-spec validation)
 central-runview    → central-eventjournal  (journal fold and lineage projection types)
 ```
 
-- **Approved exception (upstream issue-122 parity):** `central-runsubmit` is an orchestration-only submission service and MAY compose `central-adapter-postgres` change-set stores directly for task, workflow, and execution-adjacent writes. It owns no new business rules; every task transition still passes through the `central-task` domain service. This is the only service-layer crate permitted a concrete-adapter import.
+- **`central-runsubmit` store access (upstream issue-122):** `central-runsubmit` is an orchestration-only submission service; it owns no new business rules and every task transition still passes through the `central-task` domain service. It declares narrow consumer-side store traits in its own `port.rs` — task commands (`TaskCommands`), a run-by-key reader (`RunByKeyReader`), and a workflow graph store (`GraphStore`) — and additionally consumes `central-task`'s aggregate-loader `port.rs` trait. `central-adapter-postgres` store types implement the store-facing traits (`RunByKeyReader`, `GraphStore`, task aggregate loader); `central-task::app` satisfies `TaskCommands`; `central-kernel` and `bins/central` wire the implementations at composition over the serve pool or the operator-supplied DSN (issue-122 D7). `central-runsubmit` never names `central-adapter-postgres`: no service crate imports an adapter crate, and that rule admits no exceptions.
 - **`central-harness` coordinator isolation:** the sequential coordinator drives `central-execution`, `central-authorization`, `central-checkpoint`, `central-artifact`, and `central-event` exclusively through its own `port.rs` traits; it holds no capability-import edge. Coordination is port-mediated, not import-mediated.
 - **Claimability surface:** `central-execution::query` owns the claimability-decoration read contract (upstream `task/app/query` claimability decorator) so that `central-task` never imports `central-execution`. See §2.2 cyclic-edge rule.
 - Service-to-service edges never cycle. Lower capabilities (`task`, `authorization`, `checkpoint`, `artifact`, `event`, `workspace`, `session`, `workflow`, `eventjournal`, `scheduler`, `retry`, `backup`, `infra`) never import `central-harness`, `central-execution`, `central-runsubmit`, transport, or `central-kernel`.
