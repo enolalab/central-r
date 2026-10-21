@@ -157,20 +157,20 @@
 - Create: `$CENTRAL_RUST_SRC/docs/implementation/current-phase.md`
 - Adapt: `$CENTRAL_RUST_SRC/docs/README.md`, `docs/newcomer-guide.md`, `docs/architecture/overview.md`, `docs/architecture/durable-execution.md`
 
-- [ ] **Step 1: Author `AGENTS.md` and `CLAUDE.md`**
+- [x] **Step 1: Author `AGENTS.md` and `CLAUDE.md`**
   Adapt `$CENTRAL_SRC/AGENTS.md` and `CLAUDE.md` for `central-rust`:
   - Update technology constraints: Main language **Rust** (Cargo Workspace), Database **PostgreSQL 16** (`sqlx` compile-time checked), Artifact storage **S3-compatible / MinIO** (`aws-sdk-s3`), Web UI **Server-rendered HTML (`axum` + `askama`)**, Linux security boundaries (`rustix`).
   - Point required reading to `docs/product/vision.md`, `docs/product/roadmap.md`, `docs/architecture/overview.md`, `docs/architecture/durable-execution.md`, `docs/architecture/rust-application-boundaries.md`, `docs/implementation/rust-engineering-workflow.md`, and `docs/implementation/current-phase.md`.
   - Preserve all architectural, database/artifact, security, and ADR 0028 D3 delegation rules verbatim.
 
-- [ ] **Step 2: Author `docs/implementation/rust-vertical-slice-roadmap.md` and `docs/implementation/current-phase.md`**
+- [x] **Step 2: Author `docs/implementation/rust-vertical-slice-roadmap.md` and `docs/implementation/current-phase.md`**
   - In `rust-vertical-slice-roadmap.md`, detail the complete `R0` through `R6` vertical-slice plan (`Spec §6`), mapping each R-Slice to its owning capability crates, SQL migrations (`v0..b37`), upstream reference specs/dossiers, and acceptance criteria.
   - In `current-phase.md`, record **Phase R0 — Documentation & Contract Baseline** as Complete upon R0 acceptance and **Phase R1 — Workspace Scaffold, Canonical SQL Extraction (`v0..b37`) & Durable Task/Execution Core** as the next active implementation slice, while summarizing the upstream Phase 0–2 reference baseline.
 
-- [ ] **Step 3: Copy and adapt `docs/README.md`, `docs/newcomer-guide.md`, `docs/architecture/overview.md`, and `docs/architecture/durable-execution.md`**
+- [x] **Step 3: Copy and adapt `docs/README.md`, `docs/newcomer-guide.md`, `docs/architecture/overview.md`, and `docs/architecture/durable-execution.md`**
   - Copy from `$CENTRAL_SRC/docs/` and update references from `go-application-boundaries.md` $\rightarrow$ `rust-application-boundaries.md`, `go-engineering-workflow.md` $\rightarrow$ `rust-engineering-workflow.md`, and Go kernel/packages $\rightarrow$ Rust Cargo Workspace crates (`central-kernel`, `crates/capabilities/*`, `crates/adapters/*`), while adding `rust-vertical-slice-roadmap.md` and `ADR 0043` to `docs/README.md`.
 
-- [ ] **Step 4: Commit Task 5**
+- [x] **Step 4: Commit Task 5**
   Commit with message `docs(r0): add AGENTS.md, CLAUDE.md, R-slice roadmap, and adapt core orientation docs`.
 
 ---

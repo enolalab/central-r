@@ -1,0 +1,104 @@
+# Rust Vertical-Slice Roadmap (`R0`–`R6`)
+
+- **Status:** Adopted
+- **Governing design:** [Central-Rust Documentation Baseline & Architecture Design](../internal/superpowers/specs/2026-10-21-central-rust-documentation-and-architecture-design.md), §6
+- **ADR:** [ADR 0043 — Adopt Rust workspace and harness-first porting strategy](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md)
+- **Companion contracts:** [rust-application-boundaries.md](../architecture/rust-application-boundaries.md) (crate topology and role rules), [postgresql-adapter-mapping.md](../persistence/postgresql-adapter-mapping.md) (schema and migration-ledger contract), [rust-engineering-workflow.md](rust-engineering-workflow.md) (verification pipeline and test taxonomy)
+- **Active slice:** see [current-phase.md](current-phase.md)
+
+## 1. Delivery model
+
+`central-rust` is delivered as seven sequential vertical slices, `R0` through `R6`. The ordering is deliberate (ADR 0043): the durable core lands first (`R1`), the verified artifact plane second (`R2`), and the two highest-value upstream surfaces — the Harness Session Boundary (ADR 0035/ADR 0036) and Phase 2 Multi-Agent Workflow Orchestration — land before the host-security and backup/restore tail (`R3`, `R4` ahead of `R5`, `R6`). The frozen upstream B09 agent loop coordinator is never ported.
+
+Each slice lands **complete**: capability `domain`/`port`/`query`/`app` surfaces, adapter implementations, schema authority, `.sqlx/` regeneration, tests per the four-tier taxonomy, and documentation — in one coherent change series ([rust-engineering-workflow.md](rust-engineering-workflow.md) §9.1). Nothing in `R1`–`R6` may weaken the R0 contracts without a new ADR.
+
+## 2. Migration authority (`v0..b37`)
+
+The canonical, ordered `.sql` files under `migrations/` are extracted **once, completely, in R1** from the upstream Go-embedded DDL (`internal/adapter/postgres/migrate/{baseline,b08..b37,reapply_incremental_runtime_grants}.go`) and thereafter change only through reviewed forward migrations. The `v0..b37` range is named by its upstream file families: `baseline.go` is `v0`; `b08`–`b37` are migration families (each carrying its own ordered schema versions — e.g. `b30` = v30, `b37` = v37 — with corrective files inside the `b08`–`b10` families filling the intermediate versions).
+
+The "migration authority" recorded per slice below identifies which extracted family **governs that slice's schema surface**. It is an ownership note, not an extraction schedule — all of `v0..b37` exists on disk from R1 onward so `cargo sqlx prepare` verifies against the complete schema.
+
+| Family | Schema surface it governs | Owning slice |
+| --- | --- | --- |
+| `v0` (`baseline.go`) | Full initial `central.*` schema: workspaces, tasks, runs, steps, step attempts, tool calls, approvals, events, checkpoints, artifacts + tombstones, sessions/bootstrap generations, capacity reservations, command receipts, epoch markers, `schema_migrations` ledger | R1 |
+| `b08` | Execution-core corrections: `execution_command_receipts`, `execution_ownership`, `outbox_workspace_work`, `recovery_coordinators` | R1 |
+| `b09` | Provider evidence tables (`provider_bindings`, `provider_execution_evidence`, `provider_fence_consumptions`) — schema carried as provenance; the B09 loop coordinator is frozen upstream and never ported | R1 (schema only) |
+| `b10` | Artifact runtime: `artifact_command_receipts`, `artifact_reconciliation_claims`/`_progress`, `provider_response_retrievals`, `migration_progress` | R2 |
+| `b11`, `b20`–`b24` | Task lineage and input spec shape, sentinel workspace ID, evidence-continuation parent grant, turn dispatch reference, recovery reconciliation | R1 |
+| `b25`–`b29` | Restore/maintenance evidence: `recovery_operations`, `recovery_quarantines`, `recovery_authority_reset_receipts`, `recovery_bootstrap_registrations`, `prune_log` | R6 |
+| `b30`–`b32` | Harness control plane: `harness_attempts`, `harness_events`, `harness_permission_approvals`, task/attempt budget columns | R3 |
+| `b33` | Phase 2A: `workflow_nodes`, `workflow_edges`, `run_events` | R4 |
+| `b34` | Artifact lineage: `artifact_produce_edges`, `artifact_read_edges` | R2 (write path) / R4 (lineage projections) |
+| `b35` | Phase 2B: `worker_registrations`, `session_attempts`, `node_leases`, `workflow_nodes.ready_at` | R4 |
+| `b36` | Phase 2C: `resume_checkpoints` (subtree-anchored checkpoints) | R4 |
+| `b37` | Phase 2D: `attempt_decisions`, `attempt_outcomes`, `event_outbox`, `artifact_finalizations` | R4 |
+
+## 3. Phase R0 — Documentation & Contract Baseline
+
+- **Status:** Complete upon R0 acceptance ([current-phase.md](current-phase.md)).
+- **Owning crates:** none — documentation only; no Rust production code is written in R0.
+- **Migration authority:** none — R0 only *specifies* the `v0..b37` extraction contract.
+- **Scope:** port all language-agnostic contracts, ADRs `0001`–`0042`, and the authoritative Phase 0/1/2 design specs (spec §2.1); author the Rust Gate 7 replacements and root guidelines (spec §2.2): `AGENTS.md`, `CLAUDE.md`, `docs/README.md`, `docs/newcomer-guide.md`, `docs/architecture/{overview,durable-execution,rust-application-boundaries}.md`, `docs/persistence/postgresql-adapter-mapping.md`, `docs/implementation/{rust-engineering-workflow,current-phase,rust-vertical-slice-roadmap}.md`, and `docs/adr/0043-*.md` + `docs/adr/README.md`.
+- **Upstream references:** the entire ported corpus; the governing spec itself.
+- **Acceptance criteria** (spec §7): complete `§2.1`/`§2.2` file inventory with the `§2.3` excluded Go Gate 7 artifacts absent; ADR ledger indexes `0001`–`0043`; zero active-doc links to the replaced Go Gate 7 contract files; Gate 7 contract parity across the boundary, mapping, and workflow documents.
+
+## 4. Phase R1 — Workspace Scaffold, Canonical SQL Extraction (`v0..b37`) & Durable Task/Execution Core
+
+- **Owning crates:** `central-foundation` (UUIDv7 identity newtypes, Failure taxonomy and exit classes); `central-adapter-postgres` (native migration runner + first `port`/`query` implementations); capability crates `central-workspace`, `central-task`, `central-execution`, `central-event`, `central-checkpoint`, `central-authorization`; `central-kernel` composition root; `bins/central` skeleton.
+- **Migration authority:** one-time extraction of the complete `v0..b37` range into `migrations/` plus the SHA-256 checksum manifest; core-domain families `v0`, `b08`–`b09`, `b11`, `b20`–`b24` govern this slice's runtime surface.
+- **Upstream references:** Phase 0 design specs ([domain lifecycle](../internal/superpowers/specs/2026-07-12-phase-0-domain-lifecycle-design.md), [runtime contracts](../internal/superpowers/specs/2026-07-14-phase-0-runtime-contracts-design.md), [PostgreSQL persistence](../internal/superpowers/specs/2026-07-14-phase-0-postgresql-persistence-design.md), [API/Event serialization](../internal/superpowers/specs/2026-07-14-phase-0-api-event-serialization-design.md), [security baseline & SecretReference](../internal/superpowers/specs/2026-07-13-phase-0-security-baseline-secret-reference-design.md)); ADRs [0001](../adr/0001-adopt-durable-task-domain-and-lifecycle.md), [0003](../adr/0003-adopt-phase-1-security-policy-and-secret-reference-model.md), [0004](../adr/0004-adopt-staged-single-agent-runtime-and-verified-adapter-handoffs.md), [0007](../adr/0007-adopt-postgresql-persistence-and-recovery-contracts.md); contracts [postgresql.md](../persistence/postgresql.md), [migrations-and-recovery.md](../persistence/migrations-and-recovery.md), [runtime/](../runtime/) v1 contracts; dossiers [phase-1-entry-reconciliation.md](phase-1-entry-reconciliation.md), [phase-1-vertical-slice-backlog.md](phase-1-vertical-slice-backlog.md), [Slice B](phase-1-slices/slice-b-first-safe-runnable-environment.md) (B08 durable execution core).
+- **Acceptance criteria:**
+  - Workspace compiles under the pinned toolchain with `[workspace.dependencies]`/`[workspace.lints]` per the boundary contract; `cargo deny check` clean.
+  - `migrations/` contains the complete `v0..b37` ordered SQL + checksum manifest, verified statement-for-statement against the upstream Go-embedded DDL (no new DDL, no semantic change).
+  - `central-adapter-postgres` implements the native `central.schema_migrations` checksum ledger, single-session `pg_advisory_lock`, version-zero `VerifiedEmptyTarget` atomic baseline installer, dirty data-backfill resume without generic `Force`, and `reapply_incremental_runtime_grants` after `pg_restore`; `_sqlx_migrations` is absent.
+  - `cargo sqlx prepare --workspace -- --all-targets` produces committed `.sqlx/`; the §7 fail-fast pipeline is green.
+  - Core durable domains (workspace, task, execution, event, checkpoint, authorization) pass Tier 1 unit tests and Tier 2 deterministic PostgreSQL integration suites covering lease fencing, recovery epochs, retry, and the outbox.
+
+## 5. Phase R2 — Verified Artifact Lifecycle & Object Storage
+
+- **Owning crates:** `central-artifact`; `central-adapter-s3`.
+- **Migration authority:** `b10` (artifact runtime receipts and reconciliation) and `b34` (`artifact_produce_edges`/`artifact_read_edges` lineage write path); artifact core tables ride on the `v0` baseline.
+- **Upstream references:** [ADR 0005](../adr/0005-adopt-verified-artifact-lifecycle-and-safe-content-delivery.md); [artifacts/lifecycle.md](../artifacts/lifecycle.md) and [artifacts/content-policy.md](../artifacts/content-policy.md); [Phase 0 artifact design](../internal/superpowers/specs/2026-07-14-phase-0-artifact-storage-content-policy-design.md); [Phase 2 artifact lineage spec](../internal/superpowers/specs/2026-10-07-phase-2-artifact-lineage.md); Slice B dossier (B10 object-store runtime).
+- **Acceptance criteria:** staging reservation → streaming SHA-256 and size verification → ready-key promotion without overwrite → one durable finalization command; required-Artifact readiness as the Task/Run completion guard; untrusted-body content policy (detected classification, disposition, preview allowlist, inspection bounds); workspace-scoped two-phase deletion with tombstone; staging expiry and orphan reconciliation; quota admission; `b34` lineage edges recorded; deterministic MinIO integration suite green.
+
+## 6. Phase R3 — Harness Control Plane & `central serve` (ADR 0035, ADR 0036, Multi-Harness Focus)
+
+- **Owning crates:** `central-harness`; `central-adapter-harness` (Claude Code, OpenCode, Codex, Antigravity adapters + gitclone + launcher client); `central-session`; `central-transport-http` (`axum` API v1 + `askama` SSR Web UI); `central-kernel` serve composition; `bins/central` serve surface and `bins/central-harness-launcherd`.
+- **Migration authority:** `b30` (`harness_attempts`, `harness_events`), `b31` (`harness_permission_approvals`, `tasks.permission_policy`), `b32` (task/attempt budget columns); session/bootstrap persistence rides on `v0` tables.
+- **Upstream references:** ADRs [0035](../adr/0035-freeze-b09-loop-coordinator-and-adopt-harness-session-boundary.md), [0036](../adr/0036-add-a-separate-harness-launcher-for-operator-harness-sessions.md), [0012](../adr/0012-extend-root-credential-mount-and-add-minio-provision-mode.md), [0013](../adr/0013-widen-frame-0xb1-peer-authorization-to-admit-runtime-uid.md); the [harness spec series](../internal/superpowers/specs/2026-09-27-harness-adapter-boundary-design.md) (phases 1a–3m); adapter/issue specs ([issue-111](../internal/superpowers/specs/2026-10-08-issue-111-launcher-killer-design.md), [issue-120](../internal/superpowers/specs/2026-10-09-issue-120-real-launcher-default-design.md), [issue-124](../internal/superpowers/specs/2026-10-09-issue-124-bp4-serve-real-launcher-design.md), [issue-126](../internal/superpowers/specs/2026-10-10-issue-126-opencode-adapter-design.md), [issue-128](../internal/superpowers/specs/2026-10-10-issue-128-codex-adapter-design.md), [issue-129](../internal/superpowers/specs/2026-10-11-issue-129-antigravity-adapter-design.md)); [api/v1.md](../api/v1.md), [events/v1.md](../events/v1.md), [web-ui-feature-spec.md](../product/web-ui-feature-spec.md), [operations/harness-execution.md](../operations/harness-execution.md); Slice B dossier (B11 operator flow).
+- **Acceptance criteria:**
+  - Harness control plane: four adapters (Claude Code, OpenCode per issue #126, Codex per issue #128, Antigravity per issue #129); git shadow repo and Central-owned per-Run clone; `harness.report`/`harness.patch`/`harness.commits` capture; permission approval bridge (`v31`); cost/wall-clock/token budgets (`v32`); cancel/resume/rerun semantics covering upstream phases 3a–3m.
+  - `central serve`: `central-session` bootstrap exchange, session lifecycle, and CSRF bindings; `central-transport-http` serving API v1 JSON and the `askama` SSR Web UI under the exact resource-cap and security-header contract (32 active requests / 64 waiters / 5 s admission / 2 MiB buffer / 64 MiB aggregate; CSP `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: same-origin`, `Cache-Control: no-store`; PRG, CSRF + `Origin`, restart-barrier enforcement).
+  - `central-harness-launcherd` socket-activated launcher per ADR 0036; dev `localexec` available only behind the explicit dev gate per issue #120.
+  - Tier 3 launcher suites on the reference host and the Tier 4 Playwright SSR acceptance suite are green.
+
+## 7. Phase R4 — Multi-Agent Workflow Orchestration (Phase 2 Parity: Slices 2A–2F)
+
+- **Owning crates:** `central-workflow`, `central-eventjournal`, `central-scheduler`, `central-runsubmit`, `central-retry`, `central-runview`; `central-checkpoint` gains the Phase 2 subtree-anchored checkpoint surface; `central-artifact` lineage is consumed read-side.
+- **Migration authority:** `b33` (`workflow_nodes`, `workflow_edges`, `run_events`), `b35` (`worker_registrations`, `session_attempts`, `node_leases`, `workflow_nodes.ready_at`), `b36` (`resume_checkpoints`), `b37` (`attempt_decisions`, `attempt_outcomes`, `event_outbox`, `artifact_finalizations`); `b34` lineage projections.
+- **Upstream references:** the [Phase 2 spec series](../internal/superpowers/specs/2026-10-07-phase-2-workflow-graph-scheduling-design.md) (workflow graph scheduling, event schema reconstruction, artifact lineage, checkpoint/resume format, concurrency & resource limits, idempotency & consistency, retry/timeout error taxonomy, task leasing & worker protocol, recovery test matrix, spec-gate, and [acceptance design](../internal/superpowers/specs/2026-10-08-phase-2-acceptance-design.md)); [issue-122 run-submission spec](../internal/superpowers/specs/2026-10-09-issue-122-run-submission-entrypoint-design.md); the [phase-2-slices dossiers](phase-2-slices/README.md) (2A–2F); [operations/phase-2-run-submit.md](../operations/phase-2-run-submit.md); [agent-orchestration-view-design.md](../product/agent-orchestration-view-design.md).
+- **Acceptance criteria:**
+  - **2A:** `central-workflow` + `central-eventjournal` — `workflow_nodes`/`workflow_edges`/`run_events`, dynamic child expansion, canonical journal fold/reconstruction, `central artifact read`.
+  - **2B:** `central-scheduler` + `central-runsubmit` — `SKIP LOCKED` ready queue, worker registration, node leases, missed-beat ladder, `central run submit` / `POST /app/runs/submit`.
+  - **2C:** Phase 2 subtree checkpoints — `resume_checkpoints` recording and resume preflight.
+  - **2D:** `central-retry` — error taxonomy, timeout hierarchy, compensation, transactional `event_outbox`, `central node decide`.
+  - **2E:** `central-runview` — `/app/runs` DAG projection UI, `run_lineage`, fleet view.
+  - **2F:** the 23-scenario recovery test matrix passes end to end.
+
+## 8. Phase R5 — Host Authority, Protected Broker & Compose Topology (Slice A & B01–B07 Parity)
+
+- **Owning crates:** `central-adapter-linux` (audited `rustix` boundary); `central-infra`; protected execution modes of `bins/central` (`helper`, `central-protected-broker`, `central-sandbox-launcher`); the launcher binaries' OS-side boundary.
+- **Migration authority:** none — host-authority and protected state live in locked filesystems and the syscall boundary; the `v0..b37` schema is already complete.
+- **Upstream references:** ADRs [0009](../adr/0009-adopt-local-development-environment-topology.md), [0011](../adr/0011-amend-local-topology-for-dedicated-migration-operator.md), [0014](../adr/0014-authorize-postgresql-throughput-fixture-provisioner.md), [0028](../adr/0028-adopt-a-pre-authorized-grant-ceremony-and-context-independent-verdicts.md), [0012](../adr/0012-extend-root-credential-mount-and-add-minio-provision-mode.md), [0013](../adr/0013-widen-frame-0xb1-peer-authorization-to-admit-runtime-uid.md), [0036](../adr/0036-add-a-separate-harness-launcher-for-operator-harness-sessions.md); [local-development-environment.md](../architecture/local-development-environment.md) and its [governing spec](../internal/superpowers/specs/2026-07-16-phase-0-local-development-environment-design.md); [local-prerequisites.md](../operations/local-prerequisites.md), [local-security-authority.md](../operations/local-security-authority.md), [local-configuration-and-protected-state.md](../security/local-configuration-and-protected-state.md), [threat-model.md](../security/threat-model.md), [capability-policy.md](../security/capability-policy.md); [Slice A dossier](phase-1-slices/slice-a-host-authority-foundation.md) and Slice B B01–B07.
+- **Acceptance criteria:** `central-protected-broker` delivers sealed `memfd` descriptors via `SCM_RIGHTS`, signs TLS leafs and export tokens, and projects signed XDG views; PAM/TTY physical-console ceremonies and the ADR 0028 `grant` ceremony work end to end; the helper's closed operation matrix and the sandbox-launcher denial matrix hold; `central local init`/`prepare`/`up`/`down`/`doctor`/`status` operate the digest-pinned six-service Compose topology; Tier 3 reference-host suites pass.
+
+## 9. Phase R6 — Backup, Restore, Wipe & Maintenance (Slice C, D, E Parity)
+
+- **Owning crates:** `central-backup`; `bins/central-backup`, `bins/central-restore`, `bins/central-backup-launcherd`; `bins/central-migration-launcherd` + `bins/central-migrate` (CLI migration ops); `central-infra` maintenance/advisory surface; `bins/central-advisory-sign` offline tool.
+- **Migration authority:** `b25`–`b29` (restore/maintenance evidence families already extracted in R1) plus the migration-runner CLI surface (`migrate verify/up/status/resume`, exact version-zero `migrate reset`).
+- **Upstream references:** slice dossiers [C](phase-1-slices/slice-c-required-recovery.md), [D](phase-1-slices/slice-d-destructive-portable-operations.md), [E](phase-1-slices/slice-e-dependency-maintenance.md); [local-backup-and-restore.md](../operations/local-backup-and-restore.md), [migrations-and-recovery.md](../persistence/migrations-and-recovery.md), [maintenance-runbook.md](../operations/maintenance-runbook.md), [install-acceptance.md](../operations/install-acceptance.md), [release-authority-custody.md](../operations/release-authority-custody.md), [slice-c-maintainer-tasks.md](../operations/slice-c-maintainer-tasks.md); ADRs [0015](../adr/0015-bind-restore-engine-process-identity-outside-the-authorized-process.md)–[0018](../adr/0018-authorize-the-restore-capacity-reserve-authority.md), [0032](../adr/0032-extend-grant-ceremony-to-slice-d-verbs.md), [0033](../adr/0033-admit-a-docker-evidence-profile-for-slice-d.md), [0034](../adr/0034-restore-imported-data-to-the-data-plane.md).
+- **Acceptance criteria:** `central-backup`/`central-restore` implement exclusive target capture, `pg_dump`/`pg_restore` fd-3 tool adapters, chunked canonical-key inventory, verified manifest seal, one-use restore tickets, the restore capacity reserve gate (ADR 0018), quarantine resolution, authority reset on restore, and the rescue-backup lifecycle; `wipe`, `prune`, `security-rescue`, maintenance plan/apply/rollback, and backup export/import/delete complete the Slice C/D/E command surface; incremental runtime grants are reapplied after every `pg_restore`.
+
+## 10. Sequencing rationale
+
+The R-order trades upstream's host-authority-first sequencing for harness-first delivery (ADR 0043): the durable core (`R1`) and verified artifact plane (`R2`) are prerequisites for everything, `R3` lands the product surface upstream proved most valuable (the harness control plane and operator Web UI), and `R4` lands Phase 2 orchestration while its specs are freshest. Host authority (`R5`) and backup/restore (`R6`) follow; until R5, development runs under the documented dev-admission/evaluator paths, and the root-owned ceremonies are never stubbed into acceptance evidence.
