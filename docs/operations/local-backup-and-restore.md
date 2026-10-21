@@ -604,7 +604,7 @@ already accepted as damaged cannot die of `ENOSPC` partway through replacing
 the database. It is authorized by
 [ADR 0018](../adr/0018-authorize-the-restore-capacity-reserve-authority.md)
 and its design is
-[`docs/internal/superpowers/specs/2026-08-12-restore-capacity-reserve-authority-design.md`](../internal/superpowers/specs/2026-08-12-restore-capacity-reserve-authority-design.md).
+`docs/internal/superpowers/specs/2026-08-12-restore-capacity-reserve-authority-design.md` (upstream `central` record: `docs/internal/superpowers/specs/2026-08-12-restore-capacity-reserve-authority-design.md`).
 
 The mechanism is: `restore verify` allocates a **reserve set** — one physical
 reserve object per writable device the restore will touch — and the broker
@@ -1605,8 +1605,8 @@ Health: READY
 
 ### Restore confirmation — ADR 0009 amendment
 
-**Historical context.** ADR 0008 and the canonical Gate 7 [Go Application
-Boundaries](../architecture/go-application-boundaries.md) section 5.4
+**Historical context.** ADR 0008 and the canonical Gate 7 [application
+boundaries](../architecture/rust-application-boundaries.md) contract section 5.4
 originally defined restore-apply confirmation through `--confirm-operation`
 and `--confirm-target` flags. Under the now-accepted same-operator-UID
 threat model, those public values are replayable by a compromised

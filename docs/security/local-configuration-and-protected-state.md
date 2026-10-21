@@ -879,4 +879,4 @@ Total: 42 reason codes (the governing design has exactly these).
 - [Gate 2 Threat model](../security/threat-model.md)
 - [Gate 2 SecretReference contract](../security/secret-reference.md)
 - [Gate 7 PostgreSQL contract](../persistence/postgresql.md)
-- [Gate 7 Go application boundaries](../architecture/go-application-boundaries.md)
+- [Gate 7 Rust application boundaries](../architecture/rust-application-boundaries.md)

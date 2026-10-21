@@ -143,7 +143,7 @@ preserving ADR 0004's per-run guarantee) and names the seven invariants that
 are now binding constraints. Acceptance authorizes **no implementation**: the
 required next step is a dedicated design gate that resolves the seven
 invariants — now drafted in
-[task-decomposition design](../internal/superpowers/specs/2026-08-18-task-decomposition-design.md),
+task-decomposition design (upstream `central` record: `docs/internal/superpowers/specs/2026-08-18-task-decomposition-design.md`),
 which fixes the `task_edges` model, the idempotent bounded spawn command,
 roll-up/cancellation, partial-tree recovery, and flags the child authority +
 tree-budget derivation as needing its own follow-on ADR. Until that design and

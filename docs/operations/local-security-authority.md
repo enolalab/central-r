@@ -344,4 +344,4 @@ The release-security owner must validate before every bundle publication:
 - [ADR 0009](../adr/0009-adopt-local-development-environment-topology.md)
 - [Local configuration and protected state contract](../security/local-configuration-and-protected-state.md)
 - [Local topology contract](../architecture/local-development-environment.md)
-- [Gate 8 implementation plan](../internal/superpowers/plans/2026-07-16-phase-0-local-development-environment.md)
+- Gate 8 implementation plan (upstream `central` record: `docs/internal/superpowers/plans/2026-07-16-phase-0-local-development-environment.md`)

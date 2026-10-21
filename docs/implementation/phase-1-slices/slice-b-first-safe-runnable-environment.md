@@ -52,21 +52,21 @@ Advisory consumer verifies signature, evaluates host compatibility, and gates ad
 
 B02 implements explicit `central local prepare` only. It verifies the accepted PostgreSQL 16.14 Bookworm OCI index/platform/config digests and builds the selected MinIO commit `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a` from archive SHA-256 `be6d0bd3696c3a13a35f02d3a0280b64319c67918b4501c5c3d87f96d000085c` using the hermetic two-clean-builder reproducibility contract. It records exact release/configuration manifests for offline daily operation. It performs no tag-based pull, starts no service, runs no health check, and creates no schema or bucket.
 
-**Status:** Accepted on 2026-07-19 with 191/191 portable and 224/224 reference-host scenarios passing. See [acceptance evidence](../../internal/superpowers/reviews/2026-07-19-phase-1-b02-dependency-prepare-acceptance.md).
+**Status:** Accepted on 2026-07-19 with 191/191 portable and 224/224 reference-host scenarios passing. See acceptance evidence (upstream `central` record: `docs/internal/superpowers/reviews/2026-07-19-phase-1-b02-dependency-prepare-acceptance.md`).
 
 ## B03
 
 B03 realizes the exact six-service Compose topology—`postgres-fs-init`, `minio-fs-init`, `postgres`, `minio`, `postgres-provision`, and `minio-provision`—with digest-qualified images, `pull_policy: never`, `restart: "no"`, one internal `infra` network, ordered one-shot/daemon/provisioner lifecycle, loopback-only published ports, three health layers, crash detection, and `up/down/status`. Central remains a host process and is never a Compose service.
 
-**Status:** Accepted on 2026-07-20 on the portable semantic lifecycle suite, which is B03's sole acceptance input and verifies the injected lifecycle service, topology policy, denial paths, recovery, redaction, and structured errors. Reference-host preflight and platform-version gates were deliberately disabled for B03, so no reference-host acceptance count exists for it; the previously recorded "56/56 portable and 6/6 reference-host" figures have no source and are withdrawn. The acceptance decision was committed on 2026-08-12; see [B03 acceptance decision](../../internal/superpowers/reviews/2026-08-12-b03-compose-lifecycle-acceptance-decision.md) and [B03 evidence reconciliation](../current-phase.md#b03-evidence-reconciliation). Acceptance is semantic: every assertion runs against fakes, and B03's real Compose Render/ComposeRunner path remains unexercised by any acceptance suite.
+**Status:** Accepted on 2026-07-20 on the portable semantic lifecycle suite, which is B03's sole acceptance input and verifies the injected lifecycle service, topology policy, denial paths, recovery, redaction, and structured errors. Reference-host preflight and platform-version gates were deliberately disabled for B03, so no reference-host acceptance count exists for it; the previously recorded "56/56 portable and 6/6 reference-host" figures have no source and are withdrawn. The acceptance decision was committed on 2026-08-12; see B03 acceptance decision (upstream `central` record: `docs/internal/superpowers/reviews/2026-08-12-b03-compose-lifecycle-acceptance-decision.md`) and [B03 evidence reconciliation](../current-phase.md#b03-evidence-reconciliation). Acceptance is semantic: every assertion runs against fakes, and B03's real Compose Render/ComposeRunner path remains unexercised by any acceptance suite.
 
 `local up` and `local down` require a Linux helper built with `CGO_ENABLED=1` and the explicit `pam` build tag against the installed `central-helper` PAM service. The helper authenticates the Unix-socket peer through PAM and reads a fresh fixed confirmation phrase from that peer's physical console TTY; non-PAM builds deny lifecycle mutation. Broker lifecycle nonces are atomically persisted before the lifecycle service is invoked, so replay remains denied after a broker restart. `local down` keeps the MinIO handoff intact until Compose teardown has produced stopped proof for every service; failed proof settles failure evidence and leaves the handoff for safe recovery.
 
 ## B04
 
-> **Canonical authority:** [B04 Durable Proof Design](../../internal/superpowers/specs/2026-07-20-phase-1-b04-durable-proof-design.md) supersedes every conflicting B04 credential creation, handoff, recovery, and acceptance statement below. B04 adopts and materializes only the existing B03 `minio_root_v1` generation; all other registered purposes are declaration-only for their owning later packets.
+> **Canonical authority:** B04 Durable Proof Design (upstream `central` record: `docs/internal/superpowers/specs/2026-07-20-phase-1-b04-durable-proof-design.md`) supersedes every conflicting B04 credential creation, handoff, recovery, and acceptance statement below. B04 adopts and materializes only the existing B03 `minio_root_v1` generation; all other registered purposes are declaration-only for their owning later packets.
 
-**Status:** Accepted on 2026-07-21. Portable CI, Linux build, and root reference-host B04 verification passed; see [canonical acceptance evidence](../../internal/superpowers/reviews/2026-07-20-phase-1-b04-canonical-acceptance.md).
+**Status:** Accepted on 2026-07-21. Portable CI, Linux build, and root reference-host B04 verification passed; see canonical acceptance evidence (upstream `central` record: `docs/internal/superpowers/reviews/2026-07-20-phase-1-b04-canonical-acceptance.md`).
 
 ### Identity and outcome
 
@@ -150,7 +150,7 @@ The only Preview Tool is one ordered, batched, read-only Workspace filesystem op
 
 ## B10
 
-B10 report materialization receives its source from an external agent adapter and fails closed when that source is absent; see the [B09 Agent Adapter Boundary Design](../../internal/superpowers/specs/2026-08-03-b09-agent-adapter-boundary-design.md).
+B10 report materialization receives its source from an external agent adapter and fails closed when that source is absent; see the B09 Agent Adapter Boundary Design (upstream `central` record: `docs/internal/superpowers/specs/2026-08-03-b09-agent-adapter-boundary-design.md`).
 
 B10 durably reserves an Artifact and unique UUIDv4 staging generation, streams the body to an opaque staging key, computes and verifies full-body size plus SHA-256, promotes to an opaque ready key without overwrite, re-verifies the promoted body, and atomically finalizes PostgreSQL metadata, lineage, and the required-Artifact completion contribution. Keys contain only version markers and application-generated opaque IDs; no filename, repository path, Task text, media type, secret, or backend locator appears in a key. The required Markdown report is capped at 1 MB by default and 10 MB hard; exceeding the hard cap fails the StepAttempt. Deletion, retention mutation, and prune are absent until D04.
 

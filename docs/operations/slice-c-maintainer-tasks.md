@@ -13,7 +13,7 @@ is exactly two kinds of human act, and they are the substance of what
 Neither can be automated away without turning "accepted" into a false record —
 the exact failure this repository withdrew from SC-G0 on 2026-08-17.
 
-> **Amended 2026-09-10.** [Governance §5](../internal/superpowers/specs/2026-08-14-slice-c-acceptance-governance.md#5-independence)
+> **Amended 2026-09-10.** Governance §5 (upstream `central` record: `docs/internal/superpowers/specs/2026-08-14-slice-c-acceptance-governance.md`)
 > was amended: this repository's independent human reviewer is no longer
 > active, and the maintainer (`hieuntg81`) is now its sole contributor. From
 > SC-G1 onward, item 1 above no longer applies as written — an AI agent,

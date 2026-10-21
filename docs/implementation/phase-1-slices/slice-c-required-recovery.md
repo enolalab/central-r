@@ -5,8 +5,8 @@
 - **Packets:** C01–C06
 - **Dependency:** B12 (Slice B first value)
 - **Outcome:** Operator-driven verified local backup and restore with interruption-safe external restore barrier, quarantine, and post-restore authority reset
-- **Technical design:** [Slice C Required Recovery Design](../../internal/superpowers/specs/2026-08-09-slice-c-required-recovery-design.md)
-- **Implementation plan:** [Slice C Required Recovery Implementation Plan](../../internal/superpowers/plans/2026-08-09-slice-c-required-recovery.md)
+- **Technical design:** Slice C Required Recovery Design (upstream `central` record: `docs/internal/superpowers/specs/2026-08-09-slice-c-required-recovery-design.md`)
+- **Implementation plan:** Slice C Required Recovery Implementation Plan (upstream `central` record: `docs/internal/superpowers/plans/2026-08-09-slice-c-required-recovery.md`)
 
 ## Slice C ownership
 

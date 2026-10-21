@@ -514,7 +514,7 @@ Deferred commands never perform a partial approximation, ask for manual Docker/f
 | --- | --- | --- |
 | First use (host setup → bootstrap) | `Verbatim future first-use journey` below | This document |
 | Daily changed-code loop | `Verbatim changed-code daily journey` below | This document |
-| Diagnosis and remediation | `Derived environment state`, `Diagnostic output planes` (§9.2, §9.3) | This document + [Go application boundaries](../architecture/go-application-boundaries.md) |
+| Diagnosis and remediation | `Derived environment state`, `Diagnostic output planes` (§9.2, §9.3) | This document + [Rust application boundaries](../architecture/rust-application-boundaries.md) |
 | Backup and verification | `Normative operator journeys` (§1486–1501) | [Governing design](../internal/superpowers/specs/2026-07-16-phase-0-local-development-environment-design.md) |
 | Restore and interruption | `Normative operator journeys` (§1518–1548) | [Governing design](../internal/superpowers/specs/2026-07-16-phase-0-local-development-environment-design.md) |
 | Fresh-host export/import | `Normative operator journeys` (§1552–1578) | [Governing design](../internal/superpowers/specs/2026-07-16-phase-0-local-development-environment-design.md) |

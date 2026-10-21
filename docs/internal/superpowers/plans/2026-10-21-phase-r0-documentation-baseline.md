@@ -180,7 +180,7 @@
 **Files:**
 - Inspect/Modify if needed: active docs under `$CENTRAL_RUST_SRC/docs/`, `AGENTS.md`, `CLAUDE.md`
 
-- [ ] **Step 1: Check and fix any residual references to `go-application-boundaries.md` or `go-engineering-workflow.md` in active docs**
+- [x] **Step 1: Check and fix any residual references to `go-application-boundaries.md` or `go-engineering-workflow.md` in active docs**
   Run:
   ```bash
   git -C $CENTRAL_RUST_SRC grep -nE 'go-application-boundaries\.md|go-engineering-workflow\.md' -- \
@@ -190,12 +190,12 @@
   ```
   Rewrite any remaining occurrences in active docs (including `docs/persistence/postgresql.md`, `docs/persistence/migrations-and-recovery.md`, `docs/architecture/local-development-environment.md`) to `rust-application-boundaries.md` and `rust-engineering-workflow.md`.
 
-- [ ] **Step 2: Run the Phase R0 Acceptance Criteria Verification Suite (`Spec §7`)**
+- [x] **Step 2: Run the Phase R0 Acceptance Criteria Verification Suite (`Spec §7`)**
   Execute verification checks confirming:
   1. **Criterion 1 (Completeness & Exclusions):** All `§2.1` and `§2.2` files exist; `go-application-boundaries.md`, `go-engineering-workflow.md`, and `docs/prototypes/` are absent.
   2. **Criterion 2 (ADR Ledger Integrity):** `docs/adr/0001-*.md` through `docs/adr/0043-*.md` exist and are indexed in `docs/adr/README.md`.
   3. **Criterion 3 (Zero Broken Active Links to Replaced Go Contracts):** Active docs contain zero references to `go-application-boundaries.md` or `go-engineering-workflow.md`, and all markdown links inside the newly authored Rust docs (`AGENTS.md`, `CLAUDE.md`, `docs/README.md`, `docs/architecture/rust-application-boundaries.md`, `docs/persistence/postgresql-adapter-mapping.md`, `docs/implementation/rust-engineering-workflow.md`, `docs/implementation/current-phase.md`, `docs/implementation/rust-vertical-slice-roadmap.md`, `docs/adr/0043-*.md`) resolve to existing files in `central-rust`.
   4. **Criterion 4 (Gate 7 Parity):** Verify all required sections exist in `rust-application-boundaries.md`, `postgresql-adapter-mapping.md`, and `rust-engineering-workflow.md`.
 
-- [ ] **Step 3: Commit any link adjustments and finalize Phase R0**
+- [x] **Step 3: Commit any link adjustments and finalize Phase R0**
   Commit with message `docs(r0): complete link-integrity sweep and verify Phase R0 acceptance criteria`.
