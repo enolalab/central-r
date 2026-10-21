@@ -106,7 +106,7 @@
 **Files:**
 - Create: `$CENTRAL_RUST_SRC/docs/architecture/rust-application-boundaries.md`
 
-- [ ] **Step 1: Author `docs/architecture/rust-application-boundaries.md`**
+- [x] **Step 1: Author `docs/architecture/rust-application-boundaries.md`**
   Using `$CENTRAL_SRC/docs/architecture/go-application-boundaries.md` and Spec `§3` as the structural reference, write the comprehensive canonical contract covering:
   1. **Workspace & Dependency Baseline (`§1`):** Rust toolchain, workspace structure, pinned crate selection (`tokio`, `trait-variant`, `axum`, `askama`, `sqlx` v0.8 features, `aws-sdk-s3`, `rustix`, `uuid`, `time`, `tracing`, `prometheus-client`), license policy (MIT / Apache-2.0 / BSD-3).
   2. **Four-Layer Role Matrix (`§2`):**
@@ -117,7 +117,7 @@
   3. **Binary vs Execution-Mode Topology (`§3`):** Map `bins/central` (including `serve`, `helper`, `central-protected-broker`, `central-sandbox-launcher` modes) and standalone root/operator daemons (`central-harness-launcherd`, `central-migration-launcherd`, `central-migrate`, `central-backup-launcherd`, `central-backup`, `central-restore`, `central-advisory-sign`).
   4. **HTTP, SSR HTML, Security Header & Resource Contract (`§4`):** Carry over Gate 7's exact resource limits (32 active non-streaming requests, 64 waiters, 5s wait timeout, 2 MiB max buffer, 64 MiB aggregate buffered memory), mandatory headers (`CSP: frame-ancestors 'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` per SB-G4, `Cache-Control: no-store`), PRG pattern, CSRF + `Origin` checks, restart-barrier enforcement, and WCAG keyboard accessibility baseline.
 
-- [ ] **Step 2: Verify completeness and Commit Task 3**
+- [x] **Step 2: Verify completeness and Commit Task 3**
   Commit with message `docs(arch): add rust-application-boundaries canonical contract`.
 
 ---
