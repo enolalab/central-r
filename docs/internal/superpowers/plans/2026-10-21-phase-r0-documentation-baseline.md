@@ -128,14 +128,14 @@
 - Create: `$CENTRAL_RUST_SRC/docs/persistence/postgresql-adapter-mapping.md`
 - Create: `$CENTRAL_RUST_SRC/docs/implementation/rust-engineering-workflow.md`
 
-- [ ] **Step 1: Adapt `docs/persistence/postgresql-adapter-mapping.md` for Rust & `sqlx`**
+- [x] **Step 1: Adapt `docs/persistence/postgresql-adapter-mapping.md` for Rust & `sqlx`**
   Start from `$CENTRAL_SRC/docs/persistence/postgresql-adapter-mapping.md` (preserving the complete table, column, constraint, index, role-grant, and SQLSTATE matrices) and update §1–§2 for Rust (`Spec §4`):
   - Replace `pgx/v5` + `sqlc` references with `sqlx` (`v0.8+`, `postgres`, `runtime-tokio`, `tls-rustls-ring`, `macros`, `uuid`, `time`, `json`) and `.sqlx/` offline compile-time verification (`SQLX_OFFLINE=true`).
   - Document the Rust type mapping table (`central_foundation::identity::*Id` wrapping `uuid::Uuid`, `time::OffsetDateTime`, `i64` / `Version(u64)`, `[u8; 32]`, `sqlx::types::Json<T>`).
   - Document the Migration Extraction & Native Ledger contract (`SR-02`): canonical `.sql` extraction from `baseline.go` (`v0`) and `b08`..`b37` into `migrations/`, governed by `central.schema_migrations` checksum verification, single-session `pg_advisory_lock`, version-zero `VerifiedEmptyTarget` proof, and `reapply_incremental_runtime_grants` after `pg_restore` (explicitly prohibiting `_sqlx_migrations`).
   - Update links from `go-application-boundaries.md` to `rust-application-boundaries.md`.
 
-- [ ] **Step 2: Author `docs/implementation/rust-engineering-workflow.md`**
+- [x] **Step 2: Author `docs/implementation/rust-engineering-workflow.md`**
   Define the canonical Rust engineering workflow (`Spec §5`):
   - **Toolchain & Workspace Manifest:** `rust-toolchain.toml` (pinned stable Rust, `rustfmt`, `clippy`), workspace `Cargo.toml` dependency pinning rules (no floating git branches, no unapproved `patch` directives).
   - **Workspace Lints:** `unsafe_code = "forbid"` in all capability, transport, postgres, s3, and harness crates (isolated audited syscall boundary in `central-adapter-linux` and launcher daemons only); `clippy::unwrap_used = "deny"`, `clippy::expect_used = "deny"`, `clippy::panic = "deny"`, `clippy::todo = "deny"`, `clippy::dbg_macro = "deny"` in production targets.
@@ -143,7 +143,7 @@
   - **Supply-Chain, License & Vulnerability Gate (`cargo-deny`):** `deny.toml` configuration enforcing MIT / Apache-2.0 / BSD-3 allowlist, banning wildcards/git sources, and scanning RustSec advisories (`cargo deny check`).
   - **Test Taxonomy & Fail-Fast CI Pipeline:** Pure synchronous domain unit tests, deterministic PostgreSQL/MinIO integration suites, reference-host Linux security/launcher suites, and Playwright SSR browser acceptance suites.
 
-- [ ] **Step 3: Commit Task 4**
+- [x] **Step 3: Commit Task 4**
   Commit with message `docs(gate7): add postgresql-adapter-mapping for sqlx and rust-engineering-workflow`.
 
 ---
