@@ -102,7 +102,7 @@ The workspace `Cargo.toml` carries `[workspace.lints]` applied to every member. 
 unsafe_code = "forbid"
 ```
 
-Only `central-adapter-linux` and the launcher binaries (`bins/`, e.g. `central-harness-launcherd`, `central-migration-launcherd`) may contain `unsafe` code, and only inside the audited OS-syscall boundary, expressed through safe `rustix` wrappers rather than raw `libc` calls. `unsafe_code = "forbid"` violations anywhere else are compile errors by construction, not review conventions.
+Only `central-adapter-linux` and the launcher and protected-execution-mode binaries (`bins/`, e.g. `central-harness-launcherd`, `central-migration-launcherd`, and `bins/central`'s helper/broker/sandbox-launcher modes) may contain `unsafe` code, and only inside the audited OS-syscall boundary, expressed through safe `rustix` wrappers rather than raw `libc` calls. `unsafe_code = "forbid"` violations anywhere else are compile errors by construction, not review conventions.
 
 ### 5.3 Denied Clippy lints (production targets)
 
@@ -243,7 +243,7 @@ Where an upstream Go mechanism has no Rust equivalent, the equivalent is stated 
 | `pgx/v5` driver | `sqlx` (`PgPool`/`PgConnection`) (§3.4) |
 | `gin` HTTP | `axum` + `askama` SSR in `central-transport-http` (R3; not yet implemented) |
 | `remark-cli` markdown/link check | Retained — language-independent; same tool, same CI position |
-| Secret-sentinel scan | Retained — language-independent; same coverage rules (§12 below) |
+| Secret-sentinel scan | Retained — language-independent; same coverage rules (§13 below) |
 | Architecture-import checks (`archguard` tests) | Cargo dependency graph + `[workspace.lints]`; capability crates cannot even name forbidden crates because they are not declared as dependencies |
 
 ## 13. Secret-sentinel coverage
@@ -255,7 +255,7 @@ The upstream sentinel scan is carried over unchanged in intent: no credentials, 
 Cargo makes most upstream import rules structural: a capability crate physically cannot import `sqlx`, `axum`, S3 SDKs, or `rustix` unless its `Cargo.toml` declares them, so review focuses on the manifest plus `#[allow]`/feature gates rather than import scans. The standing detection list:
 
 1. **Forbidden dependencies in capability manifests.** `sqlx`, `axum`, `tokio` (in `domain`/`port`/`query`), S3 SDKs, `rustix`, and `unsafe` may not appear in capability `Cargo.toml`s except where the boundary contract assigns the crate (§5.2).
-2. **`unsafe` outside `central-adapter-linux` and launchers.** Compile-enforced by `unsafe_code = "forbid"`; any `#[allow(unsafe_code)]` override is an acceptance failure.
+2. **`unsafe` outside `central-adapter-linux` and the launcher/protected-execution-mode binaries.** Compile-enforced by `unsafe_code = "forbid"`; any `#[allow(unsafe_code)]` override is an acceptance failure.
 3. **`sqlx` types in public port/query signatures.** `sqlx::Transaction`, `PgPool`, `PgConnection`, `sqlx::Error`, and `sqlx::types::*` must never appear in `port.rs`/`query.rs` or cross the adapter boundary.
 4. **Dynamic SQL and prohibited query forms.** `format!`/`format_args!` on SQL text, `sqlx::query()`/`query_as()` function forms, and any non-macro query construction (§4.4).
 5. **Prohibited query shapes.** Offset pagination, N+1, readiness exact counts, unbounded results, unqualified names, `public` schema (mapping doc §2.1).

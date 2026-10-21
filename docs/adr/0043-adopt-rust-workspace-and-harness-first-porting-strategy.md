@@ -129,7 +129,7 @@ This amendment is scoped to the `central-rust` repository. In the upstream `cent
 ### Costs and limitations
 
 - Rust code holds no B09 evidence even in frozen form; historical `b09_*` tables exist only as migrated schema. Operators auditing old B09 provider-turn history must read upstream `central`.
-- This ADR forward-links `rust-application-boundaries.md`, `postgresql-adapter-mapping.md`, `rust-engineering-workflow.md`, `rust-vertical-slice-roadmap.md`, and `current-phase.md`, which land in the remaining Phase R0 tasks; the links resolve at Phase R0 acceptance, and until then dependent implementation remains blocked exactly as `Implementation blocked at` states.
+- This ADR forward-links `rust-application-boundaries.md`, `postgresql-adapter-mapping.md`, `rust-engineering-workflow.md`, and `rust-vertical-slice-roadmap.md`, which land in the remaining Phase R0 tasks; the links resolve at Phase R0 acceptance, and until then dependent implementation remains blocked exactly as `Implementation blocked at` states.
 - The amendment is repository-scoped: readers must track that ADR 0008's effective decision differs between `central` (Go) and `central-rust` (Cargo Workspace), and the upstream ADR 0008 file cannot record the reciprocal `Amended by` because it is immutable.
 - Full-parity porting risks semantic drift between the Go reference and Rust implementations; the mitigation is contract-level conformance to the ported specifications plus deterministic PostgreSQL/MinIO integration suites in each R-slice, not line-by-line transliteration.
 - Async-trait `Send` machinery (`trait-variant`) adds an indirection layer over plain `async fn` in traits, and `sqlx` compile-time checking requires maintaining the `.sqlx/` offline metadata and a verification database provisioned from `migrations/`.
@@ -176,4 +176,5 @@ Rejected. Capability ownership, manual composition, the four-layer roles, change
 - [Rust application boundaries contract](../architecture/rust-application-boundaries.md)
 - [PostgreSQL adapter mapping (sqlx)](../persistence/postgresql-adapter-mapping.md)
 - [Rust engineering workflow](../implementation/rust-engineering-workflow.md)
+- [Rust vertical-slice roadmap](../implementation/rust-vertical-slice-roadmap.md)
 - [ADR governance and index](README.md)

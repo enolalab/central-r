@@ -25,7 +25,7 @@ Supply chain:    deny.toml                  (cargo-deny license, advisory, and s
 | Server-rendered HTML | `askama` (compile-time typed templates with auto-escaping) | `central-transport-http` (`web` module) only | MIT / Apache-2.0 |
 | PostgreSQL | `sqlx` (v0.8, features: `postgres`, `runtime-tokio`, `tls-rustls-ring`, `macros`, `uuid`, `time`, `json`; `migrate` feature disabled in favor of Central's native migration ledger) | `central-adapter-postgres` only | MIT / Apache-2.0 |
 | Object storage (S3/MinIO) | `aws-sdk-s3` + `aws-config` + `sha2` | `central-adapter-s3` only | Apache-2.0 |
-| Linux syscalls & IPC | `rustix` (`fs`, `net`, `process`, `shm`/`mm` for `memfd_create`, `SCM_RIGHTS`, `SO_PEERCRED`, `openat2`, `pidfd`) | `central-adapter-linux` and launcher binaries only | Apache-2.0 / MIT |
+| Linux syscalls & IPC | `rustix` (`fs`, `net`, `process`, `shm`/`mm` for `memfd_create`, `SCM_RIGHTS`, `SO_PEERCRED`, `openat2`, `pidfd`) | `central-adapter-linux` and the launcher and protected-execution-mode binaries only | Apache-2.0 / MIT |
 | Identity (UUIDv7) | `uuid` (v1, `v7`, `serde`) | Wrapped privately inside `central-foundation::identity` | Apache-2.0 / MIT |
 | Time | `time` (v0.3, `serde`, `formatting`, `parsing`, `macros`) | `central-foundation` and across workspace | MIT / Apache-2.0 |
 | Serialization | `serde` + `serde_json` | Wire envelopes, event payloads, config schemas, adapters | MIT / Apache-2.0 |
@@ -39,7 +39,7 @@ Production dependencies use tagged registry versions pinned in shared `[workspac
 - `sqlx`'s `migrate` feature is disabled workspace-wide. Central's native `central.schema_migrations` checksum ledger — not `_sqlx_migrations` — governs schema state; see §8.5 and [postgresql-adapter-mapping.md](../persistence/postgresql-adapter-mapping.md).
 - `uuid::Uuid` never escapes `central-foundation::identity`; every capability sees only opaque newtype IDs.
 - `tokio`/`tokio-util` are absent from every capability crate's `[dependencies]`. Rust future-drop replaces `context.Context` cancellation inside capability boundaries: `app.rs`, `port.rs`, and `query.rs` signatures carry no context parameter; callers cancel by dropping the returned future. Explicit deadlines (`time::OffsetDateTime`), authority, and operation identity remain ordinary parameters. `tokio_util::sync::CancellationToken` lives only in `central-kernel`, adapters, transport, and binaries.
-- `unsafe_code` is `forbid` in every capability, transport, `central-adapter-postgres`, `central-adapter-s3`, and `central-adapter-harness` crate. Only `central-adapter-linux` and the launcher binaries may encapsulate audited OS syscall boundaries through `rustix` safe wrappers.
+- `unsafe_code` is `forbid` in every capability, transport, `central-adapter-postgres`, `central-adapter-s3`, and `central-adapter-harness` crate. Only `central-adapter-linux` and the launcher and protected-execution-mode binaries may encapsulate audited OS syscall boundaries through `rustix` safe wrappers.
 
 ## 2. Four-layer role matrix
 
@@ -157,7 +157,7 @@ Service-to-service edges never cycle. Lower capabilities (`task`, `authorization
 - Adapters classify and sanitize `sqlx`, object-store, harness, platform, and resolver errors before returning. Raw SQLSTATE detail, query text, object location, provider body, secret locator, or unbounded external message never crosses the adapter boundary.
 - Adapters may enforce stronger resource/privilege safety but cannot decide business lifecycle or create authority.
 - Repository abstractions, DI frameworks, service locators, and generic `Invoke(kind, payload)` adapters are prohibited.
-- Adapters may not be imported upward by `app.rs`, `domain.rs`, `port.rs`, or `query.rs`: no capability crate ever depends on an adapter crate. Concrete-adapter wiring exists only in `central-kernel` and `bins/*` composition (§3.3). This rule has no exceptions.
+- Adapters may not be imported upward by `app.rs`, `domain.rs`, `port.rs`, or `query.rs`: no capability crate ever depends on an adapter crate. Concrete-adapter wiring exists only in `central-kernel` composition, invoked from `bins/*` binaries (§3.3). This rule has no exceptions.
 
 **Artifact delivery rules (infrastructure contract):**
 
@@ -250,7 +250,7 @@ SR-F1 rule: adding a new privileged operation is a **binary-or-mode decision**, 
 
 | Importing crate | May import | Must not import |
 | --- | --- | --- |
-| Controller (`central-transport-http`, `bins/*`) | `central-foundation`, service-layer `app` command/result types, `query` request/projection **value types** for mapping | `query` traits, command-persistence ports, concrete adapters, `sqlx`, `aws-sdk-s3`, `rustix` (outside `central-adapter-linux` + launcher bins), harness SDKs |
+| Controller (`central-transport-http`, `bins/*`) | `central-foundation`, service-layer `app` command/result types, `query` request/projection **value types** for mapping | `query` traits, command-persistence ports, concrete adapters (except `central-adapter-linux` inside the §3.2 launcher and protected-execution-mode binaries), `sqlx`, `aws-sdk-s3`, `rustix` (outside `central-adapter-linux` + launcher and protected-execution-mode bins), harness SDKs |
 | Service (`central-<cap>::app`) | Its own capability `domain`/`port`/`query`; approved cross-capability types per the §2.2/§6.4 DAG | Any transport, adapter, or framework crate; `axum`; `sqlx`; cross-capability `app` implementations not on the approved DAG |
 | Usecase (`domain.rs`) | `central-foundation`, `time`, `serde` value-type derives | `async`, `tokio`, I/O traits, service implementations, `axum`, `sqlx`, `aws-sdk-s3`, `rustix`, `prometheus-client` |
 | Usecase (`port.rs`) | `central-foundation`, its capability `domain.rs`, `trait-variant` | `app.rs` internals, `query.rs`, transport, kernel, adapters |
@@ -894,7 +894,7 @@ central-workflow   → central-retry         (retry-policy domain types in node-
 central-runview    → central-eventjournal  (journal fold and lineage projection types)
 ```
 
-- **`central-runsubmit` store access (upstream issue-122):** `central-runsubmit` is an orchestration-only submission service; it owns no new business rules and every task transition still passes through the `central-task` domain service. It declares narrow consumer-side store traits in its own `port.rs` — task commands (`TaskCommands`), a run-by-key reader (`RunByKeyReader`), and a workflow graph store (`GraphStore`) — and additionally consumes `central-task`'s aggregate-loader `port.rs` trait. `central-adapter-postgres` store types implement the store-facing traits (`RunByKeyReader`, `GraphStore`, task aggregate loader); `central-task::app` satisfies `TaskCommands`; `central-kernel` and `bins/central` wire the implementations at composition over the serve pool or the operator-supplied DSN (issue-122 D7). `central-runsubmit` never names `central-adapter-postgres`: no service crate imports an adapter crate, and that rule admits no exceptions.
+- **`central-runsubmit` store access (upstream issue-122):** `central-runsubmit` is an orchestration-only submission service; it owns no new business rules and every task transition still passes through the `central-task` domain service. It declares narrow consumer-side store traits in its own `port.rs` — task commands (`TaskCommands`), a run-by-key reader (`RunByKeyReader`), and a workflow graph store (`GraphStore`) — and additionally consumes `central-task`'s aggregate-loader `port.rs` trait. `central-adapter-postgres` store types implement the store-facing traits (`RunByKeyReader`, `GraphStore`, task aggregate loader); `central-task::app` satisfies `TaskCommands`; `central-kernel` wires the implementations at composition over the serve pool or the operator-supplied DSN (issue-122 D7); `bins/central` invokes that composition function — binaries never import adapter crates (§3.3). `central-runsubmit` never names `central-adapter-postgres`: no service crate imports an adapter crate, and that rule admits no exceptions.
 - **`central-harness` coordinator isolation:** the sequential coordinator drives `central-execution`, `central-authorization`, `central-checkpoint`, `central-artifact`, and `central-event` exclusively through its own `port.rs` traits; it holds no capability-import edge. Coordination is port-mediated, not import-mediated.
 - **Claimability surface:** `central-execution::query` owns the claimability-decoration read contract (upstream `task/app/query` claimability decorator) so that `central-task` never imports `central-execution`. See §2.2 cyclic-edge rule.
 - Service-to-service edges never cycle. Lower capabilities (`task`, `authorization`, `checkpoint`, `artifact`, `event`, `workspace`, `session`, `workflow`, `eventjournal`, `scheduler`, `retry`, `backup`, `infra`) never import `central-harness`, `central-execution`, `central-runsubmit`, transport, or `central-kernel`.
@@ -1051,7 +1051,7 @@ Capability-owned `port.rs` modules own:
 
 ### 8.4 `central-adapter-linux` (protected broker / platform boundary)
 
-- Implements the protected-broker protocol, `memfd_create`, `SCM_RIGHTS` fd passing, `SO_PEERCRED` peer authorization, `openat2`, `pidfd`, PAM/TTY ceremonies, namespaces, and cgroups — through `rustix` safe wrappers inside audited `unsafe` boundaries. This crate is the only place (with the launcher binaries) where `unsafe`/`rustix` is permitted.
+- Implements the protected-broker protocol, `memfd_create`, `SCM_RIGHTS` fd passing, `SO_PEERCRED` peer authorization, `openat2`, `pidfd`, PAM/TTY ceremonies, namespaces, and cgroups — through `rustix` safe wrappers inside audited `unsafe` boundaries. This crate is the only place (with the launcher and protected-execution-mode binaries) where `unsafe`/`rustix` is permitted.
 - Implements `central-authorization` protected-use/resolution port traits (the upstream secret-resolver role), `central-infra` platform port traits, and `central-backup` fd-3 helper adapters (`pg_dump`/`pg_restore` fd protocol under `central-backup-launcherd`).
 - The root-owned helper protocol mediates every privileged operation; no capability or CLI calls Docker, Compose, or storage tools directly.
 
