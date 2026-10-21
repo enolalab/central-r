@@ -47,7 +47,7 @@ The workspace DAG — not convention — prohibits boundary violations:
 - `crates/central-kernel`: manual dependency composition, supervised task runner, graceful shutdown.
 - `bins/`: the `central` CLI (including `serve` and the protected-broker, helper, and sandbox-launcher execution modes) and standalone daemons `central-harness-launcherd` (ADR 0036), `central-migration-launcherd`, `central-migrate`, `central-backup-launcherd`, `central-backup`, `central-restore`, `central-advisory-sign`.
 
-`unsafe_code` is forbidden in every capability, transport, PostgreSQL, S3, and harness crate; only `central-adapter-linux` and the launcher binaries may encapsulate audited syscall boundaries through `rustix`. The canonical crate matrix, import rules, and resource limits live in [rust-application-boundaries.md](../architecture/rust-application-boundaries.md).
+`unsafe_code` is forbidden in every capability, transport, PostgreSQL, S3, and harness crate; only `central-adapter-linux` and the launcher and protected-execution-mode binaries may encapsulate audited syscall boundaries through `rustix`. The canonical crate matrix, import rules, and resource limits live in [rust-application-boundaries.md](../architecture/rust-application-boundaries.md).
 
 ### 2. Pin the Rust dependency baseline
 
@@ -61,7 +61,7 @@ The dependency baseline of the approved Central-Rust design (§3.1) is adopted; 
 | Server-rendered HTML | `askama` — `central-transport-http` web module only |
 | PostgreSQL | `sqlx` (v0.8: `postgres`, `runtime-tokio`, `tls-rustls-ring`, `macros`, `uuid`, `time`, `json`; `migrate` feature disabled) — `central-adapter-postgres` only |
 | Object storage | `aws-sdk-s3` + `aws-config` + `sha2` — `central-adapter-s3` only |
-| Linux syscalls and IPC | `rustix` (`fs`, `net`, `process`, `shm`/`mm` for `memfd_create`, `SCM_RIGHTS`, `SO_PEERCRED`, `openat2`, `pidfd`) — `central-adapter-linux` and launcher binaries only |
+| Linux syscalls and IPC | `rustix` (`fs`, `net`, `process`, `shm`/`mm` for `memfd_create`, `SCM_RIGHTS`, `SO_PEERCRED`, `openat2`, `pidfd`) — `central-adapter-linux` and launcher and protected-execution-mode binaries only |
 | Identity | `uuid` (v1: `v7`, `serde`) — wrapped inside `central-foundation::identity` |
 | Time | `time` (v0.3: `serde`, `formatting`, `parsing`, `macros`) — workspace-wide |
 | Serialization | `serde` + `serde_json` — wire envelopes, event payloads, config, adapters |
@@ -105,7 +105,7 @@ R3 and R4 precede R5/R6 because they carry the active product surface decided by
 | "the four Clean Architecture roles as per-capability responsibilities, not global horizontal packages" | Retained as the `domain.rs` / `port.rs` / `query.rs` / `app.rs` module split inside every capability crate, enforced by the workspace dependency DAG and lints at compile time rather than by review alone. |
 | "controller-to-service-to-usecase dependency direction with infrastructure implementing Usecase-owned `port` and declaration-only `app/query` contracts" | Retained: `central-transport-http` and `bins/*` controllers call `app.rs` services; adapter crates implement capability-owned `port`/`query` traits; only the parent service invokes query traits after surface-appropriate authorization; transport never receives a query trait or a concrete adapter. |
 | "domain-approved change-set commits plus named atomic conditional ports, with no public Unit of Work" | Retained unchanged. |
-| "Gin isolation, pgx/sqlc adapter isolation, typed safe failures, explicit external-effect prepare/invoke/settle protocols, and supervised component lifecycle" | `axum`/`askama` confined to `central-transport-http`; `sqlx` to `central-adapter-postgres`; `aws-sdk-s3` to `central-adapter-s3`; `rustix` to `central-adapter-linux` and launchers. Typed safe failures, `prepare -> invoke outside transaction -> settle`, and supervised lifecycle are retained unchanged. |
+| "Gin isolation, pgx/sqlc adapter isolation, typed safe failures, explicit external-effect prepare/invoke/settle protocols, and supervised component lifecycle" | `axum`/`askama` confined to `central-transport-http`; `sqlx` to `central-adapter-postgres`; `aws-sdk-s3` to `central-adapter-s3`; `rustix` to `central-adapter-linux` and the launcher and protected-execution-mode binaries. Typed safe failures, `prepare -> invoke outside transaction -> settle`, and supervised lifecycle are retained unchanged. |
 | "the selected dependency and observability baseline" | Replaced by the pinned Rust baseline in decision item 2; `tracing` + `prometheus-client` preserve the observability contract. |
 | "Gate 8 ownership of concrete local topology/protected stores and Gate 9 ownership of executable vertical slices" | Replaced by the `R0`–`R6` slice ownership in decision item 4. |
 
