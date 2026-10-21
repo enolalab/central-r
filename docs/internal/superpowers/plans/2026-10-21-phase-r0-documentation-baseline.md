@@ -55,22 +55,22 @@
 **Files:**
 - Copy from `$CENTRAL_SRC/docs/` to `$CENTRAL_RUST_SRC/docs/` all files specified in Spec `§2.1`.
 
-- [ ] **Step 1: Create directory structure in `$CENTRAL_RUST_SRC/docs/`**
+- [x] **Step 1: Create directory structure in `$CENTRAL_RUST_SRC/docs/`**
   Create directories: `product`, `api`, `events`, `artifacts`, `runtime`, `persistence`, `security`, `architecture`, `operations`, `implementation/phase-1-slices`, `implementation/phase-2-slices`, `adr`, `internal/superpowers/specs`, `internal/superpowers/plans`, `internal/superpowers/reviews`, `internal/tasks`.
 
-- [ ] **Step 2: Copy Product, API, Events, Artifacts, Runtime, Persistence, Security, Operations, and Implementation Dossiers**
+- [x] **Step 2: Copy Product, API, Events, Artifacts, Runtime, Persistence, Security, Operations, and Implementation Dossiers**
   Copy all files listed in Spec `§2.1` from `$CENTRAL_SRC/docs/` into `$CENTRAL_RUST_SRC/docs/`, explicitly excluding `docs/architecture/go-application-boundaries.md`, `docs/implementation/go-engineering-workflow.md`, and `docs/prototypes/`.
 
-- [ ] **Step 3: Copy ADRs `0001`–`0042` and `template.md`**
+- [x] **Step 3: Copy ADRs `0001`–`0042` and `template.md`**
   Copy `$CENTRAL_SRC/docs/adr/00*.md` and `template.md` into `$CENTRAL_RUST_SRC/docs/adr/`.
 
-- [ ] **Step 4: Copy Authoritative Phase 0, Phase 1 (Harness & Adapters), and Phase 2 Specs**
+- [x] **Step 4: Copy Authoritative Phase 0, Phase 1 (Harness & Adapters), and Phase 2 Specs**
   Copy the selected specs from `$CENTRAL_SRC/docs/internal/superpowers/specs/` into `$CENTRAL_RUST_SRC/docs/internal/superpowers/specs/` (preserving `2026-10-21-central-rust-documentation-and-architecture-design.md`).
 
-- [ ] **Step 5: Verify copied file counts and exclusions**
+- [x] **Step 5: Verify copied file counts and exclusions**
    verify that `go-application-boundaries.md` and `go-engineering-workflow.md` do not exist in `central-rust/docs/`, and all 42 historical ADRs (`0001`–`0042`) are present.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
   Commit with message `docs(r0): import language-agnostic contracts, ADRs 0001-0042, and reference specs`.
 
 ---
