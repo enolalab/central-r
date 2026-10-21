@@ -81,7 +81,7 @@
 - Create: `$CENTRAL_RUST_SRC/docs/adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md`
 - Create: `$CENTRAL_RUST_SRC/docs/adr/README.md`
 
-- [ ] **Step 1: Author `docs/adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md`**
+- [x] **Step 1: Author `docs/adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md`**
   Follow `docs/adr/template.md` and ADR governance rules:
   - **Number:** 0043
   - **Status:** Accepted
@@ -93,10 +93,10 @@
     4. Execute the `R0`–`R6` delivery sequence prioritizing the active Harness Control Plane (`R3`) and Phase 2 Multi-Agent Workflow Orchestration (`R4`) rather than re-implementing the frozen B09 agent loop coordinator.
   - **Amends:** ADR 0008 (for the `central-rust` repository, replacing Go module/package boundaries with the Rust Cargo Workspace contract).
 
-- [ ] **Step 2: Copy and update `docs/adr/README.md`**
+- [x] **Step 2: Copy and update `docs/adr/README.md`**
   Copy `$CENTRAL_SRC/docs/adr/README.md` and add `ADR 0043` to the index table as `Accepted`, noting that in `central-rust` it adapts Gate 7 application boundaries to Rust while retaining all upstream ADR `0001`–`0042` domain, security, persistence, and topology decisions.
 
-- [ ] **Step 3: Verify ADR links and Commit Task 2**
+- [x] **Step 3: Verify ADR links and Commit Task 2**
   Verify `0043` is linked in `docs/adr/README.md` and commit with message `docs(adr): add ADR 0043 for Rust workspace and harness-first porting strategy`.
 
 ---
