@@ -66,8 +66,22 @@ enum Resolution {
 /// Resolves argv (minus argv[0]) to a version print or the canonical
 /// `command_id` for the deferred envelope.
 fn resolve(args: &[String]) -> Resolution {
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        return Resolution::Version;
+    // `--version`/`-V` wins only as the sole argument or while it still
+    // precedes the first positional verb — `central serve --version`
+    // must reach the deferred `serve` command, not print the version.
+    // `--config` consumes its value before the scan continues.
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        match arg.as_str() {
+            "--config" => skip_value = true,
+            "--version" | "-V" => return Resolution::Version,
+            _ if !arg.starts_with('-') => break,
+            _ => {}
+        }
     }
 
     // Global flags are consumed without affecting command identity; the
@@ -234,6 +248,41 @@ mod tests {
             &["-V"][..],
             &["version"][..],
             &["--config", "/abs/central.json", "--version"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, 0, "argv {argv:?}");
+            assert_eq!(
+                stdout,
+                format!("{{\"version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
+
+    #[test]
+    fn version_flag_after_a_positional_verb_reaches_the_deferred_path() {
+        // `central serve --version` is a deferred `serve` invocation,
+        // not a version print — the flag belongs to the command.
+        for argv in [
+            &["serve", "--version"][..],
+            &["serve", "-V"][..],
+            &["local", "up", "--version"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, 5, "argv {argv:?}");
+            let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+            assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
+        }
+        let (_, stdout, _) = invoke(&["serve", "--version"]);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "serve");
+    }
+
+    #[test]
+    fn version_flag_before_any_positional_verb_still_prints() {
+        for argv in [
+            &["--version", "serve"][..],
+            &["-V", "serve"][..],
+            &["--config", "/abs/central.json", "--version", "serve"][..],
         ] {
             let (code, stdout, _) = invoke(argv);
             assert_eq!(code, 0, "argv {argv:?}");

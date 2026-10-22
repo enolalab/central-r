@@ -11,10 +11,12 @@
 //! never by a capability-imported kernel type.
 //!
 //! A terminal component failure cancels the whole profile and surfaces
-//! [`ExitClass::Terminal`] (process exit `6`); an intentional stop marks
-//! the profile `shutting_down`, revokes the ready proof, settles
+//! [`ExitClass::Terminal`] (process exit `6`); an intentional stop
+//! revokes the ready proof, marks the profile `shutting_down`, settles
 //! components in reverse registration order under the shutdown budget,
-//! and returns `Ok`.
+//! and returns `Ok` — the upstream `stop()`/`fail()` sequence
+//! (`revokeProof` → `markShuttingDown`/`markFailed` → `cancel` →
+//! `shutdown`).
 
 use std::future::Future;
 use std::task::{Context, Poll};
@@ -484,24 +486,36 @@ impl Profile {
         }
 
         // Only the admitted singleton may invalidate an older generation,
-        // and it does so while retaining the outer proof guard.
-        if let Some(publisher) = session.publisher.as_mut()
-            && let Err(cause) = publisher.revoke().await
-        {
-            let _ = session.abort().await;
-            readiness.mark_failed("BACKGROUND_LOOP_FAILED");
-            tracing::warn!(
-                code = cause.code(),
-                "kernel: stale ready proof revoke failed"
-            );
-            return Err(ExitError::new(
-                ExitClass::Terminal,
-                "BACKGROUND_LOOP_FAILED",
-                Failure::internal(
-                    "kernel_stale_proof_revoke_failed",
-                    "stale ready proof could not be revoked",
-                ),
-            ));
+        // and it does so while retaining the outer proof guard. The call
+        // runs under the startup deadline exactly like upstream's
+        // `Revoke(startupCtx)` — upstream maps any failure on this path,
+        // deadline expiry included, to `BACKGROUND_LOOP_FAILED`.
+        if let Some(publisher) = session.publisher.as_mut() {
+            let revoked = timeout_at(startup_deadline, publisher.revoke()).await;
+            let cause = match revoked {
+                Ok(Ok(())) => None,
+                Ok(Err(cause)) => Some(cause),
+                Err(_) => Some(Failure::internal(
+                    "kernel_startup_deadline",
+                    "stale ready proof revoke exceeded the startup budget",
+                )),
+            };
+            if let Some(cause) = cause {
+                let _ = session.abort().await;
+                readiness.mark_failed("BACKGROUND_LOOP_FAILED");
+                tracing::warn!(
+                    code = cause.code(),
+                    "kernel: stale ready proof revoke failed"
+                );
+                return Err(ExitError::new(
+                    ExitClass::Terminal,
+                    "BACKGROUND_LOOP_FAILED",
+                    Failure::internal(
+                        "kernel_stale_proof_revoke_failed",
+                        "stale ready proof could not be revoked",
+                    ),
+                ));
+            }
         }
 
         // Startup admission: preflights run sequentially inside the
@@ -555,20 +569,32 @@ impl Profile {
         };
         session.owned_generation = proof.runtime_generation.clone();
         readiness.mark_ready(proof.clone());
-        if let Some(publisher) = session.publisher.as_mut()
-            && let Err(cause) = publisher.publish(proof).await
-        {
-            let _ = session.revoke().await;
-            readiness.mark_failed("BACKGROUND_LOOP_FAILED");
-            tracing::warn!(code = cause.code(), "kernel: ready proof publish failed");
-            return Err(ExitError::new(
-                ExitClass::Terminal,
-                "BACKGROUND_LOOP_FAILED",
-                Failure::internal(
-                    "kernel_proof_publish_failed",
-                    "ready proof publication failed",
-                ),
-            ));
+        // Publication is likewise bounded by the startup deadline
+        // (upstream `Publish(startupCtx, proof)`); a failure — deadline
+        // expiry included — exits `BACKGROUND_LOOP_FAILED`.
+        if let Some(publisher) = session.publisher.as_mut() {
+            let published = timeout_at(startup_deadline, publisher.publish(proof)).await;
+            let cause = match published {
+                Ok(Ok(())) => None,
+                Ok(Err(cause)) => Some(cause),
+                Err(_) => Some(Failure::internal(
+                    "kernel_startup_deadline",
+                    "ready proof publication exceeded the startup budget",
+                )),
+            };
+            if let Some(cause) = cause {
+                let _ = session.revoke().await;
+                readiness.mark_failed("BACKGROUND_LOOP_FAILED");
+                tracing::warn!(code = cause.code(), "kernel: ready proof publish failed");
+                return Err(ExitError::new(
+                    ExitClass::Terminal,
+                    "BACKGROUND_LOOP_FAILED",
+                    Failure::internal(
+                        "kernel_proof_publish_failed",
+                        "ready proof publication failed",
+                    ),
+                ));
+            }
         }
 
         // Supervised phase. Every component's run future is borrowed and
@@ -598,6 +624,32 @@ impl Profile {
             }
         };
 
+        // Upstream `stop()`/`fail()` ordering: the proof revoke and the
+        // readiness transition land BEFORE cancellation and settlement —
+        // leaving them after `settle_components` would keep the
+        // stale-proof window open for the whole settle budget.
+        let mut shutdown_cause: Option<Failure> = None;
+        match &cause {
+            Cause::Stop => {
+                if session.revoke().await.is_err() {
+                    shutdown_cause = Some(Failure::internal(
+                        "kernel_proof_revoke_failed",
+                        "ready proof revocation failed",
+                    ));
+                }
+                readiness.mark_shutting_down();
+            }
+            Cause::Terminal(_) => {
+                if session.revoke().await.is_err() {
+                    shutdown_cause = Some(Failure::internal(
+                        "kernel_proof_revoke_failed",
+                        "ready proof revocation failed",
+                    ));
+                }
+                readiness.mark_failed("BACKGROUND_LOOP_FAILED");
+            }
+        }
+
         // Cancellation phase: signal the profile token, then give
         // in-flight component work up to `settlement` to finish — the
         // bounded settlement window. Survivors are cancelled by dropping
@@ -611,33 +663,37 @@ impl Profile {
         let settle = self.settle_components().await;
         match cause {
             Cause::Stop => {
-                if session.revoke().await.is_err() {
-                    tracing::warn!("kernel: ready proof revocation failed on stop");
-                }
-                readiness.mark_shutting_down();
                 if let Err(failure) = settle {
-                    return Err(ExitError::new(
+                    shutdown_cause = Some(match shutdown_cause {
+                        Some(joined) => join_failure(joined, failure),
+                        None => failure,
+                    });
+                }
+                // Upstream maps a failed revoke or a failed settlement
+                // on the stop path to `exitError(6, "SHUTDOWN_FAILED")`.
+                match shutdown_cause {
+                    Some(failure) => Err(ExitError::new(
                         ExitClass::Terminal,
                         "SHUTDOWN_FAILED",
                         failure,
-                    ));
+                    )),
+                    None => Ok(()),
                 }
-                Ok(())
             }
             Cause::Terminal(result) => {
+                // Upstream `errors.Join`: the component failure stays the
+                // reported cause; the revoke and settlement failures are
+                // attached, not substituted.
                 let mut cause = result;
-                if session.revoke().await.is_err() {
-                    cause = Failure::internal(
-                        "kernel_proof_revoke_failed",
-                        "ready proof revocation failed",
-                    );
+                if let Some(revoke_failure) = shutdown_cause {
+                    cause = join_failure(cause, revoke_failure);
                 }
-                readiness.mark_failed("BACKGROUND_LOOP_FAILED");
                 if let Err(failure) = settle {
                     tracing::warn!(
                         code = failure.code(),
                         "kernel: settlement failed on terminal path"
                     );
+                    cause = join_failure(cause, failure);
                 }
                 Err(ExitError::new(
                     ExitClass::Terminal,
@@ -674,6 +730,18 @@ impl Profile {
             None => Ok(()),
         }
     }
+}
+
+/// The [`Failure`] port of `errors.Join` for the shutdown-path cause:
+/// the first failure's kind and code stay the reported classification
+/// while the second failure's `[code] message` is appended the way a Go
+/// joined error renders — one error per line.
+fn join_failure(first: Failure, second: Failure) -> Failure {
+    Failure::new(
+        first.kind(),
+        first.code(),
+        format!("{}\n{}", first.message(), second),
+    )
 }
 
 /// Polls every outstanding run future once per wakeup and yields the
@@ -832,6 +900,117 @@ mod tests {
         }
         fn abort_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
             self.log.lock().unwrap().push("abort_startup");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A publisher that records into a shared ordering log so tests can
+    /// pin the upstream revoke-before-settle sequence; `fail_revoke`
+    /// makes `revoke_if_generation` fail the way an unreachable proof
+    /// store would.
+    struct OrderingPublisher {
+        log: Arc<StdMutex<Vec<String>>>,
+        fail_revoke: bool,
+    }
+
+    impl ReadyProofPublisher for OrderingPublisher {
+        fn begin_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            self.log.lock().unwrap().push("begin_startup".to_string());
+            Box::pin(async { Ok(()) })
+        }
+        fn publish(&mut self, _proof: ReadyProof) -> BoxFuture<'_, Result<(), Failure>> {
+            self.log.lock().unwrap().push("publish".to_string());
+            Box::pin(async { Ok(()) })
+        }
+        fn revoke(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            self.log.lock().unwrap().push("revoke".to_string());
+            Box::pin(async { Ok(()) })
+        }
+        fn revoke_if_generation(
+            &mut self,
+            _generation: String,
+        ) -> BoxFuture<'_, Result<(), Failure>> {
+            self.log
+                .lock()
+                .unwrap()
+                .push("revoke_if_generation".to_string());
+            let fail = self.fail_revoke;
+            Box::pin(async move {
+                if fail {
+                    Err(Failure::unavailable(
+                        "proof_store_down",
+                        "proof store unreachable",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn abort_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            self.log.lock().unwrap().push("abort_startup".to_string());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A component that pends in `run` and, inside `settle`, records the
+    /// readiness state it observes into the shared ordering log — the
+    /// probe that pins mark-before-settle ordering.
+    struct StateProbingComponent {
+        log: Arc<StdMutex<Vec<String>>>,
+        readiness: Readiness,
+    }
+
+    impl Component for StateProbingComponent {
+        fn run(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            Box::pin(std::future::pending())
+        }
+        fn settle(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            let log = self.log.clone();
+            let readiness = self.readiness.clone();
+            Box::pin(async move {
+                log.lock()
+                    .unwrap()
+                    .push(format!("settle:{}", readiness.state().as_str()));
+                Ok(())
+            })
+        }
+    }
+
+    /// A publisher whose selected call never completes — the startup
+    /// deadline must bound it.
+    struct HungPublisher {
+        hang_on: &'static str,
+    }
+
+    impl ReadyProofPublisher for HungPublisher {
+        fn begin_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn publish(&mut self, _proof: ReadyProof) -> BoxFuture<'_, Result<(), Failure>> {
+            let hang = self.hang_on == "publish";
+            Box::pin(async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+        fn revoke(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            let hang = self.hang_on == "revoke";
+            Box::pin(async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+        fn revoke_if_generation(
+            &mut self,
+            _generation: String,
+        ) -> BoxFuture<'_, Result<(), Failure>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn abort_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
             Box::pin(async { Ok(()) })
         }
     }
@@ -1060,5 +1239,156 @@ mod tests {
         let exit = ExitError::new(ExitClass::Incompatible, "MIGRATION_REQUIRED", plain);
         assert_eq!(exit_code(Some(&exit)), 5);
         assert_eq!(exit.to_string(), "central serve: MIGRATION_REQUIRED");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_revokes_proof_and_marks_readiness_before_settlement() {
+        // Upstream stop() order: revokeProof -> markShuttingDown ->
+        // cancel -> shutdown. The revoke must precede settlement so the
+        // stale-proof window is not open for the whole settle budget.
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let readiness = Readiness::new();
+        let mut profile = Profile::new(test_config(), readiness.clone());
+        profile.set_launch_id("launch-order");
+        profile.set_proof_publisher(OrderingPublisher {
+            log: log.clone(),
+            fail_revoke: false,
+        });
+        profile.add_component(StateProbingComponent {
+            log: log.clone(),
+            readiness: readiness.clone(),
+        });
+        let result = profile.run(std::future::ready(())).await;
+        assert!(result.is_ok());
+        let calls = log.lock().unwrap().clone();
+        let revoke = calls
+            .iter()
+            .position(|c| c == "revoke_if_generation")
+            .expect("proof must be revoked on the stop path");
+        let settle = calls
+            .iter()
+            .position(|c| c.starts_with("settle:"))
+            .expect("component must settle on the stop path");
+        assert!(
+            revoke < settle,
+            "proof revocation must precede component settlement: {calls:?}"
+        );
+        assert_eq!(
+            calls[settle], "settle:shutting_down",
+            "readiness transition must land before settlement: {calls:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_failure_revokes_proof_before_settlement_and_joins_causes() {
+        // Upstream fail() order: revokeProof -> markFailed -> cancel ->
+        // shutdown, with `errors.Join` keeping the component failure as
+        // the reported cause when the revoke also fails.
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let readiness = Readiness::new();
+        let mut profile = Profile::new(test_config(), readiness.clone());
+        profile.set_launch_id("launch-order");
+        profile.set_proof_publisher(OrderingPublisher {
+            log: log.clone(),
+            fail_revoke: true,
+        });
+        let mut failing = RecordingComponent::new(
+            "failing",
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(StdMutex::new(Vec::new())),
+        );
+        failing.run_fails = true;
+        profile.add_component(failing);
+        profile.add_component(StateProbingComponent {
+            log: log.clone(),
+            readiness,
+        });
+
+        let err = profile.run(pending_stop()).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Terminal);
+        assert_eq!(err.reason(), "BACKGROUND_LOOP_FAILED");
+        let calls = log.lock().unwrap().clone();
+        let revoke = calls
+            .iter()
+            .position(|c| c == "revoke_if_generation")
+            .expect("proof revoke must be attempted on the terminal path");
+        let settle = calls
+            .iter()
+            .position(|c| c.starts_with("settle:"))
+            .expect("component must settle on the terminal path");
+        assert!(
+            revoke < settle,
+            "proof revocation must precede component settlement: {calls:?}"
+        );
+        assert_eq!(
+            calls[settle], "settle:failed",
+            "readiness transition must land before settlement: {calls:?}"
+        );
+        // `errors.Join` parity: the component failure stays the cause and
+        // the revoke failure is attached, not substituted.
+        let cause = std::error::Error::source(&err)
+            .and_then(|e| e.downcast_ref::<Failure>())
+            .expect("ExitError must carry the component failure");
+        assert_eq!(cause.code(), "component_failed");
+        assert!(
+            cause.message().contains("ready proof revocation failed"),
+            "revoke failure must join the component failure: {}",
+            cause.message()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_with_failing_proof_revoke_exits_shutdown_failed() {
+        // Upstream stop() returns `exitError(6, "SHUTDOWN_FAILED")` when
+        // the proof revoke fails — never a warn-and-Ok.
+        let mut profile = Profile::new(test_config(), Readiness::new());
+        profile.set_launch_id("launch-revoke-fail");
+        profile.set_proof_publisher(OrderingPublisher {
+            log: Arc::new(StdMutex::new(Vec::new())),
+            fail_revoke: true,
+        });
+        let err = profile.run(std::future::ready(())).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Terminal);
+        assert_eq!(err.class().code(), 6);
+        assert_eq!(err.reason(), "SHUTDOWN_FAILED");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hung_publish_is_bounded_by_the_startup_deadline() {
+        let config = ProfileConfig {
+            startup_limit: Duration::from_millis(30),
+            ..test_config()
+        };
+        let mut profile = Profile::new(config, Readiness::new());
+        profile.set_launch_id("launch-hung-publish");
+        profile.set_proof_publisher(HungPublisher { hang_on: "publish" });
+        let started = Instant::now();
+        let err = profile.run(pending_stop()).await.unwrap_err();
+        // Upstream maps a `Publish(startupCtx, …)` failure — deadline
+        // expiry included — to exit 6 BACKGROUND_LOOP_FAILED.
+        assert_eq!(err.class(), ExitClass::Terminal);
+        assert_eq!(err.reason(), "BACKGROUND_LOOP_FAILED");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "publish must be bounded by the startup deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hung_stale_revoke_is_bounded_by_the_startup_deadline() {
+        let config = ProfileConfig {
+            startup_limit: Duration::from_millis(30),
+            ..test_config()
+        };
+        let mut profile = Profile::new(config, Readiness::new());
+        profile.set_proof_publisher(HungPublisher { hang_on: "revoke" });
+        let started = Instant::now();
+        let err = profile.run(pending_stop()).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Terminal);
+        assert_eq!(err.reason(), "BACKGROUND_LOOP_FAILED");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stale-proof revoke must be bounded by the startup deadline"
+        );
     }
 }
