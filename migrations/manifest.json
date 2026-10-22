@@ -1,0 +1,186 @@
+{
+  "migrations": [
+    {
+      "version": 0,
+      "ledger_checksum": "baseline-zero",
+      "file": "0000_baseline_zero.sql",
+      "sha256": "cc36f2175b2dca2cd232583ff27ce362a22af51bcf9133b09070fc1e7c095c95"
+    },
+    {
+      "version": 8,
+      "ledger_checksum": "b08-execution-evidence",
+      "file": "0008_b08_execution_evidence.sql",
+      "sha256": "ea0ea143cd8efb54a9a6d227acd84b09145a134410d98c98e189d092ee1c7029"
+    },
+    {
+      "version": 9,
+      "ledger_checksum": "b08-recovery-evidence-correction",
+      "file": "0009_b08_recovery_evidence_correction.sql",
+      "sha256": "303062eb5ed586ac5c40bd362e59dc06056bd7f4f4886c066cb93f2617357aea"
+    },
+    {
+      "version": 10,
+      "ledger_checksum": "b08-final-safety-correction",
+      "file": "0010_b08_final_safety_correction.sql",
+      "sha256": "d20f1bf6feab057f214e400773940767094db40ec13e11d3282a9c8a3b7ac4e6"
+    },
+    {
+      "version": 11,
+      "ledger_checksum": "b09-provider-evidence",
+      "file": "0011_b09_provider_evidence.sql",
+      "sha256": "01009a1c0698b9d2186c815b956897552ed4c02547f4fa3c9cbde0bf00000765"
+    },
+    {
+      "version": 12,
+      "ledger_checksum": "b09-provider-evidence-correction",
+      "file": "0012_b09_provider_evidence_correction.sql",
+      "sha256": "6d270ea82818dcb31574706e092113462f1264806faa9fc0da1241e4376cb8ba"
+    },
+    {
+      "version": 13,
+      "ledger_checksum": "b09-provider-evidence-response-id-correction",
+      "file": "0013_b09_provider_evidence_response_id_correction.sql",
+      "sha256": "9679b93fa937cde62493adfa293715a1558afe8f8151a9deab7b7633aef1b355"
+    },
+    {
+      "version": 14,
+      "ledger_checksum": "b10-artifact-lifecycle",
+      "file": "0014_b10_artifact_lifecycle.sql",
+      "sha256": "95f0aab6dffae1b68a44afe989a884fc44cb000ec00853b4b168496ff39f3a67"
+    },
+    {
+      "version": 16,
+      "ledger_checksum": "b09-provider-tool-call-mapping-correction",
+      "file": "0016_b09_provider_tool_call_mapping_correction.sql",
+      "sha256": "91f8bdbca93a2b388488bc65904b9583d4cf01126ff4c5c2e7410ccb4f7e0159"
+    },
+    {
+      "version": 17,
+      "ledger_checksum": "b09-durable-context-authority",
+      "file": "0017_b09_durable_context_authority.sql",
+      "sha256": "8152823d7d6c630e154b08dbbfe2aa291a112fddd199ee20b61b080e029213c3"
+    },
+    {
+      "version": 18,
+      "ledger_checksum": "b09-provider-turn",
+      "file": "0018_b09_provider_turn.sql",
+      "sha256": "e30e2bc885f9e1cf3d980f7770c7b8bc3f1ffdfe63505f2fab58c2c7ec23d4d7"
+    },
+    {
+      "version": 19,
+      "ledger_checksum": "b11-task-lineage",
+      "file": "0019_b11_task_lineage.sql",
+      "sha256": "d361694c8dc814c8266dc7b5c2ac3e746039dbf6f53428479dc89ce71b497dfd"
+    },
+    {
+      "version": 20,
+      "ledger_checksum": "b20-sentinel-workspace-id",
+      "file": "0020_b20_sentinel_workspace_id.sql",
+      "sha256": "5017c2c7afd7288a5b9c679f2b272f66efbee8c971554e5cf807500bfb0c9dc5"
+    },
+    {
+      "version": 21,
+      "ledger_checksum": "b21-task-input-spec-shape",
+      "file": "0021_b21_task_input_spec_shape.sql",
+      "sha256": "f87d51826e0ee58b04069a2c39ea68df78711e271dcbcabdb6d2c76d0abb52c4"
+    },
+    {
+      "version": 22,
+      "ledger_checksum": "b22-evidence-continuation-parent-grant",
+      "file": "0022_b22_evidence_continuation_parent_grant.sql",
+      "sha256": "69da84e4c62ba32c50c84acdd8c5888df3be7e5b6c73c2c6792db5cecf2656fa"
+    },
+    {
+      "version": 23,
+      "ledger_checksum": "b23-turn-dispatch-reference",
+      "file": "0023_b23_turn_dispatch_reference.sql",
+      "sha256": "e0938ba2d951abbe5f17608864bbbb586e262cd5fa6f00b4e3f6a8dbf4375b2f"
+    },
+    {
+      "version": 24,
+      "ledger_checksum": "b24-b09-recovery-reconciliation",
+      "file": "0024_b24_b09_recovery_reconciliation.sql",
+      "sha256": "72551358f61a44f6644ddf3e5625e8031988b7ed7d0f78d0dd77d6d6bca59e15"
+    },
+    {
+      "version": 25,
+      "ledger_checksum": "b25-recovery-audit",
+      "file": "0025_b25_recovery_audit.sql",
+      "sha256": "b10bf9b06727461b6df685acd59248c82f80026b0ff08e422cf214d42f6a37aa"
+    },
+    {
+      "version": 26,
+      "ledger_checksum": "b26-recovery-bootstrap-registration",
+      "file": "0026_b26_recovery_bootstrap_registration.sql",
+      "sha256": "f85cf627e26ec5b70fd712e41900b7ab1f30a1dc3dc85eaf7953fcb5ba748272"
+    },
+    {
+      "version": 27,
+      "ledger_checksum": "b27-recovery-abandonment",
+      "file": "0027_b27_recovery_abandonment.sql",
+      "sha256": "7a33bdf200f2894e6c8bbf3bdfb839d55c7e549c4d480854557685b5b8653018"
+    },
+    {
+      "version": 28,
+      "ledger_checksum": "b28-quarantine-observation-source",
+      "file": "0028_b28_quarantine_observation_source.sql",
+      "sha256": "45afc30c6a5c78b30f0a13a558fcfd29ca55619f12301c441161f3d9087aceeb"
+    },
+    {
+      "version": 29,
+      "ledger_checksum": "b29-prune-log",
+      "file": "0029_b29_prune_log.sql",
+      "sha256": "1fcb633000859213882ba74e105b8da3216b71e726777532f7bbc45e5aa1feac"
+    },
+    {
+      "version": 30,
+      "ledger_checksum": "b30-harness-attempts",
+      "file": "0030_b30_harness_attempts.sql",
+      "sha256": "f42a284d96b448ea7e9e1ba44d0c2c975d401be76d335127ea8f93d7b42212a8"
+    },
+    {
+      "version": 31,
+      "ledger_checksum": "b31-harness-permission-approvals",
+      "file": "0031_b31_harness_permission_approvals.sql",
+      "sha256": "ed2e3ffec4f5fa4e951da87c869df7197e7c54f1f163186a7ffd5794fc26e0e9"
+    },
+    {
+      "version": 32,
+      "ledger_checksum": "b32-task-attempt-budgets",
+      "file": "0032_b32_task_attempt_budgets.sql",
+      "sha256": "a035df962f4ec23782b7b8b2f19b9d435d47984f9856bf6a0c82f0bd722e5324"
+    },
+    {
+      "version": 33,
+      "ledger_checksum": "b33-workflow-graph",
+      "file": "0033_b33_workflow_graph.sql",
+      "sha256": "275e4f4d4a003587b54d8ebb419b7c520d6174df36e143751d168a5c7ee83aea"
+    },
+    {
+      "version": 34,
+      "ledger_checksum": "b34-artifact-lineage",
+      "file": "0034_b34_artifact_lineage.sql",
+      "sha256": "541c1c16637cdb03b407d0e6e291a8a8060330a4cb444efe12e0b6b5e658aa04"
+    },
+    {
+      "version": 35,
+      "ledger_checksum": "b35-scheduler-workers",
+      "file": "0035_b35_scheduler_workers.sql",
+      "sha256": "73350dbea6e5cd812cbc716eb688e2df64316c7606821271f42ca66d9270cb1e"
+    },
+    {
+      "version": 36,
+      "ledger_checksum": "b36-checkpoints",
+      "file": "0036_b36_checkpoints.sql",
+      "sha256": "79aa2f9d9191ed1cee95ed4ceaf66ed622b4aa372ace1680f402c2cfe5ea4f0b"
+    },
+    {
+      "version": 37,
+      "ledger_checksum": "b37-retry-idempotency",
+      "file": "0037_b37_retry_idempotency.sql",
+      "sha256": "c69e9ec03659c063fa1456beac7d6861ba02dd3517168f4daec88ee8ab36edba"
+    }
+  ],
+  "reapply_file": "reapply_incremental_runtime_grants.sql",
+  "reapply_sha256": "08dd7477fa95e382147eee0c880b8dccd38570f1a2e27a76284fa93a2d85b6c6"
+}
