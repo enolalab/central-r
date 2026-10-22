@@ -311,6 +311,7 @@ closed_state! {
     ApprovalApproved => "approved",
     ApprovalRejected => "rejected",
     ApprovalExpired => "expired",
+    ApprovalSuperseded => "superseded",
 }
 
 closed_state! {
@@ -324,8 +325,9 @@ closed_state! {
 closed_state! {
     ReconciliationEvidenceKind,
     ReconciliationEvidenceCompletionReceipt => "completion_receipt",
+    ReconciliationEvidenceCheckpoint => "checkpoint",
+    ReconciliationEvidenceEvent => "event",
     ReconciliationEvidenceOperatorAttestation => "operator_attestation",
-    ReconciliationEvidenceExternalSystem => "external_system",
 }
 
 closed_state! {
@@ -460,8 +462,10 @@ impl ReconciliationDisposition {
 pub struct Claimability {
     /// False means the run is barred.
     pub claimable: bool,
+    /// The epoch generation this answer was evaluated under.
+    pub epoch_generation: i64,
     /// Machine reason when `!claimable` (`RECOVERY_*`).
-    pub reason: Option<String>,
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,8 +518,6 @@ pub struct ToolCall {
     pub task_id: TaskId,
     pub run_id: RunId,
     pub logical_operation_id: LogicalOperationId,
-    /// Runtime-owned correlation handle (B09 lane).
-    pub provider_turn_id: ProviderTurnId,
     pub version: i64,
     pub sequence: i64,
     pub state: ToolCallState,
@@ -569,6 +571,8 @@ pub struct Approval {
     pub predecessor_id: ApprovalId,
     /// Deciding principal (set on resolution).
     pub actor: String,
+    /// Bounded free-form operator reason for the decision.
+    pub reason_code: String,
     /// Derived from the decision event id.
     pub decision_id: [u8; 16],
     pub decided_at: OffsetDateTime,
@@ -585,8 +589,14 @@ pub struct Checkpoint {
     pub run_id: RunId,
     pub step_id: StepId,
     pub step_attempt_id: StepAttemptId,
+    pub producer_version: String,
+    pub schema_version: i64,
     /// `schema_version`-validated JSON, ≤ [`CHECKPOINT_PAYLOAD_MAX_BYTES`].
     pub payload: Vec<u8>,
+    /// `sha256.Sum256(payload)` — integrity bound at mint time.
+    pub checksum: [u8; 32],
+    pub resume_compatible: bool,
+    pub validated: bool,
     pub recorded_at: OffsetDateTime,
 }
 
@@ -642,8 +652,6 @@ pub struct Reconciliation {
     pub run_id: RunId,
     pub step_id: StepId,
     pub attempt_id: StepAttemptId,
-    pub tool_call_id: ToolCallId,
-    pub tool_attempt_id: ToolCallAttemptId,
     pub disposition: ReconciliationDisposition,
     pub evidence: Vec<ReconciliationEvidence>,
     pub resolved_at: OffsetDateTime,
@@ -668,6 +676,30 @@ impl Lease {
     #[must_use]
     pub fn is_active(&self, now: OffsetDateTime) -> bool {
         self.expires_at > now
+    }
+    /// `ValidateProjection` — the durable, credential-free portion of a
+    /// lease. Persisted reads intentionally omit `credential`.
+    pub fn validate_projection(&self) -> Result<(), Failure> {
+        if self.workspace_id.is_nil()
+            || self.run_id.is_nil()
+            || self.generation <= 0
+            || self.expires_at == ZERO_TIME
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_LEASE_PROJECTION"));
+        }
+        Ok(())
+    }
+    /// `Validate` — a full lease including its fencing verifier.
+    pub fn validate(&self) -> Result<(), Failure> {
+        if self.workspace_id.is_nil()
+            || self.run_id.is_nil()
+            || !self.credential.valid()
+            || self.generation <= 0
+            || self.expires_at == ZERO_TIME
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_LEASE"));
+        }
+        Ok(())
     }
 }
 
@@ -702,6 +734,20 @@ pub struct LeaseRelease {
     pub run_id: RunId,
     pub credential: LeaseCredential,
     pub generation: i64,
+}
+
+impl LeaseRelease {
+    /// `LeaseRelease.validate` — explicit fenced delete intent.
+    pub fn validate(&self) -> Result<(), Failure> {
+        if self.workspace_id.is_nil()
+            || self.run_id.is_nil()
+            || !self.credential.valid()
+            || self.generation <= 0
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_LEASE_RELEASE"));
+        }
+        Ok(())
+    }
 }
 
 /// Intent to assert lease state atomically at commit.
@@ -802,29 +848,35 @@ pub const EVENT_HARNESS_RUN_STARTED: EventKind = "harness_run_started";
 pub const EVENT_ATTEMPT_ABANDONED: EventKind = "attempt_abandoned";
 pub const EVENT_ATTEMPT_RESUMED: EventKind = "attempt_resumed";
 
-/// Outbox catalog event types.
+/// Outbox catalog event types — the persisted allowlist.
 pub type OutboxCatalogType = &'static str;
 
-pub const OUTBOX_ATTEMPT_PREPARED: OutboxCatalogType = "attempt_prepared";
-pub const OUTBOX_ATTEMPT_CLAIMED: OutboxCatalogType = "attempt_claimed";
-pub const OUTBOX_ATTEMPT_SETTLED: OutboxCatalogType = "attempt_settled";
-pub const OUTBOX_ATTEMPT_CANCELLED: OutboxCatalogType = "attempt_cancelled";
-pub const OUTBOX_ATTEMPT_RETRY_SCHEDULED: OutboxCatalogType = "attempt_retry_scheduled";
-pub const OUTBOX_ATTEMPT_RECONCILIATION: OutboxCatalogType = "attempt_reconciliation";
-pub const OUTBOX_ATTEMPT_RECOVERED: OutboxCatalogType = "attempt_recovered";
-pub const OUTBOX_APPROVAL_PENDING: OutboxCatalogType = "approval_pending";
-pub const OUTBOX_APPROVAL_RESOLVED: OutboxCatalogType = "approval_resolved";
-pub const OUTBOX_APPROVAL_EXPIRED: OutboxCatalogType = "approval_expired";
-pub const OUTBOX_APPROVAL_SUCCESSOR: OutboxCatalogType = "approval_successor";
-pub const OUTBOX_RECONCILIATION_RESOLVED: OutboxCatalogType = "reconciliation_resolved";
-pub const OUTBOX_HARNESS_RUN_STARTED: OutboxCatalogType = "harness_run_started";
-pub const OUTBOX_ATTEMPT_RESUMED: OutboxCatalogType = "attempt_resumed";
-pub const OUTBOX_RECONCILIATION_REQUIRED: OutboxCatalogType = "reconciliation_required";
-pub const OUTBOX_TOOL_CALL_PREPARED: OutboxCatalogType = "tool_call_prepared";
-pub const OUTBOX_TOOL_CALL_INVOKED: OutboxCatalogType = "tool_call_invoked";
-pub const OUTBOX_TOOL_CALL_SETTLED: OutboxCatalogType = "tool_call_settled";
-pub const OUTBOX_CHECKPOINT_RECORDED: OutboxCatalogType = "checkpoint_recorded";
-pub const OUTBOX_APPROVAL_RECORDED: OutboxCatalogType = "approval_recorded";
+pub const OUTBOX_ATTEMPT_PREPARED: OutboxCatalogType = "execution.attempt.prepared";
+pub const OUTBOX_ATTEMPT_CLAIMED: OutboxCatalogType = "execution.attempt.claimed";
+pub const OUTBOX_ATTEMPT_SETTLED: OutboxCatalogType = "execution.attempt.settled";
+pub const OUTBOX_TOOL_CALL_PREPARED: OutboxCatalogType = "execution.tool_call.prepared";
+pub const OUTBOX_TOOL_CALL_INVOKED: OutboxCatalogType = "execution.tool_call.invoked";
+pub const OUTBOX_TOOL_CALL_SETTLED: OutboxCatalogType = "execution.tool_call.settled";
+pub const OUTBOX_CHECKPOINT_RECORDED: OutboxCatalogType = "execution.checkpoint.recorded";
+pub const OUTBOX_APPROVAL_RECORDED: OutboxCatalogType = "execution.approval.recorded";
+pub const OUTBOX_RECONCILIATION_REQUIRED: OutboxCatalogType = "execution.reconciliation.required";
+
+/// `OutboxCatalogType.valid()` — the persisted allowlist.
+#[must_use]
+pub fn outbox_catalog_type_valid(catalog: &str) -> bool {
+    matches!(
+        catalog,
+        OUTBOX_ATTEMPT_PREPARED
+            | OUTBOX_ATTEMPT_CLAIMED
+            | OUTBOX_ATTEMPT_SETTLED
+            | OUTBOX_TOOL_CALL_PREPARED
+            | OUTBOX_TOOL_CALL_INVOKED
+            | OUTBOX_TOOL_CALL_SETTLED
+            | OUTBOX_CHECKPOINT_RECORDED
+            | OUTBOX_APPROVAL_RECORDED
+            | OUTBOX_RECONCILIATION_REQUIRED
+    )
+}
 
 /// The commit-scope dedup coordinate for each event kind
 /// (upstream `commandScope`).
@@ -900,120 +952,231 @@ pub(crate) fn go_json_escapes(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn sanitize_value(value: &serde_json::Value) -> Result<(), Failure> {
-    match value {
-        serde_json::Value::Object(map) => sanitize_object(map),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                sanitize_value(item)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
+/// Payload shape allowlist (upstream `payloadSchema`): key → child
+/// schema; `Leaf` is a scalar field.
+#[derive(Clone, Copy)]
+pub(crate) enum SchemaNode {
+    Leaf,
+    Children(PayloadSchema),
 }
 
-fn sanitize_object(map: &serde_json::Map<String, serde_json::Value>) -> Result<(), Failure> {
-    if !map.contains_key("schema_version") {
-        return Err(failure(FailureKind::Invalid, "UNSANITIZED_PAYLOAD"));
-    }
-    for (key, value) in map {
-        if key.is_empty() || key.len() > 256 {
+pub(crate) type PayloadSchema = &'static [(&'static str, SchemaNode)];
+
+const METADATA_SCHEMA: PayloadSchema = &[
+    ("producer_version", SchemaNode::Leaf),
+    ("schema_version", SchemaNode::Leaf),
+    ("source", SchemaNode::Leaf),
+    ("sequence", SchemaNode::Leaf),
+];
+
+const EVENT_PAYLOAD_SCHEMA: PayloadSchema = &[
+    ("schema_version", SchemaNode::Leaf),
+    ("type", SchemaNode::Leaf),
+    ("reason_code", SchemaNode::Leaf),
+    ("state", SchemaNode::Leaf),
+    ("sequence", SchemaNode::Leaf),
+    ("occurred_at", SchemaNode::Leaf),
+    ("logical_operation_id", SchemaNode::Leaf),
+    ("attempt_id", SchemaNode::Leaf),
+    ("invocation_id", SchemaNode::Leaf),
+    ("message", SchemaNode::Leaf),
+    ("detail", SchemaNode::Leaf),
+    ("metadata", SchemaNode::Children(METADATA_SCHEMA)),
+];
+
+const OUTBOX_PAYLOAD_SCHEMA: PayloadSchema = &[
+    ("schema_version", SchemaNode::Leaf),
+    ("event_id", SchemaNode::Leaf),
+    ("catalog_type", SchemaNode::Leaf),
+    ("deduplication_key", SchemaNode::Leaf),
+    ("metadata", SchemaNode::Children(METADATA_SCHEMA)),
+];
+
+pub(crate) const OUTCOME_PAYLOAD_SCHEMA: PayloadSchema = &[
+    ("schema_version", SchemaNode::Leaf),
+    ("status", SchemaNode::Leaf),
+    ("summary", SchemaNode::Leaf),
+    ("reason_code", SchemaNode::Leaf),
+    ("metadata", SchemaNode::Children(METADATA_SCHEMA)),
+];
+
+pub(crate) const CONTEXT_PAYLOAD_SCHEMA: PayloadSchema = &[
+    ("schema_version", SchemaNode::Leaf),
+    ("summary", SchemaNode::Leaf),
+    ("state", SchemaNode::Leaf),
+    ("metadata", SchemaNode::Children(METADATA_SCHEMA)),
+];
+
+const CONTINUATION_SCHEMA: PayloadSchema = &[
+    ("state", SchemaNode::Leaf),
+    ("cursor", SchemaNode::Leaf),
+    ("sequence", SchemaNode::Leaf),
+    ("summary", SchemaNode::Leaf),
+    ("metadata", SchemaNode::Children(METADATA_SCHEMA)),
+];
+
+const CHECKPOINT_PAYLOAD_SCHEMA: PayloadSchema = &[
+    ("schema_version", SchemaNode::Leaf),
+    ("producer_version", SchemaNode::Leaf),
+    ("continuation", SchemaNode::Children(CONTINUATION_SCHEMA)),
+    ("metadata", SchemaNode::Children(METADATA_SCHEMA)),
+];
+
+const SENSITIVE_PAYLOAD_KEYS: &[&str] = &[
+    "access_token",
+    "api_key",
+    "api_token",
+    "authorization",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "secret_key",
+    "token",
+];
+
+/// `sanitizeObject` — case-insensitive sensitive-key refusal plus
+/// schema allowlist traversal.
+fn sanitize_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+    schema: PayloadSchema,
+) -> Result<(), Failure> {
+    for (key, value) in object {
+        if SENSITIVE_PAYLOAD_KEYS.contains(&key.to_lowercase().as_str()) {
             return Err(failure(FailureKind::Invalid, "UNSANITIZED_PAYLOAD"));
         }
+        let child_schema = schema
+            .iter()
+            .find(|(name, _)| *name == key.as_str())
+            .map(|(_, child)| *child);
+        let Some(child_schema) = child_schema else {
+            return Err(failure(FailureKind::Invalid, "UNKNOWN_PAYLOAD_FIELD"));
+        };
         match value {
-            serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                sanitize_value(value)?;
+            serde_json::Value::Object(map) => {
+                let SchemaNode::Children(inner) = child_schema else {
+                    return Err(failure(FailureKind::Invalid, "UNKNOWN_PAYLOAD_FIELD"));
+                };
+                sanitize_object(map, inner)?;
             }
-            serde_json::Value::String(_) | serde_json::Value::Null => {}
-            serde_json::Value::Number(n) => {
-                if n.is_f64() && !n.as_f64().unwrap_or(0.0).is_finite() {
-                    return Err(failure(FailureKind::Invalid, "UNSANITIZED_PAYLOAD"));
+            serde_json::Value::Array(items) => {
+                let SchemaNode::Children(inner) = child_schema else {
+                    return Err(failure(FailureKind::Invalid, "UNKNOWN_PAYLOAD_FIELD"));
+                };
+                for item in items {
+                    let serde_json::Value::Object(map) = item else {
+                        return Err(failure(FailureKind::Invalid, "UNKNOWN_PAYLOAD_FIELD"));
+                    };
+                    sanitize_object(map, inner)?;
                 }
             }
-            serde_json::Value::Bool(_) => {}
+            _ => {
+                if matches!(child_schema, SchemaNode::Children(_)) {
+                    return Err(failure(FailureKind::Invalid, "UNKNOWN_PAYLOAD_FIELD"));
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Parses, schema-checks, and re-encodes the payload in Go canonical
-/// form (sorted keys, HTML-escaped strings). Bare scalars are refused.
+/// `sanitizePayload` — parses, schema-checks, and re-encodes the payload
+/// in Go canonical form (sorted keys, HTML-escaped strings). Bare
+/// scalars are refused; error codes are the upstream vocabulary.
 pub(crate) fn sanitize_payload(
     raw: &[u8],
-    max_bytes: usize,
-    code: &'static str,
+    limit: usize,
+    schema: PayloadSchema,
 ) -> Result<Vec<u8>, Failure> {
-    if raw.is_empty() || raw.len() > max_bytes {
-        return Err(failure(FailureKind::Invalid, code));
+    if raw.len() > limit {
+        return Err(failure(FailureKind::Invalid, "PAYLOAD_TOO_LARGE"));
     }
     let value: serde_json::Value = match serde_json::from_slice(raw) {
         Ok(value) => value,
-        Err(_) => return Err(failure(FailureKind::Invalid, code)),
+        Err(_) => return Err(failure(FailureKind::Invalid, "INVALID_PAYLOAD")),
     };
-    let serde_json::Value::Object(map) = &value else {
-        return Err(failure(FailureKind::Invalid, code));
+    let serde_json::Value::Object(object) = &value else {
+        return Err(failure(FailureKind::Invalid, "INVALID_PAYLOAD"));
     };
-    if sanitize_object(map).is_err() {
-        return Err(failure(FailureKind::Invalid, code));
-    }
+    sanitize_object(object, schema)?;
     let mut encoded =
-        serde_json::to_vec(&value).map_err(|_| failure(FailureKind::Invalid, code))?;
+        serde_json::to_vec(&value).map_err(|_| failure(FailureKind::Invalid, "INVALID_PAYLOAD"))?;
     encoded = go_json_escapes(&encoded);
-    if encoded.len() > max_bytes {
-        return Err(failure(FailureKind::Invalid, code));
+    if encoded.len() > limit {
+        return Err(failure(FailureKind::Invalid, "PAYLOAD_TOO_LARGE"));
     }
     Ok(encoded)
 }
 
-/// Validates an optional payload: empty means absent.
-fn validate_optional_payload(
+/// `validateOptionalPayload` — empty means absent; a present payload
+/// must be schema-clean and already in Go canonical byte form.
+pub(crate) fn validate_optional_payload(
     payload: &[u8],
-    max_bytes: usize,
-    code: &'static str,
-) -> Result<Vec<u8>, Failure> {
+    limit: usize,
+    schema: PayloadSchema,
+) -> Result<(), Failure> {
     if payload.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let sanitized = sanitize_payload(payload, max_bytes, code)?;
+    let sanitized = sanitize_payload(payload, limit, schema)?;
     if sanitized != payload {
-        return Err(failure(FailureKind::Invalid, code));
+        return Err(failure(FailureKind::Invalid, "UNSANITIZED_PAYLOAD"));
     }
-    Ok(sanitized)
+    Ok(())
 }
 
 /// `NewEventPayload` — sanitized ≤64 KiB event body.
 pub fn new_event_payload(raw: &[u8]) -> Result<Vec<u8>, Failure> {
-    sanitize_payload(raw, EVENT_PAYLOAD_MAX_BYTES, "INVALID_EVENT_PAYLOAD")
+    sanitize_payload(raw, EVENT_PAYLOAD_MAX_BYTES, EVENT_PAYLOAD_SCHEMA)
 }
 
 /// `NewOutboxPayload` — sanitized ≤64 KiB outbox body.
 pub fn new_outbox_payload(raw: &[u8]) -> Result<Vec<u8>, Failure> {
-    sanitize_payload(raw, OUTBOX_PAYLOAD_MAX_BYTES, "INVALID_OUTBOX_PAYLOAD")
+    sanitize_payload(raw, OUTBOX_PAYLOAD_MAX_BYTES, OUTBOX_PAYLOAD_SCHEMA)
 }
 
 /// `NewOutcomePayload` — sanitized ≤256 KiB settlement body.
 pub fn new_outcome_payload(raw: &[u8]) -> Result<Vec<u8>, Failure> {
-    sanitize_payload(raw, OUTCOME_PAYLOAD_MAX_BYTES, "INVALID_OUTCOME_PAYLOAD")
+    sanitize_payload(raw, OUTCOME_PAYLOAD_MAX_BYTES, OUTCOME_PAYLOAD_SCHEMA)
 }
 
 /// `NewContextPayload` — sanitized ≤256 KiB invocation context.
 pub fn new_context_payload(raw: &[u8]) -> Result<Vec<u8>, Failure> {
-    sanitize_payload(raw, CONTEXT_PAYLOAD_MAX_BYTES, "INVALID_CONTEXT_PAYLOAD")
+    sanitize_payload(raw, CONTEXT_PAYLOAD_MAX_BYTES, CONTEXT_PAYLOAD_SCHEMA)
 }
 
-/// `NewCheckpoint` — the checkpoint evidence payload.
-pub fn new_checkpoint(raw: &[u8]) -> Result<Vec<u8>, Failure> {
-    sanitize_payload(
-        raw,
+/// `NewCheckpoint` — bounded immutable inline continuation evidence:
+/// mints the identity and binds `sha256(payload)` as the checksum.
+/// All selector and producer fields stay zero — the recording command
+/// binds them.
+pub fn new_checkpoint(payload: &[u8]) -> Result<Checkpoint, Failure> {
+    use central_foundation::identity::{RunId, StepAttemptId, StepId, TaskId, WorkspaceId};
+    let sanitized = sanitize_payload(
+        payload,
         CHECKPOINT_PAYLOAD_MAX_BYTES,
-        "INVALID_CHECKPOINT_PAYLOAD",
-    )
+        CHECKPOINT_PAYLOAD_SCHEMA,
+    )?;
+    let checksum: [u8; 32] = sha2::Sha256::digest(&sanitized).into();
+    Ok(Checkpoint {
+        id: central_foundation::identity::CheckpointId::new(),
+        workspace_id: WorkspaceId::from_trusted_db_bytes([0; 16]),
+        task_id: TaskId::from_trusted_db_bytes([0; 16]),
+        run_id: RunId::from_trusted_db_bytes([0; 16]),
+        step_id: StepId::from_trusted_db_bytes([0; 16]),
+        step_attempt_id: StepAttemptId::from_trusted_db_bytes([0; 16]),
+        producer_version: String::new(),
+        schema_version: 0,
+        payload: sanitized,
+        checksum,
+        resume_compatible: false,
+        validated: false,
+        recorded_at: ZERO_TIME,
+    })
 }
 
-/// `NewCheckpointPayload` — alias carried on the command.
+/// `NewCheckpointPayload` — the checkpoint payload half only.
 pub fn new_checkpoint_payload(raw: &[u8]) -> Result<Vec<u8>, Failure> {
-    new_checkpoint(raw)
+    sanitize_payload(raw, CHECKPOINT_PAYLOAD_MAX_BYTES, CHECKPOINT_PAYLOAD_SCHEMA)
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,10 +1392,6 @@ pub struct CommandEnvelope {
     /// Caller-side state hint — the service always replaces it with
     /// authoritative state before evaluation.
     pub state: ExecutionState,
-    /// Approval subject version the caller binds (approval-gated ops).
-    pub approval_subject_version: i64,
-    /// Step version the approval subject was recorded against.
-    pub approval_expected_step_version: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,316 +1433,779 @@ impl ExecutionChangeSet {
 // build_execution_change_set — the gate every mutation passes through.
 // ---------------------------------------------------------------------------
 
-/// Validates the whole change set; returns it unchanged on success.
-/// Every refusal yields a [`Failure`] whose code is the upstream reason.
+/// `BuildExecutionChangeSet` — validates every record before returning
+/// any approved mutation. It never truncates or silently sanitizes
+/// persistence input.
 pub fn build_execution_change_set(
     candidate: ExecutionChangeSet,
 ) -> Result<ExecutionChangeSet, Failure> {
-    validate_attempt_identities(&candidate)?;
-    validate_active_attempt_cardinality(&candidate)?;
-    validate_tool_hierarchy(&candidate)?;
-    validate_attempt_assertions(&candidate)?;
-    validate_settlement_consistency(&candidate)?;
-    validate_tool_settlement_consistency(&candidate)?;
-    validate_reconciliation_evidence(&candidate)?;
-    validate_payloads(&candidate)?;
-    validate_task_transition(&candidate)?;
-    Ok(candidate)
-}
-
-fn validate_attempt_identities(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    for attempt in &change.attempts {
-        if attempt.id.is_nil()
-            || attempt.workspace_id.is_nil()
-            || attempt.task_id.is_nil()
-            || attempt.run_id.is_nil()
-            || attempt.step_id.is_nil()
-            || attempt.logical_operation_id.is_nil()
-            || attempt.physical_attempt_id.is_nil()
-        {
-            return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
-        }
-        if attempt.version <= 0 {
-            return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
-        }
-        if attempt.state.requires_invocation() && attempt.invocation_id.is_nil() {
-            return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
-        }
-        // A prepared attempt must not carry one; non-prepared states
-        // (reconciliation, cancelled-after-invoke) retain it as evidence.
-        if attempt.state == AttemptState::AttemptPrepared && !attempt.invocation_id.is_nil() {
-            return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
-        }
-        // A recovery successor must be a new version-1 row whose
-        // predecessor appears in the same set — or a non-authoritative
-        // version >= 2 upsert.
-        if !attempt.predecessor_id.is_nil() {
-            let predecessor = change
-                .attempts
-                .iter()
-                .find(|a| a.id == attempt.predecessor_id);
-            match predecessor {
-                Some(p) if attempt.version == 1 => {
-                    let same_step = p.step_id == attempt.step_id;
-                    let same_logical = p.logical_operation_id == attempt.logical_operation_id;
-                    let resume_pair = p.state == AttemptState::AttemptFailed
-                        && p.invocation_id != attempt.invocation_id
-                        && change.reconciliations.iter().any(|r| {
-                            r.attempt_id == p.id
-                                && r.disposition == ReconciliationDisposition::ReconciliationResume
-                        });
-                    let b08_pair = p.state == AttemptState::AttemptCancelled
-                        && same_step
-                        && same_logical
-                        && attempt.sequence == p.sequence + 1;
-                    let resume_shape =
-                        !same_step && !same_logical && attempt.sequence == 1 && resume_pair;
-                    if !b08_pair && !resume_shape {
-                        return Err(failure(
-                            FailureKind::Invalid,
-                            "INVALID_LOGICAL_OPERATION_REUSE",
-                        ));
-                    }
-                }
-                Some(_) | None if attempt.version >= 2 => {}
-                _ => {
-                    return Err(failure(
-                        FailureKind::Invalid,
-                        "INVALID_LOGICAL_OPERATION_REUSE",
-                    ));
-                }
-            }
-        }
-    }
-    // No two attempts may share a physical attempt id.
-    for (i, a) in change.attempts.iter().enumerate() {
-        for b in &change.attempts[i + 1..] {
-            if a.physical_attempt_id == b.physical_attempt_id {
-                return Err(failure(
-                    FailureKind::Invalid,
-                    "INVALID_PHYSICAL_ATTEMPT_REUSE",
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_active_attempt_cardinality(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    let active = |s: AttemptState| !s.is_terminal();
-    let mut step_active: BTreeMap<StepId, usize> = BTreeMap::new();
-    for attempt in &change.attempts {
-        if active(attempt.state) {
-            *step_active.entry(attempt.step_id).or_default() += 1;
-        }
-    }
-    if step_active.values().any(|n| *n > 1) {
-        return Err(failure(FailureKind::Conflict, "ACTIVE_ATTEMPT_CONFLICT"));
-    }
-    let mut call_active: BTreeMap<ToolCallId, usize> = BTreeMap::new();
-    for attempt in &change.tool_attempts {
-        if active(attempt.state) {
-            *call_active.entry(attempt.tool_call_id).or_default() += 1;
-        }
-    }
-    if call_active.values().any(|n| *n > 1) {
-        return Err(failure(FailureKind::Conflict, "ACTIVE_ATTEMPT_CONFLICT"));
-    }
-    Ok(())
-}
-
-fn validate_tool_hierarchy(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    for call in &change.tool_calls {
-        if call.id.is_nil() || call.step_attempt_id.is_nil() || call.logical_operation_id.is_nil() {
-            return Err(failure(FailureKind::Invalid, "INVALID_TOOL_HIERARCHY"));
-        }
-    }
-    for attempt in &change.tool_attempts {
-        if attempt.id.is_nil()
-            || attempt.tool_call_id.is_nil()
-            || attempt.step_attempt_id.is_nil()
-            || attempt.logical_operation_id.is_nil()
-            || attempt.physical_attempt_id.is_nil()
-        {
-            return Err(failure(FailureKind::Invalid, "INVALID_TOOL_HIERARCHY"));
-        }
-        let call = change
-            .tool_calls
-            .iter()
-            .find(|c| c.id == attempt.tool_call_id);
-        if let Some(call) = call {
-            if call.step_attempt_id != attempt.step_attempt_id {
-                return Err(failure(FailureKind::Invalid, "INVALID_TOOL_HIERARCHY"));
-            }
-            if call.logical_operation_id != attempt.logical_operation_id {
-                return Err(failure(FailureKind::Invalid, "INVALID_TOOL_HIERARCHY"));
-            }
-        }
-        // A tool attempt can never outlive its parent step attempt.
-        let parent = change
-            .attempts
-            .iter()
-            .find(|a| a.id == attempt.step_attempt_id);
-        if let Some(parent) = parent
-            && parent.state.is_terminal()
-            && !attempt.state.is_terminal()
-        {
-            return Err(failure(FailureKind::Invalid, "INVALID_TOOL_HIERARCHY"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_attempt_assertions(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    for assertion in &change.attempt_assertions {
+    validate_attempt_identities(
+        &candidate.attempts,
+        &candidate.tool_attempts,
+        &resumed_attempts(&candidate.reconciliations),
+    )?;
+    validate_active_attempt_cardinality(&candidate.attempts, &candidate.tool_attempts)?;
+    let mut hierarchy_parents: Vec<StepAttempt> = candidate.attempts.clone();
+    let mut parent_ids: BTreeSet<StepAttemptId> = candidate.attempts.iter().map(|a| a.id).collect();
+    for assertion in &candidate.attempt_assertions {
         if assertion.id.is_nil()
-            || assertion.workspace_id.is_nil()
-            || assertion.run_id.is_nil()
             || assertion.step_id.is_nil()
+            || assertion.workspace_id.is_nil()
             || assertion.task_id.is_nil()
+            || assertion.run_id.is_nil()
             || assertion.logical_operation_id.is_nil()
             || assertion.version <= 0
+            || assertion.state != AttemptState::AttemptInvoked
         {
             return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_ASSERTION"));
         }
+        if !parent_ids.insert(assertion.id) {
+            return Err(failure(
+                FailureKind::Conflict,
+                "DUPLICATE_ATTEMPT_ASSERTION",
+            ));
+        }
+        hierarchy_parents.push(StepAttempt {
+            id: assertion.id,
+            step_id: assertion.step_id,
+            workspace_id: assertion.workspace_id,
+            task_id: assertion.task_id,
+            run_id: assertion.run_id,
+            logical_operation_id: assertion.logical_operation_id,
+            physical_attempt_id: PhysicalAttemptId::default(),
+            invocation_id: InvocationId::default(),
+            predecessor_id: NIL_STEP_ATTEMPT_ID,
+            version: assertion.version,
+            sequence: 0,
+            state: assertion.state,
+            created_at: ZERO_TIME,
+            updated_at: ZERO_TIME,
+        });
     }
-    Ok(())
-}
-
-fn validate_settlement_consistency(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    for settlement in &change.settlements {
-        let attempt = change
-            .attempts
-            .iter()
-            .find(|a| a.id == settlement.attempt_id);
-        let Some(attempt) = attempt else {
-            return Err(failure(FailureKind::Invalid, "SETTLEMENT_ATTEMPT_MISMATCH"));
-        };
-        if attempt.step_id != settlement.step_id
-            || attempt.invocation_id != settlement.invocation_id
-            || attempt.state != settlement.final_state
-            || !attempt.state.is_terminal()
+    validate_tool_hierarchy(
+        &hierarchy_parents,
+        &candidate.tool_calls,
+        &candidate.tool_attempts,
+    )?;
+    let hierarchy_parents_by_id: BTreeMap<StepAttemptId, &StepAttempt> =
+        hierarchy_parents.iter().map(|p| (p.id, p)).collect();
+    let attempts_by_id: BTreeMap<StepAttemptId, &StepAttempt> =
+        candidate.attempts.iter().map(|a| (a.id, a)).collect();
+    for settlement in &candidate.settlements {
+        if settlement.workspace_id.is_nil()
+            || settlement.task_id.is_nil()
+            || settlement.run_id.is_nil()
+            || settlement.step_id.is_nil()
+            || settlement.attempt_id.is_nil()
+            || settlement.invocation_id.is_nil()
+            || !matches!(
+                settlement.final_state,
+                AttemptState::AttemptSucceeded | AttemptState::AttemptFailed
+            )
+            || settlement.settled_at == ZERO_TIME
+            || settlement.outcome.is_empty()
         {
+            return Err(failure(FailureKind::Invalid, "INVALID_SETTLEMENT"));
+        }
+        let attempt = attempts_by_id.get(&settlement.attempt_id);
+        if attempt.is_none_or(|a| {
+            a.workspace_id != settlement.workspace_id
+                || a.task_id != settlement.task_id
+                || a.run_id != settlement.run_id
+                || a.step_id != settlement.step_id
+                || a.invocation_id != settlement.invocation_id
+                || a.state != settlement.final_state
+        }) {
             return Err(failure(FailureKind::Invalid, "SETTLEMENT_ATTEMPT_MISMATCH"));
         }
+        validate_optional_payload(
+            &settlement.outcome,
+            OUTCOME_PAYLOAD_MAX_BYTES,
+            OUTCOME_PAYLOAD_SCHEMA,
+        )?;
+        validate_optional_payload(
+            &settlement.context,
+            CONTEXT_PAYLOAD_MAX_BYTES,
+            CONTEXT_PAYLOAD_SCHEMA,
+        )?;
     }
-    Ok(())
-}
-
-fn validate_tool_settlement_consistency(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    for settlement in &change.tool_settlements {
-        let attempt = change
-            .tool_attempts
-            .iter()
-            .find(|a| a.id == settlement.tool_attempt_id);
-        let Some(attempt) = attempt else {
+    let tool_calls_by_id: BTreeMap<ToolCallId, &ToolCall> =
+        candidate.tool_calls.iter().map(|c| (c.id, c)).collect();
+    let tool_attempts_by_id: BTreeMap<ToolCallAttemptId, &ToolCallAttempt> =
+        candidate.tool_attempts.iter().map(|a| (a.id, a)).collect();
+    for settlement in &candidate.tool_settlements {
+        if settlement.workspace_id.is_nil()
+            || settlement.task_id.is_nil()
+            || settlement.run_id.is_nil()
+            || settlement.step_id.is_nil()
+            || settlement.attempt_id.is_nil()
+            || settlement.tool_call_id.is_nil()
+            || settlement.tool_attempt_id.is_nil()
+            || settlement.invocation_id.is_nil()
+            || !matches!(
+                settlement.final_state,
+                AttemptState::AttemptSucceeded | AttemptState::AttemptFailed
+            )
+            || settlement.settled_at == ZERO_TIME
+            || settlement.outcome.is_empty()
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_TOOL_SETTLEMENT"));
+        }
+        let call = tool_calls_by_id.get(&settlement.tool_call_id);
+        let attempt = tool_attempts_by_id.get(&settlement.tool_attempt_id);
+        let parent = hierarchy_parents_by_id.get(&settlement.attempt_id);
+        let mismatch = match (call, attempt, parent) {
+            (Some(call), Some(attempt), Some(parent)) => {
+                call.step_attempt_id != settlement.attempt_id
+                    || attempt.step_attempt_id != settlement.attempt_id
+                    || attempt.tool_call_id != settlement.tool_call_id
+                    || call.workspace_id != settlement.workspace_id
+                    || call.task_id != settlement.task_id
+                    || call.run_id != settlement.run_id
+                    || parent.step_id != settlement.step_id
+                    || parent.workspace_id != settlement.workspace_id
+                    || parent.task_id != settlement.task_id
+                    || parent.run_id != settlement.run_id
+                    || attempt.invocation_id != settlement.invocation_id
+                    || Some(call.state) != tool_call_terminal_state(settlement.final_state)
+                    || attempt.state != settlement.final_state
+            }
+            _ => true,
+        };
+        if mismatch {
             return Err(failure(
                 FailureKind::Invalid,
                 "TOOL_SETTLEMENT_ATTEMPT_MISMATCH",
             ));
-        };
-        if attempt.tool_call_id != settlement.tool_call_id
-            || attempt.step_attempt_id != settlement.step_attempt_id
-            || attempt.invocation_id != settlement.invocation_id
-            || attempt.state != settlement.final_state
-            || !attempt.state.is_terminal()
-        {
-            return Err(failure(
-                FailureKind::Invalid,
-                "TOOL_SETTLEMENT_ATTEMPT_MISMATCH",
-            ));
         }
-    }
-    Ok(())
-}
-
-fn validate_reconciliation_evidence(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    for reconciliation in &change.reconciliations {
-        validate_evidence(&reconciliation.evidence)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_evidence(evidence: &[ReconciliationEvidence]) -> Result<(), Failure> {
-    if evidence.is_empty() {
-        return Err(failure(
-            FailureKind::Invalid,
-            "RECONCILIATION_EVIDENCE_REQUIRED",
-        ));
-    }
-    if evidence.len() > MAX_RECONCILIATION_EVIDENCE {
-        return Err(failure(
-            FailureKind::Invalid,
-            "RECONCILIATION_EVIDENCE_TOO_LARGE",
-        ));
-    }
-    let mut total = 0usize;
-    for item in evidence {
-        if item.reference.is_empty()
-            || item.reference.len() > MAX_RECONCILIATION_EVIDENCE_REFERENCE_BYTES
-        {
-            return Err(failure(
-                FailureKind::Invalid,
-                "RECONCILIATION_EVIDENCE_INVALID",
-            ));
-        }
-        total += item.reference.len();
-    }
-    if total > MAX_RECONCILIATION_EVIDENCE_TOTAL_BYTES {
-        return Err(failure(
-            FailureKind::Invalid,
-            "RECONCILIATION_EVIDENCE_TOO_LARGE",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_payloads(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    for event in &change.events {
-        validate_optional_payload(
-            &event.payload,
-            EVENT_PAYLOAD_MAX_BYTES,
-            "INVALID_EVENT_PAYLOAD",
-        )?;
-    }
-    for intent in &change.outbox {
-        validate_optional_payload(
-            &intent.payload,
-            OUTBOX_PAYLOAD_MAX_BYTES,
-            "INVALID_OUTBOX_PAYLOAD",
-        )?;
-    }
-    for settlement in &change.settlements {
         validate_optional_payload(
             &settlement.outcome,
             OUTCOME_PAYLOAD_MAX_BYTES,
-            "INVALID_OUTCOME_PAYLOAD",
+            OUTCOME_PAYLOAD_SCHEMA,
+        )?;
+        validate_optional_payload(
+            &settlement.context,
+            CONTEXT_PAYLOAD_MAX_BYTES,
+            CONTEXT_PAYLOAD_SCHEMA,
         )?;
     }
-    for settlement in &change.tool_settlements {
-        validate_optional_payload(
-            &settlement.outcome,
-            OUTCOME_PAYLOAD_MAX_BYTES,
-            "INVALID_OUTCOME_PAYLOAD",
-        )?;
+    for reconciliation in &candidate.reconciliations {
+        if reconciliation.workspace_id.is_nil()
+            || reconciliation.task_id.is_nil()
+            || reconciliation.run_id.is_nil()
+            || reconciliation.step_id.is_nil()
+            || reconciliation.attempt_id.is_nil()
+            || reconciliation.resolved_at == ZERO_TIME
+        {
+            return Err(failure(
+                FailureKind::Invalid,
+                "INVALID_RECONCILIATION_EVIDENCE",
+            ));
+        }
+        let attempt = attempts_by_id.get(&reconciliation.attempt_id);
+        let want_state = reconciliation_attempt_state(reconciliation.disposition);
+        if attempt.is_none_or(|a| {
+            a.workspace_id != reconciliation.workspace_id
+                || a.task_id != reconciliation.task_id
+                || a.run_id != reconciliation.run_id
+                || a.step_id != reconciliation.step_id
+                || a.state != want_state
+        }) {
+            return Err(failure(
+                FailureKind::Invalid,
+                "RECONCILIATION_ATTEMPT_MISMATCH",
+            ));
+        }
+        clone_and_validate_evidence(&reconciliation.evidence)?;
     }
-    for checkpoint in &change.checkpoints {
-        validate_optional_payload(
+    for lease in &candidate.leases {
+        lease.validate()?;
+    }
+    for release in &candidate.lease_releases {
+        release.validate()?;
+    }
+    for assertion in &candidate.lease_assertions {
+        if assertion.workspace_id.is_nil() || assertion.run_id.is_nil() || !assertion.no_active {
+            return Err(failure(FailureKind::Invalid, "INVALID_LEASE_ASSERTION"));
+        }
+    }
+    for release in &candidate.lease_releases {
+        for assertion in &candidate.lease_assertions {
+            if release.workspace_id == assertion.workspace_id && release.run_id == assertion.run_id
+            {
+                return Err(failure(FailureKind::Invalid, "CONFLICTING_LEASE_INTENT"));
+            }
+        }
+    }
+    for checkpoint in &candidate.checkpoints {
+        if checkpoint.payload.len() > CHECKPOINT_PAYLOAD_MAX_BYTES {
+            return Err(failure(FailureKind::Invalid, "PAYLOAD_TOO_LARGE"));
+        }
+        if sha2::Sha256::digest(&checkpoint.payload).as_slice() != checkpoint.checksum {
+            return Err(failure(
+                FailureKind::Invalid,
+                "CHECKPOINT_CHECKSUM_MISMATCH",
+            ));
+        }
+        let sanitized = sanitize_payload(
             &checkpoint.payload,
             CHECKPOINT_PAYLOAD_MAX_BYTES,
-            "INVALID_CHECKPOINT_PAYLOAD",
+            CHECKPOINT_PAYLOAD_SCHEMA,
         )?;
+        if checkpoint.payload != sanitized {
+            return Err(failure(FailureKind::Invalid, "UNSANITIZED_PAYLOAD"));
+        }
+    }
+    for event in &candidate.events {
+        if event.payload.len() > EVENT_PAYLOAD_MAX_BYTES {
+            return Err(failure(FailureKind::Invalid, "PAYLOAD_TOO_LARGE"));
+        }
+        let sanitized = new_event_payload(&event.payload)?;
+        if event.payload != sanitized {
+            return Err(failure(FailureKind::Invalid, "UNSANITIZED_PAYLOAD"));
+        }
+    }
+    for intent in &candidate.outbox {
+        if !outbox_catalog_type_valid(intent.catalog_type) {
+            return Err(failure(FailureKind::Invalid, "INVALID_OUTBOX_CATALOG"));
+        }
+        if intent.payload.len() > OUTBOX_PAYLOAD_MAX_BYTES {
+            return Err(failure(FailureKind::Invalid, "PAYLOAD_TOO_LARGE"));
+        }
+        let sanitized = new_outbox_payload(&intent.payload)?;
+        if intent.payload != sanitized {
+            return Err(failure(FailureKind::Invalid, "UNSANITIZED_PAYLOAD"));
+        }
+    }
+    Ok(candidate)
+}
+
+/// `reconciliationAttemptState` — the attempt state a disposition
+/// settles ("" upstream maps to `AttemptPrepared` here for the
+/// impossible default arm).
+fn reconciliation_attempt_state(disposition: ReconciliationDisposition) -> AttemptState {
+    match disposition {
+        ReconciliationDisposition::ReconciliationConfirmSucceeded => AttemptState::AttemptSucceeded,
+        ReconciliationDisposition::ReconciliationConfirmFailed
+        | ReconciliationDisposition::ReconciliationResume => AttemptState::AttemptFailed,
+        ReconciliationDisposition::ReconciliationCancel => AttemptState::AttemptCancelled,
+    }
+}
+
+/// `resumedAttempts` — the StepAttempts a resume Reconciliation of the
+/// same change set closes.
+fn resumed_attempts(reconciliations: &[Reconciliation]) -> BTreeSet<StepAttemptId> {
+    reconciliations
+        .iter()
+        .filter(|r| {
+            r.disposition == ReconciliationDisposition::ReconciliationResume
+                && !r.attempt_id.is_nil()
+        })
+        .map(|r| r.attempt_id)
+        .collect()
+}
+
+/// `attemptIdentityRecord` — one record in the logical-operation reuse
+/// group (`kind` is `"step"` or `"tool"`).
+#[derive(Debug, Clone)]
+struct AttemptIdentityRecord {
+    kind: &'static str,
+    id: String,
+    predecessor_id: String,
+    workspace_id: WorkspaceId,
+    task_id: TaskId,
+    run_id: RunId,
+    step_id: StepId,
+    step_attempt_id: StepAttemptId,
+    tool_call_id: ToolCallId,
+    logical_operation: LogicalOperationId,
+    invocation_id: InvocationId,
+    state: AttemptState,
+    sequence: i64,
+    version: i64,
+    /// Marks a record read from persisted state rather than proposed
+    /// by a change set.
+    authoritative: bool,
+}
+
+type LogicalOperationKey = (RunId, LogicalOperationId);
+
+/// `validateAttemptIdentities` — the change-set entry point.
+fn validate_attempt_identities(
+    step_attempts: &[StepAttempt],
+    tool_attempts: &[ToolCallAttempt],
+    resumed: &BTreeSet<StepAttemptId>,
+) -> Result<(), Failure> {
+    validate_attempt_identities_from(step_attempts, tool_attempts, false, resumed)
+}
+
+/// `validateAttemptIdentitiesFrom` — `authoritative` marks step attempts
+/// read from persisted state (command evaluation) rather than proposed
+/// by a change set.
+fn validate_attempt_identities_from(
+    step_attempts: &[StepAttempt],
+    tool_attempts: &[ToolCallAttempt],
+    authoritative: bool,
+    resumed: &BTreeSet<StepAttemptId>,
+) -> Result<(), Failure> {
+    let mut physical_ids: BTreeSet<PhysicalAttemptId> = BTreeSet::new();
+    let mut invocation_ids: BTreeSet<InvocationId> = BTreeSet::new();
+    let mut step_attempt_ids: BTreeSet<StepAttemptId> = BTreeSet::new();
+    let mut step_attempts_by_id: BTreeMap<StepAttemptId, &StepAttempt> = BTreeMap::new();
+    let mut tool_attempt_ids: BTreeSet<ToolCallAttemptId> = BTreeSet::new();
+    let mut logical_operations: BTreeMap<LogicalOperationKey, Vec<AttemptIdentityRecord>> =
+        BTreeMap::new();
+
+    for attempt in step_attempts {
+        if attempt.id.is_nil()
+            || attempt.step_id.is_nil()
+            || attempt.workspace_id.is_nil()
+            || attempt.task_id.is_nil()
+            || attempt.run_id.is_nil()
+            || attempt.logical_operation_id.is_nil()
+            || attempt.physical_attempt_id.is_nil()
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
+        }
+        if !step_attempt_ids.insert(attempt.id) {
+            return Err(failure(
+                FailureKind::Conflict,
+                "DUPLICATE_PHYSICAL_ATTEMPT_ID",
+            ));
+        }
+        step_attempts_by_id.insert(attempt.id, attempt);
+        validate_attempt_identity_values(
+            attempt.logical_operation_id,
+            attempt.physical_attempt_id,
+            attempt.invocation_id,
+            attempt.state,
+            &mut physical_ids,
+            &mut invocation_ids,
+        )?;
+        let mut predecessor = String::new();
+        if !attempt.predecessor_id.is_nil() {
+            if attempt.predecessor_id == attempt.id {
+                return Err(failure(
+                    FailureKind::Invalid,
+                    "INVALID_LOGICAL_OPERATION_REUSE",
+                ));
+            }
+            predecessor = attempt.predecessor_id.to_string();
+        }
+        logical_operations
+            .entry((attempt.run_id, attempt.logical_operation_id))
+            .or_default()
+            .push(AttemptIdentityRecord {
+                kind: "step",
+                id: attempt.id.to_string(),
+                predecessor_id: predecessor,
+                workspace_id: attempt.workspace_id,
+                task_id: attempt.task_id,
+                run_id: attempt.run_id,
+                step_id: attempt.step_id,
+                step_attempt_id: NIL_STEP_ATTEMPT_ID,
+                tool_call_id: NIL_TOOL_CALL_ID,
+                logical_operation: attempt.logical_operation_id,
+                invocation_id: attempt.invocation_id,
+                state: attempt.state,
+                sequence: attempt.sequence,
+                version: attempt.version,
+                authoritative,
+            });
+    }
+
+    for attempt in tool_attempts {
+        if attempt.id.is_nil()
+            || attempt.tool_call_id.is_nil()
+            || attempt.step_attempt_id.is_nil()
+            || attempt.workspace_id.is_nil()
+            || attempt.task_id.is_nil()
+            || attempt.run_id.is_nil()
+            || attempt.logical_operation_id.is_nil()
+            || attempt.physical_attempt_id.is_nil()
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
+        }
+        if !tool_attempt_ids.insert(attempt.id) {
+            return Err(failure(
+                FailureKind::Conflict,
+                "DUPLICATE_PHYSICAL_ATTEMPT_ID",
+            ));
+        }
+        validate_attempt_identity_values(
+            attempt.logical_operation_id,
+            attempt.physical_attempt_id,
+            attempt.invocation_id,
+            attempt.state,
+            &mut physical_ids,
+            &mut invocation_ids,
+        )?;
+        let mut predecessor = String::new();
+        if !attempt.predecessor_id.is_nil() {
+            if attempt.predecessor_id == attempt.id {
+                return Err(failure(
+                    FailureKind::Invalid,
+                    "INVALID_LOGICAL_OPERATION_REUSE",
+                ));
+            }
+            predecessor = attempt.predecessor_id.to_string();
+        }
+        logical_operations
+            .entry((attempt.run_id, attempt.logical_operation_id))
+            .or_default()
+            .push(AttemptIdentityRecord {
+                kind: "tool",
+                id: attempt.id.to_string(),
+                predecessor_id: predecessor,
+                workspace_id: attempt.workspace_id,
+                task_id: attempt.task_id,
+                run_id: attempt.run_id,
+                step_id: NIL_STEP_ID,
+                step_attempt_id: attempt.step_attempt_id,
+                tool_call_id: attempt.tool_call_id,
+                logical_operation: attempt.logical_operation_id,
+                invocation_id: attempt.invocation_id,
+                state: attempt.state,
+                sequence: attempt.sequence,
+                version: attempt.version,
+                authoritative: false,
+            });
+    }
+
+    for records in logical_operations.values() {
+        // Harness phase 3g decision 2 (review note (b)): the reuse check
+        // groups by logical id and cannot see a resume successor's
+        // predecessor, which has another logical id.
+        if records.len() == 1
+            && is_scoped_resume_successor(&records[0], &step_attempts_by_id, resumed)
+        {
+            continue;
+        }
+        validate_logical_operation_reuse(records)?;
     }
     Ok(())
 }
 
-fn validate_task_transition(change: &ExecutionChangeSet) -> Result<(), Failure> {
-    // Rust ownership already guarantees the deep-copy semantics Go
-    // enforces by cloning; only non-empty task ids may appear.
-    if let Some(transition) = &change.task_transition
-        && transition.change_set.task.id.is_nil()
+/// `validateAttemptIdentityValues` — the shared physical/invocation
+/// uniqueness rules (Rust enums guarantee `state.valid()`).
+fn validate_attempt_identity_values(
+    logical_id: LogicalOperationId,
+    physical_id: PhysicalAttemptId,
+    invocation_id: InvocationId,
+    state: AttemptState,
+    physical_ids: &mut BTreeSet<PhysicalAttemptId>,
+    invocation_ids: &mut BTreeSet<InvocationId>,
+) -> Result<(), Failure> {
+    if logical_id.0 == physical_id.0 {
+        return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
+    }
+    if !physical_ids.insert(physical_id) {
+        return Err(failure(
+            FailureKind::Conflict,
+            "DUPLICATE_PHYSICAL_ATTEMPT_ID",
+        ));
+    }
+    let invocation_required = matches!(
+        state,
+        AttemptState::AttemptInvoked
+            | AttemptState::AttemptSettling
+            | AttemptState::AttemptSucceeded
+            | AttemptState::AttemptFailed
+    );
+    if (invocation_required && invocation_id.is_nil())
+        || (state == AttemptState::AttemptPrepared && !invocation_id.is_nil())
     {
-        return Err(failure(FailureKind::Invalid, "INVALID_TASK_TRANSITION"));
+        return Err(failure(FailureKind::Invalid, "INVALID_INVOCATION_IDENTITY"));
+    }
+    if invocation_id.is_nil() {
+        return Ok(());
+    }
+    if logical_id.0 == invocation_id.0 || physical_id.0 == invocation_id.0 {
+        return Err(failure(FailureKind::Invalid, "INVALID_INVOCATION_IDENTITY"));
+    }
+    if !invocation_ids.insert(invocation_id) {
+        return Err(failure(FailureKind::Conflict, "DUPLICATE_INVOCATION_ID"));
+    }
+    Ok(())
+}
+
+/// `validateLogicalOperationReuse` — a logical operation id may appear
+/// once, or exactly as a cancelled→prepared successor pair.
+fn validate_logical_operation_reuse(records: &[AttemptIdentityRecord]) -> Result<(), Failure> {
+    if records.len() == 1 {
+        // A change set may create a recovery successor only together
+        // with its cancelled predecessor. A lone successor StepAttempt is
+        // legitimate only once it exists (authoritative), or when a later
+        // command proposes it at version >= 2.
+        let record = &records[0];
+        if !record.predecessor_id.is_empty()
+            && (record.kind != "step" || (!record.authoritative && record.version < 2))
+        {
+            return Err(failure(
+                FailureKind::Invalid,
+                "INVALID_LOGICAL_OPERATION_REUSE",
+            ));
+        }
+        return Ok(());
+    }
+    if records.len() != 2 {
+        return Err(failure(
+            FailureKind::Invalid,
+            "INVALID_LOGICAL_OPERATION_REUSE",
+        ));
+    }
+    let (mut predecessor, mut successor) = (&records[0], &records[1]);
+    if !predecessor.predecessor_id.is_empty() && successor.predecessor_id.is_empty() {
+        std::mem::swap(&mut predecessor, &mut successor);
+    }
+    if !predecessor.predecessor_id.is_empty()
+        || successor.predecessor_id != predecessor.id
+        || predecessor.kind != successor.kind
+        || predecessor.workspace_id != successor.workspace_id
+        || predecessor.task_id != successor.task_id
+        || predecessor.run_id != successor.run_id
+        || predecessor.step_id != successor.step_id
+        || predecessor.step_attempt_id != successor.step_attempt_id
+        || predecessor.tool_call_id != successor.tool_call_id
+        || predecessor.logical_operation != successor.logical_operation
+        || predecessor.state != AttemptState::AttemptCancelled
+        || successor.state != AttemptState::AttemptPrepared
+        || successor.sequence != predecessor.sequence + 1
+    {
+        return Err(failure(
+            FailureKind::Invalid,
+            "INVALID_LOGICAL_OPERATION_REUSE",
+        ));
+    }
+    if !predecessor.invocation_id.is_nil() {
+        return Err(failure(FailureKind::Denied, "RECONCILIATION_REQUIRED"));
+    }
+    Ok(())
+}
+
+/// `isScopedResumeSuccessor` — the lone new StepAttempt of a
+/// ResumeReconciledAttempt change set (prepared v1 seq1, never invoked,
+/// predecessor closed failed by a resume Reconciliation in the same
+/// change set, different step and logical id).
+fn is_scoped_resume_successor(
+    record: &AttemptIdentityRecord,
+    by_id: &BTreeMap<StepAttemptId, &StepAttempt>,
+    resumed: &BTreeSet<StepAttemptId>,
+) -> bool {
+    if record.kind != "step"
+        || record.authoritative
+        || record.predecessor_id.is_empty()
+        || record.state != AttemptState::AttemptPrepared
+        || record.version != 1
+        || record.sequence != 1
+        || !record.invocation_id.is_nil()
+    {
+        return false;
+    }
+    for id in resumed {
+        if id.to_string() != record.predecessor_id {
+            continue;
+        }
+        return by_id.get(id).is_some_and(|p| {
+            p.state == AttemptState::AttemptFailed
+                && !p.invocation_id.is_nil()
+                && p.workspace_id == record.workspace_id
+                && p.task_id == record.task_id
+                && p.run_id == record.run_id
+                && p.step_id != record.step_id
+                && p.logical_operation_id != record.logical_operation
+        });
+    }
+    false
+}
+
+/// `validateToolHierarchy` — calls must belong to a parent attempt and
+/// children may not advance beyond their parents.
+fn validate_tool_hierarchy(
+    step_attempts: &[StepAttempt],
+    tool_calls: &[ToolCall],
+    tool_attempts: &[ToolCallAttempt],
+) -> Result<(), Failure> {
+    let mut parents: BTreeMap<StepAttemptId, &StepAttempt> = BTreeMap::new();
+    let mut logical_owners: BTreeSet<LogicalOperationKey> = BTreeSet::new();
+    for parent in step_attempts {
+        parents.insert(parent.id, parent);
+        logical_owners.insert((parent.run_id, parent.logical_operation_id));
+    }
+    let mut calls: BTreeMap<ToolCallId, &ToolCall> = BTreeMap::new();
+    for call in tool_calls {
+        if call.id.is_nil()
+            || call.step_attempt_id.is_nil()
+            || call.workspace_id.is_nil()
+            || call.task_id.is_nil()
+            || call.run_id.is_nil()
+            || call.logical_operation_id.is_nil()
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_TOOL_CALL_IDENTITY"));
+        }
+        if calls.insert(call.id, call).is_some() {
+            return Err(failure(FailureKind::Conflict, "DUPLICATE_TOOL_CALL_ID"));
+        }
+        if !logical_owners.insert((call.run_id, call.logical_operation_id)) {
+            return Err(failure(
+                FailureKind::Invalid,
+                "INVALID_LOGICAL_OPERATION_REUSE",
+            ));
+        }
+        let parent = parents.get(&call.step_attempt_id);
+        if !parent.is_some_and(|p| tool_call_matches_parent(call, p)) {
+            return Err(failure(FailureKind::Invalid, "PARENT_ATTEMPT_MISMATCH"));
+        }
+        if !tool_call_state_allowed_by_parent(call.state, parents[&call.step_attempt_id].state) {
+            return Err(failure(
+                FailureKind::Conflict,
+                "CHILD_ADVANCES_BEYOND_PARENT",
+            ));
+        }
+    }
+    let mut recovery_predecessors: BTreeSet<ToolCallAttemptId> = BTreeSet::new();
+    for successor in tool_attempts {
+        if !successor.predecessor_id.is_nil() {
+            recovery_predecessors.insert(successor.predecessor_id);
+        }
+    }
+    for child in tool_attempts {
+        let parent = parents.get(&child.step_attempt_id);
+        if !parent.is_some_and(|p| tool_attempt_matches_parent(child, p)) {
+            return Err(failure(FailureKind::Invalid, "PARENT_ATTEMPT_MISMATCH"));
+        }
+        let call = calls.get(&child.tool_call_id);
+        if !call.is_some_and(|c| tool_attempt_matches_call(child, c)) {
+            return Err(failure(FailureKind::Invalid, "TOOL_CALL_ATTEMPT_MISMATCH"));
+        }
+        if recovery_predecessors.contains(&child.id) {
+            continue;
+        }
+        let parent_state = parents[&child.step_attempt_id].state;
+        if !attempt_state_allowed_by_parent(child.state, parent_state) {
+            if parent_state.is_terminal() {
+                return Err(failure(
+                    FailureKind::Conflict,
+                    "PARENT_TERMINAL_STATE_MISMATCH",
+                ));
+            }
+            return Err(failure(
+                FailureKind::Conflict,
+                "CHILD_ADVANCES_BEYOND_PARENT",
+            ));
+        }
+        if !tool_attempt_follows_call(child.state, calls[&child.tool_call_id].state) {
+            return Err(failure(FailureKind::Conflict, "TOOL_CALL_STATE_MISMATCH"));
+        }
+    }
+    Ok(())
+}
+
+fn tool_call_matches_parent(call: &ToolCall, parent: &StepAttempt) -> bool {
+    call.step_attempt_id == parent.id
+        && call.workspace_id == parent.workspace_id
+        && call.task_id == parent.task_id
+        && call.run_id == parent.run_id
+}
+
+fn tool_attempt_matches_parent(attempt: &ToolCallAttempt, parent: &StepAttempt) -> bool {
+    attempt.step_attempt_id == parent.id
+        && attempt.workspace_id == parent.workspace_id
+        && attempt.task_id == parent.task_id
+        && attempt.run_id == parent.run_id
+}
+
+fn tool_attempt_matches_call(attempt: &ToolCallAttempt, call: &ToolCall) -> bool {
+    attempt.tool_call_id == call.id
+        && attempt.step_attempt_id == call.step_attempt_id
+        && attempt.workspace_id == call.workspace_id
+        && attempt.task_id == call.task_id
+        && attempt.run_id == call.run_id
+        && attempt.logical_operation_id == call.logical_operation_id
+}
+
+fn tool_call_state_allowed_by_parent(child: ToolCallState, parent: AttemptState) -> bool {
+    use ToolCallState as T;
+    match parent {
+        AttemptState::AttemptPrepared => {
+            matches!(child, T::ToolCallQueued | T::ToolCallPrepared)
+        }
+        AttemptState::AttemptInvoked => {
+            matches!(
+                child,
+                T::ToolCallQueued | T::ToolCallPrepared | T::ToolCallInvoked
+            ) || child.is_terminal()
+        }
+        AttemptState::AttemptSettling => {
+            matches!(
+                child,
+                T::ToolCallQueued | T::ToolCallPrepared | T::ToolCallInvoked | T::ToolCallSettling
+            ) || child.is_terminal()
+        }
+        AttemptState::AttemptReconciliation => {
+            child == T::ToolCallReconciliation || child.is_terminal()
+        }
+        AttemptState::AttemptSucceeded => child == T::ToolCallSucceeded,
+        AttemptState::AttemptFailed => child == T::ToolCallFailed,
+        AttemptState::AttemptCancelled => child == T::ToolCallCancelled,
+    }
+}
+
+fn attempt_state_allowed_by_parent(child: AttemptState, parent: AttemptState) -> bool {
+    use AttemptState as A;
+    match parent {
+        A::AttemptPrepared => child == A::AttemptPrepared,
+        A::AttemptInvoked => {
+            matches!(child, A::AttemptPrepared | A::AttemptInvoked) || child.is_terminal()
+        }
+        A::AttemptSettling => {
+            matches!(
+                child,
+                A::AttemptPrepared | A::AttemptInvoked | A::AttemptSettling
+            ) || child.is_terminal()
+        }
+        A::AttemptReconciliation => child == A::AttemptReconciliation || child.is_terminal(),
+        A::AttemptSucceeded | A::AttemptFailed | A::AttemptCancelled => child == parent,
+    }
+}
+
+fn tool_attempt_follows_call(attempt: AttemptState, call: ToolCallState) -> bool {
+    use AttemptState as A;
+    match call {
+        ToolCallState::ToolCallPrepared => attempt == A::AttemptPrepared,
+        ToolCallState::ToolCallInvoked => attempt == A::AttemptInvoked,
+        ToolCallState::ToolCallSettling => attempt == A::AttemptSettling,
+        ToolCallState::ToolCallSucceeded => attempt == A::AttemptSucceeded,
+        ToolCallState::ToolCallFailed => attempt == A::AttemptFailed,
+        ToolCallState::ToolCallCancelled => attempt == A::AttemptCancelled,
+        ToolCallState::ToolCallReconciliation => attempt == A::AttemptReconciliation,
+        ToolCallState::ToolCallQueued => false,
+    }
+}
+
+/// `ValidateActiveAttemptCardinality` — at most one non-terminal
+/// StepAttempt per Run / ToolCallAttempt per ToolCall.
+fn validate_active_attempt_cardinality(
+    step_attempts: &[StepAttempt],
+    tool_attempts: &[ToolCallAttempt],
+) -> Result<(), Failure> {
+    let mut active_runs: BTreeSet<RunId> = BTreeSet::new();
+    for attempt in step_attempts {
+        if attempt.state.is_terminal() {
+            continue;
+        }
+        if !active_runs.insert(attempt.run_id) {
+            return Err(failure(FailureKind::Conflict, "ACTIVE_ATTEMPT_CONFLICT"));
+        }
+    }
+    let mut active_calls: BTreeSet<ToolCallId> = BTreeSet::new();
+    for attempt in tool_attempts {
+        if attempt.state.is_terminal() {
+            continue;
+        }
+        if !active_calls.insert(attempt.tool_call_id) {
+            return Err(failure(FailureKind::Conflict, "ACTIVE_ATTEMPT_CONFLICT"));
+        }
     }
     Ok(())
 }
@@ -1677,6 +2299,10 @@ pub struct PrepareCommand {
     pub physical_attempt_id: PhysicalAttemptId,
     pub step_sequence: i64,
     pub attempt_sequence: i64,
+    /// Approval subject version the caller binds (approval-gated ops).
+    pub approval_subject_version: i64,
+    /// Step version the approval subject was recorded against.
+    pub approval_expected_step_version: i64,
 }
 deref_envelope!(PrepareCommand);
 
@@ -1687,6 +2313,10 @@ pub struct MarkInvokedCommand {
     pub envelope: CommandEnvelope,
     /// Fresh invocation identity for the in-flight window.
     pub invocation_id: InvocationId,
+    /// Approval subject version the caller binds (approval-gated ops).
+    pub approval_subject_version: i64,
+    /// Step version the approval subject was recorded against.
+    pub approval_expected_step_version: i64,
 }
 deref_envelope!(MarkInvokedCommand);
 
@@ -1712,45 +2342,49 @@ pub struct EnterReconciliationCommand {
     /// Selector, guards, and caller-state envelope.
     pub envelope: CommandEnvelope,
     /// Why reconciliation was required (bounded vocabulary).
-    pub reason_code: ReconciliationReason,
+    pub reason_code: ProviderReconciliationReason,
 }
 deref_envelope!(EnterReconciliationCommand);
 
-/// Bounded reconciliation reason vocabulary (upstream
-/// `ReconciliationReason`).
+/// `ProviderReconciliationReason` — the closed safe explanation for an
+/// ambiguous provider outcome (upstream `ProviderReconciliationReason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ReconciliationReason {
-    /// The lease was lost mid-invocation.
-    LeaseLost,
-    /// The executor vanished without a durable outcome.
-    ExecutorVanished,
-    /// The harness exited without a result.
-    HarnessExitedWithoutResult,
-    /// The reported invocation identity does not match.
-    InvocationMismatch,
-    /// The settlement outcome was rejected.
-    SettlementRejected,
-    /// The upstream catch-all for other causes.
-    Unknown,
+pub enum ProviderReconciliationReason {
+    /// The provider acknowledged ambiguous delivery.
+    AmbiguousDelivery,
+    /// The provider's response mismatched the request.
+    ResponseMismatch,
+    /// The provider handoff failed.
+    HandoffFailed,
 }
 
-impl ReconciliationReason {
+impl ProviderReconciliationReason {
     /// Persisted string form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LeaseLost => "lease_lost",
-            Self::ExecutorVanished => "executor_vanished",
-            Self::HarnessExitedWithoutResult => "harness_exited_without_result",
-            Self::InvocationMismatch => "invocation_mismatch",
-            Self::SettlementRejected => "settlement_rejected",
-            Self::Unknown => "unknown",
+            Self::AmbiguousDelivery => "ambiguous_delivery",
+            Self::ResponseMismatch => "response_mismatch",
+            Self::HandoffFailed => "handoff_failed",
         }
     }
-    /// Upstream `valid()`.
+    /// Upstream `valid()` — the closed allowlist.
     #[must_use]
-    pub fn valid(self) -> bool {
-        !matches!(self, Self::Unknown)
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ambiguous_delivery" => Some(Self::AmbiguousDelivery),
+            "response_mismatch" => Some(Self::ResponseMismatch),
+            "handoff_failed" => Some(Self::HandoffFailed),
+            _ => None,
+        }
+    }
+    /// Whether the reason is inside the closed vocabulary.
+    #[must_use]
+    pub const fn valid(self) -> bool {
+        matches!(
+            self,
+            Self::AmbiguousDelivery | Self::ResponseMismatch | Self::HandoffFailed
+        )
     }
 }
 
@@ -1765,6 +2399,10 @@ pub struct PrepareToolCallCommand {
     pub physical_attempt_id: PhysicalAttemptId,
     pub call_sequence: i64,
     pub attempt_sequence: i64,
+    /// Approval subject version the caller binds (approval-gated ops).
+    pub approval_subject_version: i64,
+    /// Step version the approval subject was recorded against.
+    pub approval_expected_step_version: i64,
 }
 deref_envelope!(PrepareToolCallCommand);
 
@@ -1777,6 +2415,10 @@ pub struct MarkToolCallInvokedCommand {
     pub tool_attempt_id: ToolCallAttemptId,
     pub tool_logical_operation_id: LogicalOperationId,
     pub invocation_id: InvocationId,
+    /// Approval subject version the caller binds (approval-gated ops).
+    pub approval_subject_version: i64,
+    /// Step version the approval subject was recorded against.
+    pub approval_expected_step_version: i64,
 }
 deref_envelope!(MarkToolCallInvokedCommand);
 
@@ -1792,8 +2434,6 @@ pub struct SettleToolCallCommand {
     pub outcome: Vec<u8>,
     /// Optional invocation context snapshot.
     pub context: Vec<u8>,
-    /// Bounded failure vocabulary (empty defaults to `execution_failed`).
-    pub reason_code: FailureReason,
 }
 deref_envelope!(SettleToolCallCommand);
 
@@ -1863,7 +2503,7 @@ deref_envelope!(ResolveReconciliationCommand);
 /// `TransitionStep` — closed transition; bumps version.
 pub fn transition_step(current: Step, to: StepState) -> Result<Step, Failure> {
     if !current.state.can_transition(to) {
-        return Err(failure(FailureKind::Denied, "IMMUTABLE_STEP"));
+        return Err(failure(FailureKind::Denied, "INVALID_TRANSITION"));
     }
     let mut next = current;
     next.state = to;
@@ -1874,7 +2514,7 @@ pub fn transition_step(current: Step, to: StepState) -> Result<Step, Failure> {
 /// `TransitionAttempt` — closed transition; bumps version.
 pub fn transition_attempt(current: StepAttempt, to: AttemptState) -> Result<StepAttempt, Failure> {
     if !current.state.can_transition(to) {
-        return Err(failure(FailureKind::Denied, "IMMUTABLE_ATTEMPT"));
+        return Err(failure(FailureKind::Denied, "INVALID_TRANSITION"));
     }
     let mut next = current;
     next.state = to;
@@ -1885,7 +2525,7 @@ pub fn transition_attempt(current: StepAttempt, to: AttemptState) -> Result<Step
 /// `TransitionToolCall` — closed transition; bumps version.
 pub fn transition_tool_call(current: ToolCall, to: ToolCallState) -> Result<ToolCall, Failure> {
     if !current.state.can_transition(to) {
-        return Err(failure(FailureKind::Denied, "IMMUTABLE_TOOL_CALL"));
+        return Err(failure(FailureKind::Denied, "INVALID_TRANSITION"));
     }
     let mut next = current;
     next.state = to;
@@ -1893,23 +2533,13 @@ pub fn transition_tool_call(current: ToolCall, to: ToolCallState) -> Result<Tool
     Ok(next)
 }
 
-/// `TransitionApproval` — pending → approved|rejected|expired only.
+/// `TransitionApproval` — pending → approved|rejected|expired|superseded.
 pub fn transition_approval(current: Approval, to: ApprovalState) -> Result<Approval, Failure> {
-    let allowed = matches!(
-        (current.state, to),
-        (
-            ApprovalState::ApprovalPending,
-            ApprovalState::ApprovalApproved
-        ) | (
-            ApprovalState::ApprovalPending,
-            ApprovalState::ApprovalRejected
-        ) | (
-            ApprovalState::ApprovalPending,
-            ApprovalState::ApprovalExpired
-        )
-    );
-    if !allowed {
+    if current.state != ApprovalState::ApprovalPending {
         return Err(failure(FailureKind::Denied, "IMMUTABLE_APPROVAL"));
+    }
+    if to == ApprovalState::ApprovalPending {
+        return Err(failure(FailureKind::Denied, "INVALID_TRANSITION"));
     }
     let mut next = current;
     next.state = to;
@@ -1922,8 +2552,11 @@ pub fn mark_attempt_invoked(
     current: StepAttempt,
     invocation_id: InvocationId,
 ) -> Result<StepAttempt, Failure> {
-    if current.state != AttemptState::AttemptPrepared || invocation_id.is_nil() {
+    if current.state != AttemptState::AttemptPrepared {
         return Err(failure(FailureKind::Denied, "IMMUTABLE_ATTEMPT"));
+    }
+    if invocation_id.is_nil() || !current.invocation_id.is_nil() {
+        return Err(failure(FailureKind::Invalid, "INVALID_INVOCATION_ID"));
     }
     let mut next = current;
     next.state = AttemptState::AttemptInvoked;
@@ -2214,81 +2847,16 @@ pub(crate) fn validate_evaluation(
 }
 
 /// Identity/cardinality/hierarchy re-validation of the state snapshot
-/// (`validateAttemptIdentitiesFrom` + cardinality + tool hierarchy).
+/// (`validateAttemptIdentitiesFrom` authoritative + cardinality + tool
+/// hierarchy — upstream `validateEvaluation` tail).
 fn validate_snapshot(state: &ExecutionState) -> Result<(), Failure> {
-    let mut physical = std::collections::HashSet::new();
-    let mut invocations = std::collections::HashSet::new();
-    if let Some(attempt) = &state.attempt {
-        validate_identity_values(
-            attempt.logical_operation_id,
-            attempt.physical_attempt_id,
-            attempt.invocation_id,
-            attempt.state,
-            &mut physical,
-            &mut invocations,
-        )?;
-    }
-    for attempt in &state.tool_attempts {
-        validate_identity_values(
-            attempt.logical_operation_id,
-            attempt.physical_attempt_id,
-            attempt.invocation_id,
-            attempt.state,
-            &mut physical,
-            &mut invocations,
-        )?;
-    }
-    let mut active_calls = 0usize;
-    for call in &state.tool_calls {
-        if !call.state.is_terminal() {
-            active_calls += 1;
-        }
-    }
-    let mut active_tool_attempts = 0usize;
-    for attempt in &state.tool_attempts {
-        if !attempt.state.is_terminal() {
-            active_tool_attempts += 1;
-        }
-    }
-    if active_calls > 1 || active_tool_attempts > 1 {
-        return Err(failure(FailureKind::Conflict, "ACTIVE_ATTEMPT_CONFLICT"));
-    }
-    Ok(())
-}
-
-fn validate_identity_values(
-    logical: LogicalOperationId,
-    physical: PhysicalAttemptId,
-    invocation: InvocationId,
-    state: AttemptState,
-    physical_ids: &mut std::collections::HashSet<PhysicalAttemptId>,
-    invocation_ids: &mut std::collections::HashSet<InvocationId>,
-) -> Result<(), Failure> {
-    if logical.0 == physical.0 {
-        return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
-    }
-    if !physical_ids.insert(physical) {
-        return Err(failure(
-            FailureKind::Conflict,
-            "DUPLICATE_PHYSICAL_ATTEMPT_ID",
-        ));
-    }
-    if state.requires_invocation() && invocation.is_nil() {
-        return Err(failure(FailureKind::Invalid, "INVALID_INVOCATION_IDENTITY"));
-    }
-    if state == AttemptState::AttemptPrepared && !invocation.is_nil() {
-        return Err(failure(FailureKind::Invalid, "INVALID_INVOCATION_IDENTITY"));
-    }
-    if invocation.is_nil() {
-        return Ok(());
-    }
-    if logical.0 == invocation.0 || physical.0 == invocation.0 {
-        return Err(failure(FailureKind::Invalid, "INVALID_INVOCATION_IDENTITY"));
-    }
-    if !invocation_ids.insert(invocation) {
-        return Err(failure(FailureKind::Conflict, "DUPLICATE_INVOCATION_ID"));
-    }
-    Ok(())
+    let step_attempts: &[StepAttempt] = match &state.attempt {
+        Some(attempt) => std::slice::from_ref(attempt),
+        None => &[],
+    };
+    validate_attempt_identities_from(step_attempts, &state.tool_attempts, true, &BTreeSet::new())?;
+    validate_active_attempt_cardinality(step_attempts, &state.tool_attempts)?;
+    validate_tool_hierarchy(step_attempts, &state.tool_calls, &state.tool_attempts)
 }
 
 /// `validateApprovedSubject` — the binding every approval-gated
@@ -2777,8 +3345,8 @@ fn evaluate_prepare(
             approval,
             cmd.envelope.logical_operation,
             cmd.envelope.operation_digest,
-            cmd.envelope.approval_subject_version,
-            cmd.envelope.approval_expected_step_version,
+            cmd.approval_subject_version,
+            cmd.approval_expected_step_version,
         )?;
     }
     let step = match &cmd.state.step {
@@ -2929,8 +3497,8 @@ fn evaluate_mark_invoked(
             approval,
             cmd.envelope.logical_operation,
             cmd.envelope.operation_digest,
-            cmd.envelope.approval_subject_version,
-            cmd.envelope.approval_expected_step_version,
+            cmd.approval_subject_version,
+            cmd.approval_expected_step_version,
         )?;
     }
     let attempt = cmd
@@ -2991,12 +3559,12 @@ fn evaluate_schedule_retry(
             validate_optional_payload(
                 &cmd.outcome,
                 OUTCOME_PAYLOAD_MAX_BYTES,
-                "UNSANITIZED_PAYLOAD",
+                OUTCOME_PAYLOAD_SCHEMA,
             )?;
             validate_optional_payload(
                 &cmd.context,
                 CONTEXT_PAYLOAD_MAX_BYTES,
-                "UNSANITIZED_PAYLOAD",
+                CONTEXT_PAYLOAD_SCHEMA,
             )?;
             if attempt.state == AttemptState::AttemptInvoked {
                 attempt = transition_attempt(attempt, AttemptState::AttemptSettling)?;
@@ -3183,8 +3751,8 @@ fn evaluate_prepare_tool_call(
             approval,
             cmd.tool_logical_operation_id,
             cmd.envelope.operation_digest,
-            cmd.envelope.approval_subject_version,
-            cmd.envelope.approval_expected_step_version,
+            cmd.approval_subject_version,
+            cmd.approval_expected_step_version,
         )?;
     }
     let call = ToolCall {
@@ -3194,7 +3762,6 @@ fn evaluate_prepare_tool_call(
         task_id: cmd.task_id,
         run_id: cmd.run_id,
         logical_operation_id: cmd.tool_logical_operation_id,
-        provider_turn_id: ProviderTurnId::default(),
         version: 1,
         sequence: cmd.call_sequence,
         state: ToolCallState::ToolCallPrepared,
@@ -3269,8 +3836,8 @@ fn evaluate_mark_tool_call_invoked(
             approval,
             cmd.tool_logical_operation_id,
             cmd.envelope.operation_digest,
-            cmd.envelope.approval_subject_version,
-            cmd.envelope.approval_expected_step_version,
+            cmd.approval_subject_version,
+            cmd.approval_expected_step_version,
         )?;
     }
     let mut next_call = transition_tool_call(call, ToolCallState::ToolCallInvoked)?;
@@ -3330,12 +3897,12 @@ fn evaluate_settle_tool_call(
     validate_optional_payload(
         &cmd.outcome,
         OUTCOME_PAYLOAD_MAX_BYTES,
-        "UNSANITIZED_PAYLOAD",
+        OUTCOME_PAYLOAD_SCHEMA,
     )?;
     validate_optional_payload(
         &cmd.context,
         CONTEXT_PAYLOAD_MAX_BYTES,
-        "UNSANITIZED_PAYLOAD",
+        CONTEXT_PAYLOAD_SCHEMA,
     )?;
     let (call, attempt) = selected_tool_state(
         &cmd.state,
@@ -3406,12 +3973,12 @@ fn evaluate_settle(
     validate_optional_payload(
         &cmd.outcome,
         OUTCOME_PAYLOAD_MAX_BYTES,
-        "UNSANITIZED_PAYLOAD",
+        OUTCOME_PAYLOAD_SCHEMA,
     )?;
     validate_optional_payload(
         &cmd.context,
         CONTEXT_PAYLOAD_MAX_BYTES,
-        "UNSANITIZED_PAYLOAD",
+        CONTEXT_PAYLOAD_SCHEMA,
     )?;
     let mut attempt = cmd
         .state
@@ -3821,6 +4388,7 @@ fn evaluate_create_approval_successor(
         subject: cmd.subject.clone(),
         predecessor_id: prior.id,
         actor: String::new(),
+        reason_code: String::new(),
         decision_id: [0u8; 16],
         decided_at: ZERO_TIME,
         version: 1,
@@ -3854,9 +4422,6 @@ fn evaluate_resolve_reconciliation(
         true,
         false,
     )?;
-    if !cmd.disposition.is_resolvable() {
-        return Err(failure(FailureKind::Invalid, "INVALID_DISPOSITION"));
-    }
     let evidence = clone_and_validate_evidence(&cmd.evidence)?;
     let attempt_src = cmd
         .state
@@ -3895,8 +4460,6 @@ fn evaluate_resolve_reconciliation(
             run_id: cmd.run_id,
             step_id: cmd.step_id,
             attempt_id: cmd.attempt_id,
-            tool_call_id: NIL_TOOL_CALL_ID,
-            tool_attempt_id: NIL_TOOL_CALL_ATTEMPT_ID,
             disposition: cmd.disposition,
             evidence,
             resolved_at: meta.now,

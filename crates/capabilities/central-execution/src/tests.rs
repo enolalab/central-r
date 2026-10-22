@@ -205,8 +205,6 @@ fn envelope(
         lease_generation: 0,
         assert_no_active_lease: false,
         state,
-        approval_subject_version: 0,
-        approval_expected_step_version: 0,
     }
 }
 
@@ -230,7 +228,7 @@ fn step_attempt_toolcall_closed_transitions() {
     assert_eq!(settling.version, 2);
     assert!(transition_step(settling.clone(), StepState::StepSucceeded).is_ok());
     let e = transition_step(settling, StepState::StepRunning).unwrap_err();
-    assert_eq!(e.code(), "IMMUTABLE_STEP");
+    assert_eq!(e.code(), "INVALID_TRANSITION");
 
     let a = prepared_attempt(&s);
     assert!(transition_attempt(a.clone(), AttemptState::AttemptSucceeded).is_err());
@@ -724,17 +722,7 @@ fn recovery_mints_prepared_successor_for_never_invoked_attempt() {
     // Expired ownership row: recovery treats it as no lease.
     let expired = lease(sc.workspace_id, s.run_id, 2, T0 - Duration::seconds(5));
     let state = claim_state(&agg, &s, &a, Some(expired));
-    let change = evaluate_recovery(
-        &state,
-        T0,
-        StepAttemptId::new(),
-        PhysicalAttemptId::new(),
-        ExecutionEventId::new(),
-        OutboxId::new(),
-        "recovery-1",
-        "recovery:attempt:1",
-    )
-    .unwrap();
+    let change = evaluate_recovery(&state, T0, 7, StepAttemptId::new()).unwrap();
     assert_eq!(change.attempts.len(), 2);
     assert_eq!(change.attempts[0].state, AttemptState::AttemptCancelled);
     assert_eq!(change.attempts[0].version, 2);
@@ -748,17 +736,7 @@ fn recovery_mints_prepared_successor_for_never_invoked_attempt() {
     // An active lease bars recovery.
     let active = lease(sc.workspace_id, s.run_id, 2, T0 + Duration::seconds(30));
     let state = claim_state(&agg, &s, &a, Some(active));
-    let e = evaluate_recovery(
-        &state,
-        T0,
-        StepAttemptId::new(),
-        PhysicalAttemptId::new(),
-        ExecutionEventId::new(),
-        OutboxId::new(),
-        "recovery-1",
-        "recovery:attempt:1",
-    )
-    .unwrap_err();
+    let e = evaluate_recovery(&state, T0, 7, StepAttemptId::new()).unwrap_err();
     assert_eq!(e.code(), "ACTIVE_LEASE_CONFLICT");
 }
 
@@ -810,7 +788,7 @@ fn recovery_completion_settles_from_immutable_receipt() {
         final_state: AttemptState::AttemptSucceeded,
         outcome: new_settlement_outcome(AttemptState::AttemptSucceeded, "").unwrap(),
         context: vec![],
-        b09_references: B09References::default(),
+        b09_references: Vec::new(),
         producer_id: "producer-1".to_string(),
     };
     let change = evaluate_recovery_completion(&state, &receipt, T0).unwrap();
@@ -937,6 +915,9 @@ fn recovery_claimability_quarantines_pre_watermark_runs() {
         coordinator_fence: RecoveryCoordinatorFence { generation: 2 },
         state: RecoveryEpochState::RecoveryEpochRunning,
         scheduler_cursor: workspace,
+        workspace_count: 1,
+        processed_count: 0,
+        claim_cycle: 0,
         retry_attempt: 3,
         snapshot_at: T0,
     };
@@ -946,6 +927,13 @@ fn recovery_claimability_quarantines_pre_watermark_runs() {
         state: RecoveryWorkspaceState::RecoveryWorkspaceFailed,
         watermark_created_at: T0 - Duration::hours(1),
         watermark_run_id: RunId::new(),
+        cursor_created_at: ZERO_TIME,
+        cursor_run_id: RunId::from_trusted_db_bytes([0; 16]),
+        scanned_count: 0,
+        reconciled_count: 0,
+        retry_attempt: 0,
+        failure_class: String::new(),
+        failure_reason: String::new(),
     };
     // Pre-watermark, unreconciled → quarantined.
     let claimability =
@@ -986,13 +974,21 @@ fn resume_epoch_requires_matching_fingerprint() {
     let sc = TrustedScope {
         principal_id: "coordinator".to_string(),
         workspace_id: WorkspaceId::new(),
-        capabilities: [Capability::RecoveryCoordinator].into_iter().collect(),
+        capabilities: [
+            Capability::WorkspaceOperator,
+            Capability::RecoveryCoordinator,
+        ]
+        .into_iter()
+        .collect(),
     };
     let epoch = RecoveryEpoch {
         generation: 3,
         coordinator_fence: RecoveryCoordinatorFence { generation: 1 },
         state: RecoveryEpochState::RecoveryEpochDegraded,
         scheduler_cursor: WorkspaceId::new(),
+        workspace_count: 0,
+        processed_count: 0,
+        claim_cycle: 0,
         retry_attempt: 2,
         snapshot_at: T0,
     };
@@ -1009,13 +1005,13 @@ fn resume_epoch_requires_matching_fingerprint() {
         fingerprint: RequestFingerprint::default(),
     };
     cmd.fingerprint = recovery_resume_fingerprint(&cmd);
-    let next = evaluate_resume_recovery_epoch(&cmd, &epoch, T0).unwrap();
+    let next = evaluate_resume_recovery_epoch(&cmd, &epoch).unwrap();
     assert_eq!(next.state, RecoveryEpochState::RecoveryEpochRunning);
     assert_eq!(next.coordinator_fence.generation, 2);
 
     // Fingerprint drift is refused.
     cmd.acknowledgement_reason = "tampered".to_string();
-    let e = evaluate_resume_recovery_epoch(&cmd, &epoch, T0).unwrap_err();
+    let e = evaluate_resume_recovery_epoch(&cmd, &epoch).unwrap_err();
     assert_eq!(e.code(), "INVALID_RECOVERY_RESUME");
 }
 
@@ -1179,5 +1175,5 @@ fn payload_sanitization_and_fingerprint() {
         &meta(),
     )
     .unwrap_err();
-    assert_eq!(e.code(), "UNSANITIZED_PAYLOAD");
+    assert_eq!(e.code(), "INVALID_PAYLOAD");
 }

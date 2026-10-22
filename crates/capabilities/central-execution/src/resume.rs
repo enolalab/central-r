@@ -53,11 +53,11 @@ impl RecoveryEpochState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::RecoveryEpochOpen => "recovery_epoch_open",
-            Self::RecoveryEpochRunning => "recovery_epoch_running",
-            Self::RecoveryEpochDegraded => "recovery_epoch_degraded",
-            Self::RecoveryEpochFailed => "recovery_epoch_failed",
-            Self::RecoveryEpochCompleted => "recovery_epoch_completed",
+            Self::RecoveryEpochOpen => "open",
+            Self::RecoveryEpochRunning => "running",
+            Self::RecoveryEpochDegraded => "degraded",
+            Self::RecoveryEpochFailed => "failed",
+            Self::RecoveryEpochCompleted => "completed",
         }
     }
     /// Completed/failed epochs accept no further mutation.
@@ -90,20 +90,30 @@ impl RecoveryWorkspaceState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::RecoveryWorkspacePending => "recovery_workspace_pending",
-            Self::RecoveryWorkspaceClaimed => "recovery_workspace_claimed",
-            Self::RecoveryWorkspaceCompleted => "recovery_workspace_completed",
-            Self::RecoveryWorkspaceFailed => "recovery_workspace_failed",
+            Self::RecoveryWorkspacePending => "pending",
+            Self::RecoveryWorkspaceClaimed => "claimed",
+            Self::RecoveryWorkspaceCompleted => "completed",
+            Self::RecoveryWorkspaceFailed => "failed",
         }
     }
 }
 
-/// `RecoveryCoordinatorFence` — optimistic fence on the epoch row; the
-/// coordinator holds generation `N` and every mutation asserts `N`.
+/// `RecoveryCoordinatorFence` — the generation granted to the one
+/// deployment-wide coordinator lease. The verifier is never retained by
+/// the application; the adapter stores its hash and rechecks this
+/// generation atomically.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecoveryCoordinatorFence {
     /// Fenced generation; 0 means "no coordinator".
     pub generation: i64,
+}
+
+impl RecoveryCoordinatorFence {
+    /// Upstream `RecoveryCoordinatorFence.Valid`.
+    #[must_use]
+    pub const fn valid(self) -> bool {
+        self.generation > 0
+    }
 }
 
 /// `RecoveryEpoch` — the durable epoch row.
@@ -116,6 +126,13 @@ pub struct RecoveryEpoch {
     pub state: RecoveryEpochState,
     /// Scan cursor over the workspace keyspace.
     pub scheduler_cursor: WorkspaceId,
+    /// Total workspace work rows in the epoch.
+    pub workspace_count: i64,
+    /// Workspace work rows already scanned.
+    pub processed_count: i64,
+    /// Advances durably after every workspace claim; backed by the
+    /// epoch's processed counter so a takeover resumes fair ordering.
+    pub claim_cycle: i64,
     /// Remaining scan budget in attempts.
     pub retry_attempt: i64,
     /// When the epoch snapshotted the failed-run watermark.
@@ -135,6 +152,20 @@ pub struct RecoveryWorkspaceWork {
     pub watermark_created_at: OffsetDateTime,
     /// The watermark's run-id tiebreak.
     pub watermark_run_id: RunId,
+    /// Resume cursor: the last failed run's creation time.
+    pub cursor_created_at: OffsetDateTime,
+    /// Resume cursor: the last failed run's identity.
+    pub cursor_run_id: RunId,
+    /// Runs scanned by this work row.
+    pub scanned_count: i64,
+    /// Runs reconciled by this work row.
+    pub reconciled_count: i64,
+    /// Bounded recovery attempts spent on this row.
+    pub retry_attempt: i64,
+    /// Coarse failure bucket persisted on a failed row.
+    pub failure_class: String,
+    /// Operator-visible failure detail persisted on a failed row.
+    pub failure_reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,41 +185,53 @@ pub fn recovery_claimability(
 ) -> Claimability {
     let claimable = || Claimability {
         claimable: true,
-        reason: None,
+        epoch_generation: epoch.generation,
+        reason: String::new(),
     };
     if work.epoch_generation != epoch.generation
-        || epoch.state.is_terminal()
-        || work.state != RecoveryWorkspaceState::RecoveryWorkspaceFailed
+        || work.state == RecoveryWorkspaceState::RecoveryWorkspaceCompleted
+        || reconciled_epoch_generation >= epoch.generation
     {
         return claimable();
     }
-    let before_watermark = run_created_at < work.watermark_created_at
-        || (run_created_at == work.watermark_created_at && run_id <= work.watermark_run_id);
-    if !before_watermark || reconciled_epoch_generation >= epoch.generation {
-        return claimable();
+    let pre_watermark = run_created_at < work.watermark_created_at
+        || (run_created_at == work.watermark_created_at
+            && run_id.to_string() <= work.watermark_run_id.to_string());
+    // Once serving continues in a degraded state, an operator may resume
+    // the same epoch while listeners remain live. Therefore open/running
+    // work is quarantined by the same durable watermark rule as
+    // degraded/failed work; only a completed Workspace or reconciled Run
+    // proves admission.
+    if pre_watermark && epoch.state != RecoveryEpochState::RecoveryEpochCompleted {
+        return Claimability {
+            claimable: false,
+            epoch_generation: epoch.generation,
+            reason: "RECOVERY_QUARANTINE".to_string(),
+        };
     }
-    Claimability {
-        claimable: false,
-        reason: Some("RECOVERY_QUARANTINED".to_string()),
-    }
+    claimable()
 }
 
-/// `RecoveryCompletionState` — resolves an epoch's terminal state after
-/// a coordinator scan. `degraded` means the scan found work it could
-/// not recover; `clean` means every work row completed.
+/// `RecoveryCompletionState` — monotonic with respect to degradation.
+/// A later successful workspace scan cannot erase an earlier
+/// quarantine; only the explicitly authorized `ResumeEpoch` path may
+/// move a degraded epoch back to running.
 #[must_use]
 pub fn recovery_completion_state(
     current: RecoveryEpochState,
-    degraded: bool,
-    clean: bool,
+    scan_failed: bool,
+    no_incomplete_work: bool,
 ) -> (RecoveryEpochState, bool) {
-    if degraded || current == RecoveryEpochState::RecoveryEpochDegraded {
+    if current == RecoveryEpochState::RecoveryEpochDegraded
+        || current == RecoveryEpochState::RecoveryEpochFailed
+        || scan_failed
+    {
         return (RecoveryEpochState::RecoveryEpochDegraded, false);
     }
-    if clean {
+    if no_incomplete_work {
         return (RecoveryEpochState::RecoveryEpochCompleted, true);
     }
-    (current, false)
+    (RecoveryEpochState::RecoveryEpochRunning, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +273,11 @@ impl std::ops::DerefMut for ResumeReconciledAttemptCommand {
     }
 }
 
+/// `evaluateResumeReconciledAttempt` — fails the old step+attempt
+/// (disposition resume), inserts a new running step (sequence+1) with a
+/// new prepared attempt whose predecessor is the old one, and moves the
+/// task/run back to running. It grants no lease: it only asserts that
+/// none is active.
 pub(crate) fn evaluate_resume_reconciled_attempt(
     cmd: &ResumeReconciledAttemptCommand,
     meta: &EvaluationMetadata,
@@ -241,50 +289,39 @@ pub(crate) fn evaluate_resume_reconciled_attempt(
         true,
         false,
     )?;
-    // Resume is a no-lease command: it asserts lease absence and must
-    // not mint or fence a credential.
-    let assertion = domain::no_active_lease_assertion(&cmd.envelope, meta.now)?;
-    let attempt_src = cmd
-        .state
-        .attempt
-        .clone()
-        .ok_or_else(|| failure(FailureKind::Invalid, "STATE_SCOPE_MISMATCH"))?;
-    if attempt_src.state != AttemptState::AttemptReconciliation {
-        return Err(failure(FailureKind::Denied, "RECONCILIATION_NOT_REQUIRED"));
+    let evidence = domain::clone_and_validate_evidence(&cmd.evidence)?;
+    if cmd.max_step_sequence < 1 {
+        return Err(failure(FailureKind::Invalid, "INVALID_RESUME_LIMIT"));
+    }
+    if cmd.new_step_id.is_nil()
+        || cmd.new_attempt_id.is_nil()
+        || cmd.new_logical_operation.is_nil()
+        || cmd.physical_attempt_id.is_nil()
+        || cmd.new_step_id == cmd.step_id
+        || cmd.new_attempt_id == cmd.attempt_id
+        || cmd.new_logical_operation == cmd.logical_operation
+    {
+        return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
+    }
+    if !cmd.state.tool_calls.is_empty() || !cmd.state.tool_attempts.is_empty() {
+        return Err(failure(FailureKind::Denied, "RESUME_TOOL_CALLS_PRESENT"));
     }
     let step_src = cmd
         .state
         .step
         .clone()
         .ok_or_else(|| failure(FailureKind::Invalid, "STATE_SCOPE_MISMATCH"))?;
-    if step_src.state != StepState::StepReconciliation {
-        return Err(failure(FailureKind::Denied, "RECONCILIATION_NOT_REQUIRED"));
-    }
-    if !cmd.state.tool_calls.is_empty() || !cmd.state.tool_attempts.is_empty() {
-        return Err(failure(FailureKind::Denied, "RESUME_TOOL_CALLS_PRESENT"));
-    }
-    if cmd.new_step_id.is_nil()
-        || cmd.new_attempt_id.is_nil()
-        || cmd.new_logical_operation.is_nil()
-        || cmd.physical_attempt_id.is_nil()
-        || cmd.new_step_id == step_src.id
-        || cmd.new_attempt_id == attempt_src.id
-        || cmd.new_logical_operation == attempt_src.logical_operation_id
-        || cmd.physical_attempt_id == attempt_src.physical_attempt_id
-    {
-        return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
-    }
-    if cmd.max_step_sequence <= 0 {
-        return Err(failure(FailureKind::Invalid, "INVALID_RESUME_LIMIT"));
-    }
+    let attempt_src = cmd
+        .state
+        .attempt
+        .clone()
+        .ok_or_else(|| failure(FailureKind::Invalid, "STATE_SCOPE_MISMATCH"))?;
     if step_src.sequence + 1 > cmd.max_step_sequence {
         return Err(failure(FailureKind::Denied, "RESUME_ATTEMPT_LIMIT_REACHED"));
     }
     if cmd.remaining_cost_micro_usd < MIN_RESUME_COST_MICRO_USD {
         return Err(failure(FailureKind::Denied, "RESUME_BUDGET_EXHAUSTED"));
     }
-    let evidence = domain::clone_and_validate_evidence(&cmd.evidence)?;
-    // Close the reconciled pair.
     let mut attempt = domain::resolve_attempt_reconciliation(
         attempt_src.clone(),
         ReconciliationDisposition::ReconciliationResume,
@@ -295,7 +332,18 @@ pub(crate) fn evaluate_resume_reconciled_attempt(
         ReconciliationDisposition::ReconciliationResume,
     )?;
     step.updated_at = meta.now;
-    // Mint the successor pair.
+    let task_transition = execution_facade::evaluate_execution_transition(
+        ExecutionTransition::ResumeReconciled(execution_facade::ExecutionResumeReconciledRequest {
+            aggregate: cmd.state.task.clone(),
+            now: meta.now,
+            expected_task_version: cmd.expected.task,
+            expected_run_version: cmd.expected.run,
+        }),
+    )
+    .map_err(|_| failure(FailureKind::Denied, "TASK_TRANSITION_REJECTED"))?;
+    // Resume is a no-lease command: it asserts lease absence and must
+    // not mint or fence a credential.
+    let assertion = domain::no_active_lease_assertion(&cmd.envelope, meta.now)?;
     let new_step = Step {
         id: cmd.new_step_id,
         workspace_id: cmd.workspace_id,
@@ -323,15 +371,8 @@ pub(crate) fn evaluate_resume_reconciled_attempt(
         created_at: meta.now,
         updated_at: meta.now,
     };
-    let task_transition = execution_facade::evaluate_execution_transition(
-        ExecutionTransition::ResumeReconciled(execution_facade::ExecutionResumeReconciledRequest {
-            aggregate: cmd.state.task.clone(),
-            now: meta.now,
-            expected_task_version: cmd.expected.task,
-            expected_run_version: cmd.expected.run,
-        }),
-    )
-    .map_err(|_| failure(FailureKind::Denied, "TASK_TRANSITION_REJECTED"))?;
+    // The old rows come first: the store updates them before it inserts
+    // the new ones (the one-active-run index is not deferrable).
     let change = ExecutionChangeSet {
         steps: vec![step, new_step],
         attempts: vec![attempt, new_attempt],
@@ -341,8 +382,6 @@ pub(crate) fn evaluate_resume_reconciled_attempt(
             run_id: cmd.run_id,
             step_id: cmd.step_id,
             attempt_id: cmd.attempt_id,
-            tool_call_id: domain::NIL_TOOL_CALL_ID,
-            tool_attempt_id: domain::NIL_TOOL_CALL_ATTEMPT_ID,
             disposition: ReconciliationDisposition::ReconciliationResume,
             evidence,
             resolved_at: meta.now,
@@ -357,8 +396,8 @@ pub(crate) fn evaluate_resume_reconciled_attempt(
         change,
         EVENT_ATTEMPT_RESUMED,
         OUTBOX_ATTEMPT_SETTLED,
-        AttemptState::AttemptPrepared.as_str(),
-        "resume_reconciled_attempt",
+        AttemptState::AttemptFailed.as_str(),
+        "resume",
     )
 }
 
@@ -393,36 +432,36 @@ pub struct ResumeRecoveryEpochCommand {
     pub fingerprint: RequestFingerprint,
 }
 
-/// `recoveryResumeFingerprint` — sha256 over the canonical resume
-/// request; the coordinator must reproduce it byte-exactly.
+/// `recoveryResumeFingerprint` — binds an acknowledgement to the exact
+/// durable epoch facts it may reopen. Any actor, capability, fence,
+/// cursor, state, retry, or reason change creates a distinct command.
 #[must_use]
 pub fn recovery_resume_fingerprint(cmd: &ResumeRecoveryEpochCommand) -> RequestFingerprint {
     #[derive(serde::Serialize)]
     struct Body<'a> {
+        principal_id: &'a str,
         workspace_id: &'a str,
+        capability: &'a str,
         epoch_generation: i64,
-        coordinator_fence_generation: i64,
+        coordinator_fence: i64,
         expected_state: &'a str,
         expected_cursor: &'a str,
-        expected_retry_attempt: i64,
-        acknowledgement_reason: &'a str,
-        idempotency_key: &'a str,
-        capability: &'a str,
-        principal_id: &'a str,
+        expected_retry: i64,
+        acknowledgement: &'a str,
     }
     let workspace_text = cmd.scope.workspace_id.to_string();
     let cursor_text = cmd.expected_cursor.to_string();
+    let acknowledgement = cmd.acknowledgement_reason.trim().to_string();
     let body = Body {
+        principal_id: &cmd.scope.principal_id,
         workspace_id: &workspace_text,
+        capability: cmd.capability.as_str(),
         epoch_generation: cmd.epoch_generation,
-        coordinator_fence_generation: cmd.coordinator_fence.generation,
+        coordinator_fence: cmd.coordinator_fence.generation,
         expected_state: cmd.expected_state.as_str(),
         expected_cursor: &cursor_text,
-        expected_retry_attempt: cmd.expected_retry_attempt,
-        acknowledgement_reason: &cmd.acknowledgement_reason,
-        idempotency_key: &cmd.idempotency_key,
-        capability: cmd.capability.as_str(),
-        principal_id: &cmd.scope.principal_id,
+        expected_retry: cmd.expected_retry_attempt,
+        acknowledgement: &acknowledgement,
     };
     let payload = serde_json::to_vec(&body).unwrap_or_default();
     let sum = sha2::Sha256::digest(domain::go_json_escapes(&payload));
@@ -431,71 +470,58 @@ pub fn recovery_resume_fingerprint(cmd: &ResumeRecoveryEpochCommand) -> RequestF
     fp
 }
 
-/// `EvaluateResumeRecoveryEpoch` — validates the operator resume and
-/// returns the next epoch row (open → running under the new fence).
-/// A degraded epoch never silently completes; the coordinator must
-/// re-scan remaining work.
+impl ResumeRecoveryEpochCommand {
+    /// `ResumeRecoveryEpochCommand.Validate` — the scope-shape and
+    /// request-fact checks that run before any store mutation.
+    pub fn validate(&self) -> Result<(), Failure> {
+        if !self.scope.allows(Capability::WorkspaceOperator)
+            || !self.scope.allows(Capability::RecoveryCoordinator)
+            || self.scope.allows(Capability::Executor)
+            || self.scope.allows(Capability::Approver)
+            || self.capability != Capability::RecoveryCoordinator
+        {
+            return Err(failure(FailureKind::Denied, "RECOVERY_RESUME_DENIED"));
+        }
+        if self.epoch_generation <= 0
+            || !self.coordinator_fence.valid()
+            || !matches!(
+                self.expected_state,
+                RecoveryEpochState::RecoveryEpochDegraded | RecoveryEpochState::RecoveryEpochFailed
+            )
+            || self.expected_retry_attempt < 0
+            || self.acknowledgement_reason.trim().is_empty()
+            || self.idempotency_key.trim().is_empty()
+            || !domain::fingerprint_valid(&self.fingerprint)
+            || self.fingerprint != recovery_resume_fingerprint(self)
+        {
+            return Err(failure(FailureKind::Invalid, "INVALID_RECOVERY_RESUME"));
+        }
+        Ok(())
+    }
+}
+
+/// `EvaluateResumeRecoveryEpoch` — the domain-side half of the epoch
+/// resume: validates the operator command (upstream `cmd.Validate()`)
+/// then asserts the persisted epoch still matches the optimistic
+/// guards; the coordinator and adapter own lease acquisition and the
+/// atomic mutation. Returns the next epoch row under the new fence.
 pub fn evaluate_resume_recovery_epoch(
     cmd: &ResumeRecoveryEpochCommand,
     epoch: &RecoveryEpoch,
-    now: OffsetDateTime,
 ) -> Result<RecoveryEpoch, Failure> {
-    if now == ZERO_TIME
-        || cmd.epoch_generation <= 0
-        || epoch.generation != cmd.epoch_generation
-        || cmd.coordinator_fence.generation <= 0
-        || cmd.coordinator_fence.generation == epoch.coordinator_fence.generation
-        || cmd.idempotency_key.trim().is_empty()
-        || !domain::fingerprint_valid(&cmd.fingerprint)
-        || cmd.fingerprint != recovery_resume_fingerprint(cmd)
-        || cmd.capability != Capability::RecoveryCoordinator
-        || !cmd.scope.allows(Capability::RecoveryCoordinator)
-        || cmd.scope.principal_id.trim().is_empty()
-        || cmd.acknowledgement_reason.trim().is_empty()
-        || cmd.acknowledgement_reason.len() > 512
-    {
-        return Err(failure(FailureKind::Invalid, "INVALID_RECOVERY_RESUME"));
-    }
-    if !matches!(
-        epoch.state,
-        RecoveryEpochState::RecoveryEpochDegraded | RecoveryEpochState::RecoveryEpochFailed
-    ) || epoch.state != cmd.expected_state
+    cmd.validate()?;
+    if epoch.generation != cmd.epoch_generation
+        || epoch.state != cmd.expected_state
         || epoch.scheduler_cursor != cmd.expected_cursor
         || epoch.retry_attempt != cmd.expected_retry_attempt
     {
         return Err(failure(FailureKind::Conflict, "RECOVERY_EPOCH_CONFLICT"));
     }
     Ok(RecoveryEpoch {
-        generation: epoch.generation,
         coordinator_fence: cmd.coordinator_fence,
         state: RecoveryEpochState::RecoveryEpochRunning,
-        scheduler_cursor: epoch.scheduler_cursor,
-        retry_attempt: epoch.retry_attempt,
-        snapshot_at: epoch.snapshot_at,
+        ..epoch.clone()
     })
-}
-
-/// `EvaluateRecoveryWorkspaceClaim` — the coordinator claims one
-/// workspace row inside the epoch under its fence.
-pub fn evaluate_recovery_workspace_claim(
-    epoch: &RecoveryEpoch,
-    work: &RecoveryWorkspaceWork,
-    fence: RecoveryCoordinatorFence,
-    now: OffsetDateTime,
-) -> Result<RecoveryWorkspaceWork, Failure> {
-    if now == ZERO_TIME
-        || epoch.generation <= 0
-        || work.epoch_generation != epoch.generation
-        || epoch.state != RecoveryEpochState::RecoveryEpochRunning
-        || fence.generation <= 0
-        || fence != epoch.coordinator_fence
-        || work.state != RecoveryWorkspaceState::RecoveryWorkspacePending
-    {
-        return Err(failure(FailureKind::Conflict, "RECOVERY_WORK_CONFLICT"));
-    }
-    let mut next = work.clone();
-    next.state = RecoveryWorkspaceState::RecoveryWorkspaceClaimed;
-    Ok(next)
 }
 
 /// `EvaluateRecoveryWorkspaceComplete` — marks a claimed work row

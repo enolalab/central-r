@@ -39,7 +39,7 @@ recovery-epoch evaluators (`evaluate_resume_recovery_epoch`,
 
 ## Tests
 
-20 tests in `src/tests.rs` port the upstream scenarios: closed
+26 tests port the upstream scenarios. `src/tests.rs` (20): closed
 transition tables, 256-bit lease credentials, claim generation
 fencing (mint gen 1, active-lease conflict, expired-row gen+1, stale
 guess → `STALE_LEASE_FENCE`), settle releasing the lease + completing
@@ -54,14 +54,78 @@ claimability watermark quarantine, epoch completion semantics,
 resume-epoch fingerprint drift, reconciliation resolution
 (dispositions, evidence required), action descriptors (operator vs.
 executor, fence vs. no-lease assertion), retention windows, and
-payload sanitization.
+payload sanitization. `src/app_tests.rs` (6) ports the critical
+`service_test.go` lanes with upstream fixture shapes
+(`authorizedRouteFixture` + `fakeCompositeStore`/`fakeExecutionRead`):
+the 16-row fence-provenance/absence-assertion commit table, mandatory
+recovery admission on `execution.claim` vs. its absence on heartbeat,
+exact-receipt replay skipping state read + commit, receipt-fingerprint
+conflict before evaluation, and evaluation failure never committing.
+
+## Post-review fixes (upstream anchors re-verified)
+
+Reviewer findings were corrected by faithful ports — no
+"improvements":
+
+1. **Quarantine predicate** (`resume.rs`): `recovery_claimability`
+   quarantines only unverified pre-watermark runs in a non-completed
+   epoch; completed work and reconciled generations stay claimable;
+   watermark ordered by `created_at` + run-id tie-break
+   (`resume.go`).
+2. **Commit fence provenance** (`app.rs`): `evaluated_lease_fence`
+   exports a fence only from evaluator-produced change-set evidence
+   (matching `LeaseRelease` or the closed active-lease event set);
+   caller envelope equality never confers provenance
+   (`service.go`).
+3. **Recovery-claim admission** (`app.rs`): `require_recovery_claimable`
+   is set only for `execution.claim` and `execution.start_harness_run`
+   — the lease-granting commands (`service.go`).
+4. **Recovery completion state** (`resume.rs`): degradation never
+   auto-clears; completion requires zero incomplete workspace rows
+   (`resume.go`).
+5. **Change-set gates** (`domain.rs`): `build_execution_change_set`
+   restored identity/cardinality/hierarchy validation, settlement +
+   reconciliation evidence/disposition checks, lease release/assertion
+   conflict detection, checkpoint checksum + canonical sanitization,
+   event/outbox catalog + payload gates, and task-transition linkage
+   (`domain.go` `BuildExecutionChangeSet`).
+6. **Recovery coordinator contract** (`app.rs`, `port.rs`, `resume.rs`):
+   `central.execution.recovery.v1` domain binding, `InstanceId`
+   coordinator identity, generation fences, raw 32-byte claim tokens
+   with hash-only persistence (`recovery.go`, `port.go`).
+7. **Closed vocabularies** (`domain.rs`): `ReconciliationEvidenceKind`
+   (4 kinds), `ReconciliationDisposition` (4), recovery epoch/workspace
+   state strings (`open|running|degraded|failed|completed`,
+   `pending|claimed|completed|failed`), `ProviderReconciliationReason`
+   (3 reasons) — all compile-time closed.
+8. **Service surface** (`app.rs`, `port.rs`): `issue_lease_credential`
+   mints raw bearers outside persistence; `CommitResult.replayed`;
+   `validate_lease` fails closed without an authoritative validator;
+   `create_approval_successor` returns the persisted B11 descriptor
+   (replayed included); `validate_completion_change_set` reloads
+   authoritative state and re-derives the task transition
+   (`service.go`).
+9. **Payload sanitization** (`domain.rs`): schema-allowlist traversal
+   replacing generic key filtering — metadata/event/outbox/outcome/
+   context/checkpoint schemas with sensitive-key rejection and Go
+   `encoding/json` canonical form.
+10. **Resume reconciliation** (`resume.rs`): no lease granted; asserts
+    no active lease; predecessor identity preserved; successor step +
+    prepared attempt minted through `central_task::execution_facade`.
+
+### Test-inventory delta
+
+`src/tests.rs` 20 → 20 (two expectation corrections to match upstream:
+`INVALID_PAYLOAD` for non-object payloads, `INVALID_TRANSITION` for
+closed-table rejections); `src/app_tests.rs` 0 → 6; crate total
+20 → 26; workspace 173 → 191.
 
 ## Gates (all executed)
 
 - `cargo fmt --all -- --check` — clean
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean
-- `cargo test -p central-execution` — 20/20 pass
-- `cargo test --workspace` — 173 tests, all pass
+- `cargo test -p central-execution` — 26/26 pass
+- `cargo test --workspace` — 191 tests, all pass
 
 ## Non-1:1 mappings / concerns
 

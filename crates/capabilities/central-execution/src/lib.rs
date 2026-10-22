@@ -41,3 +41,7 @@ pub mod resume;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod app_tests;

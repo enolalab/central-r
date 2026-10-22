@@ -7,16 +7,17 @@
 //! and the idempotent command receipt — or none of them.
 
 use central_foundation::failure::Failure;
-use central_foundation::identity::{RunId, StepAttemptId, StepId, TaskId, WorkspaceId};
+use central_foundation::identity::{InstanceId, RunId, StepAttemptId, StepId, TaskId, WorkspaceId};
 use central_task::domain as task;
 use time::OffsetDateTime;
 
 use crate::domain::{
-    Capability, CommandEnvelope, EvaluationMetadata, ExecutionChangeSet, ExecutionState,
-    ExpectedVersions, LeaseCredential, LogicalOperationId, RequestFingerprint, TrustedScope,
+    Capability, Claimability, CommandEnvelope, EvaluationMetadata, ExecutionChangeSet,
+    ExecutionState, ExpectedVersions, LeaseCredential, LogicalOperationId, RequestFingerprint,
+    TrustedScope,
 };
-use crate::harness_run::B09References;
-use crate::resume::{RecoveryEpoch, RecoveryWorkspaceWork};
+use crate::harness_run::B09EvidenceReference;
+use crate::resume::{RecoveryCoordinatorFence, RecoveryEpoch, RecoveryWorkspaceWork};
 
 /// `ExecutionReadRequest` — the authoritative-state load every command
 /// performs before evaluation.
@@ -49,19 +50,23 @@ pub trait ExecutionRead {
     ) -> Result<ExecutionReadResult, Failure>;
 }
 
-/// `ReceiptBinding` — the durable receipt's binding fields replay must
-/// reproduce exactly.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// `ReceiptBinding` — the immutable execution target attached to one
+/// command receipt. Exact replay must match every selector and logical
+/// operation; a request fingerprint alone is not an authority or
+/// target binding.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReceiptBinding {
-    pub task_id: Option<TaskId>,
-    pub run_id: Option<RunId>,
-    pub step_id: Option<StepId>,
-    pub attempt_id: Option<StepAttemptId>,
-    pub logical_operation: Option<LogicalOperationId>,
+    pub task_id: TaskId,
+    pub run_id: RunId,
+    pub step_id: StepId,
+    pub attempt_id: StepAttemptId,
+    pub logical_operation: LogicalOperationId,
 }
 
-/// `ReceiptLookupRequest` — idempotent receipt probe issued *before*
-/// the authoritative state read.
+/// `ReceiptLookupRequest` — the trusted, principal-bound idempotency
+/// lookup performed *before* loading mutable execution state. An
+/// adapter returns a conflict when an existing key is bound to a
+/// different fingerprint.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReceiptLookupRequest {
     /// The authenticated scope.
@@ -80,8 +85,8 @@ pub struct ReceiptLookupRequest {
     pub expected_versions: ExpectedVersions,
 }
 
-/// `ReceiptLookupResult` — `found` + the previously committed durable
-/// result.
+/// `ReceiptLookupResult` — an exact durable replay result. `found` is
+/// false only when no receipt exists for the trusted receipt identity.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReceiptLookupResult {
     /// Whether a matching receipt exists.
@@ -90,35 +95,37 @@ pub struct ReceiptLookupResult {
     pub result: Option<DurableResult>,
 }
 
-/// `LeaseValidationRequest` — ask the authoritative lease store whether
-/// `credential` fences `generation` for (workspace, run) at `now`.
+/// `LeaseValidationRequest` — asks the authoritative adapter to
+/// validate a transient lease bearer without returning its persisted
+/// verifier.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LeaseValidationRequest {
     /// The authenticated scope.
     pub scope: TrustedScope,
     pub workspace_id: WorkspaceId,
+    pub task_id: TaskId,
     pub run_id: RunId,
-    pub credential: LeaseCredential,
-    pub generation: i64,
-    /// The validation instant.
-    pub now: OffsetDateTime,
+    pub step_id: StepId,
+    pub attempt_id: StepAttemptId,
+    pub lease_credential: LeaseCredential,
+    pub lease_generation: i64,
 }
 
-/// Validates a presented lease credential against the authoritative
-/// lease store. Separate from [`ExecutionRead`] because validating a
-/// credential is a security boundary, not a data read — services that
-/// cannot reach a validator must fail closed.
+/// `LeaseCredentialValidator` — implemented by adapters that can check
+/// a transient lease bearer against the current durable ownership row.
+/// The validation is deliberately separate from `ExecutionRead`
+/// because durable reads cannot expose lease credentials; an error
+/// means the bearer is not authoritative.
 #[trait_variant::make(Send)]
 pub trait LeaseCredentialValidator {
-    /// `ValidateLeaseCredential`.
-    async fn validate_lease_credential(
-        &self,
-        request: LeaseValidationRequest,
-    ) -> Result<bool, Failure>;
+    /// `ValidateLease`.
+    async fn validate_lease(&self, request: LeaseValidationRequest) -> Result<(), Failure>;
 }
 
-/// `DurableResult` — the receipt-committed outcome a replay returns
-/// verbatim (no new lease credential is minted).
+/// `DurableResult` — the complete immutable command-result correlation
+/// retained by a receipt. It uses typed domain identities so an exact
+/// replay never degrades into an adapter-owned reference that callers
+/// must reinterpret.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DurableResult {
     pub workspace_id: WorkspaceId,
@@ -130,11 +137,18 @@ pub struct DurableResult {
     pub event_id: central_foundation::identity::ExecutionEventId,
     /// The committed event kind (`attempt_settled`, ...).
     pub event_kind: String,
-    /// Optional approval action surfaced to B11.
-    pub approval_action: Option<crate::domain::ApprovalAction>,
+    /// Present only for an approval-successor command. Persisted with
+    /// the receipt so replay never re-reads mutable "latest" approval
+    /// state.
+    pub approval_action: Option<crate::domain::ApprovalSuccessorActionDescriptor>,
 }
 
-/// `CommitRequest` — one atomic composite commit.
+/// `CommitRequest` — binds a command receipt to its trusted authority
+/// and the evaluated immutable evidence. The adapter must recheck all
+/// selectors and guards atomically. `lease_credential` and
+/// `lease_generation` are non-zero together only after evaluation
+/// proves a current active lease; `assert_no_active_lease` is the
+/// mutually exclusive evaluator-produced absence predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitRequest {
     /// The authenticated scope.
@@ -147,23 +161,31 @@ pub struct CommitRequest {
     pub fingerprint: RequestFingerprint,
     pub principal_id: String,
     pub capability: Capability,
-    /// Selector + expected versions + caller state.
-    pub envelope: CommandEnvelope,
-    /// The evaluated change set (task transition included).
-    pub change_set: ExecutionChangeSet,
-    /// The lease credential the commit binds (zero when absent).
+    /// Receipt binding + optimistic guards (never a caller envelope).
+    pub receipt_binding: ReceiptBinding,
+    /// Receipt binding + optimistic guards (never a caller envelope).
+    pub expected_versions: ExpectedVersions,
+    /// Mandatory for `execution.claim` and
+    /// `execution.start_harness_run` (the lease-granting commands) and
+    /// forbidden for every other command. The composite store rechecks
+    /// the latest durable recovery epoch and reconciled run inside the
+    /// commit transaction.
+    pub require_recovery_claimable: bool,
+    /// The evaluator-proven fence; zero when no active lease applies.
     pub lease_credential: LeaseCredential,
-    /// The fenced lease generation.
+    /// The evaluator-proven fence; zero when no active lease applies.
     pub lease_generation: i64,
     /// Assert no active lease exists at commit time.
     pub assert_no_active_lease: bool,
-    /// Assert the run is still recovery-claimable.
-    pub require_recovery_claimable: bool,
     /// The durable result stored on the receipt.
     pub result: DurableResult,
+    /// The evaluated change set (task transition included).
+    pub change_set: ExecutionChangeSet,
 }
 
-/// `CommitResult` — receipt replay or first commit.
+/// `CommitResult` — receipt replay or first commit. `replayed` reports
+/// that `result` came from an exact retained receipt rather than a new
+/// commit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommitResult {
     /// The durable result (identical on replay).
@@ -175,12 +197,17 @@ pub struct CommitResult {
 /// The single atomic commit seam for execution + task transitions.
 #[trait_variant::make(Send)]
 pub trait CompositeStore {
+    /// `IssueLeaseCredential` — mints one raw 256-bit lease bearer; only
+    /// its verifier hash is ever persisted.
+    fn issue_lease_credential(&self) -> Result<LeaseCredential, Failure>;
     /// `Commit` — applies the change set or returns the durable replay.
     async fn commit(&self, request: CommitRequest) -> Result<CommitResult, Failure>;
 }
 
-/// `CompletionChangeSetRequest` — a completing pass commits its own
-/// change set under the same composite rules (B10).
+/// `CompletionChangeSetRequest` — the narrow B08 boundary for a
+/// completion candidate. It carries no caller-authored
+/// `ExecutionState`; the application service loads the authoritative
+/// snapshot before accepting the candidate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionChangeSetRequest {
     /// The authenticated scope.
@@ -192,6 +219,26 @@ pub struct CompletionChangeSetRequest {
     pub attempt_id: StepAttemptId,
     /// The evaluated change set.
     pub change_set: ExecutionChangeSet,
+}
+
+impl CompletionChangeSetRequest {
+    /// Upstream `CompletionChangeSetRequest.Validate`.
+    pub fn validate(&self) -> Result<(), Failure> {
+        if self.scope.workspace_id.is_nil()
+            || self.scope.workspace_id != self.workspace_id
+            || self.task_id.is_nil()
+            || self.run_id.is_nil()
+            || self.step_id.is_nil()
+            || self.attempt_id.is_nil()
+        {
+            return Err(Failure::new(
+                central_foundation::failure::FailureKind::Denied,
+                "SCOPE_MISMATCH",
+                "completion request refused",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Commits the completing pass's change set after receipt validation.
@@ -233,9 +280,9 @@ pub trait OutboxStore {
     ) -> Result<(), Failure>;
 }
 
-/// Typed B09 evidence store — filesystem page hashes and provider-turn
-/// ids persist through this dedicated lane, never folded into generic
-/// execution payloads (B09 stays a narrow border).
+/// Typed B09 evidence store — the allowlisted durable evidence
+/// references persist through this dedicated lane, never folded into
+/// generic execution payloads (B09 stays a narrow border).
 #[trait_variant::make(Send)]
 pub trait B09EvidenceStore {
     /// `CommitB09Evidence` — persists the receipt's typed evidence
@@ -244,7 +291,7 @@ pub trait B09EvidenceStore {
         &self,
         scope: TrustedScope,
         attempt_id: StepAttemptId,
-        references: B09References,
+        references: Vec<B09EvidenceReference>,
     ) -> Result<(), Failure>;
 }
 
@@ -252,125 +299,151 @@ pub trait B09EvidenceStore {
 // Recovery contracts (upstream RecoveryStore + coordinator fence ops).
 // ---------------------------------------------------------------------------
 
-/// `RecoveryCoordinatorLease` — the coordinator's durable hold on an
-/// epoch.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecoveryCoordinatorLease {
-    /// Epoch under coordination.
-    pub epoch_generation: i64,
-    /// Fence generation held.
-    pub fence_generation: i64,
-    /// Lease expiry — renew before this or lose the fence.
-    pub expires_at: OffsetDateTime,
-}
-
-/// `RecoveryCoordinatorAcquireRequest`.
+/// `RecoveryCoordinatorAcquireRequest` — identifies the one
+/// deployment-wide lease; the adapter generates and stores only the
+/// token verifier. `fence` (on the lease) is the fencing fact passed
+/// to every later recovery write.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecoveryCoordinatorAcquireRequest {
-    /// The authenticated scope.
-    pub scope: TrustedScope,
-    /// Epoch to coordinate.
-    pub epoch_generation: i64,
-    /// Fence the coordinator wants (strictly greater than current).
-    pub fence_generation: i64,
-    /// Acquisition instant.
-    pub now: OffsetDateTime,
-    /// Lease duration.
-    pub ttl: time::Duration,
+    /// The coordinator domain token — always
+    /// `central.execution.recovery.v1`.
+    pub recovery_domain: String,
+    /// The coordinating process identity.
+    pub instance_id: InstanceId,
+}
+
+/// `RecoveryCoordinatorLease` — the coordinator's durable hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryCoordinatorLease {
+    /// Echoed domain token.
+    pub recovery_domain: String,
+    /// The coordinating process identity.
+    pub instance_id: InstanceId,
+    /// The fence generation held.
+    pub fence: RecoveryCoordinatorFence,
+    /// Lease expiry — renew before this or lose the fence.
+    pub expires_at: OffsetDateTime,
+    /// The raw 256-bit coordinator bearer. Only its SHA-256 verifier is
+    /// stored; every later recovery write presents this token.
+    pub claim_token: Vec<u8>,
 }
 
 /// `StartRecoveryEpochRequest` — opens a fresh epoch snapshotting the
-/// failed-run watermark.
+/// failed-run watermark under the held lease.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartRecoveryEpochRequest {
-    /// The authenticated scope.
-    pub scope: TrustedScope,
-    /// The epoch generation to open (`0` = next).
-    pub generation: i64,
-    /// Snapshot instant.
-    pub now: OffsetDateTime,
+    /// The coordinator lease fencing the open.
+    pub lease: RecoveryCoordinatorLease,
+    /// Bounded workspaces scanned per pass.
+    pub batch_size: u32,
 }
 
 /// `ClaimRecoveryWorkspaceRequest` — claims pending work inside the
-/// epoch under the coordinator fence.
+/// epoch under the coordinator lease.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimRecoveryWorkspaceRequest {
-    /// The authenticated scope.
-    pub scope: TrustedScope,
-    /// Epoch + fence held.
+    /// The coordinator lease fencing the claim.
+    pub lease: RecoveryCoordinatorLease,
+    /// Epoch under coordination.
     pub epoch_generation: i64,
-    /// Epoch + fence held.
-    pub fence_generation: i64,
-    /// Claim instant.
-    pub now: OffsetDateTime,
     /// Max workspaces to claim.
-    pub limit: u32,
+    pub batch_size: u32,
 }
 
-/// `RecoveryWorkspaceClaim` — claimed work plus the loaded epoch.
+/// `RecoveryWorkspaceClaim` — one durable round-robin item. An empty
+/// `work.workspace_id` means the epoch is complete or no item is
+/// currently ready.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecoveryWorkspaceClaim {
     /// The epoch under coordination.
     pub epoch: RecoveryEpoch,
     /// The claimed work row.
     pub work: RecoveryWorkspaceWork,
+    /// The coordinator lease the claim was minted under.
+    pub coordinator_lease: RecoveryCoordinatorLease,
+    /// An opaque 256-bit runtime credential; its SHA-256 verifier is
+    /// the only stored representation. Callers must present it to
+    /// complete exactly this workspace claim.
+    pub claim_token: Vec<u8>,
+    /// Whether a work row was claimed.
+    pub claimed: bool,
+    /// Whether the claimed row is already complete.
+    pub completed: bool,
+    /// Database-derived delay returned only for an unclaimed,
+    /// incomplete placeholder; prevents busy-polling.
+    pub retry_after: time::Duration,
 }
 
 /// `CompleteRecoveryWorkspaceRequest`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompleteRecoveryWorkspaceRequest {
-    /// The authenticated scope.
-    pub scope: TrustedScope,
-    /// Epoch + fence held.
+    /// The coordinator lease fencing the completion.
+    pub lease: RecoveryCoordinatorLease,
+    /// Epoch under coordination.
     pub epoch_generation: i64,
-    /// Epoch + fence held.
-    pub fence_generation: i64,
     /// The work row to close.
     pub workspace_id: WorkspaceId,
-    /// Whether recovery failed for the workspace.
-    pub failed: bool,
-    /// Completion instant.
-    pub now: OffsetDateTime,
+    /// The claim token presented for this exact claim.
+    pub claim_token: Vec<u8>,
+    /// Fail-closed scan acknowledgement. A successful request ignores
+    /// caller-authored cursor/count facts and runs the adapter-owned
+    /// bounded keyset scanner.
+    pub degraded: bool,
+    /// Coarse failure bucket persisted on a degraded row.
+    pub failure_class: String,
+    /// Operator-visible failure detail persisted on a degraded row.
+    pub failure_reason: String,
 }
 
 /// `ResumeRecoveryEpochRequest` — operator resume of a degraded epoch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeRecoveryEpochRequest {
-    /// The authenticated scope.
-    pub scope: TrustedScope,
-    /// The resume command (already fingerprint-validated upstream of
-    /// the store).
+    /// The resume command (already validated upstream of the store).
     pub command: crate::resume::ResumeRecoveryEpochCommand,
-    /// Commit instant.
-    pub now: OffsetDateTime,
+    /// The coordinator lease fencing the resume.
+    pub lease: RecoveryCoordinatorLease,
 }
 
-/// `FailedRecoveryWorkspaces` — the operator-facing failed-work page.
+/// Bounds one `list_failed_recovery_workspaces` page.
+pub const MAX_FAILED_RECOVERY_WORKSPACES: u32 = 250;
+
+/// `FailedRecoveryWorkspaces` — the first page of an epoch's failed
+/// workspace rows in ascending workspace-id order, and `total`, the
+/// number of failed rows the epoch has in all.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FailedRecoveryWorkspaces {
-    /// Failed work rows.
-    pub workspaces: Vec<RecoveryWorkspaceWork>,
-    /// Resume cursor (opaque; empty when done).
-    pub next_cursor: String,
+    /// Failed workspace ids.
+    pub ids: Vec<WorkspaceId>,
+    /// Total failed rows in the epoch.
+    pub total: i64,
 }
 
-/// `ArtifactWorkClaim` — an artifact-producing work unit the recovery
-/// lane claims for B11/B12 follow-up.
+/// `ArtifactWorkClaim` — the single B10 artifact-reconciliation work
+/// item carried by the existing `recovery_coordinator` lease. It is
+/// derived from — and fenced by — exactly the lease and epoch the
+/// coordinator already holds, so `fence` and `claim_token` are that
+/// lease's own fencing generation and raw 256-bit bearer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactWorkClaim {
-    /// The claim's workspace.
-    pub workspace_id: WorkspaceId,
-    /// The claimed run.
-    pub run_id: RunId,
-    /// Claim expiry.
+    /// The coordinator fence backing the claim.
+    pub fence: RecoveryCoordinatorFence,
+    /// The epoch the claim belongs to.
+    pub epoch_generation: i64,
+    /// The lease's raw 256-bit bearer, passed through unchanged.
+    pub claim_token: Vec<u8>,
+    /// Claim expiry (the lease expiry).
     pub expires_at: OffsetDateTime,
+    /// False when no live lease backs the claim; a false value must
+    /// never mutate durable artifact state.
+    pub claimed: bool,
 }
 
 /// `RecoveryStore` — durable recovery-epoch operations; every mutation
 /// is fenced by the coordinator lease.
 #[trait_variant::make(Send)]
 pub trait RecoveryStore {
-    /// `AcquireRecoveryCoordinator` — takes/renews the epoch fence.
+    /// `AcquireRecoveryCoordinator` — takes/renews the deployment-wide
+    /// coordinator lease.
     async fn acquire_recovery_coordinator(
         &self,
         request: RecoveryCoordinatorAcquireRequest,
@@ -380,26 +453,11 @@ pub trait RecoveryStore {
         &self,
         request: StartRecoveryEpochRequest,
     ) -> Result<RecoveryEpoch, Failure>;
-    /// `LoadRecoveryEpoch`.
-    async fn load_recovery_epoch(
-        &self,
-        scope: TrustedScope,
-        generation: i64,
-    ) -> Result<RecoveryEpoch, Failure>;
     /// `ClaimRecoveryWorkspaces` — claims pending work rows.
     async fn claim_recovery_workspaces(
         &self,
         request: ClaimRecoveryWorkspaceRequest,
     ) -> Result<Vec<RecoveryWorkspaceClaim>, Failure>;
-    /// `RenewRecoveryWorkspaceClaim`.
-    async fn renew_recovery_workspace_claim(
-        &self,
-        scope: TrustedScope,
-        epoch_generation: i64,
-        workspace_id: WorkspaceId,
-        fence_generation: i64,
-        now: OffsetDateTime,
-    ) -> Result<(), Failure>;
     /// `CompleteRecoveryWorkspace`.
     async fn complete_recovery_workspace(
         &self,
@@ -410,39 +468,28 @@ pub trait RecoveryStore {
         &self,
         request: ResumeRecoveryEpochRequest,
     ) -> Result<RecoveryEpoch, Failure>;
-    /// `ListFailedRecoveryWorkspaces`.
+    /// `ListFailedRecoveryWorkspaces` — read-only: it takes no
+    /// coordinator lease and changes nothing.
     async fn list_failed_recovery_workspaces(
         &self,
-        scope: TrustedScope,
         epoch_generation: i64,
-        cursor: &str,
         limit: u32,
     ) -> Result<FailedRecoveryWorkspaces, Failure>;
-    /// `ClaimArtifactWork` — claims artifact-producing recovery work.
-    async fn claim_artifact_work(
-        &self,
-        scope: TrustedScope,
-        epoch_generation: i64,
-        fence_generation: i64,
-        now: OffsetDateTime,
-        limit: u32,
-    ) -> Result<Vec<ArtifactWorkClaim>, Failure>;
 }
 
-/// `RecoveryClaimabilityReader` — the read the claimability decorator
-/// issues per run; on failure the decorator fails closed
-/// (`RECOVERY_STATUS_UNAVAILABLE`).
+/// `RecoveryClaimabilityReader` — supplies the durable recovery gate
+/// for a run. It is separate from an aggregate read because
+/// claimability is an admission decision derived from recovery
+/// epoch/workspace facts, not caller state.
 #[trait_variant::make(Send)]
 pub trait RecoveryClaimabilityReader {
-    /// `RecoveryClaimability` — returns `(epoch, work, reconciled
-    /// generation)` for the run's workspace, or `None` when no epoch
-    /// covers it.
-    async fn recovery_claimability_for(
+    /// `RecoveryClaimability`.
+    async fn recovery_claimability(
         &self,
         scope: TrustedScope,
-        workspace_id: WorkspaceId,
+        task_id: TaskId,
         run_id: RunId,
-    ) -> Result<Option<(RecoveryEpoch, RecoveryWorkspaceWork, i64)>, Failure>;
+    ) -> Result<Claimability, Failure>;
 }
 
 /// `Clock` — the single time source services depend on.
@@ -453,8 +500,9 @@ pub trait Clock {
 }
 
 /// `CompositeExecutionStore` — the façade services consume: read +
-/// receipt + commit. Adapters implement the three traits; services
-/// take `S: ExecutionRead + CompositeStore`.
+/// receipt + commit. Adapters implement the traits; services take
+/// `S: ExecutionRead + CompositeStore` (+ `LeaseCredentialValidator`
+/// for the lease-validation method).
 #[trait_variant::make(Send)]
 pub trait CompositeExecutionStore: ExecutionRead + CompositeStore {
     /// `LookupReceipt` — the receipt probe before authoritative reads.

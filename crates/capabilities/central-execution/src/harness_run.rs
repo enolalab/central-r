@@ -7,17 +7,17 @@ use central_foundation::failure::{Failure, FailureKind};
 use central_foundation::identity::{RunId, StepAttemptId, StepId, TaskId, WorkspaceId};
 use central_task::domain as task;
 use central_task::execution_facade::{self, ExecutionTransition};
+use sha2::Digest;
 use time::OffsetDateTime;
 
 use crate::domain::{
     self, AttemptState, Capability, CommandEnvelope, EvaluationMetadata, ExecutionChangeSet,
-    ExecutionState, FailureReason, InvocationId, Lease, LeaseCredential, LogicalOperationId,
-    NIL_STEP_ATTEMPT_ID, PhysicalAttemptId, ProviderTurnId, ReconciliationDisposition,
-    RequestFingerprint, StepAttempt, StepState, ZERO_TIME,
+    ExecutionState, FailureReason, InvocationId, Lease, LogicalOperationId, NIL_STEP_ATTEMPT_ID,
+    PhysicalAttemptId, ReconciliationDisposition, StepAttempt, StepState, ZERO_TIME,
 };
 use crate::domain::{
-    EVENT_ATTEMPT_ABANDONED, EVENT_ATTEMPT_CANCELLED, EVENT_ATTEMPT_RECOVERED,
-    EVENT_HARNESS_RUN_STARTED, OUTBOX_ATTEMPT_CLAIMED, OUTBOX_ATTEMPT_SETTLED,
+    EVENT_ATTEMPT_ABANDONED, EVENT_ATTEMPT_CANCELLED, EVENT_HARNESS_RUN_STARTED,
+    OUTBOX_ATTEMPT_CLAIMED, OUTBOX_ATTEMPT_SETTLED,
 };
 
 fn failure(kind: FailureKind, reason: &'static str) -> Failure {
@@ -446,7 +446,11 @@ pub fn new_settlement_outcome(
 // `CompletionReceipt`); consumed again by the artifact completion guard.
 // ---------------------------------------------------------------------------
 
-/// The immutable settlement handoff a completing pass persists first.
+/// `CompletionReceipt` — immutable evidence captured after one
+/// external invocation and before its B08 settlement projection.
+/// Recovery may consume it only when every logical, physical, and
+/// invocation identity matches the unsettled attempt. It deliberately
+/// carries no provider or tool credential.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionReceipt {
     pub workspace_id: WorkspaceId,
@@ -457,23 +461,27 @@ pub struct CompletionReceipt {
     pub logical_operation_id: LogicalOperationId,
     pub physical_attempt_id: PhysicalAttemptId,
     pub invocation_id: InvocationId,
-    /// Always `1` — the only accepted generation.
+    /// Positive invocation generation (`1` for the completing pass).
     pub invocation_generation: i64,
     pub final_state: AttemptState,
     pub outcome: Vec<u8>,
     pub context: Vec<u8>,
-    /// Bounded producer evidence references (B09 lanes only).
-    pub b09_references: B09References,
+    /// Opaque, allowlisted durable evidence references. They
+    /// intentionally exclude prompts, responses, credentials, and raw
+    /// provider payloads.
+    pub b09_references: Vec<B09EvidenceReference>,
     pub producer_id: String,
 }
 
-/// The allowlisted B09 evidence reference kinds a receipt may carry.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct B09References {
-    /// `provider_turn` evidence ids.
-    pub provider_turn_ids: Vec<ProviderTurnId>,
-    /// `filesystem_page` evidence hashes.
-    pub filesystem_page_hashes: Vec<[u8; 32]>,
+/// `B09EvidenceReference` — an opaque link to the B09 provider-evidence
+/// store.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct B09EvidenceReference {
+    /// One of `provider_evidence`, `reconciliation_proof`,
+    /// `tool_page_hash`.
+    pub kind: String,
+    /// The store-side evidence id (non-blank, ≤256 bytes).
+    pub id: String,
 }
 
 impl CompletionReceipt {
@@ -487,17 +495,46 @@ impl CompletionReceipt {
             || self.logical_operation_id.is_nil()
             || self.physical_attempt_id.is_nil()
             || self.invocation_id.is_nil()
-            || self.invocation_generation != 1
+            || self.invocation_generation <= 0
             || !matches!(
                 self.final_state,
                 AttemptState::AttemptSucceeded | AttemptState::AttemptFailed
             )
             || self.producer_id.trim().is_empty()
+            || self.producer_id.len() > 256
+            || self.outcome.is_empty()
         {
             return Err(failure(FailureKind::Invalid, "INVALID_COMPLETION_RECEIPT"));
         }
-        if self.outcome.is_empty() {
-            return Err(failure(FailureKind::Invalid, "INVALID_COMPLETION_RECEIPT"));
+        domain::validate_optional_payload(
+            &self.outcome,
+            domain::OUTCOME_PAYLOAD_MAX_BYTES,
+            domain::OUTCOME_PAYLOAD_SCHEMA,
+        )?;
+        domain::validate_optional_payload(
+            &self.context,
+            domain::CONTEXT_PAYLOAD_MAX_BYTES,
+            domain::CONTEXT_PAYLOAD_SCHEMA,
+        )?;
+        let mut seen = std::collections::HashSet::with_capacity(self.b09_references.len());
+        for reference in &self.b09_references {
+            if !matches!(
+                reference.kind.as_str(),
+                "provider_evidence" | "reconciliation_proof" | "tool_page_hash"
+            ) || reference.id.trim().is_empty()
+                || reference.id.len() > 256
+            {
+                return Err(failure(
+                    FailureKind::Invalid,
+                    "INVALID_B09_EVIDENCE_REFERENCE",
+                ));
+            }
+            if !seen.insert(reference) {
+                return Err(failure(
+                    FailureKind::Invalid,
+                    "DUPLICATE_B09_EVIDENCE_REFERENCE",
+                ));
+            }
         }
         Ok(())
     }
@@ -732,21 +769,84 @@ pub fn evaluate_recovery_cancellation(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-/// `EvaluateRecovery` — mints the prepared successor of a prepared,
-/// never-invoked attempt whose lease B08 expired. The predecessor ends
-/// cancelled; the successor keeps the logical operation and bumps the
-/// sequence. Requires `attempt_reconciliation` evidence kind on the
-/// event; the caller persists under its own recovery fence.
+/// `RecoveryFence` — the epoch-backed fence a successor mint is bound
+/// to (upstream `RecoveryFence`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryFence {
+    /// The recovery epoch generation fencing the mint.
+    pub generation: i64,
+    /// The minted successor attempt id.
+    pub successor_id: StepAttemptId,
+}
+
+/// `physicalAttemptIDFromStepAttemptID` — the successor's physical id
+/// is derived, never supplied: `sha256("step-attempt:"+id)` truncated
+/// to 16 bytes.
+#[must_use]
+pub fn physical_attempt_id_from_step_attempt_id(id: StepAttemptId) -> PhysicalAttemptId {
+    let sum = sha2::Sha256::digest(format!("step-attempt:{id}").as_bytes());
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&sum[..16]);
+    PhysicalAttemptId(raw)
+}
+
+/// `CancelPreparedForRecovery` — mints the prepared successor of a
+/// prepared, never-invoked attempt whose lease recovery expired. The
+/// successor keeps the logical operation and bumps the sequence; an
+/// attempt that already has a predecessor can never mint a second
+/// successor through this path.
+pub fn cancel_prepared_for_recovery(
+    current: &StepAttempt,
+    fence: RecoveryFence,
+) -> Result<StepAttempt, Failure> {
+    if current.state != AttemptState::AttemptPrepared {
+        if matches!(
+            current.state,
+            AttemptState::AttemptInvoked
+                | AttemptState::AttemptSettling
+                | AttemptState::AttemptReconciliation
+        ) {
+            return Err(failure(FailureKind::Denied, "RECONCILIATION_REQUIRED"));
+        }
+        return Err(failure(FailureKind::Denied, "IMMUTABLE_ATTEMPT"));
+    }
+    if fence.generation <= 0 || fence.successor_id.is_nil() {
+        return Err(failure(FailureKind::Invalid, "INVALID_RECOVERY_FENCE"));
+    }
+    if !current.predecessor_id.is_nil() {
+        return Err(failure(
+            FailureKind::Denied,
+            "RECOVERY_SUCCESSOR_ALREADY_USED",
+        ));
+    }
+    Ok(StepAttempt {
+        id: fence.successor_id,
+        step_id: current.step_id,
+        workspace_id: current.workspace_id,
+        task_id: current.task_id,
+        run_id: current.run_id,
+        logical_operation_id: current.logical_operation_id,
+        physical_attempt_id: physical_attempt_id_from_step_attempt_id(fence.successor_id),
+        invocation_id: InvocationId::default(),
+        predecessor_id: current.id,
+        version: 1,
+        sequence: current.sequence + 1,
+        state: AttemptState::AttemptPrepared,
+        created_at: ZERO_TIME,
+        updated_at: ZERO_TIME,
+    })
+}
+
+/// `EvaluateRecovery` — the domain half of a recovery scan's prepared
+/// branch: scope + lease checks, the predecessor's cancellation, and
+/// the fenced successor mint in one change set. Recovery writes no
+/// durable event — the caller persists the set under its own
+/// coordinator fence.
 pub fn evaluate_recovery(
     state: &ExecutionState,
     now: OffsetDateTime,
+    epoch_generation: i64,
     successor_id: StepAttemptId,
-    physical_attempt_id: PhysicalAttemptId,
-    event_id: central_foundation::identity::ExecutionEventId,
-    outbox_id: central_foundation::identity::OutboxId,
-    producer_id: &str,
-    idempotency_key: &str,
 ) -> Result<ExecutionChangeSet, Failure> {
     if now == ZERO_TIME
         || state.step.is_none()
@@ -775,74 +875,23 @@ pub fn evaluate_recovery(
     {
         return Err(failure(FailureKind::Conflict, "RECOVERY_SCOPE_MISMATCH"));
     }
-    if attempt.state != AttemptState::AttemptPrepared {
-        return Err(failure(FailureKind::Conflict, "RECOVERY_NOT_REQUIRED"));
-    }
     if state.lease.as_ref().is_some_and(|l| l.expires_at > now) {
         return Err(failure(FailureKind::Conflict, "ACTIVE_LEASE_CONFLICT"));
     }
-    if successor_id.is_nil() || physical_attempt_id.is_nil() {
-        return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
-    }
+    let successor = cancel_prepared_for_recovery(
+        &attempt,
+        RecoveryFence {
+            generation: epoch_generation,
+            successor_id,
+        },
+    )?;
     let mut predecessor = attempt.clone();
     predecessor = domain::transition_attempt(predecessor, AttemptState::AttemptCancelled)?;
     predecessor.updated_at = now;
-    let successor = StepAttempt {
-        id: successor_id,
-        step_id: step.id,
-        workspace_id: run.workspace_id,
-        task_id: run.task_id,
-        run_id: run.id,
-        logical_operation_id: attempt.logical_operation_id,
-        physical_attempt_id,
-        invocation_id: InvocationId::default(),
-        predecessor_id: attempt.id,
-        version: 1,
-        sequence: attempt.sequence + 1,
-        state: AttemptState::AttemptPrepared,
-        created_at: now,
-        updated_at: now,
-    };
-    let meta = EvaluationMetadata {
-        principal_id: producer_id.to_string(),
-        capability: Capability::RecoveryCoordinator,
-        idempotency_key: idempotency_key.to_string(),
-        fingerprint: RequestFingerprint::default(),
-        now,
-        event_id,
-        outbox_id,
-        producer_id: producer_id.to_string(),
-    };
-    let envelope = CommandEnvelope {
-        scope: domain::TrustedScope {
-            principal_id: producer_id.to_string(),
-            workspace_id: run.workspace_id,
-            capabilities: std::collections::BTreeSet::from([Capability::RecoveryCoordinator]),
-        },
-        workspace_id: run.workspace_id,
-        task_id: run.task_id,
-        run_id: run.id,
-        step_id: step.id,
-        attempt_id: successor.id,
-        logical_operation: attempt.logical_operation_id,
-        expected: domain::ExpectedVersions::default(),
-        operation_digest: RequestFingerprint::default(),
-        lease_credential: LeaseCredential::default(),
-        lease_generation: 0,
-        assert_no_active_lease: false,
-        state: ExecutionState {
-            task: state.task.clone(),
-            step: None,
-            attempt: None,
-            tool_calls: Vec::new(),
-            tool_attempts: Vec::new(),
-            lease: None,
-            approval: None,
-        },
-        approval_subject_version: 0,
-        approval_expected_step_version: 0,
-    };
-    let change = ExecutionChangeSet {
+    let mut successor = successor;
+    successor.created_at = now;
+    successor.updated_at = now;
+    domain::build_execution_change_set(ExecutionChangeSet {
         attempts: vec![predecessor, successor],
         lease_assertions: vec![domain::LeaseAssertion {
             workspace_id: run.workspace_id,
@@ -850,14 +899,5 @@ pub fn evaluate_recovery(
             no_active: true,
         }],
         ..ExecutionChangeSet::default()
-    };
-    domain::build_execution_change_set(domain::with_evidence(
-        &envelope,
-        &meta,
-        change,
-        EVENT_ATTEMPT_RECOVERED,
-        domain::OUTBOX_ATTEMPT_RECOVERED,
-        AttemptState::AttemptPrepared.as_str(),
-        "recovery_successor",
-    )?)
+    })
 }

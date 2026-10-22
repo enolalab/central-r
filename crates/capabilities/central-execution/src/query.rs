@@ -11,7 +11,6 @@ use time::OffsetDateTime;
 
 use crate::domain::{Step, StepAttempt, TrustedScope};
 use crate::port::RecoveryClaimabilityReader;
-use crate::resume::recovery_claimability;
 
 fn failure(kind: FailureKind, reason: &'static str) -> Failure {
     Failure::new(kind, reason, "execution query refused")
@@ -97,6 +96,8 @@ pub fn validate_turn_activity_request(req: &RunTurnActivityRequest) -> Result<u3
 pub struct ClaimableRun {
     /// The workspace the run belongs to.
     pub workspace_id: WorkspaceId,
+    /// The task the run belongs to.
+    pub task_id: TaskId,
     /// The run.
     pub run_id: RunId,
     /// When the run row was created (recovery watermark comparison).
@@ -129,27 +130,19 @@ impl<R: RecoveryClaimabilityReader> ClaimabilityDecorator<R> {
         for run in runs.iter_mut() {
             match self
                 .reader
-                .recovery_claimability_for(scope.clone(), run.workspace_id, run.run_id)
+                .recovery_claimability(scope.clone(), run.task_id, run.run_id)
                 .await
             {
                 Err(_) => {
                     run.claimable = false;
                     run.reason = Some("RECOVERY_STATUS_UNAVAILABLE".to_string());
                 }
-                Ok(Some((epoch, work, reconciled_generation))) => {
-                    let claimability = recovery_claimability(
-                        &epoch,
-                        &work,
-                        run.created_at,
-                        run.run_id,
-                        reconciled_generation,
-                    );
+                Ok(claimability) => {
                     if !claimability.claimable {
                         run.claimable = false;
-                        run.reason = claimability.reason;
+                        run.reason = Some(claimability.reason);
                     }
                 }
-                Ok(None) => {}
             }
         }
         Ok(())
