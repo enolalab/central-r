@@ -1,0 +1,73 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, task_id, run_id, version, sequence, state, created_at, updated_at FROM central.steps WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND id = $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "sequence",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d618c3385d289ebd94338635d353aa6a4169cfb6c9be1ea2cad12c7bad328b8a"
+}

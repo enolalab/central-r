@@ -12,19 +12,19 @@ central-authorization = { path = "../../capabilities/central-authorization", ver
 central-checkpoint = { path = "../../capabilities/central-checkpoint", version = "0.1.0" }
 central-event = { path = "../../capabilities/central-event", version = "0.1.0" }
 central-task = { path = "../../capabilities/central-task", version = "0.1.0" }
+central-execution = { path = "../../capabilities/central-execution", version = "0.0.0" }
 central-workspace = { path = "../../capabilities/central-workspace", version = "0.1.0" }
 serde.workspace = true
 sqlx.workspace = true
 serde_json.workspace = true
+rand.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 trait-variant.workspace = true
 uuid.workspace = true
 time.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
 
 [lints]
 workspace = true

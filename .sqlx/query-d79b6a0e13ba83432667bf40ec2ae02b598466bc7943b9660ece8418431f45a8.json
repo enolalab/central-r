@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT request_fingerprint, principal_id, capability, expected_version_digest, result_reference, result_payload, task_id, run_id, step_id, step_attempt_id, logical_operation_id FROM central.execution_command_receipts WHERE workspace_id = $1 AND command_scope = $2 AND idempotency_key = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "request_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "principal_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "capability",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "expected_version_digest",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "result_reference",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "result_payload",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 6,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "step_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "step_attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "logical_operation_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "d79b6a0e13ba83432667bf40ec2ae02b598466bc7943b9660ece8418431f45a8"
+}

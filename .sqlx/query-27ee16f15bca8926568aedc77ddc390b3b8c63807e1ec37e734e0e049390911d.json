@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_epoch_workspaces AS work SET delivery_state = 'pending', retry_attempt = retry_attempt + 1, failure_class = NULL, failure_reason = NULL, claim_token_hash = NULL, claim_expires_at = NULL, retry_not_before = NULL, updated_at = clock_timestamp() WHERE work.epoch_generation = $1 AND delivery_state = 'failed' AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch WHERE epoch.epoch_generation = work.epoch_generation AND epoch.coordinator_domain = $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "27ee16f15bca8926568aedc77ddc390b3b8c63807e1ec37e734e0e049390911d"
+}

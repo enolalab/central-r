@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(max(epoch_generation), 0) + 1 AS \"next_gen!\" FROM central.recovery_epochs",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next_gen!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8cc90be8d672b96de46d92300fa08198fce4c6846ee344910b7109476efb9001"
+}

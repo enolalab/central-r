@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dispatch_case AS \"dispatch_case!\", workspace_id AS \"workspace_id!\", task_id AS \"task_id!\", run_id AS \"run_id!\", step_id, attempt_id, logical_operation_id, task_created_at AS \"task_created_at!\" FROM ( SELECT 'queued' AS dispatch_case, task.workspace_id AS workspace_id, task.id AS task_id, run.id AS run_id, NULL::uuid AS step_id, NULL::uuid AS attempt_id, NULL::uuid AS logical_operation_id, task.created_at AS task_created_at, run.created_at AS run_created_at, run.reconciled_epoch AS run_reconciled_epoch FROM central.tasks task JOIN central.runs run ON run.workspace_id = task.workspace_id AND run.task_id = task.id AND run.id = task.current_run_id WHERE task.status = 'queued' AND run.status = 'queued' AND task.created_at >= $1 AND NOT EXISTS ( SELECT 1 FROM central.steps step WHERE step.workspace_id = run.workspace_id AND step.run_id = run.id) UNION ALL SELECT 'prepared_successor', task.workspace_id, task.id, run.id, attempt.step_id, attempt.id, attempt.logical_operation_id, task.created_at, run.created_at, run.reconciled_epoch FROM central.tasks task JOIN central.runs run ON run.workspace_id = task.workspace_id AND run.task_id = task.id AND run.id = task.current_run_id JOIN central.step_attempts attempt ON attempt.workspace_id = run.workspace_id AND attempt.run_id = run.id AND attempt.state = 'prepared' AND attempt.predecessor_id IS NOT NULL WHERE task.status = 'running' AND run.status = 'running' AND task.created_at >= $1 AND NOT EXISTS ( SELECT 1 FROM central.execution_ownership ownership WHERE ownership.workspace_id = run.workspace_id AND ownership.run_id = run.id AND ownership.lease_expires_at > clock_timestamp()) ) dispatchable WHERE NOT EXISTS ( SELECT 1 FROM ( SELECT epoch.epoch_generation, epoch.state FROM central.recovery_epochs epoch WHERE EXISTS ( SELECT 1 FROM central.recovery_epoch_workspaces scoped WHERE scoped.epoch_generation = epoch.epoch_generation AND scoped.workspace_id = dispatchable.workspace_id) ORDER BY epoch.epoch_generation DESC LIMIT 1 ) latest JOIN central.recovery_epoch_workspaces work ON work.epoch_generation = latest.epoch_generation AND work.workspace_id = dispatchable.workspace_id WHERE latest.state <> 'completed' AND work.delivery_state <> 'completed' AND dispatchable.run_reconciled_epoch < latest.epoch_generation AND (dispatchable.run_created_at < work.watermark_created_at OR (dispatchable.run_created_at = work.watermark_created_at AND dispatchable.run_id <= work.watermark_run_id)) ) ORDER BY task_created_at, run_id LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "dispatch_case!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "task_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "run_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "step_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "logical_operation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "task_created_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "459ba528ef9eb7b0c5727aca1ce1fd57d7b4f3c7fff832ede6645b23af131b84"
+}

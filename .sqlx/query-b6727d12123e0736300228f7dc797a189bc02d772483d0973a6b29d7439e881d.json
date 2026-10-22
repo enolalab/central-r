@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.tool_call_attempts SET state = 'reconciliation', version = version + 1, updated_at = clock_timestamp() WHERE workspace_id = $1 AND run_id = $2 AND state IN ('invoked','settling')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6727d12123e0736300228f7dc797a189bc02d772483d0973a6b29d7439e881d"
+}

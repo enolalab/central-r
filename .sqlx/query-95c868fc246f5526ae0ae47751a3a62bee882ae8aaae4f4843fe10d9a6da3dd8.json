@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT 1 AS one FROM central.step_attempts WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 AND id = $5 AND logical_operation_id = $6 AND version = $7 AND state = $8 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "95c868fc246f5526ae0ae47751a3a62bee882ae8aaae4f4843fe10d9a6da3dd8"
+}

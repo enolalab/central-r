@@ -26,6 +26,7 @@ pub mod authorization;
 pub mod checkpoint;
 pub mod error;
 pub mod event;
+pub mod execution;
 pub mod migrate;
 mod store_support;
 pub mod task;

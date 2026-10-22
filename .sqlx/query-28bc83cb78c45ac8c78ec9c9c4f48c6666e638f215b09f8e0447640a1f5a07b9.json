@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT delivery_state, delivered_at FROM central.outbox WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "delivery_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "delivered_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "28bc83cb78c45ac8c78ec9c9c4f48c6666e638f215b09f8e0447640a1f5a07b9"
+}

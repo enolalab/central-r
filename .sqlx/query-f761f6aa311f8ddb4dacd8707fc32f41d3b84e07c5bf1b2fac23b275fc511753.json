@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id, a.step_id FROM central.step_attempts a WHERE a.workspace_id = $1 AND a.run_id = $2 AND a.state IN ('prepared','invoked','settling','reconciliation') ORDER BY a.updated_at DESC, a.id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "step_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "f761f6aa311f8ddb4dacd8707fc32f41d3b84e07c5bf1b2fac23b275fc511753"
+}

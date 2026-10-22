@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.runs SET status = 'waiting', waiting_reason = 'reconciliation', version = version + CASE WHEN status = 'waiting' AND waiting_reason = 'reconciliation' THEN 0 ELSE 1 END, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND status IN ('queued','running','waiting')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a4dae31ff5e583ef0afb4ace0469525f4b154ca0f047bb66b45775827bc5cf8e"
+}

@@ -1,0 +1,49 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT count(*) FROM central.steps WHERE id = $1) AS \"steps!\", (SELECT count(*) FROM central.step_attempts WHERE id = $2) AS \"attempts!\", (SELECT count(*) FROM central.events WHERE id = $3) AS \"events!\", (SELECT count(*) FROM central.outbox WHERE workspace_id = $4 AND deduplication_key = 'execution.test:k1') AS \"outbox!\", (SELECT count(*) FROM central.execution_command_receipts WHERE workspace_id = $4 AND command_scope = 'execution.test' AND idempotency_key = 'k1') AS \"receipts!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "steps!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "attempts!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "events!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "outbox!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "receipts!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "71da06b725599e5ea837d2ac583d833e40eb9d9d88da079b3bd33439a3fb242b"
+}

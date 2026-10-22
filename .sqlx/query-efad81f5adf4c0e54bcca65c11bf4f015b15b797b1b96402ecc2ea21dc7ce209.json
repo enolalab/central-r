@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.workspace_event_counters SET last_event_sequence = last_event_sequence + 1 WHERE workspace_id = $1 RETURNING last_event_sequence",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_event_sequence",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "efad81f5adf4c0e54bcca65c11bf4f015b15b797b1b96402ecc2ea21dc7ce209"
+}

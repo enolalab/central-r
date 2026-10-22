@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT fencing_generation FROM central.recovery_coordinators WHERE recovery_domain = $1 AND instance_id = $2 AND fencing_generation = $3 AND state = 'claimed' AND lease_token_hash = $4 AND lease_expires_at > clock_timestamp() FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fencing_generation",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f20e1dfc0a66d08150633cc188db0ca051cb908f017bf4f94527fae5ad5f1e71"
+}

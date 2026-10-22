@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"count!\" FROM central.recovery_epoch_workspaces AS work JOIN central.recovery_epochs AS epoch ON epoch.epoch_generation = work.epoch_generation AND epoch.coordinator_domain = $2 WHERE work.epoch_generation = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "52960e3aeb184beb0b9916e6c7806399bc9b813ad1e97e59e60f45527bab422d"
+}

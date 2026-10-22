@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT 1 AS one FROM central.recovery_epochs WHERE epoch_generation = $1 AND coordinator_fence = $2 AND coordinator_domain = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "16f5886104da53d32f047fea55fc0e54536eae5304bbe22e95eed1676133032d"
+}

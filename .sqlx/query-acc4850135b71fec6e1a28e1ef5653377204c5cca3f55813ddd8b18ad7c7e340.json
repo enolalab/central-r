@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.runs SET reconciled_epoch = $1, updated_at = clock_timestamp() WHERE workspace_id = $2 AND id = $3 AND reconciled_epoch < $1 AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch WHERE epoch.epoch_generation = $1 AND epoch.coordinator_domain = $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "acc4850135b71fec6e1a28e1ef5653377204c5cca3f55813ddd8b18ad7c7e340"
+}

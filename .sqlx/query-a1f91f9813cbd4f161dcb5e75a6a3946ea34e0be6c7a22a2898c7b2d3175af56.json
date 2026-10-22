@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.execution_ownership SET owner_identity = $3, heartbeat_at = clock_timestamp(), claimed_step_id = $4, claimed_step_attempt_id = $5, lease_token_hash = $6, fencing_generation = $7, lease_expires_at = $8, updated_at = clock_timestamp() WHERE workspace_id = $1 AND run_id = $2 AND fencing_generation = $9 AND lease_expires_at <= clock_timestamp()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Int8",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a1f91f9813cbd4f161dcb5e75a6a3946ea34e0be6c7a22a2898c7b2d3175af56"
+}

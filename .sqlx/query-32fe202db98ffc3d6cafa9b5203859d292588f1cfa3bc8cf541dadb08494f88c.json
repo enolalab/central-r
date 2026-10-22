@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT e.epoch_generation, e.coordinator_fence, e.state FROM central.recovery_epochs e WHERE EXISTS ( SELECT 1 FROM central.recovery_epoch_workspaces w WHERE w.epoch_generation = e.epoch_generation AND w.workspace_id = $1 ) ORDER BY e.epoch_generation DESC LIMIT 1 FOR UPDATE OF e",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "epoch_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "coordinator_fence",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "state",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "32fe202db98ffc3d6cafa9b5203859d292588f1cfa3bc8cf541dadb08494f88c"
+}

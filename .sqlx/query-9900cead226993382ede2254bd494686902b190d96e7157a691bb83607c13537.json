@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.recovery_epochs (epoch_generation, coordinator_domain, coordinator_fence, state, snapshot_at, workspace_count, processed_count, retry_attempt, created_at, updated_at) VALUES ($1, $2, $3, 'running', clock_timestamp(), 0, 0, 0, clock_timestamp(), clock_timestamp()) RETURNING snapshot_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "snapshot_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9900cead226993382ede2254bd494686902b190d96e7157a691bb83607c13537"
+}

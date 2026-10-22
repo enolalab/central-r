@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_epochs SET scheduler_cursor = $2, processed_count = processed_count + $3, state = CASE WHEN state = 'open' THEN 'running' ELSE state END, updated_at = clock_timestamp() WHERE epoch_generation = $1 AND coordinator_domain = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4c1ff5d2b716aae91bad99adebef277e208afe196330181cdc17c58835efc69d"
+}

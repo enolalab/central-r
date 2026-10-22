@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT fencing_generation, lease_expires_at FROM central.execution_ownership WHERE workspace_id = $1 AND run_id = $2 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fencing_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b1d7cad0a99a39be5ea1f35ed868ab55445833ab7d6ced676f1d1101b890f4f9"
+}

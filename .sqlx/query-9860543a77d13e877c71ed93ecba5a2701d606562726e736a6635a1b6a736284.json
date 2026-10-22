@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT version FROM central.tool_call_attempts WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_attempt_id = $4 AND tool_call_id = $5 AND id = $6 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9860543a77d13e877c71ed93ecba5a2701d606562726e736a6635a1b6a736284"
+}

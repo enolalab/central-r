@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.approvals SET version = $6, state = $7, decision_actor = NULLIF($8, ''), decision_reason = NULLIF($9, ''), decision_id = $10, decided_at = $11, updated_at = clock_timestamp() WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 AND id = $5 AND version = $12 AND approval_kind = 'execution'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e254d2b1e3a8b6b0da0c78fe29301c07e35288b55647d1a23b306f497e77a29e"
+}

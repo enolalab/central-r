@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.execution_ownership SET claimed_run_id = run_id, claimed_step_id = NULL, claimed_step_attempt_id = NULL, owner_scope = NULL, owner_identity = NULL, heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp(), updated_at = clock_timestamp() WHERE workspace_id = $1 AND run_id = $2 AND lease_expires_at + interval '5 seconds' <= clock_timestamp()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de9b029acd1af44919041860b981dbfc431ad7acb3bc2224875cfa835a535390"
+}

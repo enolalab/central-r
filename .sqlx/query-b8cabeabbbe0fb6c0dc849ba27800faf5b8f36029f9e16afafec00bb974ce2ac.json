@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.id, r.task_id, r.created_at, r.version FROM central.runs r JOIN central.recovery_epoch_workspaces w ON w.epoch_generation = $1 AND w.workspace_id = r.workspace_id JOIN central.recovery_epochs e ON e.epoch_generation = w.epoch_generation AND e.coordinator_domain = $6 WHERE r.workspace_id = $2 AND r.reconciled_epoch < $1 AND (r.created_at < w.watermark_created_at OR (r.created_at = w.watermark_created_at AND r.id <= w.watermark_run_id)) AND ($3::timestamptz IS NULL OR r.created_at > $3::timestamptz OR (r.created_at = $3::timestamptz AND r.id > $4::uuid)) ORDER BY r.created_at, r.id LIMIT $5",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b8cabeabbbe0fb6c0dc849ba27800faf5b8f36029f9e16afafec00bb974ce2ac"
+}

@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_epoch_workspaces AS work SET cursor_created_at = $4, cursor_run_id = $5, scanned_count = scanned_count + 1, reconciled_count = reconciled_count + 1, claim_expires_at = clock_timestamp() + interval '30 seconds', retry_not_before = NULL, failure_class = NULL, failure_reason = NULL, updated_at = clock_timestamp() WHERE work.epoch_generation = $1 AND work.workspace_id = $2 AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch WHERE epoch.epoch_generation = work.epoch_generation AND epoch.coordinator_domain = $6)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Bytea",
+        "Timestamptz",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d47edf93ef879b2538513382a60fbd612f7aeefacace6108d2fe5a4309c403a6"
+}

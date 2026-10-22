@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT lease_expires_at, clock_timestamp() AS \"now!\" FROM central.execution_ownership WHERE workspace_id = $1 AND run_id = $2 AND lease_expires_at + interval '5 seconds' > clock_timestamp() FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "now!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "77ce804bde64659022542eb9562d966ff4a60e5f872b9f674e8250d7151179c2"
+}

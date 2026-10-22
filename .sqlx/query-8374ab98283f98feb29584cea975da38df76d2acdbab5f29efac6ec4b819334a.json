@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT e.epoch_generation, e.coordinator_fence, e.state, w.delivery_state, w.watermark_created_at, w.watermark_run_id, r.created_at, r.id AS run_id, r.reconciled_epoch FROM central.runs r JOIN central.recovery_epoch_workspaces w ON w.workspace_id = r.workspace_id JOIN central.recovery_epochs e ON e.epoch_generation = w.epoch_generation WHERE r.workspace_id = $1 AND r.task_id = $2 AND r.id = $3 AND e.state <> 'completed' ORDER BY e.epoch_generation DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "epoch_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "coordinator_fence",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "delivery_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "watermark_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "watermark_run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "reconciled_epoch",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8374ab98283f98feb29584cea975da38df76d2acdbab5f29efac6ec4b819334a"
+}

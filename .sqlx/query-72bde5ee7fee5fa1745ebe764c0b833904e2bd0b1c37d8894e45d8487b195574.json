@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.approvals (id, workspace_id, version, state, approval_kind, task_id, run_id, step_id, subject_version, logical_operation_id, operation_digest, expected_step_version, decision_actor, decision_reason, decision_id, decided_at, predecessor_approval_id, recorded_at, created_at, updated_at) VALUES ($1, $2, $3, $4, 'execution', $5, $6, $7, $8, $9, $10, $11, NULLIF($12, ''), NULLIF($13, ''), $14, $15, $16, clock_timestamp(), clock_timestamp(), clock_timestamp()) ON CONFLICT (id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Bytea",
+        "Int8",
+        "Text",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "72bde5ee7fee5fa1745ebe764c0b833904e2bd0b1c37d8894e45d8487b195574"
+}

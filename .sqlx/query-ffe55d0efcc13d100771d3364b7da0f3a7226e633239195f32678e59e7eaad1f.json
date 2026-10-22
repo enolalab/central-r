@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_epochs SET coordinator_fence = $3, updated_at = clock_timestamp() WHERE epoch_generation = $1 AND coordinator_domain = $2 AND state IN ('open','running','degraded','failed')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ffe55d0efcc13d100771d3364b7da0f3a7226e633239195f32678e59e7eaad1f"
+}

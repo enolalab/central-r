@@ -1,0 +1,121 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id!\", workspace_id AS \"workspace_id!\", task_id AS \"task_id!\", run_id AS \"run_id!\", step_id AS \"step_id!\", state AS \"state!\", subject_version AS \"subject_version!\", logical_operation_id AS \"logical_operation_id!\", operation_digest AS \"operation_digest!\", expected_step_version AS \"expected_step_version!\", decision_actor, decision_reason, decision_id, predecessor_approval_id, version AS \"version!\", recorded_at AS \"recorded_at!\", decided_at FROM central.approvals WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 AND approval_kind = 'execution' ORDER BY recorded_at DESC, id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "task_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "run_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "step_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "state!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "subject_version!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "logical_operation_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "operation_digest!",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 9,
+        "name": "expected_step_version!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "decision_actor",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "decision_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "decision_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "predecessor_approval_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "version!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 15,
+        "name": "recorded_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "decided_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "28da73c7b65da7e090d69fdf1fc75379720fea77970a619379172a4d3fbfcfca"
+}

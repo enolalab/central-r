@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.step_attempts SET outcome = $6::jsonb, context = COALESCE($7::jsonb, context), updated_at = clock_timestamp() WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 AND id = $5",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9fc23f6b58489210c39536ce3953eaa29c2a39f952d017e28916c6669b258e6d"
+}

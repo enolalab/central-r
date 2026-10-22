@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.execution_completion_receipts (id, workspace_id, task_id, run_id, step_id, step_attempt_id, logical_operation_id, physical_attempt_id, invocation_id, invocation_generation, final_state, outcome, evidence_digest, producer_id, eligible_after) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, 'succeeded', '{}'::jsonb, $10, 'exec-test', clock_timestamp() + interval '90 days')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "927e978e3e1ab975e2f2d4eaa8cfc2387b031fbe4a7009a9a816bdaa159c000d"
+}

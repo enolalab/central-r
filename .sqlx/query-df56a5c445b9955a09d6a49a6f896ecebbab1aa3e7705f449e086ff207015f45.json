@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.execution_command_receipts (id, workspace_id, command_scope, idempotency_key, request_fingerprint, principal_id, capability, expected_version_digest, result_reference, result_payload, task_id, run_id, step_id, step_attempt_id, logical_operation_id, created_at, expires_at, eligible_after) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, clock_timestamp(), clock_timestamp() + interval '7 days', clock_timestamp() + interval '90 days') ON CONFLICT (workspace_id, command_scope, idempotency_key) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Bytea",
+        "Text",
+        "Text",
+        "Bytea",
+        "Uuid",
+        "Jsonb",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "df56a5c445b9955a09d6a49a6f896ecebbab1aa3e7705f449e086ff207015f45"
+}

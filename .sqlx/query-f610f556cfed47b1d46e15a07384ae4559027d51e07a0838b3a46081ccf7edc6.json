@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT epoch_generation, coordinator_fence, state, snapshot_at, scheduler_cursor, workspace_count, processed_count, retry_attempt FROM central.recovery_epochs WHERE coordinator_domain = $1 AND state IN ('open','running','degraded','failed') ORDER BY epoch_generation DESC LIMIT 1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "epoch_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "coordinator_fence",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "snapshot_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "scheduler_cursor",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "workspace_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "processed_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "retry_attempt",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f610f556cfed47b1d46e15a07384ae4559027d51e07a0838b3a46081ccf7edc6"
+}

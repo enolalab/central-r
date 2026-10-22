@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.tool_call_attempts SET version = $7, invocation_id = $8, invocation_generation = CASE WHEN $8::uuid IS NULL THEN NULL ELSE $9::bigint END, state = $10, outcome = COALESCE($11::jsonb, outcome), context = COALESCE($12::jsonb, context), updated_at = clock_timestamp() WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_attempt_id = $4 AND tool_call_id = $5 AND id = $6 AND version = $13",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38dbfa0c77bb92244e19cc4fd05ddb492ce561bb276c0ad70ee19a429c2075c5"
+}

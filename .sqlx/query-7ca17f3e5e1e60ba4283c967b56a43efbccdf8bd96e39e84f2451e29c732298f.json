@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.tool_calls SET version = $6, sequence = $7, state = $8, updated_at = clock_timestamp() WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_attempt_id = $4 AND id = $5 AND version = $9",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7ca17f3e5e1e60ba4283c967b56a43efbccdf8bd96e39e84f2451e29c732298f"
+}

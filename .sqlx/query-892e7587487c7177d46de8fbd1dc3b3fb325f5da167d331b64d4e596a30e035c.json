@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH requeued AS ( UPDATE central.recovery_epoch_workspaces AS work SET delivery_state = CASE WHEN retry_attempt >= 4 THEN 'failed' ELSE 'pending' END, claim_token_hash = NULL, claim_expires_at = NULL, retry_attempt = LEAST(retry_attempt + 1, 5), retry_not_before = CASE WHEN retry_attempt >= 4 THEN NULL ELSE clock_timestamp() + LEAST( interval '5 seconds', interval '100 milliseconds' * power(2, retry_attempt)) END, failure_class = CASE WHEN retry_attempt >= 4 THEN 'retry_exhausted' ELSE 'claim_expired' END, failure_reason = CASE WHEN retry_attempt >= 4 THEN 'recovery retry budget exhausted' ELSE 'recovery Workspace claim expired' END, updated_at = clock_timestamp() WHERE work.epoch_generation = $1 AND delivery_state = 'claimed' AND claim_expires_at <= clock_timestamp() AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch WHERE epoch.epoch_generation = work.epoch_generation AND epoch.coordinator_domain = $2) RETURNING delivery_state) SELECT count(*) FILTER (WHERE delivery_state = 'failed') AS \"failed!\" FROM requeued",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "failed!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "892e7587487c7177d46de8fbd1dc3b3fb325f5da167d331b64d4e596a30e035c"
+}

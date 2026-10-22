@@ -41,7 +41,7 @@
 
 mod event_log_store;
 mod milestone_store;
-mod queries;
+pub(crate) mod queries;
 mod store;
 
 pub use event_log_store::{EventLogStore, HIDDEN_TASK_EVENT_KINDS};

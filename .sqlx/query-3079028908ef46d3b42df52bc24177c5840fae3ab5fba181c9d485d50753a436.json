@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.workspace_event_counters (workspace_id, last_event_sequence) VALUES ($1, 0) ON CONFLICT (workspace_id) DO UPDATE SET last_event_sequence = central.workspace_event_counters.last_event_sequence RETURNING last_event_sequence",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_event_sequence",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3079028908ef46d3b42df52bc24177c5840fae3ab5fba181c9d485d50753a436"
+}

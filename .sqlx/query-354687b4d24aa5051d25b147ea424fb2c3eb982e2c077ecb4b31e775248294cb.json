@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT delivery_state, watermark_created_at, watermark_run_id FROM central.recovery_epoch_workspaces WHERE epoch_generation = $1 AND workspace_id = $2 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "delivery_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "watermark_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "watermark_run_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "354687b4d24aa5051d25b147ea424fb2c3eb982e2c077ecb4b31e775248294cb"
+}

@@ -1,0 +1,61 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT work.delivery_state, work.watermark_created_at, work.watermark_run_id, work.cursor_created_at, work.cursor_run_id, work.scanned_count, work.reconciled_count FROM central.recovery_epoch_workspaces AS work JOIN central.recovery_epochs AS epoch ON epoch.epoch_generation = work.epoch_generation AND epoch.coordinator_domain = $4 WHERE work.epoch_generation = $1 AND work.workspace_id = $2 AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 FOR UPDATE OF work",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "delivery_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "watermark_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "watermark_run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "cursor_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "cursor_run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "scanned_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "reconciled_count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f09dd175947ea7b26bca9a2afd440ac6cc24c6fa9ed35bfdea8d095cc5887fed"
+}

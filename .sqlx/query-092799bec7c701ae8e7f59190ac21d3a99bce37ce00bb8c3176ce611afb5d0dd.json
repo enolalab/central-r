@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT lease_token_hash, fencing_generation, lease_expires_at, claimed_step_id, claimed_step_attempt_id FROM central.execution_ownership WHERE workspace_id = $1 AND run_id = $2 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lease_token_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "fencing_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "claimed_step_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "claimed_step_attempt_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "092799bec7c701ae8e7f59190ac21d3a99bce37ce00bb8c3176ce611afb5d0dd"
+}

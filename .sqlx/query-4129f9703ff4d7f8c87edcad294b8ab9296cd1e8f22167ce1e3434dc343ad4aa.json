@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.recovery_coordinators (recovery_domain, instance_id, lease_token_hash, fencing_generation, lease_expires_at, state, created_at, updated_at) VALUES ($1, $2, $3, 1, clock_timestamp() + interval '30 seconds', 'claimed', clock_timestamp(), clock_timestamp()) ON CONFLICT (recovery_domain) DO UPDATE SET instance_id = EXCLUDED.instance_id, lease_token_hash = EXCLUDED.lease_token_hash, fencing_generation = CASE WHEN central.recovery_coordinators.lease_expires_at <= clock_timestamp() OR central.recovery_coordinators.instance_id <> EXCLUDED.instance_id THEN central.recovery_coordinators.fencing_generation + 1 ELSE central.recovery_coordinators.fencing_generation END, lease_expires_at = clock_timestamp() + interval '30 seconds', state = 'claimed', updated_at = clock_timestamp() WHERE central.recovery_coordinators.lease_expires_at <= clock_timestamp() OR central.recovery_coordinators.instance_id = EXCLUDED.instance_id RETURNING fencing_generation, lease_expires_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fencing_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "4129f9703ff4d7f8c87edcad294b8ab9296cd1e8f22167ce1e3434dc343ad4aa"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.outbox_workspace_work (workspace_id, next_visible_at) VALUES ($1, clock_timestamp()) ON CONFLICT (workspace_id) DO UPDATE SET next_visible_at = LEAST(central.outbox_workspace_work.next_visible_at, EXCLUDED.next_visible_at), version = central.outbox_workspace_work.version + 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "366186455e2e5a3c99aa203fee21dbf70bde408b5e20c56356e7e7c25dd14a8c"
+}

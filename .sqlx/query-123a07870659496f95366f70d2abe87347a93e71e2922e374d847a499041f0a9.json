@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_epochs SET state = 'completed', completed_at = clock_timestamp(), updated_at = clock_timestamp() WHERE epoch_generation = $1 AND coordinator_domain = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "123a07870659496f95366f70d2abe87347a93e71e2922e374d847a499041f0a9"
+}

@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, step_id, workspace_id, task_id, run_id, logical_operation_id, physical_attempt_id, invocation_id, predecessor_id, version, sequence, state, created_at, updated_at FROM central.step_attempts WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 AND id = $5",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "step_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "logical_operation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "physical_attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "invocation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "predecessor_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "sequence",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1a8ba61006d337fadea1443b747da10471bf9fc5a70dcd42ff71ef35194e6068"
+}

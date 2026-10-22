@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_epochs SET workspace_count = $2, updated_at = clock_timestamp() WHERE epoch_generation = $1 AND coordinator_domain = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "34ae8ab8392483ee3cc433264e7db4d41b75e83290ea9a6eb9a44e5444f8247c"
+}
