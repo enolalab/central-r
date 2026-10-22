@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts SET version = $3, state = $4, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND version = $5",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d29026cb0dbdc4a3d14241294d70388bcbb0746fa1ba9d9c377c2340cf0668de"
+}

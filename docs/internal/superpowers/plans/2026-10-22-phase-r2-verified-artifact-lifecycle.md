@@ -95,7 +95,7 @@ central-rust/
 - `$CENTRAL_RUST_SRC/docs/artifacts/content-policy.md`
 - `$CENTRAL_RUST_SRC/docs/persistence/postgresql-adapter-mapping.md` (§3.9, §3.10)
 
-- [ ] **Step 1: Add `"v4"` feature to workspace `uuid = "=1.28.0"` and extend `central-foundation::identity`**
+- [x] **Step 1: Add `"v4"` feature to workspace `uuid = "=1.28.0"` and extend `central-foundation::identity`**
   - In root `Cargo.toml`, update `uuid` under `[workspace.dependencies]` to `uuid = { version = "=1.28.0", features = ["v4", "v7", "serde"] }`.
   - In `crates/central-foundation/src/identity.rs`:
     - Add a `define_v4_id!` macro enforcing strict canonical lowercase 8-4-4-4-12 text, non-nil, version 4, and RFC 9562 variant (`IdParseErrorKind::WrongVersion` when version != 4), with `new()` (`Uuid::new_v4()`), `parse(&str)`, `as_bytes()`, `from_trusted_db_bytes([u8; 16])`, and `is_nil()`.
@@ -103,7 +103,7 @@ central-rust/
     - Add deterministic digest constructors `ArtifactId::from_v7_digest_bytes(raw: [u8; 16]) -> Self` (setting `(raw[6] & 0x0f) | 0x70` and `(raw[8] & 0x3f) | 0x80`) and `StagingGeneration::from_v4_digest_bytes(raw: [u8; 16]) -> Self` (setting `(raw[6] & 0x0f) | 0x40` and `(raw[8] & 0x3f) | 0x80`) so `central-artifact` never imports `uuid::Uuid`.
   - In `crates/capabilities/central-artifact/Cargo.toml`, declare **only** `central-foundation`, `central-execution`, `serde`, `serde_json`, `sha2`, `time`, and `trait-variant` (no `tokio`, no `uuid`).
 
-- [ ] **Step 2: Implement `crates/capabilities/central-artifact/src/domain.rs` (pure synchronous Rust)**
+- [x] **Step 2: Implement `crates/capabilities/central-artifact/src/domain.rs` (pure synchronous Rust)**
   - Port `FailureClass` (`Invalid`, `Conflict`, `Denied`) and `Failure` (`class`, `reason`) with `Display` formatting `"artifact: {} ({})"` and conversion into `central_foundation::failure::Failure`.
   - Port `Limits` (`DEFAULT_REQUIRED_REPORT_MAX_BYTES = 1 << 20`, `HARD_REQUIRED_REPORT_MAX_BYTES = 10 << 20`, `ARTIFACT_PREVIEW_MAX_BYTES = 128 * 1024`, `validate()`).
   - Port `derive_reservation_identity(operation_id: &str) -> Result<(ArtifactId, StagingGeneration), Failure>` using the exact domain-separated SHA-256 seeds `"central.b10.reservation-artifact-id/v1\x00"` and `"central.b10.reservation-staging-generation/v1\x00"`.
@@ -122,10 +122,10 @@ central-rust/
   - Implement content-policy delivery and preview disposition evaluator (`docs/artifacts/content-policy.md`):
     - `evaluate_delivery_policy(detected_media_type: Option<&str>, sensitivity: Sensitivity, requested_disposition: Disposition, verified_size: i64) -> DeliveryPolicyDecision` enforcing the preview allowlist (`text/plain`, `text/markdown`, `application/json`), `ARTIFACT_PREVIEW_MAX_BYTES` (`128 KiB`) raw preview bound with truncation flag, and forced `Disposition::Attachment` + `application/octet-stream` fallback for unallowlisted or `Sensitive` content.
 
-- [ ] **Step 3: Port all unit tests from `domain_test.go` and `fingerprint_coverage_test.go` plus two-phase deletion and content-policy unit tests**
+- [x] **Step 3: Port all unit tests from `domain_test.go` and `fingerprint_coverage_test.go` plus two-phase deletion and content-policy unit tests**
   - Verify UUIDv4 newtype strict parsing in `central-foundation`, state machine transitions, workspace chain mismatch denials, version conflicts, `derive_reservation_identity` byte-for-byte determinism, `reserve_fingerprint` sensitivity to every field, `verified` rejection precedence, `finalize` identity verification, `mark_delete_pending` -> `complete_deletion` tombstone construction, and `evaluate_delivery_policy` allowlist/disposition rules.
 
-- [ ] **Step 4: Run verification and commit**
+- [x] **Step 4: Run verification and commit**
   - Run: `cargo fmt --all -- --check && cargo clippy -p central-foundation -p central-artifact --all-targets -- -D warnings && cargo test -p central-foundation -p central-artifact`
   - Commit: `feat(artifact): implement B10 pure artifact lifecycle domain and UUIDv4 identities`
 
@@ -146,13 +146,13 @@ central-rust/
 - `$CENTRAL_RUST_SRC/docs/internal/superpowers/specs/2026-10-07-phase-2-artifact-lineage.md`
 - `$CENTRAL_RUST_SRC/docs/architecture/rust-application-boundaries.md` (§2.3, §3.4)
 
-- [ ] **Step 1: Implement `crates/capabilities/central-artifact/src/lineage.rs` (pure synchronous domain types & validators)**
+- [x] **Step 1: Implement `crates/capabilities/central-artifact/src/lineage.rs` (pure synchronous domain types & validators)**
   - Port closed reason codes (`REASON_ARTIFACT_NOT_FINALIZED`, `REASON_ARTIFACT_SCOPE_DENIED`, `REASON_ARTIFACT_READ_UNRESOLVED`, `REASON_LINEAGE_READ_UNDECLARED`, `REASON_ARTIFACT_BODY_INTEGRITY`, `REASON_ARTIFACT_READ_AMBIGUOUS`).
   - Port `ProduceEdge` (`id: ProduceEdgeId`, `run_id: RunId`, `node_id: WorkflowNodeId`, `attempt_id: SessionAttemptId`, `artifact_id: ArtifactId`, `created_at: OffsetDateTime`) and its validation rules.
   - Port `ReadEdge` (`id: ReadEdgeId`, `run_id: RunId`, `reader_node_id: Option<WorkflowNodeId>`, `attempt_id: Option<SessionAttemptId>`, `artifact_id: ArtifactId`, `declared: bool`, `checksum: String`, `created_at: OffsetDateTime`) enforcing the all-or-nothing `(reader_node_id, attempt_id)` pair check (`LINEAGE_READ_EDGE_READER_PAIR_MISMATCH`) and 64-char lowercase hex SHA-256 checksum validation (`LINEAGE_READ_EDGE_CHECKSUM_REQUIRED`).
   - Port `ReadScope` (`Attempt { run_id, node_id, attempt_id }` / `Operator`), `parse_attempt_scope(value: &str) -> Result<ReadScope, Failure>` (`"<run_id>:<node_id>:<attempt_id>"` or empty for operator), `LineageArtifact`, `ReadSelector` (`ByArtifactId(ArtifactId)` | `ByProduced { from_node_key: String, name: String }`), `ReadRequest`, `ReadAuthorization` (`edge()`), and `RunLineage`.
 
-- [ ] **Step 2: Implement `crates/capabilities/central-artifact/src/port.rs` and `query.rs`**
+- [x] **Step 2: Implement `crates/capabilities/central-artifact/src/port.rs` and `query.rs`**
   - Define process-wide transfer and ceiling constants from `internal/artifact/port/port.go`:
     - `MAX_CONCURRENT_TRANSFERS: usize = 2`
     - `TRANSFER_COPY_BUFFER_BYTES: usize = 256 * 1024`
@@ -175,10 +175,10 @@ central-rust/
     - `ReadStore` (`find_artifact`, `resolve_produced`, `declared_scope`, `run_produced_artifacts`)
   - In `query.rs`, define `ArtifactSummaryRead` (`#[trait_variant::make(Send)]`), `ArtifactListRequest` (`workspace_id`, `task_id`, `cursor: Option<ArtifactSeekCursor>`, bounded `page_size` default 100 / max 250), `ArtifactSeekCursor { updated_at: OffsetDateTime, artifact_id: ArtifactId }`, and `ArtifactSummaryView` (exposing no object keys, staging generations, or authority tokens) per `rust-application-boundaries.md` §2.3 & §3.4.
 
-- [ ] **Step 3: Port unit tests from `lineage_test.go` for pure lineage validation, `parse_attempt_scope`, and `query.rs` bounds**
+- [x] **Step 3: Port unit tests from `lineage_test.go` for pure lineage validation, `parse_attempt_scope`, and `query.rs` bounds**
   - Verify `ReadEdge` reader-pair mismatch rejection, checksum hex validation, `parse_attempt_scope` parsing for operator (`""`) and `<run>:<node>:<attempt>` triples, `ReadAuthorization::edge()` construction, and `ArtifactListRequest` page-size clamping/validation.
 
-- [ ] **Step 4: Run verification and commit**
+- [x] **Step 4: Run verification and commit**
   - Run: `cargo fmt --all -- --check && cargo clippy -p central-artifact --all-targets -- -D warnings && cargo test -p central-artifact`
   - Commit: `feat(artifact): add b34 lineage model and capability port/query contracts`
 
@@ -202,7 +202,7 @@ central-rust/
 - `$CENTRAL_SRC/internal/artifact/app/reconciler_resume_test.go`
 - `$CENTRAL_RUST_SRC/docs/architecture/rust-application-boundaries.md` (§2.4 lines 162–169, §3.4 lines 350–355)
 
-- [ ] **Step 1: Implement `crates/capabilities/central-artifact/src/classifier.rs`**
+- [x] **Step 1: Implement `crates/capabilities/central-artifact/src/classifier.rs`**
   - Port `ReportClassifier` (`CLASSIFY_PREFIX_BYTES = 1 << 20`, `MEDIA_TYPE_MARKDOWN = "text/markdown"`, `MEDIA_TYPE_PLAIN = "text/plain"`, `MEDIA_TYPE_OCTET_STREAM = "application/octet-stream"`).
   - Port `contains_secret_disclosure(sample: &[u8]) -> bool` covering all four upstream heuristic families:
     1. PEM private key headers (`-----BEGIN PRIVATE KEY-----`, `-----BEGIN RSA PRIVATE KEY-----`, `-----BEGIN EC PRIVATE KEY-----`, `-----BEGIN OPENSSH PRIVATE KEY-----`, `-----BEGIN PGP PRIVATE KEY BLOCK-----`).
@@ -211,7 +211,7 @@ central-rust/
     4. Credentialed URLs (`scheme://user:secret@host`) with non-placeholder secrets.
   - Port UTF-8, NUL-byte, and Markdown block/link sniffing (`looks_like_markdown`) and `normalize_media_type`.
 
-- [ ] **Step 2: Implement `crates/capabilities/central-artifact/src/app.rs`**
+- [x] **Step 2: Implement `crates/capabilities/central-artifact/src/app.rs`**
   - Port `ObjectFailureClass` (`Invalid`, `NotFound`, `Conflict`, `Denied`, `LimitExceeded`, `Unavailable`, `Ambiguous`) and `ObjectFailureClassifier` trait.
   - Port `Service`:
     - `materialize_required_report(&self, req: MaterializeRequest) -> Result<Outcome, Failure>`:
@@ -227,18 +227,18 @@ central-rust/
     - `delete_artifact_two_phase(&self, req: TwoPhaseDeleteRequest) -> Result<ArtifactTombstone, Failure>`: marks artifact `delete_pending` durably (`mark_delete_pending`), removes the object body (`remove_ready_for_delete`), and records `deleted` + `ArtifactTombstone` (`complete_deletion_with_tombstone`).
   - Port async lineage application operations from `lineage.go`: `record_produce`, `record_read`, `produced`, `read_by`, `ancestors` (BFS with cycle guard), `descendants` (BFS skipping operator reads), `run_lineage_for_run`, and `authorize_read` (declared scope union + in-run undeclared flag + operator scope).
 
-- [ ] **Step 3: Implement `crates/capabilities/central-artifact/src/reconciler.rs`**
+- [x] **Step 3: Implement `crates/capabilities/central-artifact/src/reconciler.rs`**
   - Port `Fence` (`generation`, `epoch_generation`, `claim_token`, `validate()`), `Budget` (`default_budget()`, `large_claim_budget()`, `normalize()`), `DEFAULT_STAGING_LIFETIME` (24h) / `HARD_STAGING_LIFETIME` (72h), `RECONCILE_THROUGHPUT_FLOOR_BYTES_PER_SECOND` (8 MiB/s), and `PassReport` using `std::time::{Duration, Instant}`.
   - Port `Reconciler::reconcile(&self, fence: &Fence) -> Result<PassReport, Failure>`:
     - Dedicated large-claim check (`claim_large` → `reconcile_claim` under `large_claim_budget()` → `release_large_claim`; if already resolved, continue to normal pass).
     - Normal pass: `sweep_rejected_staging` (sharing pass count and duration budgets, verifying `owns_staging_key` before `remove_staging` + `clear_staging_key`), followed by batch loop (`claim_incomplete` → per-item hard/soft budget check → `reconcile_claim` → `record_progress`).
     - `reconcile_claim`: load artifact, skip terminal/moved rows, defer to `record_large_claim` if `declared > remaining_bytes || declared > budget.max_bytes || declared > affordable_bytes(remaining_time)`, call `resume_verifying` for `State::Verifying`, or `expire_staging` + `remove_staging` + `clear_staging_key` for `State::Reserved` / `State::Staging`.
 
-- [ ] **Step 4: Port unit tests from `classifier_test.go`, `service_test.go`, `reconciler_test.go`, `reconciler_resume_test.go`, and `lineage_test.go`**
+- [x] **Step 4: Port unit tests from `classifier_test.go`, `service_test.go`, `reconciler_test.go`, `reconciler_resume_test.go`, and `lineage_test.go`**
   - Use in-memory fake implementations of `Store`, `TwoPhaseDeleteStore`, `ObjectStore`, `CompletionContributor`, `ReconciliationStore`, and `LineageReader` / `ReadStore` in `#[cfg(test)]` modules.
   - Cover all classifier secret-disclosure cases, full materialization happy path, upload non-delivery immediate rejection, size-cap rejection, secret-disclosure rejection, create-only conflict recovery, ready-object version mismatch, `resume_verifying` across both crash windows, `deliver_ready_artifact` and one-shot `AuthorizedDownload::start(self)` revalidation/denials, two-phase deletion with tombstone, reconciler budget enforcement, large-claim deferral, rejected-staging sweep, and lineage BFS graph walks.
 
-- [ ] **Step 5: Run verification and commit**
+- [x] **Step 5: Run verification and commit**
   - Run: `cargo fmt --all -- --check && cargo clippy -p central-artifact --all-targets -- -D warnings && cargo test -p central-artifact`
   - Commit: `feat(artifact): implement classifier, lifecycle service, reconciler, and lineage operations`
 
@@ -309,12 +309,12 @@ central-rust/
 - `$CENTRAL_SRC/internal/adapter/postgres/artifact/quota_lock_test.go`
 - `$CENTRAL_RUST_SRC/crates/adapters/central-adapter-postgres/src/execution/store.rs`
 
-- [ ] **Step 1: Wire `central-artifact` into `central-adapter-postgres` and implement canonical receipt fingerprinting (`queries.rs`)**
+- [x] **Step 1: Wire `central-artifact` into `central-adapter-postgres` and implement canonical receipt fingerprinting (`queries.rs`)**
   - Add `central-artifact = { path = "../../capabilities/central-artifact", version = "0.1.0" }` to `crates/adapters/central-adapter-postgres/Cargo.toml` and `pub mod artifact;` to `src/lib.rs`.
   - Port `command_receipt_key` and `canonical_identity_hash(id: &CommandIdentity) -> [u8; 32]` in `artifact/queries.rs` with the exact JSON field layout (`stage`, `workspace_id`, `artifact_id`, `expected_version`, `staging_generation`, `content_generation`, `ready_key`, `verified_size`, `verified_checksum`, `idempotency_key`, `failure_code` with `skip_serializing_if = "String::is_empty"`, `reserve_fingerprint` with `skip_serializing_if = "String::is_empty"`).
   - Port `RECEIPT_TTL = 7 * 24 * 3600s` and `lookup_artifact_receipt` / `insert_artifact_receipt` against `central.artifact_command_receipts`.
 
-- [ ] **Step 2: Implement `Store`, `TwoPhaseDeleteStore`, and `ArtifactSummaryRead` in `artifact/store.rs` using `sqlx::query!` / `sqlx::query_as!`**
+- [x] **Step 2: Implement `Store`, `TwoPhaseDeleteStore`, and `ArtifactSummaryRead` in `artifact/store.rs` using `sqlx::query!` / `sqlx::query_as!`**
   - `reserve_artifact`:
     - Check `artifact_command_receipts` for `"reserve"`; on exact fingerprint match, reload and return the stored `Artifact`; on mismatch, return `FailureKind::Conflict ("IDEMPOTENCY_FINGERPRINT_MISMATCH")`.
     - Lock workspace quota row with `SELECT quota_ready_bytes, quota_max_bytes FROM central.workspaces WHERE id = $1 FOR NO KEY UPDATE` (using `FOR NO KEY UPDATE` to prevent FK key-share deadlocks against concurrent execution commits).
@@ -332,7 +332,7 @@ central-rust/
     - `has_tombstone`: `SELECT EXISTS(SELECT 1 FROM central.artifact_tombstones WHERE workspace_id = $1 AND artifact_id = $2)` (executable under `central_runtime`).
   - `ArtifactSummaryRead`: seek-paginated query on `central.artifacts` using `artifacts_task_id_idx` (`WHERE workspace_id = $1 AND task_id = $2 AND ($3::timestamptz IS NULL OR (updated_at, id) < ($3, $4)) ORDER BY updated_at DESC, id DESC LIMIT $5`).
 
-- [ ] **Step 3: Implement `CompletionContributor::commit_artifact` in `artifact/commit.rs`**
+- [x] **Step 3: Implement `CompletionContributor::commit_artifact` in `artifact/commit.rs`**
   - Port `b10_supported_execution_change` validation (rejecting tool calls/approvals/checkpoints/leases/assertions/reconciliations, requiring `settlements.len() == 1` and `lease_releases.len() == 1` with matching `(workspace_id, run_id)` when settling an attempt, or empty execution change set for reconciler resume).
   - Reuse `central-adapter-postgres::execution`'s transaction opener (`execution::begin` with `synchronous_commit = on`) and encoding helpers (`uuid_for_invocation`, `invocation_generation`, `go_json_escapes`, `go_rfc3339_local`, `reserve_event_sequence`, `upsert_outbox_workspace_work`).
   - Enforce the exact lock ordering inside the single PostgreSQL transaction:
@@ -346,10 +346,10 @@ central-rust/
     7. `central.capacity_reservations` (`FOR UPDATE`, must be `'reserved'`, plus defensive `ready_bytes + verified_size <= max_bytes` check)
   - Apply mutations atomically: transition artifact to `'ready'` (binding `ready_object_version`), settle capacity reservation (`'settled'`), charge workspace quota (`quota_ready_bytes + verified_size`, `quota_ready_count + 1`), apply task/run/step/attempt updates, append task events (formatting absent `run_id` as `""` in `"task:{task_id}:{task_version}:{kind}:{run_id}"` outbox deduplication keys, matching upstream `zeroRun`) and execution events + `central.outbox` rows, and insert the `"finalize"` command receipt.
 
-- [ ] **Step 4: Port unit and `CENTRAL_TEST_DSN` PostgreSQL integration tests**
+- [x] **Step 4: Port unit and `CENTRAL_TEST_DSN` PostgreSQL integration tests**
   - Port fingerprint canonicalization tests (`identity_fingerprint_test.go`) and PostgreSQL integration tests (`store_test.go`, `reserve_replay_test.go`, `quota_lock_test.go`) covering reserve quota enforcement, `2 * MaxBytes` peak accounting, capacity release on verify/explicit reject, idempotent command replays and fingerprint conflicts, two-phase deletion + tombstone idempotency + quota release, `ArtifactSummaryRead` seek pagination, atomic finalize + task completion under a live B08 lease, and `STALE_LEASE_FENCE` refusal when a lease is superseded.
 
-- [ ] **Step 5: Run verification and commit**
+- [x] **Step 5: Run verification and commit**
   - Run: `cargo fmt --all -- --check && cargo clippy -p central-adapter-postgres --all-targets -- -D warnings && cargo test -p central-adapter-postgres`
   - Commit: `feat(adapter-postgres): implement B10 artifact Store, two-phase delete, and CompletionContributor`
 

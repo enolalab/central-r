@@ -1733,7 +1733,7 @@ impl Store {
 
     /// `queryUpsertOutboxWorkspaceWork` — nudge the outbox scheduler's
     /// workspace row forward in the same transaction.
-    async fn upsert_outbox_workspace_work(
+    pub(crate) async fn upsert_outbox_workspace_work(
         tx: &mut Transaction<'_, Postgres>,
         ws: WorkspaceId,
     ) -> Result<(), Failure> {
@@ -3683,7 +3683,7 @@ impl Store {
 /// seconds always, fractional digits only when nonzero with trailing
 /// zeros stripped — `time`'s Rfc3339 already emits a fractional part,
 /// so the base is built seconds-only to avoid a doubled fraction.
-fn go_rfc3339_local(t: OffsetDateTime) -> String {
+pub(crate) fn go_rfc3339_local(t: OffsetDateTime) -> String {
     let t = t.to_offset(time::UtcOffset::UTC);
     let base = t
         .format(&time::macros::format_description!(

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts SET version = $3, state = 'rejected', rejection = $4::jsonb, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND version = $5 AND state IN ('reserved', 'staging')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "26c0274da8a69e97be5b7f7d81da6ca8c69de9018ae23bd9cf45f04ae6589e0d"
+}

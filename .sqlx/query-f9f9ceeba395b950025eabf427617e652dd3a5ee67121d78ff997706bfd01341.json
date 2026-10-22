@@ -1,0 +1,98 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, task_id, run_id, state, sensitivity, disposition, detected_media_type, size, COALESCE(required_role, '') AS \"required_role!\", COALESCE(producer_id, '') AS \"producer_id!\", created_at, updated_at, ready_at FROM central.artifacts WHERE workspace_id = $1 AND task_id = $2 AND ($3::timestamptz IS NULL OR (updated_at, id) < ($3, $4::uuid)) ORDER BY updated_at DESC, id DESC LIMIT $5",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "sensitivity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "disposition",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "detected_media_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "size",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "required_role!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "producer_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "ready_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      null,
+      null,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "f9f9ceeba395b950025eabf427617e652dd3a5ee67121d78ff997706bfd01341"
+}

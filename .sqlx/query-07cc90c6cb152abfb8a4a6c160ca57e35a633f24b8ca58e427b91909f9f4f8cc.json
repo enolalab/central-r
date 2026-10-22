@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(SUM(reserved_bytes), 0)::bigint AS \"sum!\" FROM central.capacity_reservations WHERE workspace_id = $1 AND state = 'reserved'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sum!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "07cc90c6cb152abfb8a4a6c160ca57e35a633f24b8ca58e427b91909f9f4f8cc"
+}

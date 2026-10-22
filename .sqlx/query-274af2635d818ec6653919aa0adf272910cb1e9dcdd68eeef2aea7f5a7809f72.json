@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts SET version = $3, state = 'ready', ready_at = clock_timestamp(), updated_at = clock_timestamp(), ready_object_version = COALESCE($6, ready_object_version) WHERE workspace_id = $1 AND id = $2 AND version = $5 AND checksum_value = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Bytea",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "274af2635d818ec6653919aa0adf272910cb1e9dcdd68eeef2aea7f5a7809f72"
+}

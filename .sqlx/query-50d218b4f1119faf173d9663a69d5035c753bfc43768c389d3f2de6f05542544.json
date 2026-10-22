@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.capacity_reservations (id, workspace_id, run_id, artifact_id, staging_generation, reserved_bytes, state) VALUES ($1, $2, $3, $4, $5, $6, 'reserved')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "50d218b4f1119faf173d9663a69d5035c753bfc43768c389d3f2de6f05542544"
+}

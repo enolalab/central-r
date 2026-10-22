@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts SET state = 'delete_pending', delete_intent_at = COALESCE(delete_intent_at, clock_timestamp()), version = version + 1, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND version = $3 AND state = 'ready'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dfd1ea435ad2ceb791b21d406ccac72bdc41a79b5e24c4e861215eb64872dd6b"
+}

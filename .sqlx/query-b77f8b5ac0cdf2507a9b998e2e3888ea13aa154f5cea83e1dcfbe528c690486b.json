@@ -1,0 +1,161 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT workspace_id, id, version, state, staging_generation, COALESCE(staging_key, '') AS \"staging_key!\", content_generation, COALESCE(ready_key, '') AS \"ready_key!\", limits_snapshot, size, checksum_value, rejection, COALESCE(ready_object_version, '') AS \"ready_object_version!\", task_id, run_id, step_id, step_attempt_id, tool_call_attempt_id, COALESCE(producer_id, '') AS \"producer_id!\", COALESCE(required_role, '') AS \"required_role!\", sensitivity, disposition, delete_intent_at, deleted_at FROM central.artifacts WHERE workspace_id = $1 AND id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "staging_generation",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "staging_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "content_generation",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "ready_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "limits_snapshot",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 9,
+        "name": "size",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "checksum_value",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 11,
+        "name": "rejection",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "ready_object_version!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 15,
+        "name": "step_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "step_attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 17,
+        "name": "tool_call_attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 18,
+        "name": "producer_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "required_role!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "sensitivity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 21,
+        "name": "disposition",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "delete_intent_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 23,
+        "name": "deleted_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      true,
+      null,
+      true,
+      false,
+      true,
+      true,
+      null,
+      false,
+      false,
+      true,
+      true,
+      true,
+      null,
+      null,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "b77f8b5ac0cdf2507a9b998e2e3888ea13aa154f5cea83e1dcfbe528c690486b"
+}

@@ -633,6 +633,7 @@ version = "0.1.0"
 name = "central-adapter-postgres"
 version = "0.1.0"
 dependencies = [
+ "central-artifact",
  "central-authorization",
  "central-backup",
  "central-checkpoint",

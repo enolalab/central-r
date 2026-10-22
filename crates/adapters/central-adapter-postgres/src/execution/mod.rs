@@ -50,7 +50,9 @@ mod queries;
 mod reconciliation_attempt;
 mod store;
 
+pub(crate) use queries::{lock_event_counter, reserve_event_sequence};
 pub use store::Store;
+pub(crate) use store::go_rfc3339_local;
 
 use crate::error::classify_sqlx;
 use crate::store_support::{PG_DATA_CORRUPT, uuid_of};

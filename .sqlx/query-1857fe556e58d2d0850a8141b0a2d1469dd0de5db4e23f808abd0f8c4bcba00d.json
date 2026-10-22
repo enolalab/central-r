@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.capacity_reservations SET state = 'settled', settled_at = clock_timestamp() WHERE workspace_id = $1 AND artifact_id = $2 AND state = 'reserved'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1857fe556e58d2d0850a8141b0a2d1469dd0de5db4e23f808abd0f8c4bcba00d"
+}

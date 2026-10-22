@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, artifact_id, object_key, staging_generation, checksum_algorithm, checksum_value, size_at_deletion, deletion_reason FROM central.artifact_tombstones WHERE workspace_id = $1 AND artifact_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "object_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "staging_generation",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "checksum_algorithm",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "checksum_value",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 7,
+        "name": "size_at_deletion",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "deletion_reason",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "07298d42ced25559fddb79d32d941a7718391078b8fc595499c08616adfcbbd2"
+}

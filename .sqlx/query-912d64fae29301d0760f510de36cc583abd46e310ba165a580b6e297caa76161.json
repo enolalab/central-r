@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts SET version = $3, state = $4, size = $5, checksum_value = $6, checksum_algorithm = CASE WHEN $6::bytea IS NULL THEN checksum_algorithm ELSE 'sha256' END, rejection = COALESCE($7::jsonb, rejection), updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND version = $8",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Int8",
+        "Bytea",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "912d64fae29301d0760f510de36cc583abd46e310ba165a580b6e297caa76161"
+}

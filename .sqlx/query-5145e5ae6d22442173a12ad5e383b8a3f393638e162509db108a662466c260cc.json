@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.events (id, workspace_id, event_sequence, event_type, aggregate_id, aggregate_version, command_id, run_id, payload, occurred_at, task_id, step_id, attempt_id, kind, state, producer_id, policy_version, eligible_after, legal_hold) VALUES ($1, $2, $3, $4, $5, $6, $1, $7, $8::jsonb, clock_timestamp(), $5, NULL, NULL, $4, 'recorded', $9, 1, clock_timestamp() + interval '90 days', false)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5145e5ae6d22442173a12ad5e383b8a3f393638e162509db108a662466c260cc"
+}

@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.step_attempts SET version = $6, invocation_id = $7::uuid, invocation_generation = CASE WHEN $7::uuid IS NULL THEN NULL ELSE $8::bigint END, state = $9, outcome = COALESCE($10::jsonb, outcome), context = COALESCE($11::jsonb, context), updated_at = clock_timestamp() WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 AND id = $5 AND version = $12",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "34b31b58a1852ac0a22c3348184636ccb63c9b343433e388cbb2abc457c782d7"
+}

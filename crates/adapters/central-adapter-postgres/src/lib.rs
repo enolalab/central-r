@@ -22,6 +22,7 @@
 //! - [`migrate::reapply_runtime_grants`] — the post-`pg_restore`
 //!   grant/column-grant/revoke convergence replay.
 
+pub mod artifact;
 pub mod authorization;
 pub mod checkpoint;
 pub mod error;
