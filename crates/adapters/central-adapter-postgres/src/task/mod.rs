@@ -53,7 +53,7 @@ use central_task::domain::codes;
 
 /// `conflict` code for the `(workspace_id, run_key)` submit-dedup
 /// collision — upstream's `conflictFailure("DUPLICATE_IDEMPOTENCY_KEY")`.
-pub const DUPLICATE_IDEMPOTENCY_KEY: &str = "duplicate_idempotency_key";
+pub const DUPLICATE_IDEMPOTENCY_KEY: &str = "DUPLICATE_IDEMPOTENCY_KEY";
 
 /// `conflict` code for a stored `(workspace, scope, key)` receipt the
 /// commit path cannot replay — upstream's
