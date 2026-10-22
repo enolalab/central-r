@@ -1,0 +1,191 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, version, capability_identity, scope, action, actor_identity, authority_identity, reason, state, suspend_reason, security_epoch, created_at, updated_at, expiry_at, approval_kind, task_id, run_id, step_id, subject_version, logical_operation_id, operation_digest, expected_step_version, decision_actor, decision_reason, decision_id, decided_at, predecessor_approval_id, recorded_at FROM central.approvals WHERE workspace_id = $1 AND id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "capability_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "actor_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "authority_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "suspend_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "security_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "expiry_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "approval_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 17,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 18,
+        "name": "step_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 19,
+        "name": "subject_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 20,
+        "name": "logical_operation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 21,
+        "name": "operation_digest",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 22,
+        "name": "expected_step_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 23,
+        "name": "decision_actor",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 24,
+        "name": "decision_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 25,
+        "name": "decision_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 26,
+        "name": "decided_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 27,
+        "name": "predecessor_approval_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 28,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "f59389ce9a74f96e294c2f054ea4001a622ceb4c7662ff6beb23278ac3dbc84a"
+}

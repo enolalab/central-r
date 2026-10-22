@@ -106,7 +106,11 @@ version = "0.1.0"
 name = "central-adapter-postgres"
 version = "0.1.0"
 dependencies = [
+ "central-authorization",
+ "central-checkpoint",
+ "central-event",
  "central-foundation",
+ "central-workspace",
  "serde",
  "serde_json",
  "sha2 0.11.1",

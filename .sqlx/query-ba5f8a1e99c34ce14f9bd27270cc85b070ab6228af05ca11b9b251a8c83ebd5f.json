@@ -1,0 +1,93 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, capability_identity, scope, action, actor_identity, state, suspend_reason, reason, authority_identity, created_at, updated_at, expiry_at FROM central.approvals WHERE workspace_id = $1 AND actor_identity = $2 AND ($3::uuid IS NULL OR task_id = $3) AND ($4::timestamptz IS NULL OR (updated_at, id) < ($4::timestamptz, $5::uuid)) ORDER BY updated_at DESC, id DESC LIMIT $6",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "capability_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "scope",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "actor_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "suspend_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "authority_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "expiry_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ba5f8a1e99c34ce14f9bd27270cc85b070ab6228af05ca11b9b251a8c83ebd5f"
+}

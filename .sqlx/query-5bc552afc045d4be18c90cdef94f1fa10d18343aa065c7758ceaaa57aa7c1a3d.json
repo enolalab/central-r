@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, created_at, updated_at, state, owner_principal_id, quota_ready_bytes, quota_ready_count, quota_max_bytes, security_epoch, restore_epoch FROM central.workspaces WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "owner_principal_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "quota_ready_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "quota_ready_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "quota_max_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "security_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "restore_epoch",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5bc552afc045d4be18c90cdef94f1fa10d18343aa065c7758ceaaa57aa7c1a3d"
+}

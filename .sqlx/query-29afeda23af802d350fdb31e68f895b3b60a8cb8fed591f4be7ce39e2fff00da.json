@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT event_sequence, payload FROM central.events WHERE workspace_id = $1 AND event_sequence > $2 AND ($3::uuid IS NULL OR aggregate_id = $3) AND ($4::uuid IS NULL OR run_id = $4) ORDER BY event_sequence ASC LIMIT $5",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event_sequence",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "payload",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "29afeda23af802d350fdb31e68f895b3b60a8cb8fed591f4be7ce39e2fff00da"
+}

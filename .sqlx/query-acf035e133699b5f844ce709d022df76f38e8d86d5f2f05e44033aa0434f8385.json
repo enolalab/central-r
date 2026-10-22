@@ -1,0 +1,131 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT checkpoint_id, workspace_id, run_id, node_id, attempt_id, format_version, graph_schema_version, event_watermark, harness_session_id, workspace_digest, workspace_path, completed_nodes, finalized_artifacts, in_flight_nodes, gc_class, created_at, expires_at, content_digest, checkpoint_seq FROM central.resume_checkpoints WHERE workspace_id = $1 AND checkpoint_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "checkpoint_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "format_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "graph_schema_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "event_watermark",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "harness_session_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "workspace_digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "workspace_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "completed_nodes",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 12,
+        "name": "finalized_artifacts",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 13,
+        "name": "in_flight_nodes",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 14,
+        "name": "gc_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "content_digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "checkpoint_seq",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "acf035e133699b5f844ce709d022df76f38e8d86d5f2f05e44033aa0434f8385"
+}

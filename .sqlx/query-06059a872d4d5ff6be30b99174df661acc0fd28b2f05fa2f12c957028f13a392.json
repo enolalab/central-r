@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.checkpoints (id, workspace_id, task_id, run_id, step_id, step_attempt_id, producer_id, producer_version, schema_version, checkpoint_kind, checksum, payload, resume_compatible, validated, policy_version, recorded_at, eligible_after, legal_hold, created_at, metadata, version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, clock_timestamp(), $16, $17, clock_timestamp(), $18, $19)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Bytea",
+        "Bytea",
+        "Bool",
+        "Bool",
+        "Int8",
+        "Timestamptz",
+        "Bool",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "06059a872d4d5ff6be30b99174df661acc0fd28b2f05fa2f12c957028f13a392"
+}

@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.approvals SET version = $3, approval_kind = $4, capability_identity = $5, scope = $6, action = $7, actor_identity = $8, authority_identity = $9, reason = $10, state = $11, suspend_reason = $12, security_epoch = $13, task_id = $14, run_id = $15, step_id = $16, subject_version = $17, logical_operation_id = $18, operation_digest = $19, expected_step_version = $20, decision_actor = $21, decision_reason = $22, decision_id = $23, decided_at = $24, predecessor_approval_id = $25, recorded_at = COALESCE($26, clock_timestamp()), expiry_at = $27, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND version = $28",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Bytea",
+        "Int8",
+        "Text",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a18afab76cced2bea607b5eb25450bf049f738903efd93824f150aae8819997"
+}

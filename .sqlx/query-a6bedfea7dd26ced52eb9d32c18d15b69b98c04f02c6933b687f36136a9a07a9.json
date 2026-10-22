@@ -1,0 +1,144 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, run_id, step_id, version, checkpoint_kind, metadata, created_at, task_id, step_attempt_id, producer_id, producer_version, schema_version, checksum, payload, resume_compatible, validated, policy_version, recorded_at, eligible_after, legal_hold FROM central.checkpoints WHERE workspace_id = $1 AND run_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "step_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "checkpoint_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "step_attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "producer_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "producer_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "schema_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "checksum",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 14,
+        "name": "payload",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 15,
+        "name": "resume_compatible",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "validated",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "policy_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "eligible_after",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
+        "name": "legal_hold",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a6bedfea7dd26ced52eb9d32c18d15b69b98c04f02c6933b687f36136a9a07a9"
+}

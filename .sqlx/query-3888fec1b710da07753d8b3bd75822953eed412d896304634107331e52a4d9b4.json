@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM central.resume_checkpoints WHERE workspace_id = $1 AND checkpoint_id = ANY($2::uuid[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3888fec1b710da07753d8b3bd75822953eed412d896304634107331e52a4d9b4"
+}
