@@ -1,10 +1,18 @@
 [package]
 name = "central-execution"
-description = "Execution capability — lease fencing, recovery epochs, retry, outbox (domain.rs/port.rs/query.rs/app.rs)"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-publish.workspace = true
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+central-foundation = { path = "../../central-foundation" }
+central-task = { path = "../central-task" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+trait-variant.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
