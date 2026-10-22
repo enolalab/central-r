@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT state, scheduler_cursor, retry_attempt FROM central.recovery_epochs WHERE epoch_generation = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "scheduler_cursor",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "retry_attempt",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "bc0cd768ee960113f4d67b2966ab40a7186881d0010166b146e584514030caba"
+}

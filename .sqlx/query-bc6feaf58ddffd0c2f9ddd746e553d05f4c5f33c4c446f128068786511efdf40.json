@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.outbox (id, workspace_id, event_id, delivery_state, due_at, attempt_count, created_at, updated_at, catalog_type, deduplication_key, producer_id, payload, visible_at, policy_version, eligible_after, legal_hold) VALUES ($1, $2, $3, 'pending', clock_timestamp(), 0, clock_timestamp(), clock_timestamp(), 'execution.recovery.resumed', $4, $5, $6::jsonb, clock_timestamp(), 1, clock_timestamp() + interval '7 days', false)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bc6feaf58ddffd0c2f9ddd746e553d05f4c5f33c4c446f128068786511efdf40"
+}

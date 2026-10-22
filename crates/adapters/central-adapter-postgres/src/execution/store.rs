@@ -12,7 +12,8 @@
 
 use central_execution::domain::{
     AttemptState, ExecutionState, ExpectedVersions, LeaseCredential, LogicalOperationId,
-    OutboxIntent, Step, StepAttempt, StepAttemptAssertion, TrustedScope, ZERO_TIME,
+    NIL_APPROVAL_ID, NIL_STEP_ID, OutboxIntent, Step, StepAttempt, StepAttemptAssertion, StepState,
+    TrustedScope, ZERO_TIME,
 };
 use central_execution::harness_run::B09EvidenceReference;
 use central_execution::port::{
@@ -37,16 +38,17 @@ use time::OffsetDateTime;
 
 use super::queries::{
     db_now, lock_event_counter, read_attempt, read_incomplete_recovery_epoch,
-    read_locked_recovery_epoch_for_claim, read_persisted_lease_for_update, read_run, read_step,
-    read_task, read_tool_attempts, read_tool_calls, reserve_event_sequence,
-    select_recovery_workspace_batch,
+    read_locked_recovery_epoch, read_locked_recovery_epoch_for_claim,
+    read_persisted_lease_for_update, read_run, read_step, read_task, read_tool_attempts,
+    read_tool_calls, reserve_event_sequence, select_recovery_workspace_batch,
 };
 use super::{
     RECOVERY_DOMAIN, RECOVERY_RENEW_INTERVAL, RECOVERY_RETRY_LIMIT, RECOVERY_SCAN_BATCH,
-    RESUME_SCOPE, begin, begin_recovery, begin_recovery_scan, conflict, corrupt, ct_eq, denied,
-    expected_digest, go_json_escapes, invalid, invocation_generation, new_lease_secret, null_time,
-    opt_approval_uuid, opt_attempt_uuid, opt_run_uuid, opt_step_uuid, opt_tool_attempt_uuid,
-    sha256, uuid_for_invocation, uuid_for_logical, uuid_for_physical, uuid_of, wait_reason_value,
+    RESUME_ATTEMPT_SCOPE, RESUME_SCOPE, begin, begin_recovery, begin_recovery_scan, conflict,
+    corrupt, ct_eq, denied, expected_digest, go_json_escapes, invalid, invocation_generation,
+    new_lease_secret, null_time, opt_approval_uuid, opt_attempt_uuid, opt_run_uuid, opt_step_uuid,
+    opt_tool_attempt_uuid, sha256, uuid_for_invocation, uuid_for_logical, uuid_for_physical,
+    uuid_of, wait_reason_value,
 };
 use crate::error::{SqlxContext, classify_sqlx};
 use crate::store_support::opt_uuid_of;
@@ -90,18 +92,22 @@ impl Store {
         Ok(())
     }
 
-    /// The canonical receipt-result JSON (`result_payload`) — typed
-    /// DurableResult rendered with Go field names.
-    fn encode_result_payload(result: &DurableResult, logical: LogicalOperationId) -> Vec<u8> {
-        let approval = result.approval_action.as_ref().map(|a| {
-            serde_json::json!({
-                "Action": a.action.map_or("", |x| x.as_str()),
+    /// The canonical receipt-result JSON (`result_payload`) — upstream
+    /// stores exactly `{"approval_action":{...}}` (`omitempty` → `{}`
+    /// without a descriptor); every other durable-result leg is
+    /// rebound from the receipt binding and its event row at replay.
+    fn encode_result_payload(result: &DurableResult) -> Vec<u8> {
+        let Some(a) = result.approval_action.as_ref() else {
+            return serde_json::to_vec(&serde_json::json!({})).unwrap_or_default();
+        };
+        serde_json::to_vec(&serde_json::json!({
+            "approval_action": {
                 "Authorized": a.authorized,
+                "Action": a.action.map_or("", |x| x.as_str()),
                 "RequiredCapability": a.required_capability.map_or("", |c| c.as_str()),
                 "StepID": a.step_id.to_string(),
                 "ApprovalID": a.approval_id.to_string(),
-                "LogicalOperationID": a.logical_operation_id.0
-                    .iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "LogicalOperationID": a.logical_operation_id.0,
                 "ApprovalSubjectVersion": a.approval_subject_version,
                 "ExpectedVersions": {
                     "Task": a.expected_versions.task,
@@ -112,101 +118,118 @@ impl Store {
                     "ToolAttempt": a.expected_versions.tool_attempt,
                     "Approval": a.expected_versions.approval,
                 },
-            })
-        });
-        serde_json::to_vec(&serde_json::json!({
-            "WorkspaceID": result.workspace_id.to_string(),
-            "TaskID": result.task_id.to_string(),
-            "RunID": result.run_id.to_string(),
-            "StepID": result.step_id.to_string(),
-            "AttemptID": result.attempt_id.to_string(),
-            "LogicalOperationID": logical.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "EventID": result.event_id.to_string(),
-            "EventKind": result.event_kind,
-            "ApprovalAction": approval,
+            },
         }))
         .unwrap_or_default()
     }
 
     /// Decodes a stored `result_payload`; corrupt rows are internal.
+    /// Upstream rebinds the durable result from the request workspace,
+    /// the receipt binding, and the event row's legs — only the
+    /// approval descriptor travels inside the payload
+    /// (`durableResultFromStrings` + the `approval_action` unmarshal).
     fn decode_result_payload(
         payload: &serde_json::Value,
+        ws: WorkspaceId,
         binding: &central_execution::port::ReceiptBinding,
         event_id: uuid::Uuid,
         event_kind: &str,
     ) -> Result<DurableResult, Failure> {
-        let approval_action = payload.get("ApprovalAction").and_then(|a| {
-            if a.is_null() {
-                return None;
-            }
-            Some(
-                central_execution::domain::ApprovalSuccessorActionDescriptor {
-                    action: a
-                        .get("Action")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|_| central_execution::domain::ApprovalAction::ActionResolveApproval),
-                    authorized: a
-                        .get("Authorized")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    required_capability: a
-                        .get("RequiredCapability")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| match s {
-                            "executor" => Some(central_execution::domain::Capability::Executor),
-                            "approver" => Some(central_execution::domain::Capability::Approver),
-                            "workspace_operator" => {
-                                Some(central_execution::domain::Capability::WorkspaceOperator)
-                            }
-                            "recovery_coordinator" => {
-                                Some(central_execution::domain::Capability::RecoveryCoordinator)
-                            }
-                            _ => None,
-                        }),
-                    step_id: a
-                        .get("StepID")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                        .map_or_else(
-                            || StepId::from_trusted_db_bytes([0; 16]),
-                            |u| StepId::from_trusted_db_bytes(*u.as_bytes()),
-                        ),
-                    approval_id: a
-                        .get("ApprovalID")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                        .map_or_else(
-                            || {
-                                central_foundation::identity::ApprovalId::from_trusted_db_bytes(
-                                    [0; 16],
-                                )
-                            },
-                            |u| {
-                                central_foundation::identity::ApprovalId::from_trusted_db_bytes(
-                                    *u.as_bytes(),
-                                )
-                            },
-                        ),
-                    logical_operation_id: LogicalOperationId([0; 16]),
-                    approval_subject_version: a
-                        .get("ApprovalSubjectVersion")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    expected_versions: ExpectedVersions::default(),
-                },
-            )
-        });
         Ok(DurableResult {
-            workspace_id: binding_task_ws(payload)?,
+            workspace_id: ws,
             task_id: binding.task_id,
             run_id: binding.run_id,
             step_id: binding.step_id,
             attempt_id: binding.attempt_id,
             event_id: ExecutionEventId::from_trusted_db_bytes(*event_id.as_bytes()),
             event_kind: event_kind.to_owned(),
-            approval_action,
+            approval_action: Self::decode_approval_action(payload)?,
         })
+    }
+
+    /// Upstream's `json.Unmarshal(resultPayload, &persisted)` — every
+    /// descriptor field is read back exactly (including
+    /// `LogicalOperationID` and `ExpectedVersions`); a malformed row is
+    /// the same `dbFailure("decode receipt payload")` upstream raises.
+    fn decode_approval_action(
+        payload: &serde_json::Value,
+    ) -> Result<Option<central_execution::domain::ApprovalSuccessorActionDescriptor>, Failure> {
+        let Some(a) = payload.get("approval_action") else {
+            return Ok(None);
+        };
+        if a.is_null() {
+            return Ok(None);
+        }
+        let field = |key: &str| a.get(key).and_then(|v| v.as_str());
+        // `StepID`/`ApprovalID` unmarshal through the strict v7
+        // identity parsers upstream — nil or malformed text fails the
+        // decode rather than silently zeroing the id.
+        let step_id = StepId::parse(field("StepID").unwrap_or_default())
+            .map_err(|_| corrupt("a stored receipt descriptor step id is invalid"))?;
+        let approval_id = central_foundation::identity::ApprovalId::parse(
+            field("ApprovalID").unwrap_or_default(),
+        )
+        .map_err(|_| corrupt("a stored receipt descriptor approval id is invalid"))?;
+        // `LogicalOperationID` is a Go `[16]byte` — a JSON array of
+        // exactly 16 numbers.
+        let logical = match a.get("LogicalOperationID") {
+            None => LogicalOperationId([0; 16]),
+            Some(v) => {
+                let digits = v.as_array().filter(|arr| arr.len() == 16).ok_or_else(|| {
+                    corrupt("a stored receipt descriptor logical id is malformed")
+                })?;
+                let mut bytes = [0u8; 16];
+                for (dst, digit) in bytes.iter_mut().zip(digits.iter()) {
+                    *dst = u8::try_from(digit.as_u64().unwrap_or(u64::MAX)).map_err(|_| {
+                        corrupt("a stored receipt descriptor logical id is malformed")
+                    })?;
+                }
+                LogicalOperationId(bytes)
+            }
+        };
+        let versions = a.get("ExpectedVersions");
+        let version_at = |key: &str| {
+            versions
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+        };
+        Ok(Some(
+            central_execution::domain::ApprovalSuccessorActionDescriptor {
+                action: field("Action").and_then(central_execution::domain::ApprovalAction::parse),
+                authorized: a
+                    .get("Authorized")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                required_capability: field("RequiredCapability").and_then(|s| match s {
+                    "executor" => Some(central_execution::domain::Capability::Executor),
+                    "approver" => Some(central_execution::domain::Capability::Approver),
+                    "workspace_operator" => {
+                        Some(central_execution::domain::Capability::WorkspaceOperator)
+                    }
+                    "recovery_coordinator" => {
+                        Some(central_execution::domain::Capability::RecoveryCoordinator)
+                    }
+                    _ => None,
+                }),
+                step_id,
+                approval_id,
+                logical_operation_id: logical,
+                approval_subject_version: a
+                    .get("ApprovalSubjectVersion")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                expected_versions: ExpectedVersions {
+                    task: version_at("Task"),
+                    run: version_at("Run"),
+                    step: version_at("Step"),
+                    attempt: version_at("Attempt"),
+                    tool_call: version_at("ToolCall"),
+                    tool_attempt: version_at("ToolAttempt"),
+                    approval: version_at("Approval"),
+                },
+            },
+        ))
     }
 
     /// `readReceipt` — `None` when no row exists for the identity.
@@ -240,8 +263,7 @@ impl Store {
         req: &CommitRequest,
         digest: [u8; 32],
     ) -> Result<(), Failure> {
-        let payload =
-            Self::encode_result_payload(&req.result, req.receipt_binding.logical_operation);
+        let payload = Self::encode_result_payload(&req.result);
         let done = sqlx::query!(
             "INSERT INTO central.execution_command_receipts (\
              id, workspace_id, command_scope, idempotency_key, request_fingerprint, \
@@ -357,6 +379,48 @@ impl Store {
         {
             return Err(conflict("EXPECTED_VERSION_CONFLICT"));
         }
+        if req.command_scope == "execution.create_approval_successor" {
+            return Self::lock_and_validate_approval_successor_predecessor(tx, req).await;
+        }
+        Ok(())
+    }
+
+    /// `lockAndValidateApprovalSuccessorPredecessor` — the successor's
+    /// predecessor approval is locked `FOR UPDATE` and its version must
+    /// equal `expected_versions.approval`. A missing predecessor (or a
+    /// change set that is not exactly one successor carrying one) is
+    /// `STATE_SCOPE_MISMATCH`; a version drift is the CAS conflict.
+    async fn lock_and_validate_approval_successor_predecessor(
+        tx: &mut Transaction<'_, Postgres>,
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        if req.change_set.approvals.len() != 1 {
+            return Err(invalid("STATE_SCOPE_MISMATCH"));
+        }
+        let successor = &req.change_set.approvals[0];
+        if successor.predecessor_id.is_nil() {
+            return Err(invalid("STATE_SCOPE_MISMATCH"));
+        }
+        let binding = &req.receipt_binding;
+        let predecessor_version = sqlx::query!(
+            "SELECT version FROM central.approvals \
+             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
+             AND step_id = $4 AND id = $5 AND approval_kind = 'execution' \
+             FOR UPDATE",
+            uuid_of(req.scope.workspace_id.as_bytes()),
+            uuid_of(binding.task_id.as_bytes()),
+            uuid_of(binding.run_id.as_bytes()),
+            uuid_of(binding.step_id.as_bytes()),
+            uuid_of(successor.predecessor_id.as_bytes()),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .ctx("execution: lock approval successor predecessor")?
+        .ok_or_else(|| invalid("STATE_SCOPE_MISMATCH"))?
+        .version;
+        if predecessor_version != req.expected_versions.approval {
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+        }
         Ok(())
     }
 
@@ -460,7 +524,9 @@ impl Store {
         .await
         .ctx("execution: lock recovery claim workspace")?;
         let Some(work_row) = work_row else {
-            return Ok(());
+            // Upstream: the latest epoch exists but never recorded this
+            // workspace — a hard admission failure, not a pass.
+            return Err(conflict("RECOVERY_WORKSPACE_NOT_FOUND"));
         };
         let run_row = sqlx::query!(
             "SELECT created_at, reconciled_epoch FROM central.runs \
@@ -510,7 +576,9 @@ impl Store {
             run_row.reconciled_epoch,
         );
         if !decision.claimable {
-            return Err(conflict("RECOVERY_QUARANTINED"));
+            // Upstream passes `decision.Reason` — the domain's only
+            // non-claimable reason (`RECOVERY_QUARANTINE`, no `-D`).
+            return Err(conflict("RECOVERY_QUARANTINE"));
         }
         Ok(())
     }
@@ -561,7 +629,7 @@ impl Store {
             }
             let insert = req.expected_versions.step == 0
                 || ((req.command_scope == "execution.create_approval_successor"
-                    || req.command_scope == RESUME_SCOPE)
+                    || req.command_scope == RESUME_ATTEMPT_SCOPE)
                     && row.id != req.receipt_binding.step_id);
             let done = if insert {
                 let logical = Self::inserted_step_logical_operation(req, row)?;
@@ -630,7 +698,7 @@ impl Store {
                 }
             }
         }
-        if req.command_scope == RESUME_SCOPE {
+        if req.command_scope == RESUME_ATTEMPT_SCOPE {
             for attempt in &req.change_set.attempts {
                 if attempt.step_id == step.id && !attempt.logical_operation_id.is_nil() {
                     return Ok(attempt.logical_operation_id);
@@ -649,7 +717,7 @@ impl Store {
         req: &CommitRequest,
     ) -> Result<(), Failure> {
         Self::validate_attempt_inserts(req)?;
-        if req.command_scope == RESUME_SCOPE {
+        if req.command_scope == RESUME_ATTEMPT_SCOPE {
             return Self::persist_resumed_attempts(tx, req).await;
         }
         for row in &req.change_set.attempts {
@@ -776,7 +844,7 @@ impl Store {
     /// predecessor to `cancelled`. The resume scope's inserted rows are
     /// checked by `validateResumedAttemptInserts` instead.
     fn validate_attempt_inserts(req: &CommitRequest) -> Result<(), Failure> {
-        if req.command_scope == RESUME_SCOPE {
+        if req.command_scope == RESUME_ATTEMPT_SCOPE {
             return Self::validate_resumed_attempt_inserts(req);
         }
         if req.expected_versions.attempt != 0 {
@@ -1817,6 +1885,10 @@ impl Store {
         ws: WorkspaceId,
         attempt_id: StepAttemptId,
     ) -> Result<Option<central_execution::harness_run::CompletionReceipt>, Failure> {
+        // Upstream `queryReadCompletionReceipt` — every receipt
+        // identity leg joins to the owning attempt, so a receipt that
+        // outlived (or was rekeyed under) a different attempt row does
+        // not match.
         let row = sqlx::query!(
             "SELECT r.id, r.task_id, r.run_id, r.step_id, \
              r.logical_operation_id, r.physical_attempt_id, r.invocation_id, \
@@ -1825,10 +1897,13 @@ impl Store {
              FROM central.execution_completion_receipts r \
              JOIN central.step_attempts a \
                ON a.workspace_id = r.workspace_id AND a.id = r.step_attempt_id \
-             WHERE r.workspace_id = $1 AND r.step_attempt_id = $2 \
-             AND r.invocation_id = a.invocation_id \
-             AND r.invocation_generation = a.invocation_generation \
-             LIMIT 1",
+               AND a.task_id = r.task_id AND a.run_id = r.run_id \
+               AND a.step_id = r.step_id \
+               AND a.logical_operation_id = r.logical_operation_id \
+               AND a.physical_attempt_id = r.physical_attempt_id \
+               AND a.invocation_id = r.invocation_id \
+               AND a.invocation_generation = r.invocation_generation \
+             WHERE r.workspace_id = $1 AND r.step_attempt_id = $2",
             uuid_of(ws.as_bytes()),
             uuid_of(attempt_id.as_bytes()),
         )
@@ -2146,7 +2221,25 @@ impl Store {
         )
         .map_err(|_| denied("TASK_TRANSITION_REJECTED"))?;
         Self::apply_task_transition(tx, ws, &transition.change_set).await?;
-        Ok(transition.change_set.task.version)
+        // Upstream `persistRecoveryWaitingState`: the transition is not
+        // durable until its evidence is — the `task.wait` event plus a
+        // `task.lifecycle` outbox row written by `persistEvidence`
+        // under the recovery trusted scope.
+        let new_version = transition.change_set.task.version;
+        let req = Self::recovery_commit_request(
+            ws,
+            ExpectedVersions {
+                task: task.version,
+                run: run.version,
+                ..ExpectedVersions::default()
+            },
+            central_execution::domain::ExecutionChangeSet {
+                task_transition: Some(transition),
+                ..central_execution::domain::ExecutionChangeSet::default()
+            },
+        )?;
+        Self::persist_evidence(tx, &req).await?;
+        Ok(new_version)
     }
 
     /// `persistRecoveryRunDecision` — the per-run decision ladder. The
@@ -2507,7 +2600,7 @@ impl Store {
         let ws = request.workspace_id;
         let mut tx = begin_recovery_scan(&self.pool).await?;
         Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
-        let epoch = read_locked_recovery_epoch_for_claim(
+        let epoch = read_locked_recovery_epoch(
             &mut tx,
             request.epoch_generation,
             request.lease.fence.generation,
@@ -2778,7 +2871,7 @@ impl Store {
         let domain = request.lease.recovery_domain.as_str();
         let mut tx = begin(&self.pool).await?;
         Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
-        read_locked_recovery_epoch_for_claim(
+        read_locked_recovery_epoch(
             &mut tx,
             request.epoch_generation,
             request.lease.fence.generation,
@@ -2809,14 +2902,11 @@ impl Store {
                 .ctx("execution: commit exhausted recovery retry")?;
             return Ok(None);
         }
-        // Upstream `recoveryRetryBackoff`: 100ms doubling to a 5s cap
-        // plus ≤25% jitter.
+        // Upstream `recoveryRetryBackoff(current+1, …)`: `attempt < 1`
+        // clamps to one, then `attempt - 1` doublings — net
+        // `100ms << current` with a 5s cap plus ≤25% jitter.
         let base_ms = 100i64.saturating_mul(
-            2i64.saturating_pow(
-                u32::try_from(current.retry_attempt + 1)
-                    .unwrap_or(31)
-                    .min(31),
-            ),
+            2i64.saturating_pow(u32::try_from(current.retry_attempt).unwrap_or(31).min(31)),
         );
         let jitter_ms = base_ms / 4 * i64::from(uuid::Uuid::now_v7().as_bytes()[0]) / 255;
         let delay_ms = (base_ms + jitter_ms).clamp(100, 5000);
@@ -2868,7 +2958,7 @@ impl Store {
         let domain = request.lease.recovery_domain.as_str();
         let mut tx = begin(&self.pool).await?;
         Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
-        read_locked_recovery_epoch_for_claim(
+        read_locked_recovery_epoch(
             &mut tx,
             request.epoch_generation,
             request.lease.fence.generation,
@@ -2920,7 +3010,7 @@ impl Store {
         let domain = request.lease.recovery_domain.as_str();
         let mut tx = begin(&self.pool).await?;
         Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
-        read_locked_recovery_epoch_for_claim(
+        read_locked_recovery_epoch(
             &mut tx,
             request.epoch_generation,
             request.lease.fence.generation,
@@ -2984,7 +3074,7 @@ impl Store {
         let domain = request.lease.recovery_domain.as_str();
         let mut tx = begin(&self.pool).await?;
         Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
-        read_locked_recovery_epoch_for_claim(
+        read_locked_recovery_epoch(
             &mut tx,
             request.epoch_generation,
             request.lease.fence.generation,
@@ -3066,15 +3156,6 @@ struct ReceiptRow {
     step_id: Option<uuid::Uuid>,
     step_attempt_id: Option<uuid::Uuid>,
     logical_operation_id: Option<uuid::Uuid>,
-}
-
-fn binding_task_ws(payload: &serde_json::Value) -> Result<WorkspaceId, Failure> {
-    payload
-        .get("WorkspaceID")
-        .and_then(|v| v.as_str())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        .map(|u| WorkspaceId::from_trusted_db_bytes(*u.as_bytes()))
-        .ok_or_else(|| corrupt("a stored receipt payload is missing WorkspaceID"))
 }
 
 impl Store {
@@ -3161,185 +3242,313 @@ impl Store {
         Ok(())
     }
 
-    /// `validateChangeSetOwnership` — every durable record must be
-    /// scoped to the command's workspace/task/run, events must be
-    /// unique and carry the durable result's event leg, and outbox
-    /// intents must reference an event in the same change set.
+    /// `validateAttemptOwnership` — every `attempts` row belongs to the
+    /// result's step. The reconciled-attempt scope alone may carry
+    /// exactly one row outside it: the new attempt, inside a step the
+    /// same change set inserts (`changeSetCarriesStep`).
+    fn validate_attempt_ownership(req: &CommitRequest) -> Result<(), Failure> {
+        let result = &req.result;
+        let mut foreign = 0usize;
+        for row in &req.change_set.attempts {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+            {
+                return Err(denied("SCOPE_MISMATCH"));
+            }
+            if row.step_id == result.step_id {
+                continue;
+            }
+            if req.command_scope != RESUME_ATTEMPT_SCOPE
+                || !Self::change_set_carries_step(req, row.step_id)
+            {
+                return Err(denied("SCOPE_MISMATCH"));
+            }
+            foreign += 1;
+        }
+        if req.command_scope == RESUME_ATTEMPT_SCOPE && foreign != 1 {
+            return Err(denied("SCOPE_MISMATCH"));
+        }
+        Ok(())
+    }
+
+    /// `changeSetCarriesStep` — the change set carries a `steps` row
+    /// with this id other than the result's step.
+    fn change_set_carries_step(req: &CommitRequest, id: StepId) -> bool {
+        if id == req.result.step_id {
+            return false;
+        }
+        req.change_set.steps.iter().any(|step| step.id == id)
+    }
+
+    /// `validateResumedStepShape` — under the reconciled-attempt scope
+    /// the change set carries exactly two step rows: the binding step
+    /// and one inserted step at `sequence + 1`, version 1, running,
+    /// bound to the same workspace/task/run. The old step holds exactly
+    /// the binding's attempt row; the new attempt carries a logical
+    /// operation different from the binding's.
+    fn validate_resumed_step_shape(req: &CommitRequest) -> Result<(), Failure> {
+        if req.command_scope != RESUME_ATTEMPT_SCOPE {
+            return Ok(());
+        }
+        let binding = &req.receipt_binding;
+        let mut bound = Vec::new();
+        let mut inserted = Vec::new();
+        for row in &req.change_set.steps {
+            if row.id == binding.step_id {
+                bound.push(row);
+            } else {
+                inserted.push(row);
+            }
+        }
+        if bound.len() != 1 || inserted.len() != 1 {
+            return Err(denied("SCOPE_MISMATCH"));
+        }
+        let (old, next) = (bound[0], inserted[0]);
+        if next.sequence != old.sequence + 1
+            || next.version != 1
+            || next.state != StepState::StepRunning
+            || next.workspace_id != old.workspace_id
+            || next.task_id != old.task_id
+            || next.run_id != old.run_id
+        {
+            return Err(denied("SCOPE_MISMATCH"));
+        }
+        let mut in_old_step = 0usize;
+        for row in &req.change_set.attempts {
+            if row.step_id == old.id {
+                if row.id != binding.attempt_id {
+                    return Err(denied("SCOPE_MISMATCH"));
+                }
+                in_old_step += 1;
+            } else if row.step_id == next.id {
+                if row.logical_operation_id == binding.logical_operation {
+                    return Err(denied("SCOPE_MISMATCH"));
+                }
+            } else {
+                // Unreachable for legitimate change sets — every attempt
+                // is in the old or the inserted step
+                // (`validate_attempt_ownership`).
+                return Err(denied("SCOPE_MISMATCH"));
+            }
+        }
+        if in_old_step != 1 {
+            return Err(denied("SCOPE_MISMATCH"));
+        }
+        Ok(())
+    }
+
+    /// `validateChangeSetOwnership` — every durable record binds to the
+    /// result's workspace/task/run, events are unique and carry the
+    /// result's event leg with a matching kind, and outbox intents
+    /// reference an event in the same change set on the same workspace.
     fn validate_change_set_ownership(req: &CommitRequest) -> Result<(), Failure> {
-        let ws = req.scope.workspace_id;
         let cs = &req.change_set;
         let result = &req.result;
         let scope_err = || denied("SCOPE_MISMATCH");
-        for step in &cs.steps {
-            if step.workspace_id != ws
-                || step.task_id != result.task_id
-                || step.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for attempt in &cs.attempts {
-            if attempt.workspace_id != ws
-                || attempt.task_id != result.task_id
-                || attempt.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for call in &cs.tool_calls {
-            if call.workspace_id != ws
-                || call.task_id != result.task_id
-                || call.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for attempt in &cs.tool_attempts {
-            if attempt.workspace_id != ws
-                || attempt.task_id != result.task_id
-                || attempt.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for approval in &cs.approvals {
-            if approval.workspace_id != ws
-                || approval.task_id != result.task_id
-                || approval.run_id != result.run_id
-                || approval.step_id != result.step_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for checkpoint in &cs.checkpoints {
-            if checkpoint.workspace_id != ws
-                || checkpoint.task_id != result.task_id
-                || checkpoint.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for settlement in &cs.settlements {
-            if settlement.workspace_id != ws
-                || settlement.task_id != result.task_id
-                || settlement.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for settlement in &cs.tool_settlements {
-            if settlement.workspace_id != ws
-                || settlement.task_id != result.task_id
-                || settlement.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for reconciliation in &cs.reconciliations {
-            if reconciliation.workspace_id != ws
-                || reconciliation.task_id != result.task_id
-                || reconciliation.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        for lease in &cs.leases {
-            if lease.workspace_id != ws || lease.run_id != result.run_id {
-                return Err(scope_err());
-            }
-        }
-        for release in &cs.lease_releases {
-            if release.workspace_id != ws || release.run_id != result.run_id {
-                return Err(scope_err());
-            }
-        }
-        for assertion in &cs.lease_assertions {
-            if assertion.workspace_id != ws || assertion.run_id != result.run_id {
-                return Err(scope_err());
-            }
-        }
-        for assertion in &cs.attempt_assertions {
-            if assertion.workspace_id != ws
-                || assertion.task_id != result.task_id
-                || assertion.run_id != result.run_id
-            {
-                return Err(scope_err());
-            }
-        }
-        // Events: unique ids, scope-bound legs, and the result's event
-        // leg must be present with a matching kind.
-        let mut seen_events = std::collections::BTreeSet::new();
+        // Events: unique ids, result-bound legs (including step and
+        // attempt), and the result's event leg must be present.
+        let mut events: std::collections::BTreeMap<
+            ExecutionEventId,
+            &central_execution::domain::EventIntent,
+        > = std::collections::BTreeMap::new();
         let mut result_leg = false;
-        for event in &cs.events {
-            if event.workspace_id != ws
-                || event.task_id != result.task_id
-                || event.run_id != result.run_id
+        for row in &cs.events {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_id != result.step_id
+                || row.attempt_id != result.attempt_id
             {
                 return Err(scope_err());
             }
-            if !seen_events.insert(event.id) {
+            if events.insert(row.id, row).is_some() {
                 return Err(invalid("DUPLICATE_EVENT"));
             }
-            if event.id == result.event_id && event.kind == result.event_kind {
+            if row.id == result.event_id && row.kind == result.event_kind {
                 result_leg = true;
             }
         }
         if !result_leg {
             return Err(invalid("INVALID_DURABLE_RESULT"));
         }
-        for outbox in &cs.outbox {
-            if outbox.workspace_id != ws {
+        for row in &cs.outbox {
+            match events.get(&row.event_id) {
+                Some(event)
+                    if row.workspace_id == result.workspace_id
+                        && event.workspace_id == row.workspace_id => {}
+                _ => return Err(invalid("OUTBOX_EVENT_MISMATCH")),
+            }
+        }
+        for row in &cs.steps {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+            {
                 return Err(scope_err());
             }
-            if !seen_events.contains(&outbox.event_id) {
-                return Err(invalid("OUTBOX_EVENT_MISMATCH"));
+        }
+        Self::validate_attempt_ownership(req)?;
+        Self::validate_resumed_step_shape(req)?;
+        for row in &cs.tool_calls {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_attempt_id != result.attempt_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.tool_attempts {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_attempt_id != result.attempt_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.checkpoints {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_id != result.step_id
+                || row.step_attempt_id != result.attempt_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.approvals {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_id != result.step_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.leases {
+            if row.workspace_id != result.workspace_id || row.run_id != result.run_id {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.lease_releases {
+            if row.workspace_id != result.workspace_id || row.run_id != result.run_id {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.lease_assertions {
+            if row.workspace_id != result.workspace_id || row.run_id != result.run_id {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.settlements {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_id != result.step_id
+                || row.attempt_id != result.attempt_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.tool_settlements {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_id != result.step_id
+                || row.attempt_id != result.attempt_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for row in &cs.reconciliations {
+            if row.workspace_id != result.workspace_id
+                || row.task_id != result.task_id
+                || row.run_id != result.run_id
+                || row.step_id != result.step_id
+                || row.attempt_id != result.attempt_id
+            {
+                return Err(scope_err());
+            }
+        }
+        if let Some(transition) = &cs.task_transition {
+            let change = &transition.change_set;
+            if !change.task.id.is_nil()
+                && (change.task.workspace_id != result.workspace_id
+                    || change.task.id != result.task_id)
+            {
+                return Err(scope_err());
+            }
+            for row in &change.events {
+                if row.task_id != result.task_id || row.run_id != Some(result.run_id) {
+                    return Err(scope_err());
+                }
+            }
+            for row in &change.runs {
+                if row.workspace_id != result.workspace_id
+                    || row.task_id != result.task_id
+                    || row.id != result.run_id
+                {
+                    return Err(scope_err());
+                }
             }
         }
         Ok(())
     }
 
     /// `validateApprovalActionBinding` — the persisted approval action
-    /// is only legal on the successor scope and must describe the
-    /// change set's step/approval rows.
+    /// is only legal on the successor scope and must equal the one
+    /// legal descriptor for the caller's scope: without `Approver` it
+    /// is exactly `{RequiredCapability: Approver}` (every other field
+    /// zero); with it, the descriptor the evaluator bound to the
+    /// successor rows.
     fn validate_approval_action_binding(req: &CommitRequest) -> Result<(), Failure> {
-        let Some(action) = &req.result.approval_action else {
-            if req.command_scope == "execution.create_approval_successor" {
+        if req.command_scope != "execution.create_approval_successor" {
+            if req.result.approval_action.is_some() {
                 return Err(invalid("INVALID_DURABLE_RESULT"));
             }
             return Ok(());
+        }
+        let Some(action) = &req.result.approval_action else {
+            return Err(invalid("INVALID_DURABLE_RESULT"));
         };
-        if req.command_scope != "execution.create_approval_successor"
-            || req.change_set.steps.len() != 1
-            || req.change_set.approvals.len() != 1
-        {
+        if req.change_set.steps.len() != 1 || req.change_set.approvals.len() != 1 {
             return Err(invalid("INVALID_DURABLE_RESULT"));
         }
-        let step = &req.change_set.steps[0];
-        let approval = &req.change_set.approvals[0];
-        let authorized = req
+        let mut expected = central_execution::domain::ApprovalSuccessorActionDescriptor {
+            action: None,
+            authorized: false,
+            required_capability: Some(central_execution::domain::Capability::Approver),
+            step_id: NIL_STEP_ID,
+            approval_id: NIL_APPROVAL_ID,
+            logical_operation_id: LogicalOperationId([0; 16]),
+            approval_subject_version: 0,
+            expected_versions: ExpectedVersions::default(),
+        };
+        if req
             .scope
-            .allows(central_execution::domain::Capability::Approver);
-        if authorized != action.authorized
-            || action.step_id != step.id
-            || action.approval_id != approval.id
-            || action.approval_subject_version != approval.subject.version
+            .allows(central_execution::domain::Capability::Approver)
         {
-            return Err(invalid("INVALID_DURABLE_RESULT"));
+            let step = &req.change_set.steps[0];
+            let approval = &req.change_set.approvals[0];
+            expected.authorized = true;
+            expected.action =
+                Some(central_execution::domain::ApprovalAction::ActionResolveApproval);
+            expected.step_id = step.id;
+            expected.approval_id = approval.id;
+            expected.logical_operation_id = approval.subject.logical_operation_id;
+            expected.approval_subject_version = approval.subject.version;
+            expected.expected_versions = ExpectedVersions {
+                step: step.version,
+                attempt: 0,
+                tool_call: 0,
+                tool_attempt: 0,
+                approval: approval.version,
+                ..req.expected_versions
+            };
         }
-        if authorized
-            && (action.action
-                != Some(central_execution::domain::ApprovalAction::ActionResolveApproval)
-                || action.required_capability
-                    != Some(central_execution::domain::Capability::Approver)
-                || action.logical_operation_id != approval.subject.logical_operation_id
-                || action.expected_versions.task != req.expected_versions.task
-                || action.expected_versions.run != req.expected_versions.run
-                || action.expected_versions.step != step.version
-                || action.expected_versions.attempt != 0
-                || action.expected_versions.tool_call != 0
-                || action.expected_versions.tool_attempt != 0
-                || action.expected_versions.approval != approval.version)
-        {
+        if *action != expected {
             return Err(invalid("INVALID_DURABLE_RESULT"));
         }
         Ok(())
@@ -3471,22 +3680,26 @@ impl Store {
     }
 }
 
-/// RFC3339Nano for persisted event payloads (Go `time.Time` JSON form).
+/// RFC3339Nano for persisted event payloads (Go `time.Time` JSON form):
+/// seconds always, fractional digits only when nonzero with trailing
+/// zeros stripped — `time`'s Rfc3339 already emits a fractional part,
+/// so the base is built seconds-only to avoid a doubled fraction.
 fn go_rfc3339_local(t: OffsetDateTime) -> String {
     let t = t.to_offset(time::UtcOffset::UTC);
     let base = t
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
-        .replace("+00:00", "Z");
+        .format(&time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second]"
+        ))
+        .unwrap_or_default();
     let nanos = t.nanosecond();
     if nanos == 0 {
-        return base;
+        return format!("{base}Z");
     }
     let mut frac = format!("{nanos:09}");
     while frac.ends_with('0') {
         frac.pop();
     }
-    base.replace('Z', &format!(".{frac}Z"))
+    format!("{base}.{frac}Z")
 }
 
 fn epoch_state(state: &str) -> RecoveryEpochState {
@@ -3576,8 +3789,13 @@ impl CompositeStore for Store {
                 return Err(conflict("REASON_REQUEST_CONFLICT"));
             }
             let payload = row.result_payload.clone();
-            let result =
-                Self::decode_result_payload(&payload, binding, row.result_reference, &event.kind)?;
+            let result = Self::decode_result_payload(
+                &payload,
+                ws,
+                binding,
+                row.result_reference,
+                &event.kind,
+            )?;
             tx.commit().await.ctx("execution: commit replay")?;
             return Ok(CommitResult {
                 result,
@@ -3821,6 +4039,7 @@ impl CompositeExecutionStore for Store {
         let payload = row.result_payload.clone();
         let result = Self::decode_result_payload(
             &payload,
+            ws,
             &request.binding,
             row.result_reference,
             &event.kind,
@@ -4319,24 +4538,52 @@ impl RecoveryStore for Store {
     /// `ResumeRecoveryEpoch` — operator resume of a degraded epoch:
     /// fenced CAS on the durable row, requeue failed workspaces,
     /// durable `execution.recovery.resumed` event + outbox + receipt.
+    /// A stored receipt replays its persisted event verbatim — the
+    /// live epoch row is never re-read as the replayed answer.
     async fn resume_recovery_epoch(
         &self,
         request: ResumeRecoveryEpochRequest,
     ) -> Result<RecoveryEpoch, Failure> {
         let command = &request.command;
-        if request.lease.recovery_domain != RECOVERY_DOMAIN
-            || command.epoch_generation <= 0
-            || command.idempotency_key.trim().is_empty()
-            || command.acknowledgement_reason.trim().is_empty()
+        command.validate()?;
+        // `validateRecoveryLease` — the lease shape check before any
+        // store mutation.
+        if request.lease.recovery_domain.trim().is_empty()
+            || request.lease.instance_id.is_nil()
+            || !request.lease.fence.valid()
+            || request.lease.claim_token.len() != 32
         {
-            return Err(invalid("INVALID_RECOVERY_RESUME_REQUEST"));
+            return Err(invalid("INVALID_RECOVERY_COORDINATOR"));
+        }
+        if command.coordinator_fence.generation != request.lease.fence.generation {
+            return Err(conflict("STALE_RECOVERY_FENCE"));
         }
         let ws = command.scope.workspace_id;
-        let mut tx = begin_recovery_scan(&self.pool).await?;
+        let mut tx = begin(&self.pool).await?;
+        Self::lock_recovery_coordinator(&mut tx, &request.lease).await?;
+        // `assertRecoveryEpochDomain` — the fenced epoch must exist.
+        let epoch_exists = sqlx::query!(
+            "SELECT 1 AS \"one!\" FROM central.recovery_epochs \
+             WHERE epoch_generation = $1 AND coordinator_fence = $2 \
+             AND coordinator_domain = $3",
+            command.epoch_generation,
+            request.lease.fence.generation,
+            request.lease.recovery_domain,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .ctx("execution: assert recovery epoch domain")?;
+        if epoch_exists.is_none() {
+            return Err(conflict("STALE_RECOVERY_FENCE"));
+        }
         Self::lock_receipt_identity(&mut tx, ws, RESUME_SCOPE, &command.idempotency_key).await?;
-        // Resume-receipt replay.
+        let expected = recovery_resume_expected_digest(command);
+        // `queryReadRecoveryResumeReceipt` — a stored receipt is the
+        // durable result; replay it only when every receipt leg
+        // matches (fingerprint, expected digest, principal, capability).
         let existing = sqlx::query!(
-            "SELECT request_fingerprint, result_reference \
+            "SELECT request_fingerprint, principal_id, capability, \
+             expected_version_digest, result_reference, result_payload \
              FROM central.execution_command_receipts \
              WHERE workspace_id = $1 AND command_scope = $2 AND idempotency_key = $3",
             uuid_of(ws.as_bytes()),
@@ -4345,48 +4592,57 @@ impl RecoveryStore for Store {
         )
         .fetch_optional(&mut *tx)
         .await
-        .ctx("execution: read resume receipt")?;
+        .ctx("execution: read recovery resume receipt")?;
         if let Some(receipt) = existing {
-            if receipt.request_fingerprint != command.fingerprint {
-                return Err(conflict("REASON_REQUEST_CONFLICT"));
+            if !ct_eq(&receipt.request_fingerprint, &command.fingerprint)
+                || !ct_eq(&receipt.expected_version_digest, &expected)
+                || receipt.principal_id != command.scope.principal_id
+                || receipt.capability != command.capability.as_str()
+            {
+                return Err(conflict("IDEMPOTENCY_CONFLICT"));
             }
-            let epoch = read_locked_recovery_epoch_for_claim(
-                &mut tx,
-                command.epoch_generation,
-                command.coordinator_fence.generation,
-                &request.lease.recovery_domain,
+            let persisted = decode_recovery_resume_receipt(&receipt.result_payload)
+                .map_err(|_| conflict("IDEMPOTENCY_CONFLICT"))?;
+            if persisted.recovery_epoch_generation != command.epoch_generation
+                || persisted.recovery_event_id != receipt.result_reference.to_string()
+            {
+                return Err(conflict("IDEMPOTENCY_CONFLICT"));
+            }
+            let payload = sqlx::query!(
+                "SELECT payload::text AS \"payload!\" FROM central.events \
+                 WHERE workspace_id = $1 AND id = $2 \
+                 AND kind = 'execution.recovery.resumed'",
+                uuid_of(ws.as_bytes()),
+                receipt.result_reference,
             )
-            .await?;
-            tx.commit().await.ctx("execution: commit resume replay")?;
+            .fetch_one(&mut *tx)
+            .await
+            .ctx("execution: read recovery resume result")?
+            .payload;
+            let epoch = decode_recovery_resume_result(&payload, command)?;
+            tx.commit()
+                .await
+                .ctx("execution: commit recovery resume replay")?;
             return Ok(epoch);
         }
-        Self::lock_recovery_coordinator(&mut tx, &request.lease).await?;
-        let done = sqlx::query!(
-            "UPDATE central.recovery_epochs \
-             SET state = 'running', retry_attempt = retry_attempt + 1, \
-             failure_class = NULL, failure_reason = NULL, updated_at = clock_timestamp() \
-             WHERE epoch_generation = $1 AND coordinator_fence = $2 \
-             AND coordinator_domain = $6 AND state = $3 \
-             AND retry_attempt = $4 \
-             AND scheduler_cursor IS NOT DISTINCT FROM $5 \
-             RETURNING snapshot_at, scheduler_cursor, workspace_count, processed_count",
+        // No receipt — guard the durable epoch against the command's
+        // optimistic expectations before mutating anything.
+        let current = read_locked_recovery_epoch(
+            &mut tx,
             command.epoch_generation,
-            command.coordinator_fence.generation,
-            resume_epoch_state_value(command.expected_state),
-            command.expected_retry_attempt,
-            opt_uuid_of(
-                (!command.expected_cursor.is_nil()).then_some(command.expected_cursor),
-                |c| c.as_bytes(),
-            ),
-            request.lease.recovery_domain,
+            request.lease.fence.generation,
+            &request.lease.recovery_domain,
         )
-        .fetch_optional(&mut *tx)
-        .await
-        .ctx("execution: resume recovery epoch")?;
-        let Some(epoch_row) = done else {
-            return Err(conflict("STALE_RECOVERY_FENCE"));
-        };
-        sqlx::query!(
+        .await?;
+        if current.state != command.expected_state
+            || current.scheduler_cursor != command.expected_cursor
+            || current.retry_attempt != command.expected_retry_attempt
+        {
+            return Err(conflict("RECOVERY_RESUME_EXPECTATION_CONFLICT"));
+        }
+        // `queryRequeueFailedRecoveryWorkspaces` — a resumable epoch
+        // must actually requeue at least one failed row.
+        let requeued = sqlx::query!(
             "UPDATE central.recovery_epoch_workspaces AS work \
              SET delivery_state = 'pending', retry_attempt = retry_attempt + 1, \
              failure_class = NULL, failure_reason = NULL, \
@@ -4401,16 +4657,52 @@ impl RecoveryStore for Store {
         )
         .execute(&mut *tx)
         .await
-        .ctx("execution: requeue failed workspaces")?;
-        // Durable resume event + outbox + receipt.
+        .ctx("execution: requeue failed recovery workspaces")?
+        .rows_affected();
+        if requeued == 0 {
+            return Err(conflict("RECOVERY_EPOCH_NOT_RESUMABLE"));
+        }
+        // `queryResumeRecoveryEpoch` — the fenced CAS. The cursor binds
+        // as text exactly like upstream (`ExpectedCursor.String()` →
+        // `NULLIF($5,'')::uuid`), so a nil cursor compares to the nil
+        // uuid, never to NULL.
+        let cursor = command.expected_cursor.to_string();
+        let tag = sqlx::query!(
+            "UPDATE central.recovery_epochs \
+             SET state = 'running', retry_attempt = retry_attempt + 1, \
+             failure_class = NULL, failure_reason = NULL, updated_at = clock_timestamp() \
+             WHERE epoch_generation = $1 AND coordinator_fence = $2 \
+             AND coordinator_domain = $6 AND state = $3 \
+             AND retry_attempt = $4 \
+             AND scheduler_cursor IS NOT DISTINCT FROM NULLIF($5, '')::uuid",
+            command.epoch_generation,
+            request.lease.fence.generation,
+            resume_epoch_state_value(command.expected_state),
+            command.expected_retry_attempt,
+            cursor,
+            request.lease.recovery_domain,
+        )
+        .execute(&mut *tx)
+        .await
+        .ctx("execution: resume recovery epoch")?
+        .rows_affected();
+        if tag != 1 {
+            return Err(conflict("RECOVERY_EPOCH_NOT_RESUMABLE"));
+        }
+        let epoch = read_locked_recovery_epoch(
+            &mut tx,
+            command.epoch_generation,
+            request.lease.fence.generation,
+            &request.lease.recovery_domain,
+        )
+        .await?;
+        let deduplication_key = format!(
+            "recovery-resume:{}:{}",
+            command.epoch_generation, command.idempotency_key
+        );
         let sequence = reserve_event_sequence(&mut tx, ws).await?;
         let event_id = uuid::Uuid::now_v7();
-        let payload = serde_json::json!({
-            "EpochGeneration": command.epoch_generation,
-            "CoordinatorFence": command.coordinator_fence.generation,
-            "AcknowledgementReason": command.acknowledgement_reason,
-            "PrincipalID": command.scope.principal_id,
-        });
+        let payload = encode_recovery_resume_result(command, &epoch)?;
         sqlx::query!(
             "INSERT INTO central.events (\
              id, workspace_id, event_sequence, event_type, aggregate_id, \
@@ -4418,19 +4710,19 @@ impl RecoveryStore for Store {
              task_id, step_id, attempt_id, kind, state, producer_id, \
              policy_version, eligible_after, legal_hold) \
              VALUES ($1, $2, $3, 'execution.recovery.resumed', $2, $4, \
-             $1, NULL, $5, clock_timestamp(), NULL, NULL, NULL, \
+             $1, NULL, $5::jsonb, clock_timestamp(), NULL, NULL, NULL, \
              'execution.recovery.resumed', 'recorded', $6, 1, \
              clock_timestamp() + interval '90 days', false)",
             event_id,
             uuid_of(ws.as_bytes()),
             sequence,
             command.epoch_generation,
-            payload,
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_default(),
             command.scope.principal_id,
         )
         .execute(&mut *tx)
         .await
-        .ctx("execution: insert resume event")?;
+        .ctx("execution: insert recovery resume event")?;
         sqlx::query!(
             "INSERT INTO central.outbox (\
              id, workspace_id, event_id, delivery_state, due_at, attempt_count, \
@@ -4439,24 +4731,30 @@ impl RecoveryStore for Store {
              eligible_after, legal_hold) \
              VALUES ($1, $2, $3, 'pending', clock_timestamp(), 0, \
              clock_timestamp(), clock_timestamp(), 'execution.recovery.resumed', \
-             $4, $5, $6, clock_timestamp(), 1, \
+             $4, $5, $6::jsonb, clock_timestamp(), 1, \
              clock_timestamp() + interval '7 days', false)",
             uuid::Uuid::now_v7(),
             uuid_of(ws.as_bytes()),
             event_id,
-            format!("{}:{}", RESUME_SCOPE, command.idempotency_key),
+            deduplication_key,
             command.scope.principal_id,
-            payload,
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_default(),
         )
         .execute(&mut *tx)
         .await
-        .ctx("execution: insert resume outbox")?;
+        .ctx("execution: insert recovery resume outbox")?;
+        Self::upsert_outbox_workspace_work(&mut tx, ws).await?;
+        let receipt_payload = serde_json::json!({
+            "schema_version": 1,
+            "recovery_epoch_generation": epoch.generation,
+            "recovery_event_id": event_id.to_string(),
+        });
         sqlx::query!(
             "INSERT INTO central.execution_command_receipts (\
              id, workspace_id, command_scope, idempotency_key, request_fingerprint, \
              principal_id, capability, expected_version_digest, result_reference, \
              result_payload, created_at, expires_at, eligible_after) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb, \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, \
              clock_timestamp(), clock_timestamp() + interval '7 days', \
              clock_timestamp() + interval '90 days') \
              ON CONFLICT (workspace_id, command_scope, idempotency_key) DO NOTHING",
@@ -4467,28 +4765,14 @@ impl RecoveryStore for Store {
             &command.fingerprint[..],
             command.scope.principal_id,
             command.capability.as_str(),
-            &expected_digest(&ExpectedVersions::default())[..],
+            &expected[..],
             event_id,
+            receipt_payload,
         )
         .execute(&mut *tx)
         .await
-        .ctx("execution: insert resume receipt")?;
-        Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
-        let epoch = RecoveryEpoch {
-            generation: command.epoch_generation,
-            coordinator_fence: command.coordinator_fence,
-            state: RecoveryEpochState::RecoveryEpochRunning,
-            scheduler_cursor: epoch_row.scheduler_cursor.map_or_else(
-                || WorkspaceId::from_trusted_db_bytes([0; 16]),
-                |u| WorkspaceId::from_trusted_db_bytes(*u.as_bytes()),
-            ),
-            workspace_count: epoch_row.workspace_count,
-            processed_count: epoch_row.processed_count,
-            claim_cycle: epoch_row.processed_count,
-            retry_attempt: command.expected_retry_attempt + 1,
-            snapshot_at: epoch_row.snapshot_at,
-        };
-        tx.commit().await.ctx("execution: commit resume")?;
+        .ctx("execution: insert recovery resume receipt")?;
+        tx.commit().await.ctx("execution: commit recovery resume")?;
         Ok(epoch)
     }
 
@@ -4513,4 +4797,148 @@ fn resume_epoch_state_value(state: RecoveryEpochState) -> &'static str {
         RecoveryEpochState::RecoveryEpochCompleted => "completed",
         _ => "failed",
     }
+}
+
+/// `recoveryResumeExpectedDigest` — sha256 over the exact
+/// `gen:fence:state:cursor:retry` tuple the command binds; a receipt
+/// replay only answers a command whose expectations hash identically.
+fn recovery_resume_expected_digest(
+    command: &central_execution::resume::ResumeRecoveryEpochCommand,
+) -> [u8; 32] {
+    sha256(
+        format!(
+            "{}:{}:{}:{}:{}",
+            command.epoch_generation,
+            command.coordinator_fence.generation,
+            command.expected_state.as_str(),
+            command.expected_cursor,
+            command.expected_retry_attempt,
+        )
+        .as_bytes(),
+    )
+}
+
+/// Upstream `recoveryResumeResultPayload` — the durable
+/// `execution.recovery.resumed` event/outbox body.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecoveryResumeResultPayload {
+    schema_version: i64,
+    epoch_generation: i64,
+    coordinator_fence: i64,
+    state: String,
+    scheduler_cursor: String,
+    workspace_count: i64,
+    processed_count: i64,
+    retry_attempt: i64,
+    snapshot_at: String,
+    acknowledgement_reason: String,
+    request_fingerprint: String,
+}
+
+/// Upstream `recoveryResumeReceiptPayload` — the receipt's stored
+/// `result_payload`; the event reference is what replays.
+#[derive(serde::Deserialize)]
+struct RecoveryResumeReceiptPayload {
+    schema_version: i64,
+    recovery_epoch_generation: i64,
+    recovery_event_id: String,
+}
+
+/// `encodeRecoveryResumeResult` — the full epoch snapshot the
+/// `execution.recovery.resumed` event/outbox rows carry verbatim.
+fn encode_recovery_resume_result(
+    command: &central_execution::resume::ResumeRecoveryEpochCommand,
+    epoch: &RecoveryEpoch,
+) -> Result<Vec<u8>, Failure> {
+    serde_json::to_vec(&RecoveryResumeResultPayload {
+        schema_version: 1,
+        epoch_generation: epoch.generation,
+        coordinator_fence: epoch.coordinator_fence.generation,
+        state: epoch.state.as_str().to_owned(),
+        scheduler_cursor: epoch.scheduler_cursor.to_string(),
+        workspace_count: epoch.workspace_count,
+        processed_count: epoch.processed_count,
+        retry_attempt: epoch.retry_attempt,
+        snapshot_at: go_rfc3339_local(epoch.snapshot_at),
+        acknowledgement_reason: command.acknowledgement_reason.trim().to_owned(),
+        request_fingerprint: command
+            .fingerprint
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    })
+    .map_err(|_| corrupt("encode recovery resume evidence"))
+}
+
+/// `decodeRecoveryResumeReceipt` — structural validation only; the
+/// caller compares generation and event reference against the receipt.
+fn decode_recovery_resume_receipt(
+    payload: &serde_json::Value,
+) -> Result<RecoveryResumeReceiptPayload, Failure> {
+    let parsed: RecoveryResumeReceiptPayload = serde_json::from_value(payload.clone())
+        .map_err(|_| corrupt("decode recovery resume receipt"))?;
+    if parsed.schema_version != 1
+        || parsed.recovery_epoch_generation <= 0
+        || parsed.recovery_event_id.is_empty()
+    {
+        return Err(corrupt("decode recovery resume receipt"));
+    }
+    ExecutionEventId::parse(&parsed.recovery_event_id)
+        .map_err(|_| corrupt("parse recovery resume receipt event"))?;
+    Ok(parsed)
+}
+
+/// `decodeRecoveryResumeResult` — rebuilds the epoch from the stored
+/// event payload, cross-checked against the command; any drift is
+/// upstream's `dbFailure` (internal), not a conflict.
+fn decode_recovery_resume_result(
+    raw: &str,
+    command: &central_execution::resume::ResumeRecoveryEpochCommand,
+) -> Result<RecoveryEpoch, Failure> {
+    let payload: RecoveryResumeResultPayload =
+        serde_json::from_str(raw).map_err(|_| corrupt("decode recovery resume result"))?;
+    let fingerprint: String = command
+        .fingerprint
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if payload.schema_version != 1
+        || payload.epoch_generation != command.epoch_generation
+        || payload.coordinator_fence != command.coordinator_fence.generation
+        || payload.state != "running"
+        || payload.retry_attempt != command.expected_retry_attempt + 1
+        || payload.acknowledgement_reason != command.acknowledgement_reason.trim()
+        || payload.request_fingerprint != fingerprint
+        || payload.workspace_count < 0
+        || payload.processed_count < 0
+    {
+        return Err(corrupt("decode recovery resume result"));
+    }
+    let snapshot_at = OffsetDateTime::parse(
+        &payload.snapshot_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| corrupt("parse recovery resume snapshot"))?;
+    let cursor = if payload.scheduler_cursor.is_empty() {
+        WorkspaceId::from_trusted_db_bytes([0; 16])
+    } else {
+        WorkspaceId::parse(&payload.scheduler_cursor)
+            .map_err(|_| corrupt("parse recovery resume cursor"))?
+    };
+    if cursor != command.expected_cursor {
+        return Err(corrupt("decode recovery resume cursor"));
+    }
+    Ok(RecoveryEpoch {
+        generation: payload.epoch_generation,
+        coordinator_fence: RecoveryCoordinatorFence {
+            generation: payload.coordinator_fence,
+        },
+        state: RecoveryEpochState::RecoveryEpochRunning,
+        scheduler_cursor: cursor,
+        workspace_count: payload.workspace_count,
+        processed_count: payload.processed_count,
+        claim_cycle: payload.processed_count,
+        retry_attempt: payload.retry_attempt,
+        snapshot_at,
+    })
 }

@@ -720,6 +720,34 @@ fn epoch_from_row(r: EpochRow) -> RecoveryEpoch {
     }
 }
 
+/// `queryLockRecoveryEpoch` — the fence+domain lock admitting only the
+/// non-terminal states ('completed' is sealed). Upstream uses this for
+/// every recovery read except the claim path.
+pub(crate) async fn read_locked_recovery_epoch(
+    tx: &mut Transaction<'_, Postgres>,
+    generation: i64,
+    fence: i64,
+    domain: &str,
+) -> Result<RecoveryEpoch, Failure> {
+    let row = sqlx::query_as!(
+        EpochRow,
+        "SELECT epoch_generation, coordinator_fence, state, snapshot_at, \
+         scheduler_cursor, workspace_count, processed_count, retry_attempt \
+         FROM central.recovery_epochs \
+         WHERE epoch_generation = $1 AND coordinator_fence = $2 \
+         AND coordinator_domain = $3 \
+         AND state IN ('open','running','degraded','failed') FOR UPDATE",
+        generation,
+        fence,
+        domain,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .ctx("execution: lock recovery epoch")?;
+    row.map(epoch_from_row)
+        .ok_or_else(|| conflict("STALE_RECOVERY_FENCE"))
+}
+
 /// `queryLockRecoveryEpochForClaim` — same lock but admits 'completed'.
 pub(crate) async fn read_locked_recovery_epoch_for_claim(
     tx: &mut Transaction<'_, Postgres>,

@@ -13,9 +13,10 @@ use central_adapter_postgres::error::classify_sqlx;
 use central_adapter_postgres::execution::Store;
 use central_adapter_postgres::migrate::BaselineInstaller;
 use central_execution::domain::{
-    self, AttemptState, Capability, EventIntent, ExecutionChangeSet, ExpectedVersions, Lease,
-    LeaseAssertion, LeaseCredential, LogicalOperationId, OutboxIntent, PhysicalAttemptId, Step,
-    StepAttempt, StepState, TrustedScope,
+    self, Approval, ApprovalState, ApprovalSubject, ApprovalSuccessorActionDescriptor,
+    AttemptState, Capability, EventIntent, ExecutionChangeSet, ExpectedVersions, Lease,
+    LeaseAssertion, LeaseCredential, LogicalOperationId, NIL_APPROVAL_ID, NIL_STEP_ID,
+    OutboxIntent, PhysicalAttemptId, Step, StepAttempt, StepState, TrustedScope,
 };
 use central_execution::harness_run::{
     B09EvidenceReference, DispatchCase, ListDispatchableRunsRequest,
@@ -26,12 +27,15 @@ use central_execution::port::{
     DispatchableRunReader, ExecutionRead, ExecutionReadRequest, LeaseCredentialValidator,
     LeaseValidationRequest, OutboxStore, ReceiptBinding, ReceiptLookupRequest,
     RecoveryClaimabilityReader, RecoveryCoordinatorAcquireRequest, RecoveryStore,
-    StartRecoveryEpochRequest,
+    ResumeRecoveryEpochRequest, StartRecoveryEpochRequest,
 };
-use central_execution::resume::RecoveryWorkspaceState;
+use central_execution::resume::{
+    self, RecoveryEpochState, RecoveryWorkspaceState, ResumeRecoveryEpochCommand,
+};
 use central_foundation::failure::{Failure, FailureKind};
 use central_foundation::identity::{
-    ExecutionEventId, InstanceId, OutboxId, RunId, StepAttemptId, StepId, TaskId, WorkspaceId,
+    ApprovalId, ExecutionEventId, InstanceId, OutboxId, RunId, StepAttemptId, StepId, TaskId,
+    WorkspaceId,
 };
 use central_task::domain as task;
 use central_task::port::{ChangeSetStore, CommitTaskChangeSetRequest};
@@ -1218,7 +1222,10 @@ async fn recovery_invoked_without_receipt_requires_reconciliation() -> Result<()
 
     // Decision `reconciliation_required`: the ambiguous projection
     // closes to `reconciliation`, the aggregate waits on it, and the
-    // outbox carries the `execution.reconciliation.required` work.
+    // outbox carries the `execution.reconciliation.required` work. The
+    // wait transition itself is durable evidence — upstream
+    // `persistRecoveryWaitingState` writes the `task.wait` event plus
+    // its `task.lifecycle` outbox row inside the scan transaction.
     let row = sqlx::query!(
         "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", \
          (SELECT state FROM central.steps WHERE id = $2) AS \"step!\", \
@@ -1227,8 +1234,14 @@ async fn recovery_invoked_without_receipt_requires_reconciliation() -> Result<()
          (SELECT status FROM central.runs WHERE id = $4) AS \"run!\", \
          (SELECT count(*) FROM central.events WHERE workspace_id = $5 \
            AND kind = 'execution.recovery.reconciliation_required') AS \"evidence!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $5 \
+           AND kind = 'task.wait') AS \"wait_evidence!\", \
          (SELECT count(*) FROM central.outbox WHERE workspace_id = $5 \
-           AND catalog_type = 'execution.reconciliation.required') AS \"outbox!\"",
+           AND catalog_type = 'execution.reconciliation.required') AS \"outbox!\", \
+         (SELECT count(*) FROM central.outbox o \
+           JOIN central.events ev ON ev.id = o.event_id \
+           WHERE o.workspace_id = $5 AND o.catalog_type = 'task.lifecycle' \
+           AND ev.kind = 'task.wait') AS \"lifecycle_outbox!\"",
         uuid_of!(att.id),
         uuid_of!(step.id),
         uuid_of!(committed.task.id),
@@ -1244,7 +1257,9 @@ async fn recovery_invoked_without_receipt_requires_reconciliation() -> Result<()
     assert_eq!(row.waiting, "reconciliation");
     assert_eq!(row.run, "waiting");
     assert_eq!(row.evidence, 1);
+    assert_eq!(row.wait_evidence, 1);
     assert_eq!(row.outbox, 1);
+    assert_eq!(row.lifecycle_outbox, 1);
     Ok(())
 }
 
@@ -1514,5 +1529,417 @@ async fn receipt_replay_of_missing_event_is_corruption() -> Result<()> {
     .map_err(|e| classify_sqlx(&e))?;
     let err = store.commit(req).await.unwrap_err();
     assert_eq!(err.code(), "pg_data_corrupt");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Round-2 pinning tests — approval-successor predecessor CAS (finding 2),
+// recovery claim admission (finding 5), and resume replay from the stored
+// event payload (finding 9).
+// ---------------------------------------------------------------------------
+
+/// `execution.create_approval_successor` request — predecessor step +
+/// attempt stay the receipt binding, the successor approval carries the
+/// predecessor link, and the unauthorized descriptor is exactly
+/// `{required_capability: Approver}` (the Executor scope cannot mint an
+/// authorized descriptor).
+#[allow(clippy::too_many_arguments)]
+fn approval_successor_request(
+    ws: WorkspaceId,
+    task_id: TaskId,
+    run_id: RunId,
+    step: &Step,
+    att: &StepAttempt,
+    predecessor: ApprovalId,
+    key: &str,
+) -> CommitRequest {
+    let event = event_intent(
+        ws,
+        task_id,
+        run_id,
+        step.id,
+        att.id,
+        domain::EVENT_APPROVAL_SUCCESSOR,
+    );
+    let outbox = outbox_intent(
+        ws,
+        &event,
+        &format!("execution.create_approval_successor:{key}"),
+        domain::OUTBOX_APPROVAL_RECORDED,
+    );
+    let successor = Approval {
+        id: ApprovalId::new(),
+        workspace_id: ws,
+        task_id,
+        run_id,
+        step_id: step.id,
+        state: ApprovalState::ApprovalPending,
+        subject: ApprovalSubject {
+            version: 1,
+            logical_operation_id: LogicalOperationId::new(),
+            operation_digest: [7u8; 32],
+            expected_step_version: 2,
+        },
+        predecessor_id: predecessor,
+        actor: String::new(),
+        reason_code: String::new(),
+        decision_id: [0; 16],
+        decided_at: domain::ZERO_TIME,
+        version: 1,
+        recorded_at: NOW,
+    };
+    let mut cs = ExecutionChangeSet::new();
+    cs.steps.push(Step {
+        version: 2,
+        ..step.clone()
+    });
+    cs.approvals.push(successor);
+    cs.events.push(event);
+    cs.outbox.push(outbox);
+    cs.lease_assertions.push(LeaseAssertion {
+        workspace_id: ws,
+        run_id,
+        no_active: true,
+    });
+    let binding = ReceiptBinding {
+        task_id,
+        run_id,
+        step_id: step.id,
+        attempt_id: att.id,
+        logical_operation: att.logical_operation_id,
+    };
+    let mut req = commit_req(
+        ws,
+        task_id,
+        run_id,
+        "execution.create_approval_successor",
+        binding,
+        cs,
+        key,
+    );
+    req.expected_versions.step = 1;
+    req.expected_versions.attempt = 1;
+    req.expected_versions.approval = 2;
+    req.result.approval_action = Some(ApprovalSuccessorActionDescriptor {
+        action: None,
+        authorized: false,
+        required_capability: Some(Capability::Approver),
+        step_id: NIL_STEP_ID,
+        approval_id: NIL_APPROVAL_ID,
+        logical_operation_id: LogicalOperationId([0; 16]),
+        approval_subject_version: 0,
+        expected_versions: ExpectedVersions::default(),
+    });
+    req
+}
+
+#[tokio::test]
+async fn approval_successor_predecessor_is_locked_and_cas_checked() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "appcas").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "appcas-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+
+    // The predecessor approval the successor claims to supersede.
+    let predecessor = ApprovalId::new();
+    sqlx::query(
+        "INSERT INTO central.approvals (\
+         id, workspace_id, version, state, approval_kind, task_id, run_id, \
+         step_id, subject_version, logical_operation_id, operation_digest, \
+         expected_step_version, decision_actor, decision_reason, decision_id, \
+         decided_at, predecessor_approval_id, recorded_at, created_at, updated_at) \
+         VALUES ($1, $2, 2, 'expired', 'execution', $3, $4, $5, 1, $6, $7, 1, \
+         'exec-test', 'superseded', NULL, NULL, NULL, clock_timestamp(), \
+         clock_timestamp(), clock_timestamp())",
+    )
+    .bind(uuid_of!(predecessor))
+    .bind(uuid_of!(ws))
+    .bind(uuid_of!(committed.task.id))
+    .bind(uuid_of!(run_id))
+    .bind(uuid_of!(step.id))
+    .bind(uuid::Uuid::now_v7())
+    .bind(&[3u8; 32][..])
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+
+    // Arm 1 — a predecessor id no durable approval carries is the
+    // upstream `STATE_SCOPE_MISMATCH`, never a silent commit.
+    let miss = approval_successor_request(
+        ws,
+        committed.task.id,
+        run_id,
+        &step,
+        &att,
+        ApprovalId::new(),
+        "succ-miss",
+    );
+    let err = store.commit(miss).await.unwrap_err();
+    assert_eq!(err.code(), "STATE_SCOPE_MISMATCH");
+
+    // Arm 2 — a real predecessor whose version drifted past the
+    // evaluator's expectation is the CAS conflict.
+    let mut drift = approval_successor_request(
+        ws,
+        committed.task.id,
+        run_id,
+        &step,
+        &att,
+        predecessor,
+        "succ-drift",
+    );
+    drift.expected_versions.approval = 99;
+    let err = store.commit(drift).await.unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "EXPECTED_VERSION_CONFLICT");
+
+    // Control — the exact expectation commits and persists the
+    // successor approval row.
+    let ok = approval_successor_request(
+        ws,
+        committed.task.id,
+        run_id,
+        &step,
+        &att,
+        predecessor,
+        "succ-ok",
+    );
+    let succ_id = ok.change_set.approvals[0].id;
+    store.commit(ok).await?;
+    let row = sqlx::query!(
+        "SELECT (SELECT count(*) FROM central.approvals WHERE id = $1 \
+           AND predecessor_approval_id = $2) AS \"successor!\"",
+        uuid_of!(succ_id),
+        uuid_of!(predecessor),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.successor, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn claim_commit_is_rejected_while_run_is_quarantined() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "claimq").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "claimq-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    let binding = req.receipt_binding.clone();
+    store.commit(req).await?;
+
+    // Open an epoch but do not reconcile the run — it predates the
+    // workspace watermark, so the claim-scoped commit must hit the
+    // upstream `RECOVERY_QUARANTINE` admission conflict.
+    let lease = store
+        .acquire_recovery_coordinator(RecoveryCoordinatorAcquireRequest {
+            recovery_domain: "central.execution.recovery.v1".to_owned(),
+            instance_id: InstanceId::new(),
+        })
+        .await?;
+    let epoch = store
+        .start_recovery_epoch(StartRecoveryEpochRequest {
+            lease,
+            batch_size: 10,
+        })
+        .await?;
+    assert_eq!(epoch.workspace_count, 1);
+
+    let credential = store.issue_lease_credential()?;
+    let expires = OffsetDateTime::now_utc() + time::Duration::seconds(30);
+    let claim_event = event_intent(
+        ws,
+        committed.task.id,
+        run_id,
+        step.id,
+        att.id,
+        domain::EVENT_ATTEMPT_CLAIMED,
+    );
+    let claim_outbox = outbox_intent(
+        ws,
+        &claim_event,
+        "execution.claim:quarantined",
+        domain::OUTBOX_ATTEMPT_CLAIMED,
+    );
+    let mut cs = ExecutionChangeSet::new();
+    cs.events.push(claim_event);
+    cs.outbox.push(claim_outbox);
+    cs.leases.push(Lease {
+        workspace_id: ws,
+        run_id,
+        credential,
+        generation: 1,
+        expires_at: expires,
+        updated_at: expires,
+    });
+    let mut claim_req = commit_req(
+        ws,
+        committed.task.id,
+        run_id,
+        "execution.claim",
+        binding,
+        cs,
+        "quarantined",
+    );
+    claim_req.assert_no_active_lease = false;
+    claim_req.require_recovery_claimable = true;
+    claim_req.expected_versions.step = 1;
+    claim_req.expected_versions.attempt = 1;
+    let err = store.commit(claim_req).await.unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "RECOVERY_QUARANTINE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_replays_stored_payload_and_rejects_rebinding() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "resume").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    submit_task(&pool, ws, "resume-task").await?;
+
+    // Degrade an epoch: claim the workspace and fail it so the epoch
+    // row lands in the resumable `degraded` state.
+    let lease = store
+        .acquire_recovery_coordinator(RecoveryCoordinatorAcquireRequest {
+            recovery_domain: "central.execution.recovery.v1".to_owned(),
+            instance_id: InstanceId::new(),
+        })
+        .await?;
+    let epoch = store
+        .start_recovery_epoch(StartRecoveryEpochRequest {
+            lease: lease.clone(),
+            batch_size: 10,
+        })
+        .await?;
+    let claims = store
+        .claim_recovery_workspaces(ClaimRecoveryWorkspaceRequest {
+            lease: lease.clone(),
+            epoch_generation: epoch.generation,
+            batch_size: 10,
+        })
+        .await?;
+    let claim = claims.into_iter().next().unwrap_or_default();
+    store
+        .complete_recovery_workspace(CompleteRecoveryWorkspaceRequest {
+            lease: lease.clone(),
+            epoch_generation: epoch.generation,
+            workspace_id: ws,
+            claim_token: claim.claim_token,
+            degraded: true,
+            failure_class: "scan_failed".to_owned(),
+            failure_reason: "forced".to_owned(),
+        })
+        .await?;
+    let failed = store
+        .list_failed_recovery_workspaces(epoch.generation, 10)
+        .await?;
+    assert_eq!(failed.total, 1);
+
+    // The claim pass advanced the scheduler cursor — read the durable
+    // epoch facts the resume command must optimistically guard.
+    let degraded = sqlx::query!(
+        "SELECT state, scheduler_cursor, retry_attempt \
+         FROM central.recovery_epochs WHERE epoch_generation = $1",
+        epoch.generation,
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(degraded.state, "degraded");
+
+    let scope = TrustedScope::new(
+        "exec-recovery-operator",
+        ws,
+        &[
+            Capability::WorkspaceOperator,
+            Capability::RecoveryCoordinator,
+        ],
+    )
+    .expect("resume scope");
+    let mut command = ResumeRecoveryEpochCommand {
+        scope,
+        epoch_generation: epoch.generation,
+        coordinator_fence: lease.fence,
+        expected_state: RecoveryEpochState::RecoveryEpochDegraded,
+        expected_cursor: degraded
+            .scheduler_cursor
+            .map_or_else(|| WorkspaceId::from_trusted_db_bytes([0; 16]), |c| {
+                WorkspaceId::from_trusted_db_bytes(*c.as_bytes())
+            }),
+        expected_retry_attempt: degraded.retry_attempt,
+        acknowledgement_reason: "operator acknowledged degraded pass".to_owned(),
+        idempotency_key: "resume-1".to_owned(),
+        capability: Capability::RecoveryCoordinator,
+        fingerprint: [0; 32],
+    };
+    command.fingerprint = resume::recovery_resume_fingerprint(&command);
+    let resumed = store
+        .resume_recovery_epoch(ResumeRecoveryEpochRequest {
+            command: command.clone(),
+            lease: lease.clone(),
+        })
+        .await?;
+    assert_eq!(resumed.state, RecoveryEpochState::RecoveryEpochRunning);
+    assert_eq!(resumed.retry_attempt, epoch.retry_attempt + 1);
+
+    // Mutate the durable epoch row — the replay must rebuild the
+    // stored epoch from the `execution.recovery.resumed` event
+    // payload, not re-read the live row.
+    sqlx::query(
+        "UPDATE central.recovery_epochs \
+         SET state = 'failed', retry_attempt = 99, \
+         scheduler_cursor = NULL, updated_at = clock_timestamp() \
+         WHERE epoch_generation = $1",
+    )
+    .bind(epoch.generation)
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    let replayed = store
+        .resume_recovery_epoch(ResumeRecoveryEpochRequest {
+            command: command.clone(),
+            lease: lease.clone(),
+        })
+        .await?;
+    assert_eq!(replayed.state, resumed.state);
+    assert_eq!(replayed.retry_attempt, resumed.retry_attempt);
+    assert_eq!(replayed.scheduler_cursor, resumed.scheduler_cursor);
+    assert_eq!(replayed.generation, resumed.generation);
+
+    // Rebinding the receipt to a different fingerprint is the
+    // idempotency conflict, not a second resume.
+    let mut rebound = command.clone();
+    rebound.acknowledgement_reason = "different acknowledgement".to_owned();
+    rebound.fingerprint = resume::recovery_resume_fingerprint(&rebound);
+    let err = store
+        .resume_recovery_epoch(ResumeRecoveryEpochRequest {
+            command: rebound,
+            lease,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "IDEMPOTENCY_CONFLICT");
     Ok(())
 }

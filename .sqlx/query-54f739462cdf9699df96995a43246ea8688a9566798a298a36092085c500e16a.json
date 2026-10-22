@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT count(*) FROM central.approvals WHERE id = $1 AND predecessor_approval_id = $2) AS \"successor!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "successor!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "54f739462cdf9699df96995a43246ea8688a9566798a298a36092085c500e16a"
+}

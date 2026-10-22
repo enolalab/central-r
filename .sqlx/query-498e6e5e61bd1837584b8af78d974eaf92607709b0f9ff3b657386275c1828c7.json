@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT payload::text AS \"payload!\" FROM central.events WHERE workspace_id = $1 AND id = $2 AND kind = 'execution.recovery.resumed'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "payload!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "498e6e5e61bd1837584b8af78d974eaf92607709b0f9ff3b657386275c1828c7"
+}

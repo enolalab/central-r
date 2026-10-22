@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT r.id, r.task_id, r.run_id, r.step_id, r.logical_operation_id, r.physical_attempt_id, r.invocation_id, r.invocation_generation, r.final_state, r.outcome::text AS \"outcome!\", r.context::text AS \"context?\", r.producer_id FROM central.execution_completion_receipts r JOIN central.step_attempts a ON a.workspace_id = r.workspace_id AND a.id = r.step_attempt_id WHERE r.workspace_id = $1 AND r.step_attempt_id = $2 AND r.invocation_id = a.invocation_id AND r.invocation_generation = a.invocation_generation LIMIT 1",
+  "query": "SELECT r.id, r.task_id, r.run_id, r.step_id, r.logical_operation_id, r.physical_attempt_id, r.invocation_id, r.invocation_generation, r.final_state, r.outcome::text AS \"outcome!\", r.context::text AS \"context?\", r.producer_id FROM central.execution_completion_receipts r JOIN central.step_attempts a ON a.workspace_id = r.workspace_id AND a.id = r.step_attempt_id AND a.task_id = r.task_id AND a.run_id = r.run_id AND a.step_id = r.step_id AND a.logical_operation_id = r.logical_operation_id AND a.physical_attempt_id = r.physical_attempt_id AND a.invocation_id = r.invocation_id AND a.invocation_generation = r.invocation_generation WHERE r.workspace_id = $1 AND r.step_attempt_id = $2",
   "describe": {
     "columns": [
       {
@@ -85,5 +85,5 @@
       false
     ]
   },
-  "hash": "3c16938c322f2decb6682079ed326f59f70cf23a9f7776e727b07196c3ad199a"
+  "hash": "2d5d76d7d561b43335407c43f5b9fe790cad4220e70b3ef94b671fc5f2c42280"
 }

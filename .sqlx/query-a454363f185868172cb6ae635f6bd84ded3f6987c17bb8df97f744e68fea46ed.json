@@ -1,0 +1,74 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", (SELECT state FROM central.steps WHERE id = $2) AS \"step!\", (SELECT status FROM central.tasks WHERE id = $3) AS \"task!\", (SELECT waiting_reason FROM central.tasks WHERE id = $3) AS \"waiting!\", (SELECT status FROM central.runs WHERE id = $4) AS \"run!\", (SELECT count(*) FROM central.events WHERE workspace_id = $5 AND kind = 'execution.recovery.reconciliation_required') AS \"evidence!\", (SELECT count(*) FROM central.events WHERE workspace_id = $5 AND kind = 'task.wait') AS \"wait_evidence!\", (SELECT count(*) FROM central.outbox WHERE workspace_id = $5 AND catalog_type = 'execution.reconciliation.required') AS \"outbox!\", (SELECT count(*) FROM central.outbox o JOIN central.events ev ON ev.id = o.event_id WHERE o.workspace_id = $5 AND o.catalog_type = 'task.lifecycle' AND ev.kind = 'task.wait') AS \"lifecycle_outbox!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "attempt!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "step!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "task!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "waiting!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "run!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "evidence!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "wait_evidence!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "outbox!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "lifecycle_outbox!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "a454363f185868172cb6ae635f6bd84ded3f6987c17bb8df97f744e68fea46ed"
+}

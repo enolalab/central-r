@@ -84,7 +84,12 @@ pub(crate) fn corrupt(what: &'static str) -> Failure {
 // Constants (upstream store.go const block + recovery vocabulary).
 // ---------------------------------------------------------------------------
 
-/// `resumeReconciledAttemptScope` — harness phase 3g decision 2.
+/// `resumeReconciledAttemptScope` — harness phase 3g decision 2. The
+/// reconciled-attempt commit scope; its change-set exceptions apply to
+/// this scope only (upstream `resumeReconciledAttemptScope`).
+pub(crate) const RESUME_ATTEMPT_SCOPE: &str = "execution.resume_reconciled_attempt";
+/// The `commandScope` `ResumeRecoveryEpoch` binds its receipt identity
+/// to (upstream's function-local `commandScope`, *not* a commit scope).
 pub(crate) const RESUME_SCOPE: &str = "execution.resume_recovery";
 /// The deployment-wide recovery coordinator domain token.
 pub(crate) const RECOVERY_DOMAIN: &str = "central.execution.recovery.v1";
