@@ -17,7 +17,10 @@ use crate::domain::{
     TrustedScope,
 };
 use crate::harness_run::B09EvidenceReference;
-use crate::resume::{RecoveryCoordinatorFence, RecoveryEpoch, RecoveryWorkspaceWork};
+use crate::resume::{
+    RecoveryCoordinatorFence, RecoveryEpoch, RecoveryEpochState, RecoveryWorkspaceState,
+    RecoveryWorkspaceWork,
+};
 
 /// `ExecutionReadRequest` — the authoritative-state load every command
 /// performs before evaluation.
@@ -374,6 +377,52 @@ pub struct RecoveryWorkspaceClaim {
     pub retry_after: time::Duration,
 }
 
+impl Default for RecoveryWorkspaceClaim {
+    /// The Go `port.RecoveryWorkspaceClaim{}` zero value `ClaimNext`
+    /// returns on an empty batch — callers detect exhaustion via
+    /// `claimed == false`, never via an error.
+    fn default() -> Self {
+        Self {
+            epoch: RecoveryEpoch {
+                generation: 0,
+                coordinator_fence: RecoveryCoordinatorFence::default(),
+                state: RecoveryEpochState::default(),
+                scheduler_cursor: WorkspaceId::from_trusted_db_bytes([0; 16]),
+                workspace_count: 0,
+                processed_count: 0,
+                claim_cycle: 0,
+                retry_attempt: 0,
+                snapshot_at: crate::domain::ZERO_TIME,
+            },
+            work: RecoveryWorkspaceWork {
+                epoch_generation: 0,
+                workspace_id: WorkspaceId::from_trusted_db_bytes([0; 16]),
+                state: RecoveryWorkspaceState::default(),
+                watermark_created_at: crate::domain::ZERO_TIME,
+                watermark_run_id: RunId::from_trusted_db_bytes([0; 16]),
+                cursor_created_at: crate::domain::ZERO_TIME,
+                cursor_run_id: RunId::from_trusted_db_bytes([0; 16]),
+                scanned_count: 0,
+                reconciled_count: 0,
+                retry_attempt: 0,
+                failure_class: String::new(),
+                failure_reason: String::new(),
+            },
+            coordinator_lease: RecoveryCoordinatorLease {
+                recovery_domain: String::new(),
+                instance_id: InstanceId::from_trusted_db_bytes([0; 16]),
+                fence: RecoveryCoordinatorFence::default(),
+                expires_at: crate::domain::ZERO_TIME,
+                claim_token: Vec::new(),
+            },
+            claim_token: Vec::new(),
+            claimed: false,
+            completed: false,
+            retry_after: time::Duration::ZERO,
+        }
+    }
+}
+
 /// `CompleteRecoveryWorkspaceRequest`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompleteRecoveryWorkspaceRequest {
@@ -453,7 +502,12 @@ pub trait RecoveryStore {
         &self,
         request: StartRecoveryEpochRequest,
     ) -> Result<RecoveryEpoch, Failure>;
-    /// `ClaimRecoveryWorkspaces` — claims pending work rows.
+    /// `ClaimRecoveryWorkspaces` — claims pending work rows. The
+    /// scan's minted change sets (including the `lease_assertions`
+    /// `no_active` predicate `harness_run::evaluate_recovery` emits)
+    /// must be enforced inside the same claim transaction — upstream's
+    /// adapter mint writes no separate assertion row but expires the
+    /// lease atomically.
     async fn claim_recovery_workspaces(
         &self,
         request: ClaimRecoveryWorkspaceRequest,

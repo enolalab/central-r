@@ -93,15 +93,22 @@ pub(crate) fn evaluate_start_harness_run(
     meta: &EvaluationMetadata,
 ) -> Result<ExecutionChangeSet, Failure> {
     domain::validate_evaluation(&cmd.envelope, meta, Capability::Executor, false, true)?;
-    if cmd.state.step.is_some() || cmd.state.attempt.is_some() {
-        return Err(failure(FailureKind::Conflict, "ACTIVE_ATTEMPT_CONFLICT"));
-    }
     if cmd.envelope.attempt_id.is_nil()
         || cmd.physical_attempt_id.is_nil()
         || cmd.step_sequence <= 0
         || cmd.attempt_sequence <= 0
     {
         return Err(failure(FailureKind::Invalid, "INVALID_ATTEMPT_IDENTITY"));
+    }
+    if cmd.state.step.is_some()
+        || cmd.state.attempt.is_some()
+        || cmd.expected.step != 0
+        || cmd.expected.attempt != 0
+    {
+        return Err(failure(FailureKind::Conflict, "ACTIVE_ATTEMPT_CONFLICT"));
+    }
+    if cmd.state.approval.is_some() {
+        return Err(failure(FailureKind::Denied, "APPROVAL_REQUIRED"));
     }
     let mut next_generation = 1i64;
     if let Some(current) = &cmd.state.lease {
@@ -192,9 +199,7 @@ pub(crate) fn evaluate_abandon_prepared(
     if attempt.state != AttemptState::AttemptPrepared {
         if matches!(
             attempt.state,
-            AttemptState::AttemptInvoked
-                | AttemptState::AttemptSettling
-                | AttemptState::AttemptReconciliation
+            AttemptState::AttemptInvoked | AttemptState::AttemptSettling
         ) {
             return Err(failure(FailureKind::Denied, "RECONCILIATION_REQUIRED"));
         }

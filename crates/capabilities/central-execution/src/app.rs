@@ -840,16 +840,15 @@ impl<R: RecoveryStore, C: Clock> RecoveryCoordinatorService<R, C> {
     }
 
     /// `ClaimNext` — one workspace at a time; the persisted cursor and
-    /// claim cycle are the fairness authority.
+    /// claim cycle are the fairness authority. An empty batch yields
+    /// the zero claim (upstream `port.RecoveryWorkspaceClaim{}`, nil
+    /// error); callers detect exhaustion via `claimed == false`.
     pub async fn claim_next(
         &self,
         epoch: &RecoveryEpoch,
     ) -> Result<RecoveryWorkspaceClaim, Failure> {
         let claims = self.claim_batch(epoch, 1).await?;
-        claims
-            .into_iter()
-            .next()
-            .ok_or_else(|| failure(FailureKind::Internal, "RECOVERY_CLAIM_UNAVAILABLE"))
+        Ok(claims.into_iter().next().unwrap_or_default())
     }
 
     /// `ClaimBatch` — bounded by the coordinator's 100-row default.

@@ -601,6 +601,77 @@ fn start_harness_run_fuses_claim_step_attempt_lease() {
 }
 
 #[test]
+fn start_harness_run_refuses_expected_attempt_and_pending_approval() {
+    let sc = scope();
+    let agg = queued_aggregate(sc.workspace_id);
+    let state = ExecutionState {
+        task: agg.clone(),
+        step: None,
+        attempt: None,
+        tool_calls: vec![],
+        tool_attempts: vec![],
+        lease: None,
+        approval: None,
+    };
+    let fresh_env = |state: ExecutionState| {
+        let mut env = envelope(&sc, &agg, state);
+        env.attempt_id = StepAttemptId::new();
+        env.step_id = StepId::new();
+        env.lease_credential = LeaseCredential([3u8; 32]);
+        env.lease_generation = 1;
+        env
+    };
+    let start = |env: CommandEnvelope| {
+        evaluate_command(
+            Command::StartHarnessRun(StartHarnessRunCommand {
+                envelope: env,
+                physical_attempt_id: PhysicalAttemptId::new(),
+                step_sequence: 1,
+                attempt_sequence: 1,
+            }),
+            &meta(),
+        )
+    };
+
+    // An expected attempt version asserts an attempt that does not
+    // exist (upstream harness_run.go:224-227 → ACTIVE_ATTEMPT_CONFLICT).
+    let mut env = fresh_env(state.clone());
+    env.expected.attempt = 1;
+    let (code, kind) = err_code(start(env));
+    assert_eq!(
+        (code, kind),
+        ("ACTIVE_ATTEMPT_CONFLICT", FailureKind::Conflict)
+    );
+
+    // A pending approval gates the run (upstream harness_run.go:228-230
+    // → APPROVAL_REQUIRED).
+    let mut env = fresh_env(state);
+    env.state.approval = Some(Approval {
+        id: ApprovalId::new(),
+        workspace_id: sc.workspace_id,
+        task_id: agg.task.id,
+        run_id: env.run_id,
+        step_id: env.step_id,
+        state: ApprovalState::ApprovalPending,
+        subject: ApprovalSubject {
+            version: 1,
+            logical_operation_id: env.logical_operation,
+            operation_digest: env.operation_digest,
+            expected_step_version: 0,
+        },
+        predecessor_id: NIL_APPROVAL_ID,
+        actor: String::new(),
+        reason_code: String::new(),
+        decision_id: [0u8; 16],
+        decided_at: ZERO_TIME,
+        version: 1,
+        recorded_at: T0,
+    });
+    let (code, kind) = err_code(start(env));
+    assert_eq!((code, kind), ("APPROVAL_REQUIRED", FailureKind::Denied));
+}
+
+#[test]
 fn abandon_prepared_and_settle_cancellation() {
     let sc = scope();
     let agg = running_aggregate(sc.workspace_id);
@@ -640,6 +711,24 @@ fn abandon_prepared_and_settle_cancellation() {
         &meta(),
     ));
     assert_eq!(code, "INVALID_FAILURE_REASON");
+
+    // A reconciliation-state attempt is immutable for abandon — only
+    // Invoked/Settling map to RECONCILIATION_REQUIRED here (upstream
+    // harness_run.go:303-309; cancel_prepared_for_recovery keeps the
+    // wider arm deliberately).
+    let mut a = prepared_attempt(&s);
+    a.state = AttemptState::AttemptReconciliation;
+    a.invocation_id = InvocationId::new();
+    let state = claim_state(&agg, &s, &a, Some(lease_row.clone()));
+    let env = fenced_env(&sc, &agg, state, 1);
+    let (code, kind) = err_code(evaluate_command(
+        Command::AbandonPrepared(AbandonPreparedCommand {
+            envelope: env,
+            reason_code: FAILURE_REASON_WORKSPACE_UNAVAILABLE,
+        }),
+        &meta(),
+    ));
+    assert_eq!((code, kind), ("IMMUTABLE_ATTEMPT", FailureKind::Denied));
 
     // SettleCancellation on a cancelling task: prepared → cancelled.
     let agg = cancelling_aggregate(sc.workspace_id);

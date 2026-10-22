@@ -25,9 +25,10 @@ use central_task::domain as task;
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
-use crate::app::Service;
+use crate::app::{RecoveryCoordinatorService, Service};
 use crate::domain::*;
 use crate::port::*;
+use crate::resume::{RecoveryCoordinatorFence, RecoveryEpoch, RecoveryEpochState};
 
 const NOW: OffsetDateTime = datetime!(2026-07-27 12:00 UTC);
 
@@ -945,6 +946,103 @@ fn mismatched_receipt_fingerprint_conflicts_before_state_evaluation() {
     assert_eq!(store.lookups(), 1);
     assert_eq!(store.reads(), 0, "receipt conflict must not read state");
     assert_eq!(store.commits(), 0, "receipt conflict must not commit");
+}
+
+// ---------------------------------------------------------------------------
+// recovery.go ClaimNext — an empty claim batch returns the zero
+// `RecoveryWorkspaceClaim` and nil error; exhaustion is `claimed ==
+// false`, never a RECOVERY_CLAIM_UNAVAILABLE failure.
+// ---------------------------------------------------------------------------
+
+struct FakeRecoveryStore {
+    lease: RecoveryCoordinatorLease,
+    epoch: RecoveryEpoch,
+    claims: Vec<RecoveryWorkspaceClaim>,
+    claim_batch_sizes: Arc<Mutex<Vec<u32>>>,
+}
+
+impl RecoveryStore for FakeRecoveryStore {
+    async fn acquire_recovery_coordinator(
+        &self,
+        _request: RecoveryCoordinatorAcquireRequest,
+    ) -> Result<RecoveryCoordinatorLease, Failure> {
+        Ok(self.lease.clone())
+    }
+    async fn start_recovery_epoch(
+        &self,
+        _request: StartRecoveryEpochRequest,
+    ) -> Result<RecoveryEpoch, Failure> {
+        Ok(self.epoch.clone())
+    }
+    async fn claim_recovery_workspaces(
+        &self,
+        request: ClaimRecoveryWorkspaceRequest,
+    ) -> Result<Vec<RecoveryWorkspaceClaim>, Failure> {
+        self.claim_batch_sizes
+            .lock()
+            .unwrap()
+            .push(request.batch_size);
+        Ok(self.claims.clone())
+    }
+    async fn complete_recovery_workspace(
+        &self,
+        _request: CompleteRecoveryWorkspaceRequest,
+    ) -> Result<(), Failure> {
+        Ok(())
+    }
+    async fn resume_recovery_epoch(
+        &self,
+        _request: ResumeRecoveryEpochRequest,
+    ) -> Result<RecoveryEpoch, Failure> {
+        Ok(self.epoch.clone())
+    }
+    async fn list_failed_recovery_workspaces(
+        &self,
+        _epoch_generation: i64,
+        _limit: u32,
+    ) -> Result<FailedRecoveryWorkspaces, Failure> {
+        Ok(FailedRecoveryWorkspaces::default())
+    }
+}
+
+#[test]
+fn claim_next_empty_batch_returns_unclaimed_zero_claim() {
+    let instance_id = InstanceId::new();
+    let epoch = RecoveryEpoch {
+        generation: 3,
+        coordinator_fence: RecoveryCoordinatorFence { generation: 7 },
+        state: RecoveryEpochState::RecoveryEpochDegraded,
+        scheduler_cursor: WorkspaceId::from_trusted_db_bytes([0; 16]),
+        workspace_count: 0,
+        processed_count: 0,
+        claim_cycle: 0,
+        retry_attempt: 0,
+        snapshot_at: NOW,
+    };
+    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+    let store = FakeRecoveryStore {
+        lease: RecoveryCoordinatorLease {
+            recovery_domain: "central.execution.recovery.v1".to_string(),
+            instance_id,
+            fence: RecoveryCoordinatorFence { generation: 7 },
+            expires_at: NOW + Duration::minutes(1),
+            claim_token: vec![b'c'; 32],
+        },
+        epoch: epoch.clone(),
+        claims: vec![],
+        claim_batch_sizes: Arc::clone(&batch_sizes),
+    };
+    let coordinator = RecoveryCoordinatorService::new(store, FixedClock(NOW), instance_id);
+    let claim = block_on(coordinator.claim_next(&epoch)).unwrap();
+    assert!(
+        !claim.claimed && claim.work.workspace_id.is_nil(),
+        "empty batch must yield the zero claim, not an error"
+    );
+    assert_eq!(
+        batch_sizes.lock().unwrap().as_slice(),
+        &[1],
+        "claim_next claims one workspace at a time"
+    );
 }
 
 #[test]

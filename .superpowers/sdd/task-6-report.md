@@ -160,3 +160,37 @@ closed-table rejections); `src/app_tests.rs` 0 → 6; crate total
    generation, `assert_no_active_lease`, and
    `require_recovery_claimable` so the adapter asserts all guards
    inside the same transaction.
+
+## Fix note (e2fe557) — upstream-alignment corrections
+
+1. **`claim_next` empty batch** (`app.rs`): now returns the zero
+   `RecoveryWorkspaceClaim` + `Ok` (upstream `recovery.go:50-56`), not
+   `Internal/RECOVERY_CLAIM_UNAVAILABLE`. `RecoveryWorkspaceClaim`
+   gained a `Default` impl encoding Go's `{}` zero value
+   (`port.rs:380-424`); exhaustion is `claimed == false`.
+2. **`evaluate_start_harness_run`** (`harness_run.rs:95-112`): guards
+   reordered to upstream order (INVALID_ATTEMPT_IDENTITY →
+   ACTIVE_ATTEMPT_CONFLICT → APPROVAL_REQUIRED) and the two missing
+   upstream guards ported — `expected.step != 0 || expected.attempt !=
+   0` joins the conflict check; `state.approval.is_some()` →
+   `Denied`/`APPROVAL_REQUIRED`.
+3. **`evaluate_abandon_prepared`** (`harness_run.rs:199-207`):
+   `AttemptReconciliation` moved out of the `RECONCILIATION_REQUIRED`
+   arm → `IMMUTABLE_ATTEMPT` (upstream `harness_run.go:303-309`).
+   `cancel_prepared_for_recovery` intentionally keeps Reconciliation in
+   `RECONCILIATION_REQUIRED` (upstream `domain.go:419-421`).
+4. **Adjacent flag (not a fix):** `evaluate_recovery` emits
+   `lease_assertions[no_active]` that upstream's adapter mint expresses
+   as an atomic lease expiry, not a separate row. Left as-is; the
+   `RecoveryStore::claim_recovery_workspaces` port contract now
+   documents the adapter must enforce it inside the claim transaction
+   (`port.rs:505-510`).
+
+### Test delta
+
+`src/tests.rs` 20 → 21 (+`start_harness_run_refuses_expected_attempt_and_pending_approval`;
+reconciliation→IMMUTABLE_ATTEMPT arm added inside
+`abandon_prepared_and_settle_cancellation`); `src/app_tests.rs` 6 → 7
+(+`claim_next_empty_batch_returns_unclaimed_zero_claim` with a
+`FakeRecoveryStore`). Crate 26 → 28; workspace 191 → 193, all green
+(fmt + clippy `-D warnings` + `cargo test --workspace`).
