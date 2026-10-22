@@ -1404,7 +1404,15 @@ pub fn finalize(input: &FinalizeInput) -> Result<FinalizeResult, Failure> {
     if !input.current.state.can_transition_to(State::Ready) {
         return Err(Failure::new(FailureClass::Conflict, "INVALID_TRANSITION"));
     }
-    if input.current.ready_key.is_empty() || input.current.content_generation.is_none() {
+    // A `Some(nil)` content generation — reachable only through a
+    // corrupted `from_trusted_db_bytes` snapshot — is a missing
+    // promotion, matching upstream's `ContentGeneration.IsZero()` gate.
+    if input.current.ready_key.is_empty()
+        || input
+            .current
+            .content_generation
+            .is_none_or(|generation| generation.is_nil())
+    {
         return Err(Failure::new(FailureClass::Invalid, "MISSING_PROMOTION"));
     }
 
@@ -1937,6 +1945,9 @@ mod tests {
     fn nil_to_staging() -> StagingGeneration {
         StagingGeneration::from_trusted_db_bytes([0; 16])
     }
+    fn nil_to_content() -> ContentGeneration {
+        ContentGeneration::from_trusted_db_bytes([0; 16])
+    }
     fn nil_to_task() -> TaskId {
         TaskId::from_trusted_db_bytes([0; 16])
     }
@@ -2380,6 +2391,27 @@ mod tests {
             }),
             FailureClass::Invalid,
         );
+    }
+
+    #[test]
+    fn finalize_rejects_nil_content_generation_as_missing_promotion() {
+        // A `Some(nil)` content generation is only reachable through a
+        // corrupted `from_trusted_db_bytes` snapshot; the ready key stays
+        // assigned so only the nil-generation gate can fire.
+        let mut current = promoted_artifact();
+        current.content_generation = Some(nil_to_content());
+        let failure = finalize(&FinalizeInput {
+            workspace_id: current.workspace_id,
+            artifact_id: current.artifact_id,
+            expected: current.version,
+            size: current.verified_size,
+            checksum: current.verified_checksum,
+            ready_object_version: String::new(),
+            current,
+        })
+        .unwrap_err();
+        assert_eq!(failure.class, FailureClass::Invalid);
+        assert_eq!(failure.reason, "MISSING_PROMOTION");
     }
 
     #[test]
