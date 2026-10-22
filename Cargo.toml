@@ -81,9 +81,14 @@ askama = "=0.16.1"
 # the `migrate` feature is prohibited workspace-wide
 sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "macros", "uuid", "time", "json"] }
 
-# central-adapter-s3 only
-aws-sdk-s3 = "=1.154.0"
-aws-config = "=1.13.0"
+# central-adapter-s3 only — defaults off: the SDK's `rustls`/`sso`/
+# `credentials-process` defaults pull the legacy hyper-0.14/rustls-0.21
+# connector alongside the default rustls-0.23 one. The adapter uses the
+# default-https-client connector (aws-lc-rs rustls 0.23), the tokio
+# runtime, and http 1.x types; aws-config is kept only for its
+# unconditional `stalled_stream_protection` re-export.
+aws-sdk-s3 = { version = "=1.154.0", default-features = false, features = ["rt-tokio", "http-1x", "default-https-client"] }
+aws-config = { version = "=1.13.0", default-features = false }
 sha2 = "=0.11.1"
 sha1 = "=0.10.7"
 

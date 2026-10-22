@@ -55,6 +55,15 @@ exceptions = [
     { allow = ["ISC"], crate = "untrusted" },
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
     { allow = ["Zlib"], crate = "foldhash" },
+    # Recorded exceptions added by `central-adapter-s3` — the first
+    # workspace consumer of the AWS SDK's `default-https-client`
+    # connector (rustls 0.23 on AWS-LC): aws-lc-rs carries
+    # `ISC AND (Apache-2.0 OR ISC)`; aws-lc-sys carries the same ISC
+    # conjunct plus a MIT-0 alternative inside an already-satisfied OR.
+    # Unavoidable transitive dependencies, scoped per-crate exactly
+    # like unicode-ident above.
+    { allow = ["ISC"], crate = "aws-lc-rs" },
+    { allow = ["ISC", "MIT-0"], crate = "aws-lc-sys" },
 ]
 
 # --- 2. Sources --------------------------------------------------------------
@@ -114,4 +123,17 @@ skip = [
     { name = "windows_x86_64_gnu", version = "0.48.5" },
     { name = "windows_x86_64_gnullvm", version = "0.48.5" },
     { name = "windows_x86_64_msvc", version = "0.48.5" },
+    # Recorded duplicates introduced by `central-adapter-s3` (the first
+    # AWS SDK consumer): the SDK's checksums/http stack pins the
+    # sha1/md-5/hmac-0.13/base64-0.23/foldhash-0.2 generation while the
+    # sqlx tree and workspace pins keep the earlier generation. Neither
+    # side can move: sqlx is an upstream pin, the AWS crates are pinned
+    # upstream requirements. Each skipped version is the non-canonical
+    # lineage; the retained version is the pre-existing workspace/sqlx
+    # one.
+    { name = "base64", version = "0.23.1" },
+    { name = "foldhash", version = "0.2.0" },
+    { name = "hmac", version = "0.12.1" },
+    { name = "md-5", version = "0.11.0" },
+    { name = "sha1", version = "0.11.0" },
 ]
