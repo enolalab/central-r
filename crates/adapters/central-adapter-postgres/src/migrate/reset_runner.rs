@@ -1,16 +1,17 @@
 //! `ResetRunner` — the version-zero-only reset (`reset_runner.go`).
 //!
 //! `delete_schema` takes the canonical locks on the same session, rechecks
-//! that the observed records are exactly clean `v0` (upstream
-//! `deleteSchemaVersionZeroOnly`), consumes the reset-confirmation proof,
-//! then drops the schemas and roles verbatim and verifies the stock target
-//! afterward.
+//! the ledger-table eligibility (upstream `verifyVersionZeroEligibility`),
+//! then requires and consumes the broker's one-use reset-confirmation
+//! proof — on EVERY path, including a target whose ledger table is absent
+//! — before dropping the schemas and roles verbatim and verifying the
+//! stock target afterward.
 
 use sqlx::PgConnection;
 
 use super::baseline::BaselineInstaller;
 use super::runner::{acquire_migration_locks, release_migration_locks, session_binding};
-use super::verify_shape::{read_migration_records, schema_exists};
+use super::verify_shape::{read_migration_records, schema_exists, table_exists};
 use super::{
     BrokerProofService, ResetConfirmation, ResetRequest, Result, TargetIdentity,
     VersionZeroEligibility,
@@ -19,9 +20,6 @@ use central_foundation::failure::Failure;
 
 fn invalid(code: &'static str, msg: impl Into<String>) -> Failure {
     Failure::invalid(code, msg.into())
-}
-fn conflict(code: &'static str, msg: impl Into<String>) -> Failure {
-    Failure::conflict(code, msg.into())
 }
 
 /// Reset driver bound to one non-rebinding `central_migration` session.
@@ -57,32 +55,32 @@ impl<'a> ResetRunner<'a> {
             .map_err(|err| wrap("reset: session binding", err))?;
 
         let installer = BaselineInstaller::new();
-        let installed = schema_exists(self.conn)
+        // `verifyVersionZeroEligibility` — upstream keys on the ledger
+        // table, not the schema: a missing `central.schema_migrations`
+        // passes the recheck trivially (reset_runner.go:65-81).
+        if table_exists(self.conn, "schema_migrations")
             .await
-            .map_err(|err| wrap("reset: check installed", err))?;
-        if installed {
-            // Owned target — recheck eligibility, then consume the proof.
+            .map_err(|err| wrap("reset: recheck eligibility", err))?
+        {
             let records = read_migration_records(self.conn)
                 .await
                 .map_err(|err| wrap("reset: version-zero recheck", err))?;
             self.delete_version_zero_only(&records, target)?;
-            self.reset_confirmation_proof(binding.clone(), target, &req.confirmation)
-                .await?;
-        } else if installer.verify_stock_target(self.conn).await.is_err() {
-            // Not stock and not installed — there is nothing reset may
-            // legitimately drop.
-            return Err(conflict(
-                "reset_schema_missing",
-                "reset: central schema is missing",
-            ));
         }
-        // Fresh/stock targets converge idempotently with no proof (fresh
-        // reset requests carry no schema ownership).
+        // The broker's one-use reset confirmation is required and
+        // consumed before ANY drop on every path — including the
+        // not-installed path where eligibility passed trivially
+        // (reset_runner.go:43-48). A reset that cannot produce a
+        // confirmation never mutates; a consumed confirmation that later
+        // fails the stock verification still spent its one use, as
+        // upstream.
+        self.reset_confirmation_proof(binding, target, &req.confirmation)
+            .await?;
         self.apply_schema_drop().await?;
         installer
             .verify_stock_target(self.conn)
             .await
-            .map_err(|err| wrap("reset: verify stock target", err))
+            .map_err(|err| wrap("reset: post-reset stock verification", err))
     }
 
     /// `deleteSchemaVersionZeroOnly` — refuse anything except the clean
@@ -142,7 +140,11 @@ impl<'a> ResetRunner<'a> {
             .map_err(|err| wrap("reset: consume reset confirmation", err))
     }
 
-    /// `applySchemaDrop` — drop the central schema and the three roles.
+    /// `applySchemaDrop` — drop the central schemas and the three roles.
+    /// The role set is adapted: upstream drops `central_migrate`; this
+    /// deployment's real provisioned roles are `central_runtime`,
+    /// `central_outbox`, and `central_migration`, so those are dropped
+    /// instead (all `IF EXISTS`, same unconditional-drop semantics).
     async fn apply_schema_drop(&mut self) -> Result<()> {
         let statements = [
             "DROP SCHEMA IF EXISTS central CASCADE",

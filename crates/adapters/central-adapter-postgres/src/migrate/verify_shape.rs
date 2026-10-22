@@ -886,104 +886,133 @@ async fn has_column_update(conn: &mut PgConnection, table: &str, column: &str) -
 /// absent at the table level.
 pub(crate) async fn verify_migration_shapes(conn: &mut PgConnection) -> Result<()> {
     for shape in MIGRATION_SHAPES {
-        let label = shape.checksum;
-        for table in shape.tables {
-            if !table_exists(conn, table).await? {
-                return Err(invalid(
-                    "migration_shape_missing_table",
-                    format!("{label}: missing central.{table}"),
-                ));
-            }
+        verify_migration_shape(conn, shape).await?;
+    }
+    Ok(())
+}
+
+/// One migration's owned-object checks, addressed by version — the
+/// clean-path re-verification upstream's ApplyBXX runs even when the
+/// ledger row is already clean (b08.go:346-351, b26…:175-179,
+/// b37…:592-594).
+///
+/// # Errors
+/// `migration_shape_unknown` when the corpus has no shape for `version`;
+/// the shape's first missing/stray object otherwise.
+pub(crate) async fn verify_migration_shape_for_version(
+    conn: &mut PgConnection,
+    version: i64,
+) -> Result<()> {
+    let Some(shape) = MIGRATION_SHAPES.iter().find(|s| s.version == version) else {
+        return Err(invalid(
+            "migration_shape_unknown",
+            format!("no corpus shape spec for version {version}"),
+        ));
+    };
+    verify_migration_shape(conn, shape).await
+}
+
+async fn verify_migration_shape(
+    conn: &mut PgConnection,
+    shape: &super::shape_spec::MigrationShape,
+) -> Result<()> {
+    let label = shape.checksum;
+    for table in shape.tables {
+        if !table_exists(conn, table).await? {
+            return Err(invalid(
+                "migration_shape_missing_table",
+                format!("{label}: missing central.{table}"),
+            ));
         }
-        for (table, column) in shape.columns {
-            if !column_exists(conn, table, column).await? {
-                return Err(invalid(
-                    "migration_shape_missing_column",
-                    format!("{label}: missing column central.{table}.{column}"),
-                ));
-            }
+    }
+    for (table, column) in shape.columns {
+        if !column_exists(conn, table, column).await? {
+            return Err(invalid(
+                "migration_shape_missing_column",
+                format!("{label}: missing column central.{table}.{column}"),
+            ));
         }
-        for index in shape.indexes {
-            if !index_named_exists(conn, index).await? {
-                return Err(invalid(
-                    "migration_shape_missing_index",
-                    format!("{label}: missing index central.{index}"),
-                ));
-            }
+    }
+    for index in shape.indexes {
+        if !index_named_exists(conn, index).await? {
+            return Err(invalid(
+                "migration_shape_missing_index",
+                format!("{label}: missing index central.{index}"),
+            ));
         }
-        for constraint in shape.constraints {
-            if !constraint_named_exists(conn, constraint).await? {
-                return Err(invalid(
-                    "migration_shape_missing_constraint",
-                    format!("{label}: missing constraint {constraint}"),
-                ));
-            }
+    }
+    for constraint in shape.constraints {
+        if !constraint_named_exists(conn, constraint).await? {
+            return Err(invalid(
+                "migration_shape_missing_constraint",
+                format!("{label}: missing constraint {constraint}"),
+            ));
         }
-        for constraint in shape.absent_constraints {
-            if constraint_named_exists(conn, constraint).await? {
-                return Err(invalid(
-                    "migration_shape_stray_constraint",
-                    format!("{label}: stray constraint {constraint}"),
-                ));
-            }
+    }
+    for constraint in shape.absent_constraints {
+        if constraint_named_exists(conn, constraint).await? {
+            return Err(invalid(
+                "migration_shape_stray_constraint",
+                format!("{label}: stray constraint {constraint}"),
+            ));
         }
-        for index in shape.absent_indexes {
-            if index_named_exists(conn, index).await? {
-                return Err(invalid(
-                    "migration_shape_stray_index",
-                    format!("{label}: stray index central.{index}"),
-                ));
-            }
+    }
+    for index in shape.absent_indexes {
+        if index_named_exists(conn, index).await? {
+            return Err(invalid(
+                "migration_shape_stray_index",
+                format!("{label}: stray index central.{index}"),
+            ));
         }
-        for function in shape.functions {
-            if !function_named_exists(conn, function).await? {
-                return Err(invalid(
-                    "migration_shape_missing_function",
-                    format!("{label}: missing function central.{function}"),
-                ));
-            }
+    }
+    for function in shape.functions {
+        if !function_named_exists(conn, function).await? {
+            return Err(invalid(
+                "migration_shape_missing_function",
+                format!("{label}: missing function central.{function}"),
+            ));
         }
-        for trigger in shape.triggers {
-            if !trigger_named_exists(conn, trigger).await? {
-                return Err(invalid(
-                    "migration_shape_missing_trigger",
-                    format!("{label}: missing trigger {trigger}"),
-                ));
-            }
+    }
+    for trigger in shape.triggers {
+        if !trigger_named_exists(conn, trigger).await? {
+            return Err(invalid(
+                "migration_shape_missing_trigger",
+                format!("{label}: missing trigger {trigger}"),
+            ));
         }
-        for trigger in shape.absent_triggers {
-            if trigger_named_exists(conn, trigger).await? {
-                return Err(invalid(
-                    "migration_shape_stray_trigger",
-                    format!("{label}: stray trigger {trigger}"),
-                ));
-            }
+    }
+    for trigger in shape.absent_triggers {
+        if trigger_named_exists(conn, trigger).await? {
+            return Err(invalid(
+                "migration_shape_stray_trigger",
+                format!("{label}: stray trigger {trigger}"),
+            ));
         }
-        for (table, privilege) in shape.runtime_grants {
-            if !has_table_privilege(conn, table, privilege).await? {
-                return Err(invalid(
-                    "migration_shape_missing_grant",
-                    format!("{label}: central_runtime missing {privilege} on central.{table}"),
-                ));
-            }
+    }
+    for (table, privilege) in shape.runtime_grants {
+        if !has_table_privilege(conn, table, privilege).await? {
+            return Err(invalid(
+                "migration_shape_missing_grant",
+                format!("{label}: central_runtime missing {privilege} on central.{table}"),
+            ));
         }
-        for (table, privilege) in shape.revoked_table_privileges {
-            if runtime_acl_entries(conn, table, privilege).await? != 0 {
-                return Err(invalid(
-                    "migration_shape_stray_privilege",
-                    format!(
-                        "{label}: central_runtime still holds table-level {privilege} on central.{table}"
-                    ),
-                ));
-            }
+    }
+    for (table, privilege) in shape.revoked_table_privileges {
+        if runtime_acl_entries(conn, table, privilege).await? != 0 {
+            return Err(invalid(
+                "migration_shape_stray_privilege",
+                format!(
+                    "{label}: central_runtime still holds table-level {privilege} on central.{table}"
+                ),
+            ));
         }
-        for (table, column) in shape.column_grants {
-            if !has_column_update(conn, table, column).await? {
-                return Err(invalid(
-                    "migration_shape_missing_column_grant",
-                    format!("{label}: central_runtime missing UPDATE on central.{table}.{column}"),
-                ));
-            }
+    }
+    for (table, column) in shape.column_grants {
+        if !has_column_update(conn, table, column).await? {
+            return Err(invalid(
+                "migration_shape_missing_column_grant",
+                format!("{label}: central_runtime missing UPDATE on central.{table}.{column}"),
+            ));
         }
     }
     Ok(())

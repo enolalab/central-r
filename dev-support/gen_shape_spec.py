@@ -2,7 +2,10 @@
 """Generate shape_spec.rs from central-rust/migrations/*.sql + manifest.json."""
 import json, re, sys, os
 
-MIG = "$CENTRAL_RUST_SRC/migrations"
+# Corpus directory: argv[1] if given, else ../migrations relative to this
+# script so the generator works from any checkout location.
+MIG = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "migrations")
 manifest = json.load(open(os.path.join(MIG, "manifest.json")))["migrations"]
 manifest.sort(key=lambda m: m["version"])
 

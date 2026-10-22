@@ -45,29 +45,41 @@ impl BaselineInstaller {
     /// * schema checks or chain admission fail, or
     /// * a migration replay or post-conditions fails.
     pub async fn install(&self, conn: &mut PgConnection) -> Result<()> {
-        if !schema_exists(conn).await? {
-            self.verify_stock_target(conn).await?;
-            self.replay_all(conn).await?;
-            return Ok(());
-        }
-
-        // Existing-target admission is itself a migration mutation: hold the
-        // canonical migration locks and authenticate the checksum ledger
-        // before allowing any legacy repair or resume to mutate.
+        // The whole install is serialized on the canonical migration
+        // locks, as upstream serializes via the runner-held locks plus
+        // each ApplyBXX's own acquisition (b08.go:322 et seq.). The corpus
+        // files embed no lock statements, and the Runner only holds locks
+        // on its prepare→commit path — without this bracket two
+        // concurrent installs on the same target could both pass the
+        // stock check and double-commit `migration_checksums` rows (its
+        // (version, recorded_at) uniqueness admits rows whose recorded_at
+        // differs) or race the clean-marker UPDATEs. `pg_advisory_lock`
+        // is session-reentrant, so a Runner-held lock makes this a nested
+        // no-op; the release below only pops the level this call took.
         super::runner::acquire_migration_locks(conn).await?;
-        let mut lock_result: Result<()> = Ok(());
-        if let Err(err) = self.install_on_existing(conn).await {
-            lock_result = Err(err);
-        }
+        let result = self.install_serialized(conn).await;
         let release = super::runner::release_migration_locks(conn).await;
-        match (lock_result, release) {
+        match (result, release) {
             (Err(err), _) | (_, Err(err)) => Err(err),
             (Ok(()), Ok(())) => Ok(()),
         }
     }
 
-    /// The existing-target path: admit → ledger → optional v0 repair →
-    /// replay every missing-or-dirty file in manifest order.
+    /// The serialized install body: fresh targets replay the corpus;
+    /// existing targets go through ledger admission, repair, and resume.
+    async fn install_serialized(&self, conn: &mut PgConnection) -> Result<()> {
+        if !schema_exists(conn).await? {
+            self.verify_stock_target(conn).await?;
+            self.replay_all(conn).await?;
+            return Ok(());
+        }
+        self.install_on_existing(conn).await
+    }
+
+    /// The existing-target path (runs under [`Self::install`]'s lock
+    /// bracket): admit → authenticate the checksum ledger → optional v0
+    /// repair → replay every missing-or-dirty file in manifest order,
+    /// re-verifying each clean record's shape along the way.
     async fn install_on_existing(&self, conn: &mut PgConnection) -> Result<()> {
         let records = read_migration_records(conn).await?;
         let state = admit_install_chain(&records).map_err(|err| {
@@ -225,7 +237,15 @@ impl BaselineInstaller {
         Ok(())
     }
 
-    /// Replay every file whose record is missing or dirty, in order.
+    /// Replay every file whose record is missing or dirty, in order —
+    /// and re-verify the shape of every record already clean, as each
+    /// upstream ApplyBXX does on its clean path (b08.go:346-351,
+    /// b26_recovery_bootstrap_registration.go:175-179,
+    /// b37_retry_idempotency.go:592-594): a clean ledger row is not
+    /// taken on trust. The clean `v0` record re-runs the strict
+    /// baseline audit (upstream ApplyB08 runs `VerifyShape`
+    /// unconditionally on a clean chain); later versions run the
+    /// corpus's presence-level owned-object checks.
     async fn replay_missing(
         &self,
         conn: &mut PgConnection,
@@ -235,14 +255,34 @@ impl BaselineInstaller {
             let clean = records
                 .iter()
                 .any(|r| r.version == entry.version && r.checksum == entry.checksum && !r.dirty);
-            if !clean {
-                self.replay(conn, entry).await?;
+            if clean {
+                if entry.version == 0 {
+                    self.verify_shape(conn).await?;
+                } else {
+                    super::verify_shape::verify_migration_shape_for_version(conn, entry.version)
+                        .await?;
+                }
+                continue;
             }
+            self.replay(conn, entry).await?;
         }
         Ok(())
     }
 
-    /// Execute one trusted migration file verbatim.
+    /// Execute one trusted migration file verbatim, then assert the
+    /// committed ledger end-state the file's own clean-marker
+    /// transaction must produce. Upstream asserts
+    /// `tag.RowsAffected() == 1` on the clean-marker
+    /// `UPDATE ... WHERE version AND checksum AND dirty`
+    /// (b08.go:1353 et seq.). That guard cannot be lifted verbatim:
+    /// `sqlx::raw_sql` runs the file whole and its aggregated
+    /// `PgQueryResult` carries no per-statement command tag, and the
+    /// corpus must not be split to isolate the statement. Asserting the
+    /// committed end-state is equivalent on every reachable path —
+    /// replay only runs for a missing or dirty record, and the
+    /// canonical locks held by [`Self::install`] exclude concurrent
+    /// mutators — so exactly one clean `(version, checksum)` row must
+    /// now exist.
     async fn replay(&self, conn: &mut PgConnection, entry: &super::MigrationEntry) -> Result<()> {
         tracing::info!(
             version = entry.version,
@@ -252,8 +292,24 @@ impl BaselineInstaller {
         sqlx::raw_sql(entry.sql)
             .execute(&mut *conn)
             .await
-            .ctx("migration replay")
-            .map(|_| ())
+            .ctx("migration replay")?;
+        let dirty = sqlx::query(
+            "SELECT dirty FROM central.schema_migrations \
+             WHERE version = $1 AND checksum = $2",
+        )
+        .bind(entry.version)
+        .bind(entry.checksum)
+        .fetch_optional(&mut *conn)
+        .await
+        .ctx("migration replay: inspect clean marker")?
+        .map(|row| row.get::<bool, _>(0));
+        match dirty {
+            Some(false) => Ok(()),
+            Some(true) | None => Err(invalid(
+                "migration_clean_marker_raced",
+                "migration replay: dirty marker changed before clean commit",
+            )),
+        }
     }
 
     /// `verifyB08LegacyToolLinkage` — legacy ToolCall rows must each have

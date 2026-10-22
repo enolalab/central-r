@@ -19,7 +19,7 @@ use central_adapter_postgres::migrate::{
     ResetConfirmation, ResetRequest, ResetRunner, Result, ResumeRequest, Runner, SessionBinding,
     TargetIdentity, VerifiedEmptyTarget, WITHOUT_V15_CHAIN, reapply_runtime_grants,
 };
-use central_foundation::failure::Failure;
+use central_foundation::failure::{Failure, FailureKind};
 use sqlx::{Connection, PgConnection, Row};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -340,6 +340,85 @@ async fn test_runner_rejects_proof_binding_mismatch() -> std::result::Result<(),
 }
 
 #[tokio::test]
+async fn test_runner_commit_rejects_forged_session_binding() -> std::result::Result<(), Failure> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = provision(&mut admin, "bind").await?;
+    let result = async {
+        let mut conn = role_conn(&db, "central_migration").await?;
+        let broker = Arc::new(FakeBroker::default());
+        let op = uuid::Uuid::now_v7();
+        let mut runner = Runner::new(&mut conn, Some(broker));
+        let prepare = runner
+            .prepare_up(&PrepareUpRequest {
+                operation_id: op,
+                target: target(&db),
+            })
+            .await?;
+        // A forged binding — complete shape, wrong boot identity — must
+        // be refused by the same-session fence before the proof service
+        // is consulted.
+        let mut forged = prepare.session_binding.clone();
+        forged.boot_id = "postmaster:1970-01-01 00:00:00+00".to_owned();
+        let err = runner
+            .commit_up(&CommitUpRequest {
+                operation_id: op,
+                target: target(&db),
+                session_binding: forged.clone(),
+                proof: empty_proof(op, forged),
+            })
+            .await;
+        assert_eq!(
+            err.err().map(|e| e.code().to_owned()),
+            Some("runner_session_binding_mismatch".to_owned())
+        );
+        Ok(())
+    }
+    .await;
+    drop_db(&mut admin, &db).await;
+    result
+}
+
+#[tokio::test]
+async fn test_runner_resume_rejects_stale_instance_binding() -> std::result::Result<(), Failure> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = provision(&mut admin, "resbind").await?;
+    let result = async {
+        let mut conn = role_conn(&db, "central_migration").await?;
+        BaselineInstaller::new().install(&mut conn).await?;
+        // An expected binding captured on a different postmaster
+        // generation must be rejected by the instance fence — Conflict,
+        // matching upstream's SESSION_BINDING_MISMATCH — before any
+        // repair or fresh-install leg runs.
+        let stale = SessionBinding {
+            backend_pid: 0,
+            backend_start: "1970-01-01 00:00:00+00".to_owned(),
+            boot_id: "postmaster:1970-01-01 00:00:00+00".to_owned(),
+            lock_identities: Vec::new(),
+        };
+        let op = uuid::Uuid::now_v7();
+        let mut runner = Runner::new(&mut conn, None::<Arc<FakeBroker>>);
+        let failure = runner
+            .resume(&ResumeRequest {
+                operation_id: op,
+                target: target(&db),
+                expected_session_binding: stale,
+                session_binding: SessionBinding::default(),
+                proof: empty_proof(op, SessionBinding::default()),
+            })
+            .await
+            .expect_err("resume must reject a stale instance binding");
+        assert_eq!(failure.code(), "session_binding_mismatch");
+        assert_eq!(failure.kind(), FailureKind::Conflict);
+        Ok(())
+    }
+    .await;
+    drop_db(&mut admin, &db).await;
+    result
+}
+
+#[tokio::test]
 async fn test_inspector_facts_and_verify_serve_baseline() -> std::result::Result<(), Failure> {
     skip!();
     let mut admin = admin_conn().await?;
@@ -374,12 +453,16 @@ async fn test_reapply_runtime_grants_restores_revoked_grants() -> std::result::R
         ] {
             if let Err(err) = sqlx::query(stmt).execute(&mut mig).await {
                 // provider_turns may not exist under that name on this
-                // corpus — tolerate "undefined table" only.
-                let failure = sanitize(&err);
-                if stmt.contains("provider_turns") {
+                // corpus — tolerate only "undefined table" (42P01);
+                // every other error fails.
+                let undefined_table = matches!(
+                    &err,
+                    sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01")
+                );
+                if stmt.contains("provider_turns") && undefined_table {
                     continue;
                 }
-                return Err(failure);
+                return Err(sanitize(&err));
             }
         }
         reapply_runtime_grants(&mut mig).await?;
