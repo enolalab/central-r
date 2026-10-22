@@ -783,6 +783,8 @@ version = "0.1.0"
 name = "central-kernel"
 version = "0.1.0"
 dependencies = [
+ "central-artifact",
+ "central-execution",
  "central-foundation",
  "rand 0.10.3",
  "serde",

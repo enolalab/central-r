@@ -16,9 +16,13 @@
 //! Ports `internal/kernel` (upstream Go): [`lifecycle`] carries the
 //! supervised profile runner and exit-class contract, [`readiness`] the
 //! profile-aware health state, and [`readyproof`] the nonce-bound launch
-//! proof with its publisher port. The listener/TLS/control-lock stages
+//! proof with its publisher port, and [`artifact_reconcile`] the
+//! kernel-owned supervised wrapper for the periodic fenced Artifact
+//! reconciliation pass (upstream `cmd/central`'s
+//! `serveArtifactReconcilePass`). The listener/TLS/control-lock stages
 //! of the upstream `Run` land with the R3 serve composition.
 
+pub mod artifact_reconcile;
 pub mod lifecycle;
 pub mod readiness;
 pub mod readyproof;
