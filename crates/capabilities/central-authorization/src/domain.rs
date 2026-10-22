@@ -21,7 +21,8 @@
 
 use central_foundation::failure::Failure;
 use central_foundation::identity::{
-    ApprovalId, ConfigBindingId, InstanceId, OperationId, SecretUseEvidenceId, TaskId, WorkspaceId,
+    ApprovalId, ConfigBindingId, InstanceId, OperationId, RunId, SecretUseEvidenceId, StepId,
+    TaskId, WorkspaceId,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -636,8 +637,58 @@ pub fn validate_grant_lifetime(
 // Capability-grant approval records (adapter-mapping §3.18)
 // ---------------------------------------------------------------------------
 
+/// The row class a `central.approvals` record represents
+/// (`approvals.approval_kind`, b08: `capability` | `execution` — the
+/// complete upstream vocabulary per
+/// `approvals_execution_subject_b08_check`).
+///
+/// `Capability` rows are capability-grant effective-authority records
+/// owned by this domain. `Execution` rows are the b08 subject-bound
+/// approval evidence owned by the execution capability — this record
+/// carries their columns so the adapter can persist either kind
+/// without re-modeling, but their lifecycle is decided elsewhere.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApprovalKind {
+    /// A capability-grant record (this domain's lifecycle).
+    Capability,
+    /// A b08 execution approval — subject-bound
+    /// (`task/run/step + logical operation`) pending decision.
+    Execution,
+}
+
+impl ApprovalKind {
+    /// Canonical database text.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Capability => "capability",
+            Self::Execution => "execution",
+        }
+    }
+
+    /// Parses the canonical text.
+    pub fn parse(text: &str) -> Result<Self, Failure> {
+        match text {
+            "capability" => Ok(Self::Capability),
+            "execution" => Ok(Self::Execution),
+            _ => Err(Failure::invalid(
+                codes::APPROVAL_INVALID,
+                "unknown approval kind",
+            )),
+        }
+    }
+}
+
+impl serde::Serialize for ApprovalKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// The recorded action a capability-grant row represents
-/// (`approvals.action`: `grant` | `revoke`).
+/// (`approvals.action`: `grant` | `revoke`). The column went nullable
+/// in b08 — execution-kind rows record no action.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApprovalAction {
@@ -673,14 +724,21 @@ impl serde::Serialize for ApprovalAction {
     }
 }
 
-/// Effective-grant record state (`approvals.state`:
-/// `active` | `revoked` | `suspended` | `expired`).
+/// Persisted record state (`approvals.state`, the b08-widened
+/// `approvals_state_check`: `active` | `revoked` | `suspended` |
+/// `expired` | `pending` | `approved` | `rejected` | `superseded`).
 ///
-/// These are effective-authority states, distinct from the historical
-/// Approval aggregate's `requested`/`approved`/`rejected`/`cancelled`
-/// lifecycle (capability-policy.md §Approval and effective grant) and
-/// from the b08 `execution` approval kind's vocabulary — both owned
-/// elsewhere.
+/// `Active`/`Revoked`/`Suspended`/`Expired` are the capability-grant
+/// effective-authority states owned by this domain. `Pending`/
+/// `Approved`/`Rejected`/`Superseded` are the b08 `execution` kind's
+/// vocabulary (upstream `internal/execution` `ApprovalState`:
+/// `pending` is its only non-terminal state); they exist so the
+/// record can carry an execution-kind row — the capability lifecycle
+/// evaluators below never produce them.
+///
+/// Both vocabularies stay distinct from the historical Approval
+/// aggregate's `requested`/`approved`/`rejected`/`cancelled`
+/// lifecycle (capability-policy.md §Approval and effective grant).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApprovalState {
@@ -692,6 +750,15 @@ pub enum ApprovalState {
     Suspended,
     /// Passed its expiry. Terminal.
     Expired,
+    /// Execution-kind: recorded, awaiting decision. Non-terminal
+    /// (upstream: the only non-terminal execution state).
+    Pending,
+    /// Execution-kind: decided allow. Terminal.
+    Approved,
+    /// Execution-kind: decided deny. Terminal.
+    Rejected,
+    /// Execution-kind: replaced by a successor approval. Terminal.
+    Superseded,
 }
 
 impl ApprovalState {
@@ -703,25 +770,39 @@ impl ApprovalState {
             Self::Revoked => "revoked",
             Self::Suspended => "suspended",
             Self::Expired => "expired",
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Superseded => "superseded",
         }
     }
 
-    /// Parses the canonical text.
+    /// Parses the canonical text — the full persisted vocabulary of
+    /// both approval kinds.
     pub fn parse(text: &str) -> Result<Self, Failure> {
         match text {
             "active" => Ok(Self::Active),
             "revoked" => Ok(Self::Revoked),
             "suspended" => Ok(Self::Suspended),
             "expired" => Ok(Self::Expired),
+            "pending" => Ok(Self::Pending),
+            "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected),
+            "superseded" => Ok(Self::Superseded),
             _ => Err(Failure::invalid(codes::APPROVAL_INVALID, "unknown state")),
         }
     }
 
-    /// Whether the state is final — `revoked` and `expired` never
-    /// transition again.
+    /// Whether the state is final and never transitions again —
+    /// `revoked`/`expired` for capability grants; every valid
+    /// execution state except `pending` (upstream
+    /// `ApprovalState.IsTerminal`).
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Revoked | Self::Expired)
+        matches!(
+            self,
+            Self::Revoked | Self::Expired | Self::Approved | Self::Rejected | Self::Superseded
+        )
     }
 
     /// Whether a grant in this state can be effective (before epoch and
@@ -775,8 +856,19 @@ pub struct ApprovalChangeSet {
     pub next: ApprovalRecord,
 }
 
-/// One `central.approvals` capability-grant row (adapter-mapping
-/// §3.18) — the durable record of an effective-authority decision.
+/// One `central.approvals` row (adapter-mapping §3.18 + the b08
+/// widening) — the durable record of an authority decision.
+///
+/// The b08 migration made the capability legs nullable and added the
+/// execution-subject and decision columns; [`ApprovalRecord::validate`]
+/// enforces the `approvals_execution_subject_b08_check` shape: every
+/// capability leg is required iff `approval_kind == Capability`, and
+/// the full subject leg set is required iff `Execution`.
+///
+/// `logical_operation_id` and `decision_id` are opaque 16-byte values,
+/// NOT UUIDv7 identities: upstream `LogicalOperationID` is a random
+/// `[16]byte` and `DecisionID` a truncated SHA-256 — they ride as raw
+/// bytes so the adapter writes the `uuid` columns directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalRecord {
     /// Row identity.
@@ -785,25 +877,68 @@ pub struct ApprovalRecord {
     pub workspace_id: WorkspaceId,
     /// Optimistic-lock version.
     pub version: u64,
-    /// Canonical `resource.effect` capability identity.
-    pub capability_identity: String,
-    /// Canonical scope selector the grant binds.
-    pub scope: String,
-    /// `grant` | `revoke` — the recorded action.
-    pub action: ApprovalAction,
-    /// Actor identity the grant was issued to/for.
-    pub actor_identity: String,
-    /// Authority identity that established the record.
-    pub authority_identity: String,
-    /// Auditable reason.
-    pub reason: String,
-    /// Effective-authority state.
+    /// Row class — `capability` (this domain) or `execution` (b08).
+    pub approval_kind: ApprovalKind,
+    /// Canonical `resource.effect` capability identity — required iff
+    /// `approval_kind == Capability` (b08 dropped `NOT NULL`).
+    pub capability_identity: Option<String>,
+    /// Canonical scope selector the grant binds — same nullability.
+    pub scope: Option<String>,
+    /// `grant` | `revoke` — same nullability.
+    pub action: Option<ApprovalAction>,
+    /// Actor identity the grant was issued to/for — same nullability.
+    pub actor_identity: Option<String>,
+    /// Authority identity that established the record — same
+    /// nullability.
+    pub authority_identity: Option<String>,
+    /// Auditable reason — same nullability.
+    pub reason: Option<String>,
+    /// Persisted state — the capability or execution vocabulary per
+    /// `approval_kind`.
     pub state: ApprovalState,
     /// Why the grant is suspended — required iff `Suspended`.
     pub suspend_reason: Option<String>,
     /// Security epoch at issuance; a grant dies with its epoch
     /// (post-restore reset).
     pub security_epoch: u64,
+    // -- b08 subject legs (execution kind) ----------------------------------
+    /// Subject Task (`approvals.task_id`). Required iff `Execution`;
+    /// for a task-scoped capability grant the grant's bound Task.
+    pub task_id: Option<TaskId>,
+    /// Subject Run (`approvals.run_id`). Required iff `Execution`.
+    pub run_id: Option<RunId>,
+    /// Subject Step (`approvals.step_id`). Required iff `Execution`.
+    pub step_id: Option<StepId>,
+    /// Subject row version the decision was evaluated against
+    /// (`approvals.subject_version`). Required iff `Execution`.
+    pub subject_version: Option<u64>,
+    /// Logical operation the decision binds — opaque 16 bytes
+    /// (`approvals.logical_operation_id`). Required iff `Execution`.
+    pub logical_operation_id: Option<[u8; 16]>,
+    /// SHA-256 digest of the approved operation
+    /// (`approvals.operation_digest`, exactly 32 bytes). Required iff
+    /// `Execution`.
+    pub operation_digest: Option<[u8; 32]>,
+    /// Expected step-row version guard
+    /// (`approvals.expected_step_version`). Required iff `Execution`.
+    pub expected_step_version: Option<u64>,
+    // -- b08 decision legs ---------------------------------------------------
+    /// Identity that recorded the decision
+    /// (`approvals.decision_actor`; b08 backfill: `actor_identity`).
+    pub decision_actor: Option<String>,
+    /// Auditable decision reason (`approvals.decision_reason`;
+    /// backfill: `reason`).
+    pub decision_reason: Option<String>,
+    /// Decision identity — opaque 16 bytes, a derived value upstream,
+    /// not a UUIDv7 (`approvals.decision_id`).
+    pub decision_id: Option<[u8; 16]>,
+    /// Decision time (`approvals.decided_at`).
+    pub decided_at: Option<OffsetDateTime>,
+    /// Superseded-by chain (`approvals.predecessor_approval_id`).
+    pub predecessor_approval_id: Option<ApprovalId>,
+    /// Record time (`approvals.recorded_at`; backfill: `created_at`).
+    /// Required iff `Execution`.
+    pub recorded_at: Option<OffsetDateTime>,
     /// Issuance time.
     pub created_at: OffsetDateTime,
     /// Last decision time.
@@ -814,41 +949,75 @@ pub struct ApprovalRecord {
 }
 
 impl ApprovalRecord {
-    /// Validates the persisted-record invariants: bounded text legs,
-    /// taxonomy-parseable capability identity, suspend-reason shape,
-    /// and the ≤ 24 h grant lifetime.
+    /// Validates the persisted-record invariants: bounded present text
+    /// legs, per-kind presence (every capability leg iff `Capability`;
+    /// the `approvals_execution_subject_b08_check` set iff
+    /// `Execution`), a taxonomy-parseable capability identity,
+    /// suspend-reason shape, and the ≤ 24 h grant lifetime.
     pub fn validate(&self) -> Result<(), Failure> {
-        if self.capability_identity.is_empty()
-            || self.capability_identity.len() > MAX_CAPABILITY_IDENTITY_BYTES
-        {
-            return Err(Failure::invalid(
-                codes::APPROVAL_INVALID,
-                "capability_identity must be 1..=128 bytes",
-            ));
-        }
-        Capability::parse(&self.capability_identity).map_err(|_| {
-            Failure::invalid(
-                codes::APPROVAL_INVALID,
-                "capability_identity is outside the closed taxonomy",
-            )
-        })?;
-        for (name, text, max) in [
-            ("scope", &self.scope, MAX_SCOPE_BYTES),
-            ("actor_identity", &self.actor_identity, MAX_IDENTITY_BYTES),
+        for (text, max) in [
             (
-                "authority_identity",
-                &self.authority_identity,
-                MAX_IDENTITY_BYTES,
+                self.capability_identity.as_deref(),
+                MAX_CAPABILITY_IDENTITY_BYTES,
             ),
-            ("reason", &self.reason, MAX_REASON_BYTES),
+            (self.scope.as_deref(), MAX_SCOPE_BYTES),
+            (self.actor_identity.as_deref(), MAX_IDENTITY_BYTES),
+            (self.authority_identity.as_deref(), MAX_IDENTITY_BYTES),
+            (self.reason.as_deref(), MAX_REASON_BYTES),
+            (self.decision_actor.as_deref(), MAX_IDENTITY_BYTES),
+            (self.decision_reason.as_deref(), MAX_REASON_BYTES),
         ] {
-            if text.is_empty() || text.len() > max {
+            if text.is_some_and(|leg| leg.is_empty() || leg.len() > max) {
                 return Err(Failure::invalid(
                     codes::APPROVAL_INVALID,
-                    "a required text leg is empty or over its bound",
+                    "a text leg is empty or over its bound",
                 ));
             }
-            let _ = name;
+        }
+        match self.approval_kind {
+            ApprovalKind::Capability => {
+                let Some(identity) = self.capability_identity.as_deref() else {
+                    return Err(Failure::invalid(
+                        codes::APPROVAL_INVALID,
+                        "a capability approval requires capability_identity",
+                    ));
+                };
+                if self.scope.is_none()
+                    || self.action.is_none()
+                    || self.actor_identity.is_none()
+                    || self.authority_identity.is_none()
+                    || self.reason.is_none()
+                {
+                    return Err(Failure::invalid(
+                        codes::APPROVAL_INVALID,
+                        "a capability approval requires every capability leg",
+                    ));
+                }
+                Capability::parse(identity).map_err(|_| {
+                    Failure::invalid(
+                        codes::APPROVAL_INVALID,
+                        "capability_identity is outside the closed taxonomy",
+                    )
+                })?;
+            }
+            ApprovalKind::Execution => {
+                // `approvals_execution_subject_b08_check` verbatim:
+                // the complete subject leg set plus `recorded_at`.
+                if self.task_id.is_none()
+                    || self.run_id.is_none()
+                    || self.step_id.is_none()
+                    || self.subject_version.is_none()
+                    || self.logical_operation_id.is_none()
+                    || self.operation_digest.is_none()
+                    || self.expected_step_version.is_none()
+                    || self.recorded_at.is_none()
+                {
+                    return Err(Failure::invalid(
+                        codes::APPROVAL_INVALID,
+                        "an execution approval requires the full subject leg set",
+                    ));
+                }
+            }
         }
         match (self.state, &self.suspend_reason) {
             (ApprovalState::Suspended, Some(reason))
@@ -870,22 +1039,41 @@ impl ApprovalRecord {
         validate_grant_lifetime(self.created_at, self.expiry_at)
     }
 
-    /// Establishes a new active `grant` record (version 0).
+    /// Establishes a new active `grant` record (version 0) —
+    /// `approval_kind = capability` with every capability leg present.
+    /// The decision legs follow the b08 backfill convention
+    /// (`decision_actor ← actor`, `decision_reason ← reason`,
+    /// `recorded_at ← created`) and `task_id` carries the grant's
+    /// bound Task.
     pub fn grant(request: GrantRequest) -> Result<Self, Failure> {
         request.scope.validate()?;
         let record = Self {
             id: ApprovalId::new(),
             workspace_id: request.workspace_id,
             version: 0,
-            capability_identity: request.capability.identity(),
-            scope: request.scope.selector,
-            action: ApprovalAction::Grant,
-            actor_identity: request.actor_identity,
-            authority_identity: request.authority_identity,
-            reason: request.reason,
+            approval_kind: ApprovalKind::Capability,
+            capability_identity: Some(request.capability.identity()),
+            scope: Some(request.scope.selector),
+            action: Some(ApprovalAction::Grant),
+            actor_identity: Some(request.actor_identity.clone()),
+            authority_identity: Some(request.authority_identity),
+            reason: Some(request.reason.clone()),
             state: ApprovalState::Active,
             suspend_reason: None,
             security_epoch: request.security_epoch,
+            task_id: request.scope.task_id,
+            run_id: None,
+            step_id: None,
+            subject_version: None,
+            logical_operation_id: None,
+            operation_digest: None,
+            expected_step_version: None,
+            decision_actor: Some(request.actor_identity),
+            decision_reason: Some(request.reason),
+            decision_id: None,
+            decided_at: None,
+            predecessor_approval_id: None,
+            recorded_at: Some(request.issued_at),
             created_at: request.issued_at,
             updated_at: request.issued_at,
             expiry_at: request.expiry_at,
@@ -922,8 +1110,8 @@ impl ApprovalRecord {
         self.terminal_guard()?;
         let mut next = self.clone();
         next.state = ApprovalState::Revoked;
-        next.action = ApprovalAction::Revoke;
-        next.reason = reason.into();
+        next.action = Some(ApprovalAction::Revoke);
+        next.reason = Some(reason.into());
         next.suspend_reason = None;
         next.validate()?;
         Ok(self.guarded(next, at))
@@ -995,13 +1183,19 @@ impl ApprovalRecord {
         at: OffsetDateTime,
         current_security_epoch: u64,
     ) -> Option<EffectiveGrant> {
-        if self.action != ApprovalAction::Grant
+        if self.approval_kind != ApprovalKind::Capability
+            || self.action != Some(ApprovalAction::Grant)
             || !self.state.grants()
             || self.security_epoch != current_security_epoch
             || self.expiry_at.is_some_and(|expiry| expiry <= at)
         {
             return None;
         }
+        let (Some(capability_identity), Some(scope)) =
+            (self.capability_identity.clone(), self.scope.clone())
+        else {
+            return None;
+        };
         Some(EffectiveGrant {
             approval_id: self.id,
             workspace_id: self.workspace_id,
@@ -1010,8 +1204,8 @@ impl ApprovalRecord {
             } else {
                 GrantClass::PerAction
             },
-            capability_identity: self.capability_identity.clone(),
-            scope: self.scope.clone(),
+            capability_identity,
+            scope,
             security_epoch: self.security_epoch,
             expires_at: self.expiry_at,
         })
@@ -1702,7 +1896,7 @@ mod tests {
             .evaluate_revocation("user withdrew", T0 + Duration::seconds(2))
             .unwrap();
         assert_eq!(revoked.next.state, ApprovalState::Revoked);
-        assert_eq!(revoked.next.action, ApprovalAction::Revoke);
+        assert_eq!(revoked.next.action, Some(ApprovalAction::Revoke));
 
         let err = revoked
             .next
@@ -1806,6 +2000,140 @@ mod tests {
             per_action.effective_grant(T0, 7).unwrap().class,
             GrantClass::PerAction
         );
+    }
+
+    // -- b08 approval kinds ---------------------------------------------------
+
+    #[test]
+    fn approval_kind_and_state_vocabularies_round_trip() {
+        for (text, kind) in [
+            ("capability", ApprovalKind::Capability),
+            ("execution", ApprovalKind::Execution),
+        ] {
+            assert_eq!(ApprovalKind::parse(text).unwrap(), kind);
+            assert_eq!(kind.as_str(), text);
+        }
+        assert_eq!(
+            ApprovalKind::parse("bogus").unwrap_err().code(),
+            codes::APPROVAL_INVALID
+        );
+
+        // The widened `approvals_state_check` vocabulary — every value
+        // the column can persist parses back.
+        for text in [
+            "active",
+            "revoked",
+            "suspended",
+            "expired",
+            "pending",
+            "approved",
+            "rejected",
+            "superseded",
+        ] {
+            let state = ApprovalState::parse(text).unwrap();
+            assert_eq!(state.as_str(), text);
+        }
+        // Upstream execution rule: pending is the only non-terminal.
+        assert!(!ApprovalState::Pending.is_terminal());
+        assert!(ApprovalState::Approved.is_terminal());
+        assert!(ApprovalState::Rejected.is_terminal());
+        assert!(ApprovalState::Superseded.is_terminal());
+    }
+
+    #[test]
+    fn execution_approval_requires_the_subject_leg_set() {
+        // A complete b08 execution-kind row validates…
+        let mut record = ApprovalRecord {
+            id: ApprovalId::new(),
+            workspace_id: WorkspaceId::new(),
+            version: 0,
+            approval_kind: ApprovalKind::Execution,
+            capability_identity: None,
+            scope: None,
+            action: None,
+            actor_identity: None,
+            authority_identity: None,
+            reason: None,
+            state: ApprovalState::Pending,
+            suspend_reason: None,
+            security_epoch: 0,
+            task_id: Some(TaskId::new()),
+            run_id: Some(RunId::new()),
+            step_id: Some(StepId::new()),
+            subject_version: Some(3),
+            logical_operation_id: Some([0x11; 16]),
+            operation_digest: Some([0x22; 32]),
+            expected_step_version: Some(4),
+            decision_actor: None,
+            decision_reason: None,
+            decision_id: None,
+            decided_at: None,
+            predecessor_approval_id: None,
+            recorded_at: Some(T0),
+            created_at: T0,
+            updated_at: T0,
+            expiry_at: None,
+        };
+        record.validate().unwrap();
+
+        // …and any missing subject leg fails the
+        // `approvals_execution_subject_b08_check` shape.
+        for blank in [
+            ApprovalRecord {
+                task_id: None,
+                ..record.clone()
+            },
+            ApprovalRecord {
+                run_id: None,
+                ..record.clone()
+            },
+            ApprovalRecord {
+                step_id: None,
+                ..record.clone()
+            },
+            ApprovalRecord {
+                subject_version: None,
+                ..record.clone()
+            },
+            ApprovalRecord {
+                logical_operation_id: None,
+                ..record.clone()
+            },
+            ApprovalRecord {
+                operation_digest: None,
+                ..record.clone()
+            },
+            ApprovalRecord {
+                expected_step_version: None,
+                ..record.clone()
+            },
+            ApprovalRecord {
+                recorded_at: None,
+                ..record.clone()
+            },
+        ] {
+            assert_eq!(
+                blank.validate().unwrap_err().code(),
+                codes::APPROVAL_INVALID
+            );
+        }
+        record.task_id = None;
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn capability_approval_requires_its_capability_legs() {
+        let mut record = grant_record();
+        record.capability_identity = None;
+        assert_eq!(
+            record.validate().unwrap_err().code(),
+            codes::APPROVAL_INVALID
+        );
+
+        // An execution-kind record never derives an effective grant.
+        let mut execution = grant_record();
+        execution.approval_kind = ApprovalKind::Execution;
+        assert!(execution.effective_grant(T0, 7).is_none());
     }
 
     // -- secret-use evidence -----------------------------------------------------

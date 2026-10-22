@@ -125,23 +125,29 @@ where
     /// The post-restore authority reset: suspends every `active`
     /// capability grant in the Workspace with
     /// `restore_review_required`. Returns the number suspended.
-    /// Non-active rows are untouched; each commit runs under its own
-    /// version guard so a concurrent decision cannot be clobbered.
+    /// Non-active rows are untouched; the whole sweep commits through
+    /// ONE [`ApprovalStore::commit_approval_change_sets`] call so the
+    /// adapter applies it in a single transaction — a mid-sweep
+    /// failure cannot leave a partially reset Workspace (the upstream
+    /// reset is likewise one statement). Each set still carries its
+    /// own version guard, so a concurrent decision cannot be
+    /// clobbered.
     pub async fn reset_authority_for_restore(
         &self,
         workspace_id: WorkspaceId,
         now: OffsetDateTime,
     ) -> Result<usize, Failure> {
         let records = self.store.load_workspace_approvals(workspace_id).await?;
-        let mut suspended = 0usize;
+        let mut change_sets = Vec::new();
         for record in records {
             if let RestoreSuspension::ChangeSet(change_set) =
                 record.evaluate_restore_suspension(now)?
             {
-                self.store.commit_approval_change_set(*change_set).await?;
-                suspended += 1;
+                change_sets.push(*change_set);
             }
         }
+        let suspended = change_sets.len();
+        self.store.commit_approval_change_sets(change_sets).await?;
         Ok(suspended)
     }
 
@@ -216,8 +222,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        ApprovalAction, ApprovalState, Capability, CapabilityScope, Effect, ResourceClass,
-        UidGidMap,
+        ApprovalAction, ApprovalKind, ApprovalState, Capability, CapabilityScope, Effect,
+        ResourceClass, UidGidMap,
     };
     use crate::query::ApprovalSummary;
     use central_foundation::failure::FailureKind;
@@ -240,6 +246,27 @@ mod tests {
     #[derive(Default)]
     struct StubStore {
         rows: Mutex<BTreeMap<ApprovalId, ApprovalRecord>>,
+        /// Sizes of each committed batch — proves the sweep is one
+        /// atomic call, not a per-row loop.
+        batch_sizes: Mutex<Vec<usize>>,
+        /// Test-controlled poison: the next batch commit fails before
+        /// applying anything.
+        fail_next_batch: Mutex<bool>,
+    }
+
+    impl StubStore {
+        fn guard(
+            rows: &BTreeMap<ApprovalId, ApprovalRecord>,
+            change_set: &crate::domain::ApprovalChangeSet,
+        ) -> Result<(), Failure> {
+            let current = rows.get(&change_set.next.id).ok_or_else(|| {
+                Failure::not_found(crate::domain::codes::APPROVAL_NOT_FOUND, "missing")
+            })?;
+            if current.version != change_set.expected_version {
+                return Err(Failure::conflict("approval_version_conflict", "stale row"));
+            }
+            Ok(())
+        }
     }
 
     impl ApprovalStore for StubStore {
@@ -263,13 +290,29 @@ mod tests {
             change_set: crate::domain::ApprovalChangeSet,
         ) -> Result<(), Failure> {
             let mut rows = self.rows.lock().unwrap();
-            let current = rows.get(&change_set.next.id).ok_or_else(|| {
-                Failure::not_found(crate::domain::codes::APPROVAL_NOT_FOUND, "missing")
-            })?;
-            if current.version != change_set.expected_version {
-                return Err(Failure::conflict("approval_version_conflict", "stale row"));
-            }
+            Self::guard(&rows, &change_set)?;
             rows.insert(change_set.next.id, change_set.next);
+            Ok(())
+        }
+
+        async fn commit_approval_change_sets(
+            &self,
+            change_sets: Vec<crate::domain::ApprovalChangeSet>,
+        ) -> Result<(), Failure> {
+            if *self.fail_next_batch.lock().unwrap() {
+                *self.fail_next_batch.lock().unwrap() = false;
+                return Err(Failure::internal("batch_commit", "injected batch failure"));
+            }
+            self.batch_sizes.lock().unwrap().push(change_sets.len());
+            let mut rows = self.rows.lock().unwrap();
+            // One transaction: every guard checked before any write —
+            // a failed set aborts the whole batch.
+            for change_set in &change_sets {
+                Self::guard(&rows, change_set)?;
+            }
+            for change_set in change_sets {
+                rows.insert(change_set.next.id, change_set.next);
+            }
             Ok(())
         }
 
@@ -381,7 +424,8 @@ mod tests {
     fn record_grant_inserts_and_resolve_commits_under_version_guard() {
         let svc = service();
         let record = grant(&svc);
-        assert_eq!(record.action, ApprovalAction::Grant);
+        assert_eq!(record.action, Some(ApprovalAction::Grant));
+        assert_eq!(record.approval_kind, ApprovalKind::Capability);
         assert_eq!(record.state, ApprovalState::Active);
 
         let revoked = block_on(svc.resolve_approval(
@@ -431,8 +475,66 @@ mod tests {
 
         let n = block_on(svc.reset_authority_for_restore(active.workspace_id, T0)).unwrap();
         assert_eq!(n, 1, "revoked and foreign-workspace rows are untouched");
+        assert_eq!(
+            svc.store.batch_sizes.lock().unwrap().as_slice(),
+            &[1],
+            "the whole sweep is one atomic batch commit"
+        );
         let suspended = svc.store.rows.lock().unwrap()[&revoked.id].clone();
         assert_eq!(suspended.state, ApprovalState::Revoked);
+        let suspended_other = svc.store.rows.lock().unwrap()[&other.id].clone();
+        assert_eq!(suspended_other.state, ApprovalState::Suspended);
+        assert_eq!(
+            suspended_other.suspend_reason.as_deref(),
+            Some(domain::RESTORE_SUSPEND_REASON)
+        );
+    }
+
+    #[test]
+    fn restore_reset_commits_all_active_grants_in_one_batch() {
+        let svc = service();
+        let ws = WorkspaceId::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut row = grant(&svc);
+            row.workspace_id = ws;
+            svc.store.rows.lock().unwrap().insert(row.id, row.clone());
+            ids.push(row.id);
+        }
+
+        let n = block_on(svc.reset_authority_for_restore(ws, T0)).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(svc.store.batch_sizes.lock().unwrap().as_slice(), &[3]);
+        let rows = svc.store.rows.lock().unwrap();
+        for id in ids {
+            assert_eq!(rows[&id].state, ApprovalState::Suspended);
+        }
+    }
+
+    #[test]
+    fn restore_reset_batch_failure_leaves_everything_untouched() {
+        let svc = service();
+        let ws = WorkspaceId::new();
+        for _ in 0..2 {
+            let mut row = grant(&svc);
+            row.workspace_id = ws;
+            svc.store.rows.lock().unwrap().insert(row.id, row);
+        }
+        *svc.store.fail_next_batch.lock().unwrap() = true;
+
+        assert!(
+            block_on(svc.reset_authority_for_restore(ws, T0)).is_err(),
+            "a mid-sweep failure propagates"
+        );
+        assert!(
+            svc.store
+                .rows
+                .lock()
+                .unwrap()
+                .values()
+                .all(|r| r.state == ApprovalState::Active),
+            "no partial reset — the batch is all-or-nothing"
+        );
     }
 
     #[test]

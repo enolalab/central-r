@@ -310,6 +310,7 @@ mod tests {
             policy_fingerprint: "sha256:aa".into(),
             agent_revision_fingerprint: "sha256:bb".into(),
             payload: payload(),
+            metadata: None,
             eligible_after: T0 + Duration::days(90),
             legal_hold: false,
             source_checkpoint_id: None,

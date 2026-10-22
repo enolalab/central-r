@@ -345,6 +345,17 @@ impl<'de> serde::Deserialize<'de> for CheckpointKind {
 /// verified continuation evidence. Nothing about it changes after
 /// commit (checkpoints.md §Envelope: "prior evidence is immutable and
 /// is never rewritten, extended, or merged").
+///
+/// Persisted/in-memory split: `policy_fingerprint`,
+/// `agent_revision_fingerprint`, and `source_checkpoint_id` are
+/// **in-memory-only legs** — `central.checkpoints` has no columns for
+/// them, upstream's writer (`queryInsertCheckpoint`,
+/// `persistCheckpoints`) stores no such value, and the payload-schema
+/// allowlist excludes them (their envelope content is the
+/// checkpoint.md compatibility contract, evaluated against
+/// caller-supplied facts at preflight, not a persisted column). The
+/// Task-7 adapter must not invent columns for them; a record reloaded
+/// from the table simply cannot supply them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Checkpoint {
     /// Immutable identity.
@@ -361,7 +372,8 @@ pub struct Checkpoint {
     pub step_attempt_id: Option<StepAttemptId>,
     /// Row version — `0` at insert; immutable evidence never bumps it.
     pub version: u64,
-    /// The boundary kind.
+    /// The boundary kind (`checkpoints.checkpoint_kind` — the column
+    /// went nullable in b08; a domain record always names its kind).
     pub kind: CheckpointKind,
     /// Producer identity (the component that wrote the evidence).
     pub producer_id: String,
@@ -370,16 +382,25 @@ pub struct Checkpoint {
     /// Envelope schema version — matches the payload's declared
     /// `schema_version` (validated).
     pub schema_version: u64,
+    /// Policy version the record was written under
+    /// (`checkpoints.policy_version bigint NOT NULL`; upstream writes
+    /// the literal `1` — [`CURRENT_POLICY_VERSION`]).
+    pub policy_version: u64,
     /// Effective-policy fingerprint the checkpoint was validated
     /// under — opaque `sha256:`-style text, never raw policy content.
+    /// **In-memory only** — see the struct-level persistence note.
     pub policy_fingerprint: String,
     /// AgentDefinition revision the run's snapshot carried — opaque
-    /// fingerprint text.
+    /// fingerprint text. **In-memory only** — same note.
     pub agent_revision_fingerprint: String,
     /// The sanitized continuation payload.
     pub payload: CheckpointPayload,
     /// SHA-256 over `payload` — binds the record to exact content.
     pub checksum: [u8; 32],
+    /// The b08-nullable `metadata jsonb` column — upstream's writer
+    /// leaves it `NULL` (the doc-level fingerprints deliberately do
+    /// NOT ride here; see the struct-level persistence note).
+    pub metadata: Option<serde_json::Value>,
     /// When the evidence was recorded.
     pub recorded_at: OffsetDateTime,
     /// Row creation (database-authoritative on commit; carried for the
@@ -394,9 +415,18 @@ pub struct Checkpoint {
     /// Legal hold — GC never collects while set.
     pub legal_hold: bool,
     /// CM-1 lineage: the source Checkpoint this record migrated from.
-    /// `None` for original writes.
+    /// `None` for original writes. **In-memory only** — same note.
     pub source_checkpoint_id: Option<CheckpointId>,
 }
+
+/// The `policy_version` every record of this build writes — the
+/// literal upstream `queryInsertCheckpoint` fixes at `1`.
+pub const CURRENT_POLICY_VERSION: u64 = 1;
+
+/// Defense-in-depth bound for the nullable `metadata jsonb` leg —
+/// the column is unconstrained, matching the 64 KiB class of bound
+/// upstream applies to evidence payloads.
+pub const MAX_METADATA_BYTES: usize = 64 * 1024;
 
 /// The schema-version vocabulary this build reads and writes. Phase-1
 /// writers record `1`; readers accept exactly it (check 3 of the
@@ -465,6 +495,20 @@ impl Checkpoint {
                 codes::CHECKPOINT_INVALID,
                 "the column schema_version disagrees with the payload declaration",
             ));
+        }
+        if let Some(metadata) = &self.metadata {
+            let serialized = serde_json::to_vec(metadata).map_err(|_| {
+                Failure::invalid(
+                    codes::CHECKPOINT_INVALID,
+                    "the metadata cannot be canonically encoded",
+                )
+            })?;
+            if serialized.len() > MAX_METADATA_BYTES {
+                return Err(Failure::invalid(
+                    codes::CHECKPOINT_INVALID,
+                    "the metadata exceeds its bound",
+                ));
+            }
         }
         Ok(())
     }
@@ -565,10 +609,12 @@ impl Checkpoint {
             producer_id: self.producer_id.clone(),
             producer_version: request.producer_version,
             schema_version: request.new_schema_version,
+            policy_version: self.policy_version,
             policy_fingerprint: request.new_policy_fingerprint,
             agent_revision_fingerprint: request.new_agent_revision_fingerprint,
             checksum: payload_checksum(request.new_payload.as_bytes()),
             payload: request.new_payload,
+            metadata: self.metadata.clone(),
             recorded_at: request.at,
             created_at: request.at,
             resume_compatible: false,
@@ -630,12 +676,16 @@ pub struct CheckpointIntent {
     pub producer_version: String,
     /// Envelope schema version.
     pub schema_version: u64,
-    /// Effective-policy fingerprint.
+    /// Effective-policy fingerprint — in-memory-only leg (see
+    /// [`Checkpoint`]'s persistence note).
     pub policy_fingerprint: String,
-    /// AgentDefinition revision fingerprint.
+    /// AgentDefinition revision fingerprint — in-memory-only leg.
     pub agent_revision_fingerprint: String,
     /// Sanitized continuation payload.
     pub payload: CheckpointPayload,
+    /// The nullable `metadata` column — `None` matches upstream's
+    /// writer.
+    pub metadata: Option<serde_json::Value>,
     /// Retention eligibility.
     pub eligible_after: OffsetDateTime,
     /// Legal hold.
@@ -660,10 +710,12 @@ impl CheckpointIntent {
             producer_id: self.producer_id,
             producer_version: self.producer_version,
             schema_version: self.schema_version,
+            policy_version: CURRENT_POLICY_VERSION,
             policy_fingerprint: self.policy_fingerprint,
             agent_revision_fingerprint: self.agent_revision_fingerprint,
             checksum: payload_checksum(self.payload.as_bytes()),
             payload: self.payload,
+            metadata: self.metadata,
             recorded_at: at,
             created_at: at,
             resume_compatible: false,
@@ -1210,6 +1262,7 @@ mod tests {
             agent_revision_fingerprint: "sha256:agent".into(),
             payload: CheckpointPayload::sanitize(payload_bytes(), DEFAULT_INLINE_PAYLOAD_LIMIT)
                 .unwrap(),
+            metadata: None,
             eligible_after: T0 + Duration::days(90),
             legal_hold: false,
             source_checkpoint_id: None,
@@ -1291,6 +1344,29 @@ mod tests {
             assert_eq!(kind.as_str(), text);
         }
         assert!(CheckpointKind::parse("other").is_err());
+    }
+
+    #[test]
+    fn record_carries_persistable_b08_columns() {
+        let c = checkpoint();
+        // `policy_version` — the literal upstream `queryInsertCheckpoint`
+        // fixes at 1; `metadata` — the b08-nullable column upstream
+        // leaves NULL.
+        assert_eq!(c.policy_version, CURRENT_POLICY_VERSION);
+        assert!(c.metadata.is_none());
+
+        let mut with_metadata = c.clone();
+        with_metadata.metadata = Some(serde_json::json!({"source": "test"}));
+        with_metadata.validate().unwrap();
+
+        let mut oversized = c;
+        oversized.metadata = Some(serde_json::json!({
+            "blob": "x".repeat(MAX_METADATA_BYTES)
+        }));
+        assert_eq!(
+            oversized.validate().unwrap_err().code(),
+            codes::CHECKPOINT_INVALID
+        );
     }
 
     #[test]

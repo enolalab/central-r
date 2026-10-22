@@ -42,6 +42,21 @@ pub trait ApprovalStore: Send + Sync + 'static {
         change_set: ApprovalChangeSet,
     ) -> Result<(), Failure>;
 
+    /// Atomically persists a batch of already-evaluated change sets —
+    /// the adapter runs the whole batch in ONE transaction: every set
+    /// commits under its own `expected_version` guard, and the first
+    /// guard failure aborts them all (no partial batch). This is the
+    /// port the post-restore authority reset uses so a mid-sweep
+    /// failure cannot leave a partially reset Workspace — the
+    /// upstream sweep is likewise a single statement
+    /// (`UPDATE … SET state='suspended' WHERE state='active'` in
+    /// `internal/adapter/postgres/backup/recovery_audit.go`).
+    /// An empty batch is a no-op.
+    async fn commit_approval_change_sets(
+        &self,
+        change_sets: Vec<ApprovalChangeSet>,
+    ) -> Result<(), Failure>;
+
     /// Inserts a fresh record (`version == 0`). Conflict when the
     /// identity already exists.
     async fn insert_approval(&self, record: ApprovalRecord) -> Result<(), Failure>;
