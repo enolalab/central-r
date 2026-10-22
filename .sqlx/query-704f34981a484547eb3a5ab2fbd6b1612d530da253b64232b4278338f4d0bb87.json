@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id FROM central.artifacts WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND state = 'ready' AND delete_intent_at IS NULL ORDER BY (required_role IS NOT DISTINCT FROM 'harness.report') DESC, updated_at DESC, id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "704f34981a484547eb3a5ab2fbd6b1612d530da253b64232b4278338f4d0bb87"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.runs SET version = $3, status = $4, run_index = $5, waiting_reason = $6, failure_reason = $7, ownership_token = $8, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND version = $9",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a38a1e8abaef68571ebd5520bcd78c321c1535e13bdc1c9f14d4604273c1dbd2"
+}

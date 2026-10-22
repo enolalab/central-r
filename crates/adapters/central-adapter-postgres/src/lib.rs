@@ -28,4 +28,5 @@ pub mod error;
 pub mod event;
 pub mod migrate;
 mod store_support;
+pub mod task;
 pub mod workspace;

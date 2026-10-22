@@ -15,9 +15,7 @@ use central_foundation::identity::{ArtifactId, RunId, TaskId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::domain::{
-    Budget, EventKind, PermissionPolicy, RunStatus, TaskStatus, WaitingReason, codes,
-};
+use crate::domain::{Budget, PermissionPolicy, RunStatus, TaskStatus, WaitingReason, codes};
 
 /// Default and maximum page sizes for task projections.
 pub const DEFAULT_TASK_LIST_PAGE_SIZE: u32 = 100;
@@ -295,8 +293,14 @@ pub struct TaskEvent {
     pub task_id: TaskId,
     /// The run when the event is run-scoped.
     pub run_id: Option<RunId>,
-    /// The lifecycle event kind.
-    pub kind: EventKind,
+    /// The lifecycle event kind. Upstream `task.EventKind` is an open
+    /// `string` type, and the feed deliberately surfaces every
+    /// producer's kind — `task.*` lifecycle intents, `harness.*`
+    /// milestones, and `attempt_*`/`checkpoint_*` execution evidence —
+    /// filtering only [`mod@crate::query`]'s hidden kinds. The closed
+    /// [`crate::domain::EventKind`] enum stays the write-intent
+    /// vocabulary; the projection carries the raw kind text.
+    pub kind: String,
     /// The resulting task state when the event carried one.
     pub state: Option<TaskStatus>,
     /// When the event occurred.

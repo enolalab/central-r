@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT input_fingerprint, expected_aggregate_versions, result_reference FROM central.command_receipts WHERE workspace_id = $1 AND command_scope = $2 AND idempotency_key = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "input_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "expected_aggregate_versions",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "result_reference",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "917b93fc46cf66cdc987de9751bec75fbc6b18e56590437a64704a8f1dafeea7"
+}

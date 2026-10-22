@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, status, current_run_id, COALESCE(waiting_reason, '') AS \"waiting_reason!\", retry_count, title, COALESCE(failure_reason, '') AS \"failure_reason!\", retry_eligible_at, updated_at, created_at FROM central.tasks WHERE workspace_id = $1 AND ($3::text IS NULL OR (status > $3 OR (status = $3 AND (updated_at, id) < ($4, $5)))) ORDER BY status ASC, updated_at DESC, id DESC LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "current_run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "waiting_reason!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "retry_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "failure_reason!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "retry_eligible_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      null,
+      false,
+      false,
+      null,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f9384494c6343dadb5477edbda8c10c04f49ee8f36bf12b47c1d9d577eb98258"
+}

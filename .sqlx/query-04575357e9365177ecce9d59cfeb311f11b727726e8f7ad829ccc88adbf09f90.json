@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT event_sequence, COALESCE(task_id, aggregate_id) AS \"task_id!\", run_id, kind, COALESCE(state, '') AS \"state!\", occurred_at FROM central.events WHERE workspace_id = $1 AND ($3::uuid IS NULL OR aggregate_id = $3) AND ($4::bigint IS NULL OR event_sequence < $4) AND kind <> ALL($5::text[]) ORDER BY event_sequence DESC LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event_sequence",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "state!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "occurred_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Int8",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      true,
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "04575357e9365177ecce9d59cfeb311f11b727726e8f7ad829ccc88adbf09f90"
+}

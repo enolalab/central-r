@@ -85,6 +85,7 @@ sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "
 aws-sdk-s3 = "=1.154.0"
 aws-config = "=1.13.0"
 sha2 = "=0.11.1"
+sha1 = "=0.10.7"
 
 # central-adapter-linux + launcher/protected-execution-mode binaries only
 rustix = { version = "=1.1.5", features = ["fs", "net", "process", "shm", "mm"] }

@@ -1,0 +1,125 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, version, status, current_run_id, last_run_index, retry_count, retry_eligible_at, COALESCE(waiting_reason, '') AS \"waiting_reason!\", COALESCE(failure_reason, '') AS \"failure_reason!\", input_spec::text AS \"input_spec!\", title, created_at, updated_at, parent_task_id, permission_policy, COALESCE(budget_cost_micro_usd, 0) AS \"budget_cost_micro_usd!\", COALESCE(budget_wall_clock_seconds, 0) AS \"budget_wall_clock_seconds!\" FROM central.tasks WHERE workspace_id = $1 AND id = $2 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "current_run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_run_index",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "retry_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "retry_eligible_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "waiting_reason!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "failure_reason!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "input_spec!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "parent_task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 15,
+        "name": "permission_policy",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "budget_cost_micro_usd!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 17,
+        "name": "budget_wall_clock_seconds!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      null,
+      null,
+      null,
+      false,
+      false,
+      false,
+      true,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "735e2035d8c8edc17e0eef0c91e2eafaffccb366cf3d5be85c4eef16c9982ca4"
+}

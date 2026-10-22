@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.tasks (id, workspace_id, version, status, current_run_id, last_run_index, retry_count, retry_eligible_at, waiting_reason, failure_reason, input_spec, title, correlation_id, causation_id, idempotency_key, parent_task_id, permission_policy, budget_cost_micro_usd, budget_wall_clock_seconds, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULLIF($15, ''), $16, $17, NULLIF($18::bigint, 0), NULLIF($19::integer, 0), clock_timestamp(), clock_timestamp()) ON CONFLICT (id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a6d1ce26968f2fac8bf1dfc6305e9a6362c7b0f4ae20f60659d372c227fc56df"
+}

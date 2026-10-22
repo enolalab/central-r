@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(MAX(event_sequence), 0) FROM central.events WHERE workspace_id = $1 AND aggregate_id = $2 AND kind <> ALL($3::text[])",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "coalesce",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "626861d4a501caf34520f2cb5b0cddce3fc775aaaa9ef9ec17361425e6401e37"
+}

@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.command_receipts (id, workspace_id, command_scope, idempotency_key, input_fingerprint, expected_aggregate_versions, result_kind, result_reference, correlation_id, causation_id, expiry_at) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp() + interval '7 days') ON CONFLICT (workspace_id, command_scope, idempotency_key) DO NOTHING RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Bytea",
+        "Jsonb",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2606565466025e4636f5734ce9658a48747fe91c2dc40f5226d68c2510683656"
+}

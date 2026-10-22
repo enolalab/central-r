@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.tasks SET version = $3, status = $4, current_run_id = $5, last_run_index = $6, retry_count = $7, retry_eligible_at = $8, waiting_reason = $9, failure_reason = $10, correlation_id = $11, causation_id = $12, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND version = $13",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e418cfa542fa7e8b2e5879d7013ac28b4b1f5c90179d4e7729bda7395e85fdcd"
+}
