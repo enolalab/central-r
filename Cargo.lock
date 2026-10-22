@@ -133,6 +133,12 @@ version = "0.1.0"
 [[package]]
 name = "central-authorization"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "serde",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-backup"
@@ -149,10 +155,25 @@ version = "0.1.0"
 [[package]]
 name = "central-checkpoint"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-event"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "serde",
+ "serde_json",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-eventjournal"
@@ -234,6 +255,12 @@ version = "0.1.0"
 [[package]]
 name = "central-workspace"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "serde",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "cfg-if"

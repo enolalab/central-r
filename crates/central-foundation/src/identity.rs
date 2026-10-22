@@ -363,6 +363,47 @@ define_id! {
     OutboxId
 }
 
+define_id! {
+    /// Identifies the domain aggregate an Event concerns. Events store the
+    /// bare aggregate identity; the aggregate *kind* travels separately as
+    /// `aggregate_type` (docs/events/v1.md §2).
+    AggregateId
+}
+
+define_id! {
+    /// Identifies one `command_receipts` row — the durable idempotency
+    /// receipt of an accepted command (`events.command_id` references it).
+    CommandId
+}
+
+define_id! {
+    /// Identifies one generated `central.config/v1` configuration binding,
+    /// recorded on the genesis `InstanceBinding`.
+    ConfigBindingId
+}
+
+define_id! {
+    /// Identifies one `central.secret_use` audit-evidence row — the
+    /// durable record that a SecretReference was used under an
+    /// authorization decision (adapter-mapping §3.19). The row's `id`
+    /// column is a plain `uuid` in the baseline schema.
+    SecretUseEvidenceId
+}
+
+define_id! {
+    /// The scope-wide correlation identifier carried by an Event
+    /// (`events.correlation_id`, `command_receipts.correlation_id`) —
+    /// an opaque UUID relating causally-linked commands and Events.
+    CorrelationId
+}
+
+define_id! {
+    /// The immediate-cause identifier carried by an Event
+    /// (`events.causation_id`): the Event or command identity that
+    /// directly caused this transition.
+    CausationId
+}
+
 /// The b20 sentinel workspace row's fixed identity:
 /// `019fdc8d-e33a-76ed-9ef0-a0d9fe92e54a`.
 ///
@@ -483,6 +524,12 @@ mod tests {
         assert_id_contract::<ResumeCheckpointId>();
         assert_id_contract::<OutboxEventId>();
         assert_id_contract::<OutboxId>();
+        assert_id_contract::<AggregateId>();
+        assert_id_contract::<CommandId>();
+        assert_id_contract::<ConfigBindingId>();
+        assert_id_contract::<SecretUseEvidenceId>();
+        assert_id_contract::<CorrelationId>();
+        assert_id_contract::<CausationId>();
     }
 
     #[test]
