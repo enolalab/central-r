@@ -245,6 +245,15 @@ impl CompletionChangeSetRequest {
 }
 
 /// Commits the completing pass's change set after receipt validation.
+///
+/// Deliberately unimplemented in `central-adapter-postgres`: upstream
+/// has no `CommitCompletionChangeSet` store method — the completion
+/// candidate is validated by `ValidateCompletionChangeSet` (an
+/// app-layer port) and then commits through the single atomic
+/// [`CompositeStore::commit`] seam with its receipt. This trait is
+/// reserved forward surface; an adapter impl lands with its first
+/// caller (same deferral class as `central-authorization`'s
+/// `GenesisStore`).
 #[trait_variant::make(Send)]
 pub trait CompletionChangeSetStore {
     /// `CommitCompletionChangeSet`.
@@ -560,6 +569,10 @@ pub trait DispatchableRunReader {
 }
 
 /// `Clock` — the single time source services depend on.
+///
+/// Not a store port: no PostgreSQL impl is expected. Upstream wires
+/// `retryport.SystemClock` at the composition root; the Rust
+/// equivalent lands when a binary composes the execution services.
 #[trait_variant::make(Send)]
 pub trait Clock {
     /// `Now`.

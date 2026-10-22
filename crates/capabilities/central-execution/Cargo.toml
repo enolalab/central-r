@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-central-foundation = { path = "../../central-foundation" }
-central-task = { path = "../central-task" }
+central-foundation = { path = "../../central-foundation", version = "0.1.0" }
+central-task = { path = "../central-task", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
