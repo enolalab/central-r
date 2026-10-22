@@ -2121,6 +2121,26 @@ mod tests {
         }
     }
 
+    /// An object-failure classifier that reports a create-only conflict:
+    /// the destination key is already occupied — the shape the
+    /// composition root installs for an adapter whose
+    /// `promote_create_only` precondition lost to an existing object.
+    struct ConflictFailures;
+
+    impl ObjectFailureClassifier for ConflictFailures {
+        fn classify_object_failure(&self, _failure: &Failure) -> ObjectFailureClass {
+            ObjectFailureClass::Conflict
+        }
+    }
+
+    /// The pinned content generation the conflict tests install through
+    /// `with_generators`, so the earlier attempt's object can be placed
+    /// under the ready key before the service mints it. A plain `fn` —
+    /// the generator hooks are function pointers, not closures.
+    fn pinned_content() -> ContentGeneration {
+        ContentGeneration::from_trusted_db_bytes([0xC0; 16])
+    }
+
     /// Reads a whole `ByteStream` to the end — the test-side drain.
     fn drain(mut stream: Box<dyn ByteStream>) -> Vec<u8> {
         let mut out = Vec::new();
@@ -2485,6 +2505,76 @@ mod tests {
         assert_eq!(FAILURE_CODE_OBJECT_AMBIGUOUS, outcome.failure_code);
     }
 
+    #[test]
+    fn materialize_promote_conflict_falls_through_to_second_verification() {
+        let journal = Journal::default();
+        let store = FakeStore::new(journal.clone());
+        let objects = FakeObjects::new(journal.clone());
+        let classifier = FakeClassifier::new(journal.clone());
+        let completion = FakeCompletion::new(journal.clone());
+        let service = Service::new(store, objects.clone(), classifier, completion)
+            .with_failure_classifier(ConflictFailures)
+            .with_generators(ArtifactId::new, StagingGeneration::new, pinned_content);
+
+        let mut request = materialize_request(BODY);
+        let artifact_id = ArtifactId::new();
+        request.artifact_id = Some(artifact_id);
+        // A create-only conflict means the generation-unique ready key
+        // is already occupied — necessarily by this Artifact's own
+        // earlier attempt. That object is authoritative: place it, fail
+        // the promote with a conflict, and the pass must still verify
+        // and finalize against it rather than reporting a failure.
+        let ready_key = format!(
+            "v1/ready/{}/{}/{}",
+            request.workspace_id,
+            artifact_id,
+            pinned_content()
+        );
+        objects.put(&ready_key, BODY, "v-ready");
+        *objects
+            .promote_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Failure::conflict(
+            "S3_PRECONDITION_FAILED",
+            "the ready key is already occupied",
+        ));
+
+        let outcome = block_on(service.materialize_required_report(request))
+            .unwrap_or_else(|e| unreachable!("materialize failed: {e:?}"));
+        // The conflict falls through to the second verification, which
+        // confirms the occupying object: the Artifact completes ready,
+        // never reconciliation.
+        assert_eq!(OutcomeKind::Ready, outcome.kind);
+        assert!(journal.has("object.Promote"));
+        assert!(journal.has("object.ReadReady"));
+        assert!(journal.has("completion.Commit"));
+    }
+
+    #[test]
+    fn materialize_promote_failure_is_reconciliation_not_overwrite() {
+        let f = fixture();
+        *f.objects
+            .promote_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Failure::ambiguous(
+            "S3_PROMOTE_AMBIGUOUS",
+            "the promote outcome is unknown",
+        ));
+        let outcome = block_on(
+            f.service
+                .materialize_required_report(materialize_request(BODY)),
+        )
+        .unwrap_or_else(|e| unreachable!("materialize failed: {e:?}"));
+        // The default classifier cannot prove the promote's fate: not a
+        // conflict, so the pass must not fall through — it reports
+        // reconciliation and never re-reads or overwrites the ready key.
+        assert_eq!(OutcomeKind::Reconciliation, outcome.kind);
+        assert_eq!(FAILURE_CODE_OBJECT_AMBIGUOUS, outcome.failure_code);
+        assert!(f.journal.has("object.Promote"));
+        assert!(!f.journal.has("object.ReadReady"));
+        assert!(!f.journal.has("completion.Commit"));
+    }
+
     // ------------------------------------------------------------------
     // resume_verifying — the crash-recovery half
     // ------------------------------------------------------------------
@@ -2573,6 +2663,75 @@ mod tests {
             .unwrap_or_else(|e| unreachable!("resume failed: {e:?}"));
         assert!(!result.resolved);
         assert_eq!(OutcomeKind::Reconciliation, result.outcome.kind);
+        assert!(!f.journal.has("completion.Commit"));
+    }
+
+    #[test]
+    fn resume_promote_conflict_falls_through_to_second_verification() {
+        let journal = Journal::default();
+        let store = FakeStore::new(journal.clone());
+        let objects = FakeObjects::new(journal.clone());
+        let classifier = FakeClassifier::new(journal.clone());
+        let completion = FakeCompletion::new(journal.clone());
+        let service = Service::new(store, objects.clone(), classifier, completion)
+            .with_failure_classifier(ConflictFailures)
+            .with_generators(ArtifactId::new, StagingGeneration::new, pinned_content);
+
+        let artifact = verifying_artifact(BODY);
+        // The crash landed between Verify and Promote, but the earlier
+        // attempt's promote actually landed: when the resume retries it
+        // create-only the generation-unique ready key is already
+        // occupied, and that object is authoritative.
+        objects.put(&artifact.staging_key, BODY, "v-staging");
+        let ready_key = format!(
+            "v1/ready/{}/{}/{}",
+            artifact.workspace_id,
+            artifact.artifact_id,
+            pinned_content()
+        );
+        objects.put(&ready_key, BODY, "v-ready");
+        *objects
+            .promote_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Failure::conflict(
+            "S3_PRECONDITION_FAILED",
+            "the ready key is already occupied",
+        ));
+
+        let result = block_on(service.resume_verifying(artifact))
+            .unwrap_or_else(|e| unreachable!("resume failed: {e:?}"));
+        // The conflict falls through to the second verification, which
+        // confirms the occupying object: the resume resolves ready
+        // rather than parking the record in reconciliation.
+        assert!(result.resolved);
+        assert_eq!(OutcomeKind::Ready, result.outcome.kind);
+        assert!(journal.has("store.Promote"));
+        assert!(journal.has("object.Promote"));
+        assert!(journal.has("object.ReadReady"));
+        assert!(journal.has("completion.Commit"));
+    }
+
+    #[test]
+    fn resume_promote_failure_stays_reconciliation() {
+        let f = fixture();
+        let artifact = verifying_artifact(BODY);
+        f.objects.put(&artifact.staging_key, BODY, "v-staging");
+        *f.objects
+            .promote_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Failure::ambiguous(
+            "S3_PROMOTE_AMBIGUOUS",
+            "the promote outcome is unknown",
+        ));
+        let result = block_on(f.service.resume_verifying(artifact))
+            .unwrap_or_else(|e| unreachable!("resume failed: {e:?}"));
+        // Not a conflict: nothing proves the ready key is occupied by
+        // this Artifact's own work, so the record stays verifying in
+        // reconciliation — the ready key is never re-read as
+        // authoritative.
+        assert!(!result.resolved);
+        assert_eq!(OutcomeKind::Reconciliation, result.outcome.kind);
+        assert!(!f.journal.has("object.ReadReady"));
         assert!(!f.journal.has("completion.Commit"));
     }
 
@@ -2694,7 +2853,8 @@ mod tests {
                 }),
         )
         .unwrap_or_else(|e| unreachable!("prepare failed: {e:?}"));
-        let started = block_on(download.start()).unwrap_or_else(|e| unreachable!("start failed: {e:?}"));
+        let started =
+            block_on(download.start()).unwrap_or_else(|e| unreachable!("start failed: {e:?}"));
         assert_eq!("text/markdown", started.media_type.as_str());
         assert_eq!(Disposition::Inline, started.disposition);
         assert_eq!(BODY.len() as u64, started.size);
@@ -2749,7 +2909,8 @@ mod tests {
                 }),
         )
         .unwrap_or_else(|e| unreachable!("prepare failed: {e:?}"));
-        let started = block_on(download.start()).unwrap_or_else(|e| unreachable!("start failed: {e:?}"));
+        let started =
+            block_on(download.start()).unwrap_or_else(|e| unreachable!("start failed: {e:?}"));
         // Sensitivity may only ever downgrade a requested disposition.
         assert_eq!(Disposition::Attachment, started.disposition);
     }
@@ -3022,7 +3183,8 @@ mod tests {
         // The operator NULL pair never dedupes: each read is a distinct
         // observable event.
         let operator = read_edge(run_id, None, artifact);
-        block_on(record_read(Some(&store), operator.clone())).unwrap_or_else(|e| unreachable!("{e:?}"));
+        block_on(record_read(Some(&store), operator.clone()))
+            .unwrap_or_else(|e| unreachable!("{e:?}"));
         block_on(record_read(Some(&store), operator)).unwrap_or_else(|e| unreachable!("{e:?}"));
         assert_eq!(
             3,
@@ -3044,7 +3206,8 @@ mod tests {
         let read = read_edge(run_id, Some(node), artifact);
         block_on(record_read(Some(&store), read)).unwrap_or_else(|e| unreachable!("{e:?}"));
 
-        let produced_edges = block_on(produced(&store, node)).unwrap_or_else(|e| unreachable!("{e:?}"));
+        let produced_edges =
+            block_on(produced(&store, node)).unwrap_or_else(|e| unreachable!("{e:?}"));
         assert_eq!(1, produced_edges.len());
         assert_eq!(artifact, produced_edges[0].artifact_id);
         let read_edges = block_on(read_by(&store, node)).unwrap_or_else(|e| unreachable!("{e:?}"));
@@ -3132,7 +3295,8 @@ mod tests {
         let edge_3 = produce_edge(run_id, node2, a3);
         block_on(record_produce(Some(&store), edge_3)).unwrap_or_else(|e| unreachable!("{e:?}"));
 
-        let descendants = block_on(descendants(&store, a1)).unwrap_or_else(|e| unreachable!("{e:?}"));
+        let descendants =
+            block_on(descendants(&store, a1)).unwrap_or_else(|e| unreachable!("{e:?}"));
         assert_eq!(2, descendants.len());
         assert_eq!(a2, descendants[0].artifact_id);
         assert_eq!(a3, descendants[1].artifact_id);

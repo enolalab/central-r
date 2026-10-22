@@ -917,7 +917,8 @@ fn owns_staging_key(workspace_id: &str, artifact_id: &str, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Artifact, Disposition, Limits, Sensitivity};
+    use crate::app::ResumeResult;
+    use crate::domain::{Artifact, Disposition, Limits, Outcome, OutcomeKind, Sensitivity};
     use crate::port::{ClaimIncompleteResult, LargeClaim, RejectedStagingClaim};
     use crate::testkit::{
         FakeLifecycle, FakeObjects, FakeReconciliationStore, FakeRecords, Journal, block_on,
@@ -1114,8 +1115,82 @@ mod tests {
     // Large claims
     // ------------------------------------------------------------------
 
+    /// Upstream `TestProcessedLargeClaimIsReleasedAfterOwningThePass`:
+    /// a genuine large claim — real work the pass does not resolve —
+    /// runs alone, and its claim row does not outlive it.
     #[test]
-    fn pending_large_claim_runs_alone_and_releases() {
+    fn processed_large_claim_releases_after_owning_the_pass() {
+        let f = fixture();
+        let artifact = artifact_at(State::Staging);
+        f.records
+            .artifacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(artifact.artifact_id, artifact.clone());
+        f.objects.put(&artifact.staging_key, b"staged", "v-staging");
+        // The store's database-derived clock says the record outlived
+        // the installed lifetime, so the dedicated pass performs real
+        // expiry work that stays unresolved.
+        f.claims
+            .age
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(artifact.artifact_id, Duration::from_secs(48 * 60 * 60));
+        *f.claims.large.lock().unwrap_or_else(|e| e.into_inner()) = Some(LargeClaim {
+            artifact_id: artifact.artifact_id,
+            workspace_id: artifact.workspace_id,
+            lease_expires_at: OffsetDateTime::now_utc(),
+        });
+        // A queued normal claim proves the pass returned early rather
+        // than merely finding the backlog empty.
+        let ordinary = artifact_at(State::Staging);
+        push_batch(&f, vec![claim_for(&f, &ordinary, State::Staging)]);
+
+        let report = block_on(f.reconciler.reconcile(&fence()))
+            .unwrap_or_else(|e| unreachable!("reconcile failed: {e:?}"));
+        assert_eq!(1, report.processed);
+        // The claim did real work — the staging record expired.
+        assert_eq!(
+            vec![artifact.artifact_id],
+            f.claims
+                .expired
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        );
+        // Unresolved work owns the whole pass: the normal cursor never
+        // ran — no claim_incomplete request was ever issued.
+        assert!(!f.journal.has("claim.Incomplete"));
+        assert!(
+            f.claims
+                .claim_reqs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        assert_eq!(
+            1,
+            *f.claims
+                .large_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        );
+        // The consumed claim row is released either way.
+        assert_eq!(
+            vec![artifact.artifact_id],
+            f.claims
+                .released_large
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        );
+    }
+
+    /// The resume half of the ownership rule: a dedicated claim whose
+    /// `resume_verifying` leaves the record unresolved still owns the
+    /// whole pass — the `!resolved` early return is exercised directly.
+    #[test]
+    fn unresolved_large_claim_resume_owns_the_pass() {
         let f = fixture();
         let artifact = artifact_at(State::Verifying);
         f.records
@@ -1128,11 +1203,20 @@ mod tests {
             workspace_id: artifact.workspace_id,
             lease_expires_at: OffsetDateTime::now_utc(),
         });
+        // The resume re-observes the record but cannot prove it
+        // resolved — genuinely ambiguous work, not a stale claim row.
+        *f.lifecycle.result.lock().unwrap_or_else(|e| e.into_inner()) = ResumeResult {
+            outcome: Outcome {
+                kind: OutcomeKind::Reconciliation,
+                failure_code: String::new(),
+            },
+            resolved: false,
+            bytes_moved: 0,
+        };
 
         let report = block_on(f.reconciler.reconcile(&fence()))
             .unwrap_or_else(|e| unreachable!("reconcile failed: {e:?}"));
         assert_eq!(1, report.processed);
-        // The dedicated pass ran the resume and released its claim.
         assert_eq!(
             1,
             f.lifecycle
@@ -1141,6 +1225,18 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .len()
         );
+        // The unresolved claim owns the pass: claim_incomplete was
+        // never called and the pass returned early.
+        assert!(!f.journal.has("claim.Incomplete"));
+        assert!(
+            f.claims
+                .claim_reqs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        // The claim is still released: it is re-observed by the normal
+        // cursor next pass, so no claim row outlives the work.
         assert_eq!(
             vec![artifact.artifact_id],
             f.claims
@@ -1148,20 +1244,6 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
-        );
-        // Unresolved large work takes the whole pass — the normal
-        // cursor never ran.
-        assert!(
-            f.claims
-                .claim_reqs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty()
-                || f.lifecycle
-                    .result
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .resolved
         );
     }
 
