@@ -258,16 +258,16 @@ central-rust/
 - `$CENTRAL_SRC/internal/adapter/objectstore/minio.go`
 - `$CENTRAL_SRC/internal/adapter/objectstore/minio_test.go`
 
-- [ ] **Step 1: Configure `crates/adapters/central-adapter-s3/Cargo.toml`**
+- [x] **Step 1: Configure `crates/adapters/central-adapter-s3/Cargo.toml`**
   - Add **only** workspace dependencies declared in root `Cargo.toml`: `central-foundation`, `central-artifact`, `aws-config`, `aws-sdk-s3`, `sha2`, `tokio`, `tokio-util`, `trait-variant`, `tracing`. Use `aws_sdk_s3::primitives::ByteStream` and `aws_sdk_s3::error::ProvideErrorMetadata` re-exports directly from `aws-sdk-s3`.
 
-- [ ] **Step 2: Implement `error.rs` and `limiter.rs`**
+- [x] **Step 2: Implement `error.rs` and `limiter.rs`**
   - In `error.rs`, implement `FailureClass` (`Invalid`, `NotFound`, `Conflict`, `Denied`, `LimitExceeded`, `Unavailable`, `Ambiguous`), `Reason` (`KeyRoleInvalid`, `LimitInvalid`, `ConfigInvalid`, `BodyMissing`, `ObjectMissing`, `PreconditionConflict`, `AccessDenied`, `LimitExceeded`, `IdleTimeout`, `TotalDeadline`, `Canceled`, `UpstreamRejected`, `TransferIncomplete`), and `Failure { op, class, reason }`.
   - Implement `ObjectFailureClassifier` for `S3FailureClassifier` so `central-artifact::app::Service` maps `Failure` to `ObjectFailureClass` without inspecting strings.
   - Ensure `Failure` **never** wraps or echoes raw `aws_sdk_s3` error messages, bucket names, object keys, or endpoints (`"objectstore: {op} {class} ({reason})"`).
   - In `limiter.rs`, implement `TransferLimiter` backed by `Arc<tokio::sync::Semaphore>` initialized with `MAX_CONCURRENT_TRANSFERS` (`2`), returning an idempotent `TransferPermit` guard (`OwnedSemaphorePermit`) that releases on drop or explicit `release()`.
 
-- [ ] **Step 3: Implement `stream.rs` and `store.rs`**
+- [x] **Step 3: Implement `stream.rs` and `store.rs`**
   - Validate key roles before any network call: `is_staging_key` (`"v1/staging/"`), `is_ready_key` (`"v1/ready/"`), rejecting empty keys, leading `/`, or `".."`.
   - Implement `STAGING_PART_SIZE_BYTES = 5 * 1024 * 1024` (5 MiB S3 multipart floor).
   - Implement bounded streaming helpers:
@@ -280,11 +280,11 @@ central-rust/
     - `remove_ready_for_delete`: refuse any non-ready key (`Reason::KeyRoleInvalid`), used exclusively by two-phase deletion / prune after `delete_pending` or tombstone metadata commits.
     - `open_backup_throughput_fixture`: read `v1/system/backup-throughput-fixture-v1` and require exact size `512 * 1024 * 1024`.
 
-- [ ] **Step 4: Port unit and mock/local-HTTP S3 tests from `minio_test.go`, plus gated live MinIO integration test**
+- [x] **Step 4: Port unit and mock/local-HTTP S3 tests from `minio_test.go`, plus gated live MinIO integration test**
   - Test key-role validation (`v1/staging/` vs `v1/ready/`, path traversal `".."` rejection), `TransferLimiter` concurrency cap at 2, over-limit stream cutoff at `max_bytes + 1` without committing, idle stall timeout classification into `AMBIGUOUS (idle_timeout)`, HTTP status code classification (`404` -> `NOT_FOUND`, `412`/`409` -> `CONFLICT`, `401`/`403` -> `DENIED`, `400`/`405`/`411`/`413` -> `UNAVAILABLE`, `500` -> `AMBIGUOUS`), and locator-free error strings.
   - Add a MinIO integration test gated on `CENTRAL_TEST_MINIO_ENDPOINT` (following `rust-engineering-workflow.md` §4 Tier 2 rules) exercising `upload` → `read` → `promote_create_only` (including second-call `CONFLICT` precondition proof) → `remove_staging`.
 
-- [ ] **Step 5: Run verification and commit**
+- [x] **Step 5: Run verification and commit**
   - Run: `cargo fmt --all -- --check && cargo clippy -p central-adapter-s3 --all-targets -- -D warnings && cargo test -p central-adapter-s3`
   - Commit: `feat(adapter-s3): implement S3/MinIO ObjectStore and bounded TransferLimiter`
 
@@ -370,7 +370,7 @@ central-rust/
 - `$CENTRAL_SRC/internal/adapter/postgres/artifact/lineage_store_test.go`
 - `$CENTRAL_SRC/internal/adapter/postgres/artifact/explain_test.go`
 
-- [ ] **Step 1: Implement `ReconciliationStore` in `artifact/reconcile.rs`**
+- [x] **Step 1: Implement `ReconciliationStore` in `artifact/reconcile.rs`**
   - `claim_incomplete`: round-robin workspace seek (`queryNextIncompleteWorkspace`, `queryWorkspaceHasIncompleteAfterCursor`, and per-state index scan `queryScanIncompleteByWorkspaceAndState` over `('reserved', 'staging', 'verifying')` with `MAX_SKIPPED_WORKSPACES_PER_CALL = 64`), acquiring per-artifact claims in `central.artifact_reconciliation_claims` with `claim_token_hash = sha256(claim_token)` and database-derived `clock_timestamp()` lease expiry.
   - `claim_large` and `release_large_claim` (**SB-G4 `central_runtime` privilege fix**):
     - Because `0014_b10_artifact_lifecycle.sql` grants `SELECT, INSERT, UPDATE` (and not `DELETE`) on `central.artifact_reconciliation_claims` to `central_runtime`, demote resolved large claims in `claim_large` via:
@@ -395,16 +395,16 @@ central-rust/
   - `expire_staging`: verify active claim, lock artifact row, compare age in SQL via `SELECT created_at < clock_timestamp() - make_interval(secs => $3::double precision) FROM central.artifacts WHERE workspace_id = $1 AND id = $2` (never using caller wall clock), evaluate domain `reject`, apply rejection + capacity release + `"reject"` receipt idempotently.
   - `claim_rejected_staging` (`WHERE staging_key IS NOT NULL AND state = 'rejected' ORDER BY workspace_id, staging_key LIMIT $1`), `clear_staging_key` (`UPDATE central.artifacts SET staging_key = NULL ... WHERE state = 'rejected'`), and `record_progress` (`central.artifact_reconciliation_progress`).
 
-- [ ] **Step 2: Implement `b34` Lineage Stores in `artifact/lineage_store.rs`**
+- [x] **Step 2: Implement `b34` Lineage Stores in `artifact/lineage_store.rs`**
   - Implement `ProduceEdgeStore::insert_produce_edge` (`INSERT INTO central.artifact_produce_edges ... ON CONFLICT (artifact_id) DO NOTHING`, falling back to `SELECT` on conflict for idempotent replay).
   - Implement `ReadEdgeStore::insert_read_edge` (`INSERT INTO central.artifact_read_edges ... ON CONFLICT (run_id, reader_node_id, attempt_id, artifact_id) DO NOTHING`, falling back to `SELECT` when `reader_node_id IS NOT NULL` so attempt-scoped reads dedupe while operator `NULL` reads append distinct rows).
   - Implement `LineageReader` (`produce_edge_for_artifact`, `read_edges_for_artifact`, `read_edges_for_node`, `produce_edges_for_node`, `produce_edges_for_run`, `read_edges_for_run`).
   - Implement `ReadStore` (`find_artifact`, `resolve_produced` joining `artifact_produce_edges`, `workflow_nodes`, and `artifacts`, `declared_scope` unioning `workflow_edges` of `kind = 'artifact'` with `workflow_nodes.input_artifact_refs` JSONB UUIDs, and `run_produced_artifacts`).
 
-- [ ] **Step 3: Port PostgreSQL integration tests from `reconcile_store_test.go`, `lineage_store_test.go`, and `explain_test.go`**
+- [x] **Step 3: Port PostgreSQL integration tests from `reconcile_store_test.go`, `lineage_store_test.go`, and `explain_test.go`**
   - Verify round-robin workspace cursor progression, skip-budget bounding (`64` workspaces), DB-clock staging expiry, large-claim promotion/demotion under `central_runtime` privileges (proving `claim_large` and `release_large_claim` succeed without `DELETE` privilege), rejected-staging key clearing, idempotent `artifact_produce_edges` and `artifact_read_edges` inserts, operator vs. attempt-scoped read edge uniqueness, `declared_scope` JSONB parsing, and `EXPLAIN` index-scan plan assertions on `artifacts_state_expiry_idx` and `artifacts_workspace_staging_key_unique_idx`.
 
-- [ ] **Step 4: Regenerate `.sqlx/` offline metadata and commit**
+- [x] **Step 4: Regenerate `.sqlx/` offline metadata and commit**
   - Run `cargo sqlx prepare --workspace -- --all-targets` against the live test database so all new `central-adapter-postgres::artifact` queries are recorded in `.sqlx/`.
   - Run: `cargo sqlx prepare --workspace --check -- --all-targets && cargo fmt --all -- --check && cargo clippy -p central-adapter-postgres --all-targets -- -D warnings && cargo test -p central-adapter-postgres`
   - Commit: `feat(adapter-postgres): implement artifact ReconciliationStore, b34 lineage stores, and sqlx metadata`
@@ -423,15 +423,15 @@ central-rust/
 - `$CENTRAL_RUST_SRC/docs/architecture/rust-application-boundaries.md` (§2.2 line 112)
 - `$CENTRAL_RUST_SRC/docs/implementation/rust-engineering-workflow.md`
 
-- [ ] **Step 1: Wire `central-artifact` and `central-adapter-s3` into `central-kernel`**
+- [x] **Step 1: Wire `central-artifact` and `central-adapter-s3` into `central-kernel`**
   - Add `central-artifact` and `central-adapter-s3` to `crates/central-kernel/Cargo.toml`.
   - Following the Kernel-edge rule ([rust-application-boundaries.md](../../architecture/rust-application-boundaries.md) §2.2 line 112), implement a kernel-owned `ArtifactReconcilerComponent` wrapper in `central-kernel` implementing `lifecycle::Component` that drives `central_artifact::reconciler::Reconciler::reconcile` on a bounded `tokio::time::Interval` ticker until future drop / `CancellationToken` cancellation and settles cleanly within `DEFAULT_SETTLEMENT`.
   - Add a deterministic unit test in `central-kernel` proving `ArtifactReconcilerComponent` starts under `Profile`, executes reconciliation passes, and settles cleanly on profile shutdown.
 
-- [ ] **Step 2: Update `docs/implementation/current-phase.md` to record R2 completion and advance active slice to R3**
+- [x] **Step 2: Update `docs/implementation/current-phase.md` to record R2 completion and advance active slice to R3**
   - Move Phase R2 to the **Completed** section with a summary of delivered crates (`central-foundation` UUIDv4 generation/edge IDs, `central-artifact`, `central-adapter-s3`, `central-adapter-postgres::artifact`, `central-kernel` reconciler supervision, `.sqlx/` metadata) and mark **Phase R3 — Harness Control Plane & `central serve`** as the active slice in the status table.
 
-- [ ] **Step 3: Execute the mandatory 5-stage verification pipeline (`rust-engineering-workflow.md` §7)**
+- [x] **Step 3: Execute the mandatory 5-stage verification pipeline (`rust-engineering-workflow.md` §7)**
   - Stage 1 (SQLx offline metadata check):
     `cargo sqlx prepare --workspace --check -- --all-targets`
   - Stage 2 (Formatting gate):
@@ -443,5 +443,5 @@ central-rust/
   - Stage 5 (Workspace unit & integration test suite):
     `cargo test --workspace --all-targets` (including `CENTRAL_TEST_DSN` PostgreSQL integration tests and `CENTRAL_TEST_MINIO_ENDPOINT` S3/MinIO integration tests when local infra is running)
 
-- [ ] **Step 4: Commit Phase R2 closeout**
+- [x] **Step 4: Commit Phase R2 closeout**
   - Commit: `docs(phase-r2): mark Phase R2 complete and advance active slice to Phase R3`

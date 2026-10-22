@@ -1,12 +1,23 @@
 # Current Phase
 
-## Active slice: Phase R2 — Verified Artifact Lifecycle & Object Storage
+## Active slice: Phase R3 — Harness Control Plane & `central serve`
 
-`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R2 is the active implementation slice**; Phase R1 is complete (see below) and its workspace, durable core, and `bins/central` skeleton are the foundation R2 builds on.
+`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R3 is the active implementation slice**; Phases R1 and R2 are complete (see below) — R2 delivered the verified artifact lifecycle, the S3 object-store adapter, the fenced reconciler, and its kernel supervision.
 
-R2 scope (roadmap §5): implement `central-artifact` and `central-adapter-s3` — the verified artifact lifecycle (staging reservation → streaming SHA-256 and size verification → ready-key promotion without overwrite → one durable finalization), required-Artifact readiness as the Task/Run completion guard, untrusted-body content policy, workspace-scoped two-phase deletion with tombstone, staging expiry and orphan reconciliation, quota admission, and `b34` lineage edges.
+R3 scope (roadmap §6, ADR 0035/0036): implement the harness control plane and `central serve` — `central-harness` plus `central-adapter-harness` (Claude Code, OpenCode, Codex, Antigravity adapters, gitclone, launcher client, capture, permission bridging, budgets, cancel/resume/rerun), `central-session`, `central-transport-http` (API v1 JSON controllers plus the `askama` SSR Web UI and health/metrics endpoints), the `central-kernel` serve composition wiring the R2 reconciler component behind the recovery-coordinator fence, the `bins/central` serve surface, and `central-harness-launcherd`.
 
-Verification for every R2 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+Verification for every R3 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+
+## Completed: Phase R2 — Verified Artifact Lifecycle & Object Storage
+
+Phase R2 delivered, per roadmap §5 and the [R2 plan](../internal/superpowers/plans/2026-10-22-phase-r2-verified-artifact-lifecycle.md):
+
+- `central-foundation`: UUIDv4 generation/edge identities (`content_generation`, lineage edge IDs) alongside the R1 UUIDv7 newtypes.
+- `central-artifact`: the pure lifecycle domain (reserve → staging → verifying → promotion → finalize, plus `reserved`/`rejected`/`delete_pending`/`deleted` with tombstones), the bounded content classifier, the orchestrating `Service` (materialize, resume-verifying, deliver, two-phase delete), the fenced bounded `Reconciler` (large-claim pass, rejected-staging sweep, staging-lifetime expiry), and the `b34` lineage model plus produce/read-edge port/query contracts.
+- `central-adapter-s3`: the S3/MinIO `ObjectStore` (staging upload, bounded reads, atomic create-only promotion, staging/ready removal) with the bounded `TransferLimiter` and per-transfer idle/total deadlines.
+- `central-adapter-postgres::artifact`: the artifact `Store`, two-phase delete + `CompletionContributor`, `ReconciliationStore`, and `b34` lineage stores — including the SB-G4 `central_runtime` UPDATE-demotion fix on `artifact_reconciliation_claims` recorded in `docs/internal/tasks/`.
+- `central-kernel`: `artifact_reconcile::ArtifactReconcilerComponent` — the supervised periodic fenced pass (claim → renew → reconcile on a bounded `tokio::time::Interval`, idle-until-shutdown without an epoch) with `ArtifactPass`/`ArtifactFenceSource` composition seams.
+- Committed `.sqlx/` offline query metadata for every new checked statement; the §7 fail-fast pipeline and the `CENTRAL_TEST_DSN` PostgreSQL integration suites are green (the `CENTRAL_TEST_MINIO_ENDPOINT`-gated S3 test skips cleanly when no MinIO is provisioned).
 
 ## Completed: Phase R1 — Workspace Scaffold, Canonical SQL Extraction (`v0..b37`) & Durable Task/Execution Core
 
@@ -40,8 +51,8 @@ Two upstream decisions shape everything below: [ADR 0035](../adr/0035-freeze-b09
 | Slice | Scope | Status |
 | --- | --- | --- |
 | R1 | Workspace scaffold, `v0..b37` extraction, native migration runner, durable Task/Execution core | **Complete** |
-| R2 | Verified artifact lifecycle, `central-adapter-s3` | **Active** |
-| R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | Pending |
+| R2 | Verified artifact lifecycle, `central-adapter-s3` | **Complete** |
+| R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | **Active** |
 | R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | Pending |
 | R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | Pending |
 | R6 | Backup, restore, wipe, maintenance, launcher daemons | Pending |
