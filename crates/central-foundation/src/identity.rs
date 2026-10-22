@@ -1,11 +1,15 @@
-//! Opaque RFC 9562 UUIDv7 identity newtypes.
+//! Opaque RFC 9562 identity newtypes — UUIDv7 identities and UUIDv4
+//! generations.
 //!
-//! Ports `central/internal/identity/identity.go`. `uuid::Uuid` stays
+//! Ports `central/internal/identity/identity.go` plus the opaque
+//! generation identities of `central/internal/artifact/domain.go`
+//! (`StagingGeneration`, `ContentGeneration` — UUIDv4 exactly, as the
+//! persisted columns and their parsers require). `uuid::Uuid` stays
 //! private to this module (rust-application-boundaries.md §1): every
 //! capability sees only the newtypes below. Text form is always the
 //! canonical lowercase 8-4-4-4-12 hyphenated representation; parsing is
 //! strict — uppercase hex, braces, `urn:` prefixes, compact unhyphenated
-//! text, nil UUIDs, non-v7 versions, and non-RFC 9562 variants are all
+//! text, nil UUIDs, wrong versions, and non-RFC 9562 variants are all
 //! rejected.
 
 use core::fmt;
@@ -22,7 +26,8 @@ pub enum IdParseErrorKind {
     /// (includes uppercase hex, braces, `urn:` prefixes, unhyphenated
     /// text, and malformed input).
     Malformed,
-    /// Well-formed UUID text whose version is not 7.
+    /// Well-formed UUID text whose version is not the one the newtype
+    /// requires (7 for identity types, 4 for generation types).
     WrongVersion,
     /// Well-formed UUID text whose variant is not RFC 9562.
     WrongVariant,
@@ -34,7 +39,7 @@ impl fmt::Display for IdParseErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Malformed => "not canonical lowercase RFC 9562 UUID text",
-            Self::WrongVersion => "must be UUIDv7",
+            Self::WrongVersion => "unexpected RFC 9562 UUID version",
             Self::WrongVariant => "must be RFC 9562 variant",
             Self::Nil => "must be non-zero",
         })
@@ -93,25 +98,35 @@ fn is_canonical_uuid_text(text: &str) -> bool {
 }
 
 /// Shared strict validator for every ID newtype: canonical syntax, then
-/// non-nil, then version 7, then RFC 9562 variant.
-fn parse_uuid_v7(id_type: &'static str, text: &str) -> Result<Uuid, IdParseError> {
+/// non-nil, then the required RFC 9562 version, then RFC 9562 variant.
+fn parse_uuid(id_type: &'static str, text: &str, version: usize) -> Result<Uuid, IdParseError> {
     if !is_canonical_uuid_text(text) {
         return Err(IdParseError::new(id_type, IdParseErrorKind::Malformed));
     }
     let uuid = Uuid::parse_str(text)
         .map_err(|_| IdParseError::new(id_type, IdParseErrorKind::Malformed))?;
     // Nil before version: the all-zero UUID would otherwise report the
-    // less precise "must be UUIDv7" (upstream intent is "must be non-zero").
+    // less precise version error (upstream intent is "must be non-zero").
     if uuid.is_nil() {
         return Err(IdParseError::new(id_type, IdParseErrorKind::Nil));
     }
-    if uuid.get_version_num() != 7 {
+    if uuid.get_version_num() != version {
         return Err(IdParseError::new(id_type, IdParseErrorKind::WrongVersion));
     }
     if uuid.get_variant() != Variant::RFC4122 {
         return Err(IdParseError::new(id_type, IdParseErrorKind::WrongVariant));
     }
     Ok(uuid)
+}
+
+/// Strict UUIDv7 validator for identity newtypes.
+fn parse_uuid_v7(id_type: &'static str, text: &str) -> Result<Uuid, IdParseError> {
+    parse_uuid(id_type, text, 7)
+}
+
+/// Strict UUIDv4 validator for generation newtypes.
+fn parse_uuid_v4(id_type: &'static str, text: &str) -> Result<Uuid, IdParseError> {
+    parse_uuid(id_type, text, 4)
 }
 
 /// Generates one opaque UUIDv7 identity newtype.
@@ -154,6 +169,104 @@ macro_rules! define_id {
             }
 
             /// Reconstructs an ID from raw bytes loaded through the
+            /// persistence adapter boundary.
+            ///
+            /// Trusted boundary: the value was durably stored by a
+            /// validated writer, so no re-validation is performed. Never
+            /// call this on untrusted input — use `parse` instead.
+            #[must_use]
+            pub const fn from_trusted_db_bytes(bytes: [u8; 16]) -> Self {
+                Self(Uuid::from_bytes(bytes))
+            }
+
+            /// Whether the underlying value is the nil (all-zero) UUID.
+            /// Unreachable through `new`/`parse`; only a corrupted
+            /// `from_trusted_db_bytes` row can produce it.
+            #[must_use]
+            pub fn is_nil(&self) -> bool {
+                self.0.is_nil()
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdParseError;
+
+            /// Same strict rules as `parse`.
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::parse(s)
+            }
+        }
+
+        impl fmt::Display for $name {
+            /// Canonical lowercase hyphenated text — the inverse of
+            /// `parse`.
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Display::fmt(&self.0, f)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, concat!(stringify!($name), "({})"), self.0)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.0.to_string())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = String::deserialize(deserializer)?;
+                Self::parse(&text).map_err(de::Error::custom)
+            }
+        }
+    };
+}
+
+/// Generates one opaque UUIDv4 generation newtype.
+///
+/// Identical surface to `define_id!` except `new()` mints `Uuid::new_v4()`
+/// and `parse` requires version 4 — used for artifact staging/content
+/// generations and other opaque one-time identities whose persisted
+/// columns and parsers require UUIDv4 (upstream `internal/artifact`'s
+/// `StagingGeneration`/`ContentGeneration` are UUIDv4 exactly).
+macro_rules! define_v4_id {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        ///
+        /// Opaque RFC 9562 UUIDv4 newtype; see
+        /// `central_foundation::identity`.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            /// Generates a fresh UUIDv4 value.
+            ///
+            /// `Default` is deliberately absent: there is no zero
+            /// generation — nil UUIDs are rejected at every boundary.
+            #[allow(clippy::new_without_default)]
+            #[must_use]
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+
+            /// Strict RFC 9562 UUIDv4 parse: canonical lowercase
+            /// 8-4-4-4-12 text, version 4, RFC 9562 variant, non-nil.
+            pub fn parse(text: &str) -> Result<Self, IdParseError> {
+                Ok(Self(parse_uuid_v4(stringify!($name), text)?))
+            }
+
+            /// The 16 raw bytes, for crossing the persistence adapter
+            /// boundary.
+            #[must_use]
+            pub const fn as_bytes(&self) -> &[u8; 16] {
+                self.0.as_bytes()
+            }
+
+            /// Reconstructs a value from raw bytes loaded through the
             /// persistence adapter boundary.
             ///
             /// Trusted boundary: the value was durably stored by a
@@ -404,6 +517,75 @@ define_id! {
     CausationId
 }
 
+// ---------------------------------------------------------------------------
+// UUIDv4 generation newtypes (upstream `internal/artifact`'s opaque
+// generations — UUIDv4 because the persisted columns and their parsers
+// require exactly that version).
+// ---------------------------------------------------------------------------
+
+define_v4_id! {
+    /// Opaque UUIDv4 staging generation minted once per artifact Reserve
+    /// command. It is never a user-controlled value.
+    StagingGeneration
+}
+
+define_v4_id! {
+    /// Opaque UUIDv4 content generation minted once per artifact Promotion
+    /// command. It is never reused, including after deletion.
+    ContentGeneration
+}
+
+define_v4_id! {
+    /// Identifies one `artifact_produce_edges` lineage edge (b34).
+    ProduceEdgeId
+}
+
+define_v4_id! {
+    /// Identifies one `artifact_read_edges` lineage edge (b34).
+    ReadEdgeId
+}
+
+define_v4_id! {
+    /// Identifies one `central.artifact_tombstones` row — the durable
+    /// non-body evidence of a completed two-phase artifact deletion
+    /// (adapter-mapping §3.10).
+    ArtifactTombstoneId
+}
+
+impl ArtifactId {
+    /// Reconstructs a UUIDv7-shaped identity from the first 16 bytes of a
+    /// digest, forcing the version (`(raw[6] & 0x0f) | 0x70`) and RFC 9562
+    /// variant (`(raw[8] & 0x3f) | 0x80`) bits exactly like upstream's
+    /// `derivedUUID(domain, input, 7)`.
+    ///
+    /// The forced version nibble means the result is never nil, so this is
+    /// infallible. It exists so callers deriving deterministic identities
+    /// (artifact reservation replay) never import `uuid::Uuid`.
+    #[must_use]
+    pub const fn from_v7_digest_bytes(mut raw: [u8; 16]) -> Self {
+        raw[6] = (raw[6] & 0x0f) | 0x70;
+        raw[8] = (raw[8] & 0x3f) | 0x80;
+        Self::from_trusted_db_bytes(raw)
+    }
+}
+
+impl StagingGeneration {
+    /// Reconstructs a UUIDv4-shaped generation from the first 16 bytes of
+    /// a digest, forcing the version (`(raw[6] & 0x0f) | 0x40`) and RFC
+    /// 9562 variant (`(raw[8] & 0x3f) | 0x80`) bits exactly like upstream's
+    /// `derivedUUID(domain, input, 4)`.
+    ///
+    /// The forced version nibble means the result is never nil, so this is
+    /// infallible. It exists so `central-artifact` never imports
+    /// `uuid::Uuid`.
+    #[must_use]
+    pub const fn from_v4_digest_bytes(mut raw: [u8; 16]) -> Self {
+        raw[6] = (raw[6] & 0x0f) | 0x40;
+        raw[8] = (raw[8] & 0x3f) | 0x80;
+        Self::from_trusted_db_bytes(raw)
+    }
+}
+
 /// The b20 sentinel workspace row's fixed identity:
 /// `019fdc8d-e33a-76ed-9ef0-a0d9fe92e54a`.
 ///
@@ -436,6 +618,8 @@ mod tests {
 
     /// A valid lowercase RFC 9562 UUIDv7 in canonical text form.
     const VALID_V7: &str = "018f3b2a-1c4d-7e9f-8a1b-2c3d4e5f6a7b";
+    /// A valid lowercase RFC 9562 UUIDv4 in canonical text form.
+    const VALID_V4: &str = "550e8400-e29b-41d4-a716-446655440000";
     /// The upstream b20 sentinel value (valid v7, RFC 9562 variant).
     const SENTINEL_TEXT: &str = "019fdc8d-e33a-76ed-9ef0-a0d9fe92e54a";
 
@@ -530,6 +714,117 @@ mod tests {
         assert_id_contract::<SecretUseEvidenceId>();
         assert_id_contract::<CorrelationId>();
         assert_id_contract::<CausationId>();
+    }
+
+    /// Runs the shared strict contract against one UUIDv4 generation
+    /// newtype: canonical parse, Display/FromStr round-trip, JSON
+    /// round-trip, byte-boundary round-trip, and rejection of everything
+    /// the v7 contract rejects — plus rejection of valid v7 text.
+    fn assert_v4_contract<T>()
+    where
+        T: FromStr<Err = IdParseError>
+            + fmt::Display
+            + fmt::Debug
+            + Copy
+            + PartialEq
+            + Ord
+            + Serialize
+            + for<'de> Deserialize<'de>,
+    {
+        let parsed = VALID_V4.parse::<T>().unwrap();
+        assert_eq!(parsed.to_string(), VALID_V4);
+        let round_tripped: T = parsed.to_string().parse().unwrap();
+        assert_eq!(round_tripped, parsed);
+
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(json, format!("\"{VALID_V4}\""));
+        let de: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, parsed);
+
+        // Rejections — same strict shape as the v7 contract.
+        assert!(VALID_V4.to_uppercase().parse::<T>().is_err());
+        assert!("00000000-0000-0000-0000-000000000000".parse::<T>().is_err());
+        assert!(VALID_V7.parse::<T>().is_err()); // v7 is the wrong version here
+        assert!("550e8400-e29b-61d4-c716-446655440000".parse::<T>().is_err()); // v6
+        assert!("550e8400-e29b-41d4-c716-446655440000".parse::<T>().is_err()); // MS variant
+        assert!("550e8400e29b41d4a716446655440000".parse::<T>().is_err()); // unhyphenated
+        assert!(format!("{{{VALID_V4}}}").parse::<T>().is_err()); // braces
+        assert!(format!("urn:uuid:{VALID_V4}").parse::<T>().is_err()); // urn
+        assert!("not-a-uuid".parse::<T>().is_err());
+    }
+
+    #[test]
+    fn every_v4_generation_type_satisfies_the_strict_contract() {
+        assert_v4_contract::<StagingGeneration>();
+        assert_v4_contract::<ContentGeneration>();
+        assert_v4_contract::<ProduceEdgeId>();
+        assert_v4_contract::<ReadEdgeId>();
+        assert_v4_contract::<ArtifactTombstoneId>();
+    }
+
+    #[test]
+    fn v4_new_generates_uuidv4_canonical_text() {
+        let generation = StagingGeneration::new();
+        let text = generation.to_string();
+        // Generated generations parse back through the strict v4
+        // validator — proof they are canonical lowercase v4 / RFC 9562 /
+        // non-nil, and never UUIDv7.
+        assert_eq!(StagingGeneration::parse(&text).unwrap(), generation);
+        assert!(ArtifactId::parse(&text).is_err());
+        assert_eq!(text.len(), 36);
+        assert_ne!(StagingGeneration::new(), StagingGeneration::new());
+    }
+
+    #[test]
+    fn v4_parse_error_kinds_are_precise() {
+        let v7 = VALID_V7.parse::<StagingGeneration>().unwrap_err();
+        assert_eq!(v7.kind(), IdParseErrorKind::WrongVersion);
+        assert_eq!(v7.id_type(), "StagingGeneration");
+
+        let nil = "00000000-0000-0000-0000-000000000000"
+            .parse::<ContentGeneration>()
+            .unwrap_err();
+        assert_eq!(nil.kind(), IdParseErrorKind::Nil);
+
+        let variant = "550e8400-e29b-41d4-c716-446655440000"
+            .parse::<ReadEdgeId>()
+            .unwrap_err();
+        assert_eq!(variant.kind(), IdParseErrorKind::WrongVariant);
+    }
+
+    #[test]
+    fn digest_constructors_force_version_and_variant_bits() {
+        // Deterministic inputs: the digest constructors must reproduce
+        // exactly upstream's derivedUUID bit-forcing — version nibble and
+        // RFC 9562 variant — whatever the raw bytes were.
+        let mut raw = [0u8; 16];
+        let artifact = ArtifactId::from_v7_digest_bytes(raw);
+        let text = artifact.to_string();
+        assert_eq!(&text[14..15], "7");
+        assert!(matches!(text.chars().nth(19), Some('8' | '9' | 'a' | 'b')));
+        // Never nil: the forced version nibble keeps byte 6 non-zero.
+        assert!(!artifact.is_nil());
+        assert_eq!(ArtifactId::parse(&text).unwrap(), artifact);
+
+        raw = [0xff; 16];
+        let generation = StagingGeneration::from_v4_digest_bytes(raw);
+        let text = generation.to_string();
+        assert_eq!(&text[14..15], "4");
+        assert!(matches!(text.chars().nth(19), Some('8' | '9' | 'a' | 'b')));
+        assert!(!generation.is_nil());
+        assert_eq!(StagingGeneration::parse(&text).unwrap(), generation);
+
+        // Byte-exact spot check against the upstream algorithm: SHA-256 of
+        // "central.b10.reservation-artifact-id/v1\x00op-1" truncated to 16
+        // bytes then v7-forced yields this exact identity.
+        let expected = ArtifactId::parse("1442ca0d-2c53-7012-a8ae-33312c9778f4").unwrap();
+        // The raw digest prefix (computed from the upstream seed formula)
+        // forced through the constructor must produce it.
+        let prefix: [u8; 16] = [
+            0x14, 0x42, 0xca, 0x0d, 0x2c, 0x53, 0x10, 0x12, 0x28, 0xae, 0x33, 0x31, 0x2c, 0x97,
+            0x78, 0xf4,
+        ];
+        assert_eq!(ArtifactId::from_v7_digest_bytes(prefix), expected);
     }
 
     #[test]

@@ -6,5 +6,17 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+central-foundation = { path = "../../central-foundation", version = "0.1.0" }
+# One-way edge for `ExecutionChangeSet` completion-guard types consumed by
+# the finalize/app path (rust-application-boundaries.md §1);
+# `central-execution` never imports `central-artifact`.
+central-execution = { path = "../central-execution", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+trait-variant.workspace = true
+
 [lints]
 workspace = true

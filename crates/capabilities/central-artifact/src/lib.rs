@@ -1,6 +1,11 @@
 //! `central-artifact` — Artifact lifecycle: reserve, stage, verify,
-//! promote, finalize; one-shot delivery capabilities (ADR 0005).
+//! promote, finalize; workspace-scoped two-phase deletion with
+//! tombstones; content-policy delivery and preview disposition
+//! (ADR 0005, `docs/artifacts/lifecycle.md`,
+//! `docs/artifacts/content-policy.md`).
 //!
-//! Stub crate: the `domain.rs` / `port.rs` / `query.rs` / `app.rs`
-//! four-layer structure lands in this capability's R-slice
-//! (rust-application-boundaries.md §2).
+//! Four-layer capability crate (rust-application-boundaries.md §2).
+//! Only [`domain`] exists so far; `lineage` / `port` / `query` /
+//! `classifier` / `reconciler` / `app` land in later R2 tasks.
+
+pub mod domain;
