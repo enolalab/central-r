@@ -357,15 +357,22 @@ define_id! {
     OutboxEventId
 }
 
+define_id! {
+    /// Identifies one `outbox_workspace_work` intent row — the execution
+    /// outbox (upstream `OutboxID`, `OutboxIntent.ID`).
+    OutboxId
+}
+
 /// The b20 sentinel workspace row's fixed identity:
-/// `018f0000-0000-7000-8000-000000000001`.
+/// `019fdc8d-e33a-76ed-9ef0-a0d9fe92e54a`.
 ///
 /// The single admitted non-generated workspace identity, matching the
-/// `SentinelWorkspaceID` constant consumed by
-/// `b20_sentinel_workspace_id.go`. It is itself a valid UUIDv7, so the
-/// strict parser admits it with no special-casing.
+/// upstream `SentinelWorkspaceID` constant consumed by
+/// `b20_sentinel_workspace_id.go` (the plan text had drifted to a
+/// different value). It is itself a valid UUIDv7, so the strict parser
+/// admits it with no special-casing.
 pub const SENTINEL_WORKSPACE_ID: WorkspaceId = WorkspaceId::from_trusted_db_bytes([
-    0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x01, 0x9f, 0xdc, 0x8d, 0xe3, 0x3a, 0x76, 0xed, 0x9e, 0xf0, 0xa0, 0xd9, 0xfe, 0x92, 0xe5, 0x4a,
 ]);
 
 impl WorkspaceId {
@@ -389,8 +396,7 @@ mod tests {
     /// A valid lowercase RFC 9562 UUIDv7 in canonical text form.
     const VALID_V7: &str = "018f3b2a-1c4d-7e9f-8a1b-2c3d4e5f6a7b";
     /// The upstream b20 sentinel value (valid v7, RFC 9562 variant).
-    const UPSTREAM_SENTINEL_TEXT: &str = "019fdc8d-e33a-76ed-9ef0-a0d9fe92e54a";
-    const SENTINEL_TEXT: &str = "018f0000-0000-7000-8000-000000000001";
+    const SENTINEL_TEXT: &str = "019fdc8d-e33a-76ed-9ef0-a0d9fe92e54a";
 
     /// Runs the shared identity contract against one concrete newtype:
     /// strict parse, lowercase-only canonical form, Display/FromStr
@@ -476,6 +482,7 @@ mod tests {
         assert_id_contract::<NodeLeaseId>();
         assert_id_contract::<ResumeCheckpointId>();
         assert_id_contract::<OutboxEventId>();
+        assert_id_contract::<OutboxId>();
     }
 
     #[test]
@@ -540,16 +547,10 @@ mod tests {
             SENTINEL_WORKSPACE_ID
         );
         assert_eq!(
-            WorkspaceId::parse(UPSTREAM_SENTINEL_TEXT)
-                .unwrap()
-                .to_string(),
-            UPSTREAM_SENTINEL_TEXT
-        );
-        assert_eq!(
             SENTINEL_WORKSPACE_ID.as_bytes(),
             &[
-                0x01, 0x8f, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x01
+                0x01, 0x9f, 0xdc, 0x8d, 0xe3, 0x3a, 0x76, 0xed, 0x9e, 0xf0, 0xa0, 0xd9, 0xfe, 0x92,
+                0xe5, 0x4a
             ]
         );
     }
