@@ -1,0 +1,10 @@
+[package]
+name = "central-retry"
+description = "Retry capability — b37 error taxonomy, budgets, timeout hierarchy, compensation, outbox (domain.rs/port.rs/query.rs/app.rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "central-migration-launcherd"
+description = "Dedicated migration launcher daemon mediating central_migration privilege (ADR 0011)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

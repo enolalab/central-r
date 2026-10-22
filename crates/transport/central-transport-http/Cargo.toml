@@ -1,0 +1,10 @@
+[package]
+name = "central-transport-http"
+description = "HTTP transport — axum controllers: API v1 JSON, Askama SSR Web UI, Health & Metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

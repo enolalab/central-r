@@ -1,0 +1,14 @@
+[package]
+name = "central-adapter-linux"
+description = "Linux platform adapter — protected-broker protocol, memfd, SCM_RIGHTS, SO_PEERCRED, openat2, pidfd, PAM/TTY, namespaces, cgroups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# This crate is one of the two places audited `unsafe` may live
+# (workflow §5.2); when implemented it overrides unsafe_code inside the
+# rustix-wrapped syscall boundary only. The stub inherits the workspace
+# forbid until then.
+[lints]
+workspace = true

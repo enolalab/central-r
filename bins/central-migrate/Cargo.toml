@@ -1,0 +1,10 @@
+[package]
+name = "central-migrate"
+description = "Migration operator binary (central-migrate UID) — single central_migration session for mutating migration ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

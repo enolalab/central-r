@@ -1,0 +1,10 @@
+[package]
+name = "central-restore"
+description = "Restore engine binary — verified-ticket authority; capacity reserve per ADR 0018"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "central-artifact"
+description = "Artifact capability — staging, SHA-256 verification, promotion, content policy, b34 lineage (domain.rs/port.rs/query.rs/app.rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "central-adapter-s3"
+description = "S3/MinIO object-storage adapter for central-artifact body-store ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

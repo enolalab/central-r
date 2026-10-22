@@ -1,0 +1,3 @@
+# rustfmt runs with defaults only — rust-engineering-workflow.md §5.1.
+# An override requires an Accepted ADR recording it; until then this file
+# intentionally sets no options.

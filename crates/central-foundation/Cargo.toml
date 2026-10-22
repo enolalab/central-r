@@ -1,0 +1,17 @@
+[package]
+name = "central-foundation"
+description = "Opaque UUIDv7 identity newtypes and the failure taxonomy shared by every crate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+uuid.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

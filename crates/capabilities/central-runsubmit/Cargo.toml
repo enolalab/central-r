@@ -1,0 +1,10 @@
+[package]
+name = "central-runsubmit"
+description = "Runsubmit capability — Phase 2 run submission orchestration (domain.rs/port.rs/query.rs/app.rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

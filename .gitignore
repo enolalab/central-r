@@ -1,0 +1,6 @@
+# Rust build output.
+/target
+
+# NOTE: `.sqlx/` is committed offline query metadata
+# (rust-engineering-workflow.md §4.2) and must never be ignored.
+# `Cargo.lock` is committed and is the resolved-version authority (§3.2).

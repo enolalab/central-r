@@ -1,0 +1,10 @@
+[package]
+name = "central-backup-launcherd"
+description = "Backup/restore launcher daemon mediating privileged steps (fd-3 pg_dump/pg_restore)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

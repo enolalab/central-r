@@ -1,0 +1,10 @@
+[package]
+name = "central-infra"
+description = "Infra capability — local init, prepare, compose lifecycle, doctor, maintenance, advisory (domain.rs/port.rs/query.rs/app.rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

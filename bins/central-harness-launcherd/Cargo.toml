@@ -1,0 +1,10 @@
+[package]
+name = "central-harness-launcherd"
+description = "Root socket-activated daemon launching isolated operator harness sessions (ADR 0036)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

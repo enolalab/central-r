@@ -1,0 +1,10 @@
+[package]
+name = "central-adapter-postgres"
+description = "PostgreSQL adapter — sqlx implementations of capability port.rs/query.rs traits + native central.schema_migrations runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

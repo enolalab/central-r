@@ -1,0 +1,10 @@
+[package]
+name = "central"
+description = "Main central CLI — serve, run submit, node decide, checkpoint *, artifact read, local *, migrate *, backup *, restore *, helper/broker/sandbox-launcher modes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

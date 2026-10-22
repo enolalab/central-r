@@ -1,0 +1,10 @@
+[package]
+name = "central-harness"
+description = "Harness capability — ADR 0035 harness control plane: attempts, budgets, permissions, capture (domain.rs/port.rs/query.rs/app.rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

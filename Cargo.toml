@@ -1,0 +1,118 @@
+# central-rust workspace root — rust-application-boundaries.md §1/§3.1,
+# rust-engineering-workflow.md §3–§5.
+#
+# Application boundaries are enforced by this dependency graph, not by
+# review convention. Member crates never restate dependency versions
+# inline (`dep.workspace = true`); `Cargo.lock` is committed and is the
+# resolved-version authority. No member is published.
+
+[workspace]
+resolver = "2"
+members = [
+    # Foundation
+    "crates/central-foundation",
+    # Capability crates (§3.1 tree; each owns domain/port/query/app)
+    "crates/capabilities/central-artifact",
+    "crates/capabilities/central-authorization",
+    "crates/capabilities/central-backup",
+    "crates/capabilities/central-checkpoint",
+    "crates/capabilities/central-event",
+    "crates/capabilities/central-eventjournal",
+    "crates/capabilities/central-execution",
+    "crates/capabilities/central-harness",
+    "crates/capabilities/central-infra",
+    "crates/capabilities/central-retry",
+    "crates/capabilities/central-runsubmit",
+    "crates/capabilities/central-runview",
+    "crates/capabilities/central-scheduler",
+    "crates/capabilities/central-session",
+    "crates/capabilities/central-task",
+    "crates/capabilities/central-workflow",
+    "crates/capabilities/central-workspace",
+    # Adapter crates (§2.4)
+    "crates/adapters/central-adapter-harness",
+    "crates/adapters/central-adapter-linux",
+    "crates/adapters/central-adapter-postgres",
+    "crates/adapters/central-adapter-s3",
+    # Transport
+    "crates/transport/central-transport-http",
+    # Kernel (single composition root)
+    "crates/central-kernel",
+    # Binary targets (§3.2 topology)
+    "bins/central",
+    "bins/central-advisory-sign",
+    "bins/central-backup",
+    "bins/central-backup-launcherd",
+    "bins/central-harness-launcherd",
+    "bins/central-migrate",
+    "bins/central-migration-launcherd",
+    "bins/central-restore",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Shared dependency policy — exact pins per workflow §3.2. Feature sets
+# follow the boundary doc §1 matrix verbatim; `sqlx` `migrate` is disabled
+# workspace-wide (§3.4/§4.4).
+[workspace.dependencies]
+# central-foundation
+uuid = { version = "=1.28.0", features = ["v7", "serde"] }
+time = { version = "=0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+
+# Async runtime — kernel, adapters, transport, binaries only
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "fs"] }
+tokio-util = "=0.7.20"
+trait-variant = "=0.1.3"
+
+# central-transport-http only
+axum = "=0.8.9"
+tower = "=0.5.3"
+tower-http = "=0.7.1"
+rustls = "=0.23.46"
+askama = "=0.16.1"
+
+# central-adapter-postgres only — canonical declaration (workflow §3.4);
+# the `migrate` feature is prohibited workspace-wide
+sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "macros", "uuid", "time", "json"] }
+
+# central-adapter-s3 only
+aws-sdk-s3 = "=1.154.0"
+aws-config = "=1.13.0"
+sha2 = "=0.11.1"
+
+# central-adapter-linux + launcher/protected-execution-mode binaries only
+rustix = { version = "=1.1.5", features = ["fs", "net", "process", "shm", "mm"] }
+
+# Cryptography — broker, advisory verification, CSRF/session/approval binding
+ed25519-dalek = "=3.0.0"
+hmac = "=0.13.0"
+rand = "=0.10.3"
+zeroize = "=1.9.1"
+
+# Observability — kernel, observability rendering, operational endpoints
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
+prometheus-client = "=0.25.1"
+
+# Workspace-wide lints (workflow §5.2–§5.3). `unsafe_code = "forbid"`
+# applies to every member; only central-adapter-linux and the launcher /
+# protected-execution-mode binaries may narrow it inside their audited
+# syscall boundary via their own `[lints]` override.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# Denied on non-test targets. Test-target relaxation for unwrap/expect
+# lives in clippy.toml (`allow-*-in-tests`); panic/todo/dbg_macro stay
+# denied everywhere.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"

@@ -1,0 +1,10 @@
+[package]
+name = "central-advisory-sign"
+description = "Offline Ed25519 advisory signing tool — no network, no database"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

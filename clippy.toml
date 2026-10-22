@@ -1,0 +1,7 @@
+# Clippy configuration — rust-engineering-workflow.md §5.3.
+#
+# `unwrap_used`/`expect_used` stay `deny` on production targets; tests may
+# relax them where a test failure is the intent. `panic`, `todo`, and
+# `dbg_macro` stay denied everywhere (no relaxation option is set here).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

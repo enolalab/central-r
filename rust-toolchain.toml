@@ -1,0 +1,7 @@
+# Pinned toolchain contract — rust-engineering-workflow.md §2.1.
+# Nightly-only features, RUSTC_BOOTSTRAP, and -Z flags are prohibited
+# workspace-wide.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,17 @@
+# Package name carries the `-bin` suffix because the capability crate
+# `central-backup` owns the crate name; the installed binary is still
+# `central-backup` via the explicit target below.
+[package]
+name = "central-backup-bin"
+description = "Backup operator binary (central-backup UID) — shared/exclusive advisory lock matrix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "central-backup"
+path = "src/main.rs"
+
+[lints]
+workspace = true

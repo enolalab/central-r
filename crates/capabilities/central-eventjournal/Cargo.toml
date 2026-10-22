@@ -1,0 +1,10 @@
+[package]
+name = "central-eventjournal"
+description = "Event journal capability — b33 canonical run_events envelope, fold & reconstruction (domain.rs/port.rs/query.rs/app.rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

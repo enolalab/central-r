@@ -1,0 +1,53 @@
+# cargo-deny policy — rust-engineering-workflow.md §6.
+#
+# Four enforced checks: licenses, sources, RustSec advisories, bans/duplicates.
+# This file is reviewed like code.
+
+[graph]
+all-features = true
+
+# --- 1. Licenses -------------------------------------------------------------
+# Allowlist: MIT, Apache-2.0, BSD-3-Clause. SPDX `OR` expressions such as
+# `MIT OR Apache-2.0` are satisfied because both terms are allowed.
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
+confidence-threshold = 0.8
+# Every member crate is `publish = false`; workspace crates carry the
+# workspace license anyway, this only guards a missed declaration.
+private = { ignore = true }
+# Recorded exceptions (workflow §6 "an accepted, recorded exception").
+# `unicode-ident` is an unavoidable transitive dependency
+# (serde_derive -> syn -> proc-macro2) and carries Unicode-3.0, an
+# OSI-approved permissive license outside the allowlist. Scope is pinned
+# to this crate only; no version bound because every released
+# unicode-ident >= 1.0.19 carries the same license.
+exceptions = [{ allow = ["Unicode-3.0"], crate = "unicode-ident" }]
+
+# --- 2. Sources --------------------------------------------------------------
+# crates.io only. Git dependencies are banned unless pinned to a full commit
+# `rev` under an Accepted ADR (workflow §3.3); branch/tag pins never pass.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+required-git-spec = "rev"
+
+# --- 3. Advisories -----------------------------------------------------------
+# RustSec advisory database; any advisory on a resolved version fails until
+# the dependency is bumped or a recorded exception applies.
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+# --- 4. Bans and duplicates ---------------------------------------------------
+# Unexpected duplicate versions fail; each expected duplicate is recorded in
+# `skip` individually with its justification comment.
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
