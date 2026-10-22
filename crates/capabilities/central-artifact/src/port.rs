@@ -459,8 +459,11 @@ pub struct IncompleteClaim {
     pub artifact_id: ArtifactId,
     /// Its owning workspace.
     pub workspace_id: WorkspaceId,
-    /// Its lifecycle state at claim time.
-    pub state: State,
+    /// Its lifecycle state at claim time. `None` is the honest encoding
+    /// of upstream's empty-string `State` sentinel: the dedicated large
+    /// claim carries no recorded state, so the reconciler's
+    /// moved-under-the-claim check is skipped for it by construction.
+    pub state: Option<State>,
     /// When the claim lease expires.
     pub lease_expires_at: OffsetDateTime,
     /// The artifact's durable creation time. Claims arrive in ascending
