@@ -906,3 +906,99 @@ pub fn evaluate_recovery(
         ..ExecutionChangeSet::default()
     })
 }
+
+// ---------------------------------------------------------------------------
+// Dispatchable-run projection (upstream DispatchCase / DispatchableRun /
+// ListDispatchableRunsRequest — harness phase 3a decision 1).
+// ---------------------------------------------------------------------------
+
+/// `DispatchCase` says which harness phase 3a decision 1 case made a
+/// Run dispatchable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DispatchCase {
+    /// Case (a): a queued Task whose queued current Run has no Step
+    /// yet. The dispatcher starts it with `StartHarnessRun`.
+    DispatchQueued,
+    /// Case (b): a running Task whose current StepAttempt is a B08
+    /// prepared successor (a crash or stop happened before
+    /// `MarkInvoked`) and whose Run holds no live lease. The
+    /// dispatcher re-claims that attempt with the existing Claim.
+    DispatchPreparedSuccessor,
+}
+
+impl DispatchCase {
+    /// The persisted string form (upstream `DispatchCase` value).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DispatchQueued => "queued",
+            Self::DispatchPreparedSuccessor => "prepared_successor",
+        }
+    }
+    /// Parses the persisted form; `None` on anything else.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(Self::DispatchQueued),
+            "prepared_successor" => Some(Self::DispatchPreparedSuccessor),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchCase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `DispatchableRun` is one Run the harness dispatcher may start. For
+/// `DispatchPreparedSuccessor`, `step_id`, `attempt_id` and
+/// `logical_operation` name the prepared successor the dispatcher
+/// re-claims; they are zero for `DispatchQueued`. Versions are not
+/// returned: the dispatcher reads the authoritative `ExecutionState`
+/// before it commits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispatchableRun {
+    /// Which dispatch case produced the row.
+    pub case: DispatchCase,
+    pub workspace_id: WorkspaceId,
+    pub task_id: TaskId,
+    pub run_id: RunId,
+    pub step_id: StepId,
+    pub attempt_id: StepAttemptId,
+    pub logical_operation: LogicalOperationId,
+    pub task_created_at: OffsetDateTime,
+}
+
+/// `MaxDispatchableRunsLimit` bounds one `list_dispatchable_runs`
+/// page.
+pub const MAX_DISPATCHABLE_RUNS_LIMIT: u32 = 100;
+
+/// `ListDispatchableRunsRequest` selects at most `limit` Runs whose
+/// Task was created at or after `eligible_after`
+/// (`CENTRAL_HARNESS_ELIGIBLE_AFTER`), oldest Task first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListDispatchableRunsRequest {
+    /// Page bound in `[1, MAX_DISPATCHABLE_RUNS_LIMIT]`.
+    pub limit: u32,
+    /// Eligibility floor on the Task's `created_at`.
+    pub eligible_after: OffsetDateTime,
+}
+
+impl ListDispatchableRunsRequest {
+    /// Upstream `Validate` — requires a limit in
+    /// `[1, MAX_DISPATCHABLE_RUNS_LIMIT]` and a non-zero eligibility
+    /// floor.
+    pub fn validate(&self) -> Result<(), Failure> {
+        if !(1..=MAX_DISPATCHABLE_RUNS_LIMIT).contains(&self.limit)
+            || self.eligible_after == ZERO_TIME
+        {
+            return Err(failure(
+                FailureKind::Invalid,
+                "INVALID_DISPATCHABLE_RUNS_REQUEST",
+            ));
+        }
+        Ok(())
+    }
+}

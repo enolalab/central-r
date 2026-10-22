@@ -16,7 +16,7 @@ use crate::domain::{
     ExecutionState, ExpectedVersions, LeaseCredential, LogicalOperationId, RequestFingerprint,
     TrustedScope,
 };
-use crate::harness_run::B09EvidenceReference;
+use crate::harness_run::{B09EvidenceReference, DispatchableRun, ListDispatchableRunsRequest};
 use crate::resume::{
     RecoveryCoordinatorFence, RecoveryEpoch, RecoveryEpochState, RecoveryWorkspaceState,
     RecoveryWorkspaceWork,
@@ -544,6 +544,19 @@ pub trait RecoveryClaimabilityReader {
         task_id: TaskId,
         run_id: RunId,
     ) -> Result<Claimability, Failure>;
+}
+
+/// `DispatchableRunReader` lists the Runs the harness dispatcher may
+/// start (harness phase 3a decision 1), across every Workspace, oldest
+/// Task first. It is a read-only projection: admission is still decided
+/// by the fenced `StartHarnessRun` or Claim commit.
+#[trait_variant::make(Send)]
+pub trait DispatchableRunReader {
+    /// `ListDispatchableRuns`.
+    async fn list_dispatchable_runs(
+        &self,
+        request: ListDispatchableRunsRequest,
+    ) -> Result<Vec<DispatchableRun>, Failure>;
 }
 
 /// `Clock` — the single time source services depend on.

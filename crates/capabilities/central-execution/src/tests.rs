@@ -1266,3 +1266,57 @@ fn payload_sanitization_and_fingerprint() {
     .unwrap_err();
     assert_eq!(e.code(), "INVALID_PAYLOAD");
 }
+
+// ---------------------------------------------------------------------------
+// harness_run.go — dispatchable-run projection request validation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_dispatchable_runs_request_validate_bounds() {
+    for limit in [1, MAX_DISPATCHABLE_RUNS_LIMIT] {
+        ListDispatchableRunsRequest {
+            limit,
+            eligible_after: T0,
+        }
+        .validate()
+        .unwrap();
+    }
+    for limit in [0, MAX_DISPATCHABLE_RUNS_LIMIT + 1] {
+        let e = ListDispatchableRunsRequest {
+            limit,
+            eligible_after: T0,
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(
+            (e.code(), e.kind()),
+            ("INVALID_DISPATCHABLE_RUNS_REQUEST", FailureKind::Invalid)
+        );
+    }
+    let e = ListDispatchableRunsRequest {
+        limit: 1,
+        eligible_after: ZERO_TIME,
+    }
+    .validate()
+    .unwrap_err();
+    assert_eq!(
+        (e.code(), e.kind()),
+        ("INVALID_DISPATCHABLE_RUNS_REQUEST", FailureKind::Invalid)
+    );
+}
+
+#[test]
+fn dispatch_case_persisted_strings_round_trip() {
+    assert_eq!(DispatchCase::DispatchQueued.as_str(), "queued");
+    assert_eq!(
+        DispatchCase::DispatchPreparedSuccessor.as_str(),
+        "prepared_successor"
+    );
+    for case in [
+        DispatchCase::DispatchQueued,
+        DispatchCase::DispatchPreparedSuccessor,
+    ] {
+        assert_eq!(DispatchCase::parse(case.as_str()), Some(case));
+    }
+    assert_eq!(DispatchCase::parse("unknown"), None);
+}
