@@ -471,7 +471,7 @@ async fn conflicting_receipt_fingerprint_is_a_conflict() -> Result<()> {
     req.fingerprint = [1u8; 32];
     let err = store.commit(req).await.unwrap_err();
     assert_eq!(err.kind(), FailureKind::Conflict);
-    assert_eq!(err.code(), "REASON_REQUEST_CONFLICT");
+    assert_eq!(err.code(), "IDEMPOTENCY_CONFLICT");
     Ok(())
 }
 

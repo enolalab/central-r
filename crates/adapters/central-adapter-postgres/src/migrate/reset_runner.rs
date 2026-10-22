@@ -10,7 +10,7 @@
 use sqlx::PgConnection;
 
 use super::baseline::BaselineInstaller;
-use super::runner::{acquire_migration_locks, release_migration_locks, session_binding};
+use super::runner::{acquire_migration_locks, session_binding};
 use super::verify_shape::{read_migration_records, schema_exists, table_exists};
 use super::{
     BrokerProofService, ResetConfirmation, ResetRequest, Result, TargetIdentity,
@@ -175,7 +175,10 @@ impl<'a> ResetRunner<'a> {
                 });
             }
         }
-        let _ = release_migration_locks(&mut *self.conn).await;
+        // Upstream never unlocks on this path: the canonical locks are
+        // session-scoped and are released when the connection closes
+        // (reset_runner.go has no `pg_advisory_unlock`); the post-drop
+        // stock verification must run under the same held locks.
         Ok(())
     }
 

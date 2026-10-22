@@ -96,11 +96,11 @@ impl Store {
     /// stores exactly `{"approval_action":{...}}` (`omitempty` → `{}`
     /// without a descriptor); every other durable-result leg is
     /// rebound from the receipt binding and its event row at replay.
-    fn encode_result_payload(result: &DurableResult) -> Vec<u8> {
+    fn encode_result_payload(result: &DurableResult) -> serde_json::Value {
         let Some(a) = result.approval_action.as_ref() else {
-            return serde_json::to_vec(&serde_json::json!({})).unwrap_or_default();
+            return serde_json::json!({});
         };
-        serde_json::to_vec(&serde_json::json!({
+        serde_json::json!({
             "approval_action": {
                 "Authorized": a.authorized,
                 "Action": a.action.map_or("", |x| x.as_str()),
@@ -119,8 +119,7 @@ impl Store {
                     "Approval": a.expected_versions.approval,
                 },
             },
-        }))
-        .unwrap_or_default()
+        })
     }
 
     /// Decodes a stored `result_payload`; corrupt rows are internal.
@@ -284,7 +283,7 @@ impl Store {
             req.capability.as_str(),
             &digest[..],
             uuid_of(req.result.event_id.as_bytes()),
-            serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_default(),
+            payload,
             uuid_of(req.receipt_binding.task_id.as_bytes()),
             opt_run_uuid(req.receipt_binding.run_id),
             opt_step_uuid(req.receipt_binding.step_id),
@@ -303,7 +302,7 @@ impl Store {
 
     /// Receipt replay equality — fingerprint + principal + capability +
     /// expected-version digest + the full binding. Any drift is
-    /// `REASON_REQUEST_CONFLICT` (upstream behavior).
+    /// `IDEMPOTENCY_CONFLICT` (upstream behavior).
     fn receipt_matches(
         row: &ReceiptRow,
         req_fp: &[u8; 32],
@@ -312,10 +311,10 @@ impl Store {
         digest: &[u8; 32],
         binding: &central_execution::port::ReceiptBinding,
     ) -> bool {
-        row.request_fingerprint == req_fp
+        ct_eq(&row.request_fingerprint, req_fp)
             && row.principal_id == principal
             && row.capability == capability.as_str()
-            && row.expected_version_digest == digest
+            && ct_eq(&row.expected_version_digest, digest)
             && row.task_id == Some(uuid_of(binding.task_id.as_bytes()))
             && row.run_id == Some(uuid_of(binding.run_id.as_bytes()))
             && row.step_id == opt_step_uuid(binding.step_id)
@@ -3766,7 +3765,7 @@ impl CompositeStore for Store {
                 &digest,
                 binding,
             ) {
-                return Err(conflict("REASON_REQUEST_CONFLICT"));
+                return Err(conflict("IDEMPOTENCY_CONFLICT"));
             }
             // Upstream `replayReceipt` reads the referenced event and
             // re-binds its legs against the receipt's stored binding —
@@ -3786,7 +3785,7 @@ impl CompositeStore for Store {
                 || event.step_id != opt_step_uuid(binding.step_id)
                 || event.attempt_id != opt_attempt_uuid(binding.attempt_id)
             {
-                return Err(conflict("REASON_REQUEST_CONFLICT"));
+                return Err(conflict("IDEMPOTENCY_CONFLICT"));
             }
             let payload = row.result_payload.clone();
             let result = Self::decode_result_payload(
@@ -4017,7 +4016,7 @@ impl CompositeExecutionStore for Store {
             &digest,
             &request.binding,
         ) {
-            return Err(conflict("REASON_REQUEST_CONFLICT"));
+            return Err(conflict("IDEMPOTENCY_CONFLICT"));
         }
         let event = sqlx::query!(
             "SELECT kind, task_id, run_id, step_id, attempt_id \
@@ -4034,7 +4033,7 @@ impl CompositeExecutionStore for Store {
             || event.step_id != opt_step_uuid(request.binding.step_id)
             || event.attempt_id != opt_attempt_uuid(request.binding.attempt_id)
         {
-            return Err(conflict("REASON_REQUEST_CONFLICT"));
+            return Err(conflict("IDEMPOTENCY_CONFLICT"));
         }
         let payload = row.result_payload.clone();
         let result = Self::decode_result_payload(
@@ -4717,7 +4716,7 @@ impl RecoveryStore for Store {
             uuid_of(ws.as_bytes()),
             sequence,
             command.epoch_generation,
-            serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_default(),
+            payload.clone(),
             command.scope.principal_id,
         )
         .execute(&mut *tx)
@@ -4738,7 +4737,7 @@ impl RecoveryStore for Store {
             event_id,
             deduplication_key,
             command.scope.principal_id,
-            serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_default(),
+            payload,
         )
         .execute(&mut *tx)
         .await
@@ -4849,8 +4848,8 @@ struct RecoveryResumeReceiptPayload {
 fn encode_recovery_resume_result(
     command: &central_execution::resume::ResumeRecoveryEpochCommand,
     epoch: &RecoveryEpoch,
-) -> Result<Vec<u8>, Failure> {
-    serde_json::to_vec(&RecoveryResumeResultPayload {
+) -> Result<serde_json::Value, Failure> {
+    serde_json::to_value(&RecoveryResumeResultPayload {
         schema_version: 1,
         epoch_generation: epoch.generation,
         coordinator_fence: epoch.coordinator_fence.generation,

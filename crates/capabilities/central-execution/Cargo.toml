@@ -1,8 +1,10 @@
 [package]
 name = "central-execution"
-version = "0.0.0"
-edition = "2024"
-publish = false
+description = "Execution capability — durable command execution, receipts, leases, recovery epochs (domain.rs/port.rs/query.rs/app.rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }

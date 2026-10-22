@@ -59,7 +59,7 @@ pub const DUPLICATE_IDEMPOTENCY_KEY: &str = "duplicate_idempotency_key";
 /// commit path cannot replay — upstream's
 /// `conflictFailure("idempotent replay is unavailable")` /
 /// `conflictFailure("idempotent request fingerprint mismatch")`.
-pub const IDEMPOTENCY_CONFLICT: &str = "idempotency_conflict";
+pub const IDEMPOTENCY_CONFLICT: &str = "IDEMPOTENCY_CONFLICT";
 
 fn invalid(reason: &'static str) -> Failure {
     Failure::invalid(codes::INVALID, reason)

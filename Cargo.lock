@@ -112,6 +112,7 @@ name = "central-adapter-postgres"
 version = "0.1.0"
 dependencies = [
  "central-authorization",
+ "central-backup",
  "central-checkpoint",
  "central-event",
  "central-execution",
@@ -156,6 +157,13 @@ dependencies = [
 [[package]]
 name = "central-backup"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "sha2 0.11.1",
+ "time",
+ "trait-variant",
+ "uuid",
+]
 
 [[package]]
 name = "central-backup-bin"
@@ -194,7 +202,7 @@ version = "0.1.0"
 
 [[package]]
 name = "central-execution"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "central-foundation",
  "central-task",

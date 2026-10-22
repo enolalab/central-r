@@ -23,12 +23,12 @@ The workspace root contains a `rust-toolchain.toml` that pins the toolchain for 
 
 ```toml
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
 ```
 
-- `channel` is the string `"stable"`; `rustup` resolves it to the current stable release, and the resolved version is recorded in CI logs for evidence. Nightly-only features, `RUSTC_BOOTSTRAP`, and `-Z` flags are prohibited workspace-wide.
+- `channel` is an exact stable release pin (currently `"1.99.1"`); every contributor and CI runner resolves the identical `rustc`. Bumps are deliberate workspace changes that update this file and the doc together. Nightly-only features, `RUSTC_BOOTSTRAP`, and `-Z` flags are prohibited workspace-wide.
 - `rustfmt` and `clippy` are mandatory components; `cargo fmt` and `cargo clippy` must work on a fresh `rustup` install without additional components.
 - No crate may set `#![feature(…)]`, a per-crate `rust-toolchain` override, or a `build.rs` that requires a non-stable compiler.
 

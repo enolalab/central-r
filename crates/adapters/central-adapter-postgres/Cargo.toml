@@ -9,10 +9,11 @@ publish.workspace = true
 [dependencies]
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-authorization = { path = "../../capabilities/central-authorization", version = "0.1.0" }
+central-backup = { path = "../../capabilities/central-backup", version = "0.1.0" }
 central-checkpoint = { path = "../../capabilities/central-checkpoint", version = "0.1.0" }
 central-event = { path = "../../capabilities/central-event", version = "0.1.0" }
 central-task = { path = "../../capabilities/central-task", version = "0.1.0" }
-central-execution = { path = "../../capabilities/central-execution", version = "0.0.0" }
+central-execution = { path = "../../capabilities/central-execution", version = "0.1.0" }
 central-workspace = { path = "../../capabilities/central-workspace", version = "0.1.0" }
 serde.workspace = true
 sqlx.workspace = true
