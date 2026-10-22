@@ -6,5 +6,16 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+central-foundation = { path = "../../central-foundation", version = "0.1.0" }
+central-artifact = { path = "../../capabilities/central-artifact", version = "0.1.0" }
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+trait-variant.workspace = true
+tracing.workspace = true
+
 [lints]
 workspace = true
