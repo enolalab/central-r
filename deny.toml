@@ -22,7 +22,40 @@ private = { ignore = true }
 # OSI-approved permissive license outside the allowlist. Scope is pinned
 # to this crate only; no version bound because every released
 # unicode-ident >= 1.0.19 carries the same license.
-exceptions = [{ allow = ["Unicode-3.0"], crate = "unicode-ident" }]
+exceptions = [
+    { allow = ["Unicode-3.0"], crate = "unicode-ident" },
+    # Recorded exceptions added by `central-adapter-postgres` — the first
+    # workspace consumer of sqlx (url → idna → ICU4X) and rustls
+    # (tls-rustls-ring). The ICU4X/unicode tree ships only Unicode-3.0
+    # (OSI-approved); the rustls chain ships ISC; webpki-roots ships
+    # CDLA-Permissive-2.0 (Mozilla CA bundle metadata); foldhash ships Zlib.
+    # All are unavoidable transitive dependencies, scoped per-crate exactly
+    # like unicode-ident above.
+    { allow = ["Unicode-3.0"], crate = "icu_collections" },
+    { allow = ["Unicode-3.0"], crate = "icu_locale_core" },
+    { allow = ["Unicode-3.0"], crate = "icu_normalizer" },
+    { allow = ["Unicode-3.0"], crate = "icu_normalizer_data" },
+    { allow = ["Unicode-3.0"], crate = "icu_properties" },
+    { allow = ["Unicode-3.0"], crate = "icu_properties_data" },
+    { allow = ["Unicode-3.0"], crate = "icu_provider" },
+    { allow = ["Unicode-3.0"], crate = "litemap" },
+    { allow = ["Unicode-3.0"], crate = "potential_utf" },
+    { allow = ["Unicode-3.0"], crate = "tinystr" },
+    { allow = ["Unicode-3.0"], crate = "unicode-normalization" },
+    { allow = ["Unicode-3.0"], crate = "writeable" },
+    { allow = ["Unicode-3.0"], crate = "yoke" },
+    { allow = ["Unicode-3.0"], crate = "yoke-derive" },
+    { allow = ["Unicode-3.0"], crate = "zerofrom" },
+    { allow = ["Unicode-3.0"], crate = "zerofrom-derive" },
+    { allow = ["Unicode-3.0"], crate = "zerotrie" },
+    { allow = ["Unicode-3.0"], crate = "zerovec" },
+    { allow = ["Unicode-3.0"], crate = "zerovec-derive" },
+    { allow = ["ISC"], crate = "ring" },
+    { allow = ["ISC"], crate = "rustls-webpki" },
+    { allow = ["ISC"], crate = "untrusted" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    { allow = ["Zlib"], crate = "foldhash" },
+]
 
 # --- 2. Sources --------------------------------------------------------------
 # crates.io only. Git dependencies are banned unless pinned to a full commit
@@ -50,4 +83,31 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 deny = []
-skip = []
+skip = [
+    # Recorded duplicates introduced by `central-adapter-postgres` (the
+    # first sqlx consumer): sqlx pins the digest-0.10/sha2-0.10 family while
+    # the workspace pins the 0.11 generation; uuid/time pull getrandom 0.2;
+    # trait-variant keeps syn 2 alongside the syn-3-pinned toolchain;
+    # rustls accepts both webpki-roots generations; windows-* crates carry
+    # the 0.48/0.52 pre-0.6 target ABI generations. Each skipped version is
+    # the non-canonical lineage; the retained version is the workspace pin.
+    { name = "block-buffer", version = "0.10.4" },
+    { name = "cpufeatures", version = "0.2.17" },
+    { name = "crypto-common", version = "0.1.7" },
+    { name = "digest", version = "0.10.7" },
+    { name = "getrandom", version = "0.2.17" },
+    { name = "hashbrown", version = "0.15.5" },
+    { name = "redox_syscall", version = "0.5.18" },
+    { name = "sha2", version = "0.10.9" },
+    { name = "syn", version = "2.0.119" },
+    { name = "windows-sys", version = "0.48.0" },
+    { name = "windows-sys", version = "0.52.0" },
+    { name = "windows-targets", version = "0.48.5" },
+    { name = "windows_aarch64_gnullvm", version = "0.48.5" },
+    { name = "windows_aarch64_msvc", version = "0.48.5" },
+    { name = "windows_i686_gnu", version = "0.48.5" },
+    { name = "windows_i686_msvc", version = "0.48.5" },
+    { name = "windows_x86_64_gnu", version = "0.48.5" },
+    { name = "windows_x86_64_gnullvm", version = "0.48.5" },
+    { name = "windows_x86_64_msvc", version = "0.48.5" },
+]

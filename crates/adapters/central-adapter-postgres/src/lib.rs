@@ -1,7 +1,26 @@
-//! `central-adapter-postgres` — `sqlx` implementations of capability
-//! `port.rs`/`query.rs` traits and the native `central.schema_migrations`
-//! ledger runner. Sole consumer of `sqlx` (canonical declaration per
-//! rust-engineering-workflow.md §3.4; `migrate` feature prohibited).
+//! `central-adapter-postgres` — the PostgreSQL infrastructure adapter.
 //!
-//! Stub crate: implementations land in this adapter's R-slice
-//! (rust-application-boundaries.md §2.4).
+//! The [`migrate`] module ports `internal/adapter/postgres/migrate/` from the
+//! Go tree: a native, self-contained migration engine that replays the
+//! trusted, compile-time-embedded SQL corpus under `migrations/` verbatim
+//! (via `sqlx::raw_sql`, preserving each file's own `begin`/`commit` and
+//! `SET LOCAL` transaction boundaries and its durable dirty-intent /
+//! clean-marker ledger protocol) instead of `sqlx::migrate!` or
+//! `_sqlx_migrations`.
+//!
+//! Contents:
+//!
+//! - [`migrate::BaselineInstaller`] — idempotent `v0..v37` install,
+//!   `verify_stock_target`, `verify_shape`, `baseline_manifest`.
+//! - [`migrate::Runner`] — single-session two-phase advisory-lock
+//!   `prepare_up`/`commit_up`/`resume` bound to a
+//!   [`migrate::SessionBinding`] (backend PID + postmaster start + boot ID).
+//! - [`migrate::Inspector`] — read-only [`migrate::PostgresMigrationFacts`]
+//!   plus `verify_serve_baseline` (the serve-readiness shape audit).
+//! - [`migrate::ResetRunner`] — version-zero-only destructive reset under
+//!   advisory locks and a broker reset-confirmation proof.
+//! - [`migrate::reapply_runtime_grants`] — the post-`pg_restore`
+//!   grant/column-grant/revoke convergence replay.
+
+pub mod error;
+pub mod migrate;
