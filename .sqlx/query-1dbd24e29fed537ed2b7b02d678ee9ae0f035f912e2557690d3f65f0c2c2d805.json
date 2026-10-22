@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.steps SET state = 'reconciliation', version = version + 1, updated_at = clock_timestamp() WHERE workspace_id = $1 AND run_id = $2 AND id = $3 AND state <> 'reconciliation'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1dbd24e29fed537ed2b7b02d678ee9ae0f035f912e2557690d3f65f0c2c2d805"
+}

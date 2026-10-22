@@ -11,9 +11,8 @@
 //! surface round out the port set.
 
 use central_execution::domain::{
-    Approval, EventIntent, ExecutionState, ExpectedVersions, Lease, LeaseCredential,
-    LogicalOperationId, OutboxIntent, Step, StepAttempt, StepAttemptAssertion, ToolCall,
-    ToolCallAttempt, TrustedScope, ZERO_TIME,
+    AttemptState, ExecutionState, ExpectedVersions, LeaseCredential, LogicalOperationId,
+    OutboxIntent, Step, StepAttempt, StepAttemptAssertion, TrustedScope, ZERO_TIME,
 };
 use central_execution::harness_run::B09EvidenceReference;
 use central_execution::port::{
@@ -28,7 +27,7 @@ use central_execution::resume::{
     self, RecoveryCoordinatorFence, RecoveryEpoch, RecoveryEpochState, RecoveryWorkspaceState,
     RecoveryWorkspaceWork,
 };
-use central_foundation::failure::Failure;
+use central_foundation::failure::{Failure, FailureKind};
 use central_foundation::identity::{
     ExecutionEventId, RunId, StepAttemptId, StepId, TaskId, WorkspaceId,
 };
@@ -37,21 +36,20 @@ use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 
 use super::queries::{
-    assert_recovery_epoch_domain, db_now, lock_event_counter, read_attempt,
-    read_incomplete_recovery_epoch, read_locked_recovery_epoch_for_claim,
-    read_persisted_lease_for_update, read_run, read_step, read_task, read_tool_attempts,
-    read_tool_calls, reserve_event_sequence, select_recovery_workspace_batch,
+    db_now, lock_event_counter, read_attempt, read_incomplete_recovery_epoch,
+    read_locked_recovery_epoch_for_claim, read_persisted_lease_for_update, read_run, read_step,
+    read_task, read_tool_attempts, read_tool_calls, reserve_event_sequence,
+    select_recovery_workspace_batch,
 };
 use super::{
-    RECOVERY_DOMAIN, RECOVERY_SCAN_BATCH, RESUME_SCOPE, begin, begin_recovery, begin_recovery_scan,
-    conflict, corrupt, ct_eq, denied, expected_digest, go_json_escapes, invalid,
-    invocation_generation, new_lease_secret, null_time, opt_approval_uuid, opt_attempt_uuid,
-    opt_run_uuid, opt_step_uuid, opt_tool_attempt_uuid, sha256, uuid_for_invocation,
-    uuid_for_logical, uuid_for_physical, uuid_of, wait_reason_value,
+    RECOVERY_DOMAIN, RECOVERY_RENEW_INTERVAL, RECOVERY_RETRY_LIMIT, RECOVERY_SCAN_BATCH,
+    RESUME_SCOPE, begin, begin_recovery, begin_recovery_scan, conflict, corrupt, ct_eq, denied,
+    expected_digest, go_json_escapes, invalid, invocation_generation, new_lease_secret, null_time,
+    opt_approval_uuid, opt_attempt_uuid, opt_run_uuid, opt_step_uuid, opt_tool_attempt_uuid,
+    sha256, uuid_for_invocation, uuid_for_logical, uuid_for_physical, uuid_of, wait_reason_value,
 };
 use crate::error::{SqlxContext, classify_sqlx};
 use crate::store_support::opt_uuid_of;
-use crate::task::queries::event_intent_payload;
 
 /// PostgreSQL execution composite store — a thin `PgPool` holder;
 /// every port method opens its own bounded transaction.
@@ -235,8 +233,8 @@ impl Store {
     }
 
     /// `insertReceipt` — `ON CONFLICT DO NOTHING`; a zero row count is
-    /// surfaced by the caller as a lost race (defensive — the advisory
-    /// lock already serializes the identity).
+    /// a lost insert race → `IDEMPOTENCY_CONFLICT` (defensive — the
+    /// advisory lock already serializes the identity).
     async fn insert_receipt(
         tx: &mut Transaction<'_, Postgres>,
         req: &CommitRequest,
@@ -244,7 +242,7 @@ impl Store {
     ) -> Result<(), Failure> {
         let payload =
             Self::encode_result_payload(&req.result, req.receipt_binding.logical_operation);
-        sqlx::query!(
+        let done = sqlx::query!(
             "INSERT INTO central.execution_command_receipts (\
              id, workspace_id, command_scope, idempotency_key, request_fingerprint, \
              principal_id, capability, expected_version_digest, result_reference, \
@@ -273,7 +271,11 @@ impl Store {
         )
         .execute(&mut **tx)
         .await
-        .ctx("execution: insert receipt")?;
+        .ctx("execution: insert receipt")?
+        .rows_affected();
+        if done != 1 {
+            return Err(conflict("IDEMPOTENCY_CONFLICT"));
+        }
         Ok(())
     }
 
@@ -303,105 +305,117 @@ impl Store {
     // Optimistic row guards (upstream lockReceipt*Target + CAS writes).
     // -----------------------------------------------------------------
 
-    async fn lock_step_target(
+    /// `lockAndValidateReceiptTarget` — step and attempt are locked
+    /// `FOR UPDATE` and re-validated against the binding: exact
+    /// expected versions, the shared logical operation, and the
+    /// insertion shapes. `execution.prepare` and
+    /// `execution.start_harness_run` bind their inserted rows instead.
+    async fn lock_and_validate_receipt_target(
         tx: &mut Transaction<'_, Postgres>,
-        ws: WorkspaceId,
-        tid: TaskId,
-        rid: RunId,
-        sid: StepId,
-    ) -> Result<i64, Failure> {
-        let row = sqlx::query!(
-            "SELECT version FROM central.steps \
-             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND id = $4 \
-             FOR UPDATE",
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        if req.command_scope == "execution.prepare"
+            || req.command_scope == "execution.start_harness_run"
+        {
+            return Self::lock_and_validate_prepared_receipt_target(tx, req).await;
+        }
+        let ws = req.scope.workspace_id;
+        let binding = &req.receipt_binding;
+        let step = sqlx::query!(
+            "SELECT logical_operation_id, version FROM central.steps \
+             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
+             AND id = $4 FOR UPDATE",
             uuid_of(ws.as_bytes()),
-            uuid_of(tid.as_bytes()),
-            uuid_of(rid.as_bytes()),
-            uuid_of(sid.as_bytes()),
+            uuid_of(binding.task_id.as_bytes()),
+            uuid_of(binding.run_id.as_bytes()),
+            uuid_of(binding.step_id.as_bytes()),
         )
         .fetch_optional(&mut **tx)
         .await
-        .ctx("execution: lock step target")?;
-        row.map(|r| r.version)
-            .ok_or_else(|| conflict("STATE_SCOPE_MISMATCH"))
-    }
-
-    async fn lock_attempt_target(
-        tx: &mut Transaction<'_, Postgres>,
-        ws: WorkspaceId,
-        tid: TaskId,
-        rid: RunId,
-        sid: StepId,
-        aid: StepAttemptId,
-    ) -> Result<i64, Failure> {
-        let row = sqlx::query!(
-            "SELECT version FROM central.step_attempts \
+        .ctx("execution: lock receipt step target")?
+        .ok_or_else(|| invalid("STATE_SCOPE_MISMATCH"))?;
+        let attempt = sqlx::query!(
+            "SELECT logical_operation_id, version FROM central.step_attempts \
              WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
              AND step_id = $4 AND id = $5 FOR UPDATE",
             uuid_of(ws.as_bytes()),
-            uuid_of(tid.as_bytes()),
-            uuid_of(rid.as_bytes()),
-            uuid_of(sid.as_bytes()),
-            uuid_of(aid.as_bytes()),
+            uuid_of(binding.task_id.as_bytes()),
+            uuid_of(binding.run_id.as_bytes()),
+            uuid_of(binding.step_id.as_bytes()),
+            uuid_of(binding.attempt_id.as_bytes()),
         )
         .fetch_optional(&mut **tx)
         .await
-        .ctx("execution: lock attempt target")?;
-        row.map(|r| r.version)
-            .ok_or_else(|| conflict("STATE_SCOPE_MISMATCH"))
+        .ctx("execution: lock receipt attempt target")?
+        .ok_or_else(|| invalid("STATE_SCOPE_MISMATCH"))?;
+        let want = uuid_for_logical(&binding.logical_operation);
+        if step.logical_operation_id != want || attempt.logical_operation_id != want {
+            return Err(invalid("STATE_SCOPE_MISMATCH"));
+        }
+        if step.version != req.expected_versions.step
+            || attempt.version != req.expected_versions.attempt
+        {
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+        }
+        Ok(())
     }
 
-    async fn lock_tool_call_target(
+    /// `lockAndValidatePreparedReceiptTarget` — a prepare/claim commit
+    /// binds the Step and StepAttempt it inserts; an existing-step
+    /// prepare additionally locks that step and checks its fence.
+    async fn lock_and_validate_prepared_receipt_target(
         tx: &mut Transaction<'_, Postgres>,
-        ws: WorkspaceId,
-        tid: TaskId,
-        rid: RunId,
-        parent: StepAttemptId,
-        id: central_foundation::identity::ToolCallId,
-    ) -> Result<i64, Failure> {
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        if req.expected_versions.attempt != 0
+            || req.change_set.steps.len() != 1
+            || req.change_set.attempts.len() != 1
+        {
+            return Err(invalid("STATE_SCOPE_MISMATCH"));
+        }
+        let step = &req.change_set.steps[0];
+        let attempt = &req.change_set.attempts[0];
+        let binding = &req.receipt_binding;
+        if step.id != binding.step_id
+            || step.workspace_id != req.scope.workspace_id
+            || step.task_id != binding.task_id
+            || step.run_id != binding.run_id
+            || attempt.id != binding.attempt_id
+            || attempt.workspace_id != req.scope.workspace_id
+            || attempt.task_id != binding.task_id
+            || attempt.run_id != binding.run_id
+            || attempt.step_id != binding.step_id
+            || attempt.logical_operation_id != binding.logical_operation
+            || attempt.version != 1
+        {
+            return Err(invalid("STATE_SCOPE_MISMATCH"));
+        }
+        if req.expected_versions.step == 0 {
+            if step.version != 1 {
+                return Err(invalid("STATE_SCOPE_MISMATCH"));
+            }
+            return Ok(());
+        }
         let row = sqlx::query!(
-            "SELECT version FROM central.tool_calls \
+            "SELECT logical_operation_id, version FROM central.steps \
              WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
-             AND step_attempt_id = $4 AND id = $5 FOR UPDATE",
-            uuid_of(ws.as_bytes()),
-            uuid_of(tid.as_bytes()),
-            uuid_of(rid.as_bytes()),
-            uuid_of(parent.as_bytes()),
-            uuid_of(id.as_bytes()),
+             AND id = $4 FOR UPDATE",
+            uuid_of(req.scope.workspace_id.as_bytes()),
+            uuid_of(binding.task_id.as_bytes()),
+            uuid_of(binding.run_id.as_bytes()),
+            uuid_of(binding.step_id.as_bytes()),
         )
         .fetch_optional(&mut **tx)
         .await
-        .ctx("execution: lock tool call target")?;
-        row.map(|r| r.version)
-            .ok_or_else(|| conflict("STATE_SCOPE_MISMATCH"))
-    }
-
-    async fn lock_tool_attempt_target(
-        tx: &mut Transaction<'_, Postgres>,
-        ws: WorkspaceId,
-        tid: TaskId,
-        rid: RunId,
-        parent: StepAttemptId,
-        call: central_foundation::identity::ToolCallId,
-        id: central_foundation::identity::ToolCallAttemptId,
-    ) -> Result<i64, Failure> {
-        let row = sqlx::query!(
-            "SELECT version FROM central.tool_call_attempts \
-             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
-             AND step_attempt_id = $4 AND tool_call_id = $5 AND id = $6 \
-             FOR UPDATE",
-            uuid_of(ws.as_bytes()),
-            uuid_of(tid.as_bytes()),
-            uuid_of(rid.as_bytes()),
-            uuid_of(parent.as_bytes()),
-            uuid_of(call.as_bytes()),
-            uuid_of(id.as_bytes()),
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .ctx("execution: lock tool attempt target")?;
-        row.map(|r| r.version)
-            .ok_or_else(|| conflict("STATE_SCOPE_MISMATCH"))
+        .ctx("execution: lock prepared receipt step target")?
+        .ok_or_else(|| invalid("STATE_SCOPE_MISMATCH"))?;
+        if row.logical_operation_id != uuid_for_logical(&binding.logical_operation) {
+            return Err(invalid("STATE_SCOPE_MISMATCH"));
+        }
+        if row.version != req.expected_versions.step {
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -533,175 +547,307 @@ impl Store {
     // Change-set application (upstream applyChangeSet — lock order §6).
     // -----------------------------------------------------------------
 
-    async fn apply_step(tx: &mut Transaction<'_, Postgres>, step: &Step) -> Result<(), Failure> {
-        let (w, t, r, s) = (
-            uuid_of(step.workspace_id.as_bytes()),
-            uuid_of(step.task_id.as_bytes()),
-            uuid_of(step.run_id.as_bytes()),
-            uuid_of(step.id.as_bytes()),
-        );
-        let version =
-            Self::lock_step_target(tx, step.workspace_id, step.task_id, step.run_id, step.id).await;
-        match version {
-            Err(_) => {
-                // Row absent → insert (upstream insertStep).
-                let done = sqlx::query!(
+    /// `persistSteps` — the evaluator's expected step version is the
+    /// CAS fence: `expected.step == 0` means insert, otherwise update
+    /// under `version = expected`. The approval-successor and resume
+    /// scopes also insert the non-bound step they carry.
+    async fn persist_steps(
+        tx: &mut Transaction<'_, Postgres>,
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        for row in &req.change_set.steps {
+            if row.workspace_id != req.scope.workspace_id {
+                return Err(denied("SCOPE_MISMATCH"));
+            }
+            let insert = req.expected_versions.step == 0
+                || ((req.command_scope == "execution.create_approval_successor"
+                    || req.command_scope == RESUME_SCOPE)
+                    && row.id != req.receipt_binding.step_id);
+            let done = if insert {
+                let logical = Self::inserted_step_logical_operation(req, row)?;
+                sqlx::query!(
                     "INSERT INTO central.steps (\
                      id, workspace_id, task_id, run_id, version, state, \
                      logical_operation_id, sequence, created_at, updated_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
                      clock_timestamp(), clock_timestamp()) \
                      ON CONFLICT (id) DO NOTHING",
-                    s,
-                    w,
-                    t,
-                    r,
-                    step.version,
-                    step.state.as_str(),
-                    uuid::Uuid::now_v7(),
-                    step.sequence,
+                    uuid_of(row.id.as_bytes()),
+                    uuid_of(row.workspace_id.as_bytes()),
+                    uuid_of(row.task_id.as_bytes()),
+                    uuid_of(row.run_id.as_bytes()),
+                    row.version,
+                    row.state.as_str(),
+                    uuid_for_logical(&logical),
+                    row.sequence,
                 )
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: insert step")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
-            }
-            Ok(version) if version == step.version.saturating_sub(1) || version == step.version => {
-                let done = sqlx::query!(
+                .rows_affected()
+            } else {
+                sqlx::query!(
                     "UPDATE central.steps \
                      SET version = $5, state = $6, sequence = $7, \
                      updated_at = clock_timestamp() \
                      WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
                      AND id = $4 AND version = $8",
-                    w,
-                    t,
-                    r,
-                    s,
-                    step.version,
-                    step.state.as_str(),
-                    step.sequence,
-                    version,
+                    uuid_of(row.workspace_id.as_bytes()),
+                    uuid_of(row.task_id.as_bytes()),
+                    uuid_of(row.run_id.as_bytes()),
+                    uuid_of(row.id.as_bytes()),
+                    row.version,
+                    row.state.as_str(),
+                    row.sequence,
+                    req.expected_versions.step,
                 )
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: update step")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
+                .rows_affected()
+            };
+            if done != 1 {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
             }
-            Ok(_) => Err(conflict("VERSION_CONFLICT")),
         }
+        Ok(())
     }
 
-    async fn apply_attempt(
+    /// `insertedStepLogicalOperation` — the bound step takes the
+    /// binding's logical operation; approval-successor and resume
+    /// steps take the logical operation of the row that created them.
+    fn inserted_step_logical_operation(
+        req: &CommitRequest,
+        step: &Step,
+    ) -> Result<LogicalOperationId, Failure> {
+        if step.id == req.receipt_binding.step_id {
+            return Ok(req.receipt_binding.logical_operation);
+        }
+        if req.command_scope == "execution.create_approval_successor" {
+            for approval in &req.change_set.approvals {
+                if approval.step_id == step.id && !approval.subject.logical_operation_id.is_nil() {
+                    return Ok(approval.subject.logical_operation_id);
+                }
+            }
+        }
+        if req.command_scope == RESUME_SCOPE {
+            for attempt in &req.change_set.attempts {
+                if attempt.step_id == step.id && !attempt.logical_operation_id.is_nil() {
+                    return Ok(attempt.logical_operation_id);
+                }
+            }
+        }
+        Err(invalid("STATE_SCOPE_MISMATCH"))
+    }
+
+    /// `persistAttempts` — `expected.attempt == 0` inserts every row,
+    /// otherwise each row updates under `version = expected`. Rows
+    /// carrying a settlement were already updated by
+    /// [`Self::persist_settlements`] and are skipped here.
+    async fn persist_attempts(
+        tx: &mut Transaction<'_, Postgres>,
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        Self::validate_attempt_inserts(req)?;
+        if req.command_scope == RESUME_SCOPE {
+            return Self::persist_resumed_attempts(tx, req).await;
+        }
+        for row in &req.change_set.attempts {
+            if Self::has_settlement(&req.change_set.settlements, row.id) {
+                continue;
+            }
+            if row.workspace_id != req.scope.workspace_id {
+                return Err(denied("SCOPE_MISMATCH"));
+            }
+            if req.expected_versions.attempt == 0 {
+                Self::insert_attempt_row(tx, row).await?;
+            } else {
+                Self::update_attempt_row(tx, row, req.expected_versions.attempt).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `persistResumedAttempts` — the resume scope updates the binding's
+    /// row first, then inserts the other rows: the active-run unique
+    /// index is not deferrable, so the predecessor must leave the
+    /// active states before the successor enters them.
+    async fn persist_resumed_attempts(
+        tx: &mut Transaction<'_, Postgres>,
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        for update in [true, false] {
+            for row in &req.change_set.attempts {
+                if (row.id == req.receipt_binding.attempt_id) != update
+                    || Self::has_settlement(&req.change_set.settlements, row.id)
+                {
+                    continue;
+                }
+                if row.workspace_id != req.scope.workspace_id {
+                    return Err(denied("SCOPE_MISMATCH"));
+                }
+                if update {
+                    Self::update_attempt_row(tx, row, req.expected_versions.attempt).await?;
+                } else {
+                    Self::insert_attempt_row(tx, row).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn insert_attempt_row(
         tx: &mut Transaction<'_, Postgres>,
         a: &StepAttempt,
     ) -> Result<(), Failure> {
-        let (w, s, t, r, id) = (
+        let done = sqlx::query!(
+            "INSERT INTO central.step_attempts (\
+             id, workspace_id, step_id, task_id, run_id, version, \
+             logical_operation_id, physical_attempt_id, invocation_id, \
+             invocation_generation, predecessor_id, sequence, state, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+             CASE WHEN $9::uuid IS NULL THEN NULL ELSE $10::bigint END, \
+             $11, $12, $13, clock_timestamp(), clock_timestamp()) \
+             ON CONFLICT (id) DO NOTHING",
+            uuid_of(a.id.as_bytes()),
             uuid_of(a.workspace_id.as_bytes()),
             uuid_of(a.step_id.as_bytes()),
             uuid_of(a.task_id.as_bytes()),
             uuid_of(a.run_id.as_bytes()),
-            uuid_of(a.id.as_bytes()),
-        );
-        let version =
-            Self::lock_attempt_target(tx, a.workspace_id, a.task_id, a.run_id, a.step_id, a.id)
-                .await;
-        match version {
-            Err(_) => {
-                let done = sqlx::query!(
-                    "INSERT INTO central.step_attempts (\
-                     id, workspace_id, step_id, task_id, run_id, version, \
-                     logical_operation_id, physical_attempt_id, invocation_id, \
-                     invocation_generation, predecessor_id, sequence, state, \
-                     created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                     CASE WHEN $9::uuid IS NULL THEN NULL ELSE $10::bigint END, \
-                     $11, $12, $13, clock_timestamp(), clock_timestamp()) \
-                     ON CONFLICT (id) DO NOTHING",
-                    id,
-                    w,
-                    s,
-                    t,
-                    r,
-                    a.version,
-                    uuid_for_logical(&a.logical_operation_id),
-                    uuid_for_physical(&a.physical_attempt_id),
-                    uuid_for_invocation(&a.invocation_id),
-                    invocation_generation(&a.invocation_id),
-                    opt_attempt_uuid(a.predecessor_id),
-                    a.sequence,
-                    a.state.as_str(),
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: insert attempt")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
-            }
-            Ok(version) if version == a.version.saturating_sub(1) || version == a.version => {
-                let done = sqlx::query!(
-                    "UPDATE central.step_attempts \
-                     SET version = $6, invocation_id = $7, \
-                     invocation_generation = CASE WHEN $7::uuid IS NULL THEN NULL ELSE $8::bigint END, \
-                     state = $9, outcome = COALESCE($10::jsonb, outcome), \
-                     context = COALESCE($11::jsonb, context), \
-                     updated_at = clock_timestamp() \
-                     WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
-                     AND step_id = $4 AND id = $5 AND version = $12",
-                    w, t, r, s, id, a.version,
-                    uuid_for_invocation(&a.invocation_id),
-                    invocation_generation(&a.invocation_id),
-                    a.state.as_str(),
-                    Option::<serde_json::Value>::None,
-                    Option::<serde_json::Value>::None,
-                    version,
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: update attempt")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
-            }
-            Ok(_) => Err(conflict("VERSION_CONFLICT")),
+            a.version,
+            uuid_for_logical(&a.logical_operation_id),
+            uuid_for_physical(&a.physical_attempt_id),
+            uuid_for_invocation(&a.invocation_id),
+            invocation_generation(&a.invocation_id),
+            opt_attempt_uuid(a.predecessor_id),
+            a.sequence,
+            a.state.as_str(),
+        )
+        .execute(&mut **tx)
+        .await
+        .ctx("execution: insert attempt")?
+        .rows_affected();
+        if done != 1 {
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
         }
+        Ok(())
     }
 
-    async fn apply_tool_call(
+    async fn update_attempt_row(
         tx: &mut Transaction<'_, Postgres>,
-        c: &ToolCall,
+        a: &StepAttempt,
+        expected: i64,
     ) -> Result<(), Failure> {
-        let (w, parent, t, r, id) = (
-            uuid_of(c.workspace_id.as_bytes()),
-            uuid_of(c.step_attempt_id.as_bytes()),
-            uuid_of(c.task_id.as_bytes()),
-            uuid_of(c.run_id.as_bytes()),
-            uuid_of(c.id.as_bytes()),
-        );
-        let version = Self::lock_tool_call_target(
-            tx,
-            c.workspace_id,
-            c.task_id,
-            c.run_id,
-            c.step_attempt_id,
-            c.id,
+        let done = sqlx::query!(
+            "UPDATE central.step_attempts \
+             SET version = $6, invocation_id = $7, \
+             invocation_generation = CASE WHEN $7::uuid IS NULL THEN NULL ELSE $8::bigint END, \
+             state = $9, outcome = COALESCE($10::jsonb, outcome), \
+             context = COALESCE($11::jsonb, context), \
+             updated_at = clock_timestamp() \
+             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
+             AND step_id = $4 AND id = $5 AND version = $12",
+            uuid_of(a.workspace_id.as_bytes()),
+            uuid_of(a.task_id.as_bytes()),
+            uuid_of(a.run_id.as_bytes()),
+            uuid_of(a.step_id.as_bytes()),
+            uuid_of(a.id.as_bytes()),
+            a.version,
+            uuid_for_invocation(&a.invocation_id),
+            invocation_generation(&a.invocation_id),
+            a.state.as_str(),
+            Option::<serde_json::Value>::None,
+            Option::<serde_json::Value>::None,
+            expected,
         )
-        .await;
-        match version {
-            Err(_) => {
-                let done = sqlx::query!(
+        .execute(&mut **tx)
+        .await
+        .ctx("execution: update attempt")?
+        .rows_affected();
+        if done != 1 {
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+        }
+        Ok(())
+    }
+
+    /// `validateAttemptInserts` — a recovery successor (predecessor
+    /// set) may only be inserted when the same change set moves that
+    /// predecessor to `cancelled`. The resume scope's inserted rows are
+    /// checked by `validateResumedAttemptInserts` instead.
+    fn validate_attempt_inserts(req: &CommitRequest) -> Result<(), Failure> {
+        if req.command_scope == RESUME_SCOPE {
+            return Self::validate_resumed_attempt_inserts(req);
+        }
+        if req.expected_versions.attempt != 0 {
+            return Ok(());
+        }
+        for row in &req.change_set.attempts {
+            if row.predecessor_id.is_nil()
+                || Self::has_settlement(&req.change_set.settlements, row.id)
+            {
+                continue;
+            }
+            let cancelled =
+                req.change_set.attempts.iter().any(|o| {
+                    o.id == row.predecessor_id && o.state == AttemptState::AttemptCancelled
+                });
+            if !cancelled {
+                return Err(invalid("INVALID_LOGICAL_OPERATION_REUSE"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `validateResumedAttemptInserts` — every inserted (non-binding)
+    /// row must be a never-invoked prepared successor at version 1,
+    /// sequence 1, whose predecessor is the binding's row moving to
+    /// failed in the same change set.
+    fn validate_resumed_attempt_inserts(req: &CommitRequest) -> Result<(), Failure> {
+        for row in &req.change_set.attempts {
+            if row.id == req.receipt_binding.attempt_id
+                || Self::has_settlement(&req.change_set.settlements, row.id)
+            {
+                continue;
+            }
+            let failed_predecessor = req.change_set.attempts.iter().any(|o| {
+                o.id == row.predecessor_id
+                    && o.id == req.receipt_binding.attempt_id
+                    && o.state == AttemptState::AttemptFailed
+            });
+            if row.predecessor_id.is_nil()
+                || !failed_predecessor
+                || row.version != 1
+                || row.sequence != 1
+                || row.state != AttemptState::AttemptPrepared
+                || !row.invocation_id.is_nil()
+            {
+                return Err(invalid("INVALID_LOGICAL_OPERATION_REUSE"));
+            }
+        }
+        Ok(())
+    }
+
+    fn has_settlement(rows: &[central_execution::domain::Settlement], id: StepAttemptId) -> bool {
+        rows.iter().any(|row| row.attempt_id == id)
+    }
+
+    fn has_tool_settlement(
+        rows: &[central_execution::domain::ToolSettlement],
+        id: central_foundation::identity::ToolCallAttemptId,
+    ) -> bool {
+        rows.iter().any(|row| row.tool_attempt_id == id)
+    }
+
+    /// `persistToolCalls` — `expected.tool_call == 0` inserts, else
+    /// updates under `version = expected`.
+    async fn persist_tool_calls(
+        tx: &mut Transaction<'_, Postgres>,
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        for row in &req.change_set.tool_calls {
+            let done = if req.expected_versions.tool_call == 0 {
+                sqlx::query!(
                     "INSERT INTO central.tool_calls (\
                      id, workspace_id, step_id, step_attempt_id, task_id, run_id, \
                      version, logical_operation_id, sequence, state, \
@@ -711,80 +857,62 @@ impl Store {
                      FROM central.step_attempts a \
                      WHERE a.workspace_id = $2 AND a.id = $3 \
                      ON CONFLICT (id) DO NOTHING",
-                    id,
-                    w,
-                    parent,
-                    t,
-                    r,
-                    c.version,
-                    uuid_for_logical(&c.logical_operation_id),
-                    c.sequence,
-                    c.state.as_str(),
+                    uuid_of(row.id.as_bytes()),
+                    uuid_of(row.workspace_id.as_bytes()),
+                    uuid_of(row.step_attempt_id.as_bytes()),
+                    uuid_of(row.task_id.as_bytes()),
+                    uuid_of(row.run_id.as_bytes()),
+                    row.version,
+                    uuid_for_logical(&row.logical_operation_id),
+                    row.sequence,
+                    row.state.as_str(),
                 )
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: insert tool call")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
-            }
-            Ok(version) if version == c.version.saturating_sub(1) || version == c.version => {
-                let done = sqlx::query!(
+                .rows_affected()
+            } else {
+                sqlx::query!(
                     "UPDATE central.tool_calls \
                      SET version = $6, sequence = $7, state = $8, \
                      updated_at = clock_timestamp() \
                      WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
                      AND step_attempt_id = $4 AND id = $5 AND version = $9",
-                    w,
-                    t,
-                    r,
-                    parent,
-                    id,
-                    c.version,
-                    c.sequence,
-                    c.state.as_str(),
-                    version,
+                    uuid_of(row.workspace_id.as_bytes()),
+                    uuid_of(row.task_id.as_bytes()),
+                    uuid_of(row.run_id.as_bytes()),
+                    uuid_of(row.step_attempt_id.as_bytes()),
+                    uuid_of(row.id.as_bytes()),
+                    row.version,
+                    row.sequence,
+                    row.state.as_str(),
+                    req.expected_versions.tool_call,
                 )
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: update tool call")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
+                .rows_affected()
+            };
+            if done != 1 {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
             }
-            Ok(_) => Err(conflict("VERSION_CONFLICT")),
         }
+        Ok(())
     }
 
-    async fn apply_tool_attempt(
+    /// `persistToolAttempts` — `expected.tool_attempt == 0` inserts,
+    /// else updates under `version = expected`; settled rows were
+    /// already written by [`Self::persist_settlements`].
+    async fn persist_tool_attempts(
         tx: &mut Transaction<'_, Postgres>,
-        a: &ToolCallAttempt,
+        req: &CommitRequest,
     ) -> Result<(), Failure> {
-        let (w, call, parent, t, r, id) = (
-            uuid_of(a.workspace_id.as_bytes()),
-            uuid_of(a.tool_call_id.as_bytes()),
-            uuid_of(a.step_attempt_id.as_bytes()),
-            uuid_of(a.task_id.as_bytes()),
-            uuid_of(a.run_id.as_bytes()),
-            uuid_of(a.id.as_bytes()),
-        );
-        let version = Self::lock_tool_attempt_target(
-            tx,
-            a.workspace_id,
-            a.task_id,
-            a.run_id,
-            a.step_attempt_id,
-            a.tool_call_id,
-            a.id,
-        )
-        .await;
-        match version {
-            Err(_) => {
-                let done = sqlx::query!(
+        for row in &req.change_set.tool_attempts {
+            if Self::has_tool_settlement(&req.change_set.tool_settlements, row.id) {
+                continue;
+            }
+            let done = if req.expected_versions.tool_attempt == 0 {
+                sqlx::query!(
                     "INSERT INTO central.tool_call_attempts (\
                      id, workspace_id, tool_call_id, step_attempt_id, task_id, run_id, \
                      version, logical_operation_id, physical_attempt_id, invocation_id, \
@@ -794,32 +922,27 @@ impl Store {
                      CASE WHEN $10::uuid IS NULL THEN NULL ELSE $11::bigint END, \
                      $12, $13, $14, clock_timestamp(), clock_timestamp()) \
                      ON CONFLICT (id) DO NOTHING",
-                    id,
-                    w,
-                    call,
-                    parent,
-                    t,
-                    r,
-                    a.version,
-                    uuid_for_logical(&a.logical_operation_id),
-                    uuid_for_physical(&a.physical_attempt_id),
-                    uuid_for_invocation(&a.invocation_id),
-                    invocation_generation(&a.invocation_id),
-                    opt_tool_attempt_uuid(a.predecessor_id),
-                    a.sequence,
-                    a.state.as_str(),
+                    uuid_of(row.id.as_bytes()),
+                    uuid_of(row.workspace_id.as_bytes()),
+                    uuid_of(row.tool_call_id.as_bytes()),
+                    uuid_of(row.step_attempt_id.as_bytes()),
+                    uuid_of(row.task_id.as_bytes()),
+                    uuid_of(row.run_id.as_bytes()),
+                    row.version,
+                    uuid_for_logical(&row.logical_operation_id),
+                    uuid_for_physical(&row.physical_attempt_id),
+                    uuid_for_invocation(&row.invocation_id),
+                    invocation_generation(&row.invocation_id),
+                    opt_tool_attempt_uuid(row.predecessor_id),
+                    row.sequence,
+                    row.state.as_str(),
                 )
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: insert tool attempt")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
-            }
-            Ok(version) if version == a.version.saturating_sub(1) || version == a.version => {
-                let done = sqlx::query!(
+                .rows_affected()
+            } else {
+                sqlx::query!(
                     "UPDATE central.tool_call_attempts \
                      SET version = $7, invocation_id = $8, \
                      invocation_generation = CASE WHEN $8::uuid IS NULL THEN NULL ELSE $9::bigint END, \
@@ -829,54 +952,52 @@ impl Store {
                      WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
                      AND step_attempt_id = $4 AND tool_call_id = $5 AND id = $6 \
                      AND version = $13",
-                    w, t, r, parent, call, id, a.version,
-                    uuid_for_invocation(&a.invocation_id),
-                    invocation_generation(&a.invocation_id),
-                    a.state.as_str(),
+                    uuid_of(row.workspace_id.as_bytes()),
+                    uuid_of(row.task_id.as_bytes()),
+                    uuid_of(row.run_id.as_bytes()),
+                    uuid_of(row.step_attempt_id.as_bytes()),
+                    uuid_of(row.tool_call_id.as_bytes()),
+                    uuid_of(row.id.as_bytes()),
+                    row.version,
+                    uuid_for_invocation(&row.invocation_id),
+                    invocation_generation(&row.invocation_id),
+                    row.state.as_str(),
                     Option::<serde_json::Value>::None,
                     Option::<serde_json::Value>::None,
-                    version,
+                    req.expected_versions.tool_attempt,
                 )
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: update tool attempt")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
+                .rows_affected()
+            };
+            if done != 1 {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
             }
-            Ok(_) => Err(conflict("VERSION_CONFLICT")),
         }
+        Ok(())
     }
 
-    async fn apply_approval(
+    /// `persistApprovals` — `expected.approval == 0` inserts, else
+    /// updates under `version = expected`; the approval-successor
+    /// scope additionally inserts rows carrying a predecessor.
+    async fn persist_approvals(
         tx: &mut Transaction<'_, Postgres>,
-        a: &Approval,
+        req: &CommitRequest,
     ) -> Result<(), Failure> {
-        let (w, t, r, s, id) = (
-            uuid_of(a.workspace_id.as_bytes()),
-            uuid_of(a.task_id.as_bytes()),
-            uuid_of(a.run_id.as_bytes()),
-            uuid_of(a.step_id.as_bytes()),
-            uuid_of(a.id.as_bytes()),
-        );
-        let locked = sqlx::query!(
-            "SELECT version FROM central.approvals \
-             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 \
-             AND id = $5 AND approval_kind = 'execution' FOR UPDATE",
-            w,
-            t,
-            r,
-            s,
-            id,
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .ctx("execution: lock approval")?;
-        match locked {
-            None => {
-                let done = sqlx::query!(
+        for a in &req.change_set.approvals {
+            let insert = req.expected_versions.approval == 0
+                || (req.command_scope == "execution.create_approval_successor"
+                    && !a.predecessor_id.is_nil());
+            let (w, t, r, s, id) = (
+                uuid_of(a.workspace_id.as_bytes()),
+                uuid_of(a.task_id.as_bytes()),
+                uuid_of(a.run_id.as_bytes()),
+                uuid_of(a.step_id.as_bytes()),
+                uuid_of(a.id.as_bytes()),
+            );
+            let done = if insert {
+                sqlx::query!(
                     "INSERT INTO central.approvals (\
                      id, workspace_id, version, state, approval_kind, task_id, run_id, \
                      step_id, subject_version, logical_operation_id, operation_digest, \
@@ -906,14 +1027,9 @@ impl Store {
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: insert approval")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
-            }
-            Some(row) if row.version == a.version.saturating_sub(1) || row.version == a.version => {
-                let done = sqlx::query!(
+                .rows_affected()
+            } else {
+                sqlx::query!(
                     "UPDATE central.approvals \
                      SET version = $6, state = $7, decision_actor = NULLIF($8, ''), \
                      decision_reason = NULLIF($9, ''), decision_id = $10, \
@@ -932,301 +1048,366 @@ impl Store {
                     a.reason_code,
                     opt_uuid_of((a.decision_id != [0; 16]).then_some(a.decision_id), |d| &d,),
                     null_time(a.decided_at),
-                    row.version,
+                    req.expected_versions.approval,
                 )
                 .execute(&mut **tx)
                 .await
                 .ctx("execution: update approval")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-                Ok(())
+                .rows_affected()
+            };
+            if done != 1 {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
             }
-            Some(_) => Err(conflict("VERSION_CONFLICT")),
         }
-    }
-
-    async fn apply_checkpoint(
-        tx: &mut Transaction<'_, Postgres>,
-        c: &central_execution::domain::Checkpoint,
-    ) -> Result<(), Failure> {
-        sqlx::query!(
-            "INSERT INTO central.checkpoints (\
-             id, workspace_id, task_id, run_id, step_id, step_attempt_id, \
-             producer_id, producer_version, schema_version, checksum, payload, \
-             resume_compatible, validated, policy_version, recorded_at, \
-             eligible_after, legal_hold, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, \
-             clock_timestamp(), clock_timestamp() + interval '90 days', false, \
-             clock_timestamp()) \
-             ON CONFLICT (id) DO NOTHING",
-            uuid_of(c.id.as_bytes()),
-            uuid_of(c.workspace_id.as_bytes()),
-            uuid_of(c.task_id.as_bytes()),
-            uuid_of(c.run_id.as_bytes()),
-            uuid_of(c.step_id.as_bytes()),
-            uuid_of(c.step_attempt_id.as_bytes()),
-            "",
-            c.producer_version,
-            c.schema_version,
-            &c.checksum[..],
-            &c.payload[..],
-            c.resume_compatible,
-            c.validated,
-        )
-        .execute(&mut **tx)
-        .await
-        .ctx("execution: insert checkpoint")?;
         Ok(())
     }
 
-    /// `applySettlements` — the durable outcome/context lives on the
-    /// attempt row (B08 columns `outcome`/`context`, bounded 256 KiB).
-    async fn apply_settlement(
+    /// `persistCheckpoints` — insert-only; a duplicate is a conflict.
+    async fn persist_checkpoints(
         tx: &mut Transaction<'_, Postgres>,
-        s: &central_execution::domain::Settlement,
+        req: &CommitRequest,
     ) -> Result<(), Failure> {
-        let outcome = serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&s.outcome))
-            .unwrap_or_default();
-        let context = (!s.context.is_empty()).then(|| {
-            serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&s.context))
+        for c in &req.change_set.checkpoints {
+            let done = sqlx::query!(
+                "INSERT INTO central.checkpoints (\
+                 id, workspace_id, task_id, run_id, step_id, step_attempt_id, \
+                 producer_id, producer_version, schema_version, checksum, payload, \
+                 resume_compatible, validated, policy_version, recorded_at, \
+                 eligible_after, legal_hold, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 1, \
+                 clock_timestamp(), clock_timestamp() + interval '90 days', false, \
+                 clock_timestamp()) \
+                 ON CONFLICT (id) DO NOTHING",
+                uuid_of(c.id.as_bytes()),
+                uuid_of(c.workspace_id.as_bytes()),
+                uuid_of(c.task_id.as_bytes()),
+                uuid_of(c.run_id.as_bytes()),
+                uuid_of(c.step_id.as_bytes()),
+                uuid_of(c.step_attempt_id.as_bytes()),
+                req.principal_id,
+                c.producer_version,
+                c.schema_version,
+                &c.checksum[..],
+                &c.payload[..],
+                c.resume_compatible,
+                c.validated,
+            )
+            .execute(&mut **tx)
+            .await
+            .ctx("execution: insert checkpoint")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("CHECKPOINT_CONFLICT"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `persistSettlements` — the bounded terminal evidence is
+    /// materialized before the matching attempt's state projection:
+    /// each settlement updates its attempt row with the validated
+    /// outcome/context under `version = expected`.
+    async fn persist_settlements(
+        tx: &mut Transaction<'_, Postgres>,
+        req: &CommitRequest,
+    ) -> Result<(), Failure> {
+        for settlement in &req.change_set.settlements {
+            let (outcome, context) =
+                Self::encoded_settlement(&settlement.outcome, &settlement.context)?;
+            let row = req
+                .change_set
+                .attempts
+                .iter()
+                .find(|a| a.id == settlement.attempt_id)
+                .ok_or_else(|| invalid("SETTLEMENT_ATTEMPT_MISMATCH"))?;
+            let done = sqlx::query!(
+                "UPDATE central.step_attempts \
+                 SET version = $6, invocation_id = $7, \
+                 invocation_generation = CASE WHEN $7::uuid IS NULL THEN NULL ELSE $8::bigint END, \
+                 state = $9, outcome = COALESCE($10::jsonb, outcome), \
+                 context = COALESCE($11::jsonb, context), \
+                 updated_at = clock_timestamp() \
+                 WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
+                 AND step_id = $4 AND id = $5 AND version = $12",
+                uuid_of(row.workspace_id.as_bytes()),
+                uuid_of(row.task_id.as_bytes()),
+                uuid_of(row.run_id.as_bytes()),
+                uuid_of(row.step_id.as_bytes()),
+                uuid_of(row.id.as_bytes()),
+                row.version,
+                uuid_for_invocation(&row.invocation_id),
+                invocation_generation(&row.invocation_id),
+                row.state.as_str(),
+                outcome,
+                context,
+                req.expected_versions.attempt,
+            )
+            .execute(&mut **tx)
+            .await
+            .ctx("execution: persist settlement")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+            }
+        }
+        for settlement in &req.change_set.tool_settlements {
+            let (outcome, context) =
+                Self::encoded_settlement(&settlement.outcome, &settlement.context)?;
+            let row = req
+                .change_set
+                .tool_attempts
+                .iter()
+                .find(|a| a.id == settlement.tool_attempt_id)
+                .ok_or_else(|| invalid("TOOL_SETTLEMENT_ATTEMPT_MISMATCH"))?;
+            let done = sqlx::query!(
+                "UPDATE central.tool_call_attempts \
+                 SET version = $7, invocation_id = $8, \
+                 invocation_generation = CASE WHEN $8::uuid IS NULL THEN NULL ELSE $9::bigint END, \
+                 state = $10, outcome = COALESCE($11::jsonb, outcome), \
+                 context = COALESCE($12::jsonb, context), \
+                 updated_at = clock_timestamp() \
+                 WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
+                 AND step_attempt_id = $4 AND tool_call_id = $5 AND id = $6 \
+                 AND version = $13",
+                uuid_of(row.workspace_id.as_bytes()),
+                uuid_of(row.task_id.as_bytes()),
+                uuid_of(row.run_id.as_bytes()),
+                uuid_of(row.step_attempt_id.as_bytes()),
+                uuid_of(row.tool_call_id.as_bytes()),
+                uuid_of(row.id.as_bytes()),
+                row.version,
+                uuid_for_invocation(&row.invocation_id),
+                invocation_generation(&row.invocation_id),
+                row.state.as_str(),
+                outcome,
+                context,
+                req.expected_versions.tool_attempt,
+            )
+            .execute(&mut **tx)
+            .await
+            .ctx("execution: persist tool settlement")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `encodedSettlement` — outcome is required JSON; context may be
+    /// absent or valid JSON. Anything else is invalid evidence.
+    fn encoded_settlement(
+        outcome: &[u8],
+        context: &[u8],
+    ) -> Result<(serde_json::Value, Option<serde_json::Value>), Failure> {
+        let outcome_json = serde_json::from_slice::<serde_json::Value>(&go_json_escapes(outcome));
+        let context_ok = context.is_empty()
+            || serde_json::from_slice::<serde_json::Value>(&go_json_escapes(context)).is_ok();
+        if outcome_json.is_err() || !context_ok {
+            return Err(invalid("INVALID_SETTLEMENT_EVIDENCE"));
+        }
+        let context_json = (!context.is_empty()).then(|| {
+            serde_json::from_slice::<serde_json::Value>(&go_json_escapes(context))
                 .unwrap_or_default()
         });
-        sqlx::query!(
-            "UPDATE central.step_attempts \
-             SET outcome = $6::jsonb, context = COALESCE($7::jsonb, context), \
-             updated_at = clock_timestamp() \
-             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
-             AND step_id = $4 AND id = $5",
-            uuid_of(s.workspace_id.as_bytes()),
-            uuid_of(s.task_id.as_bytes()),
-            uuid_of(s.run_id.as_bytes()),
-            uuid_of(s.step_id.as_bytes()),
-            uuid_of(s.attempt_id.as_bytes()),
-            outcome,
-            context,
-        )
-        .execute(&mut **tx)
-        .await
-        .ctx("execution: apply settlement")?;
-        Ok(())
+        Ok((outcome_json.unwrap_or_default(), context_json))
     }
 
-    async fn apply_tool_settlement(
+    /// `persistLeases` — insert / claim-expired / heartbeat per durable
+    /// lease fact, fenced by the change-set generation; the persisted
+    /// expiry is the fixed 30-second renewal window, and a stale fence
+    /// is a conflict.
+    async fn persist_leases(
         tx: &mut Transaction<'_, Postgres>,
-        s: &central_execution::domain::ToolSettlement,
+        req: &CommitRequest,
     ) -> Result<(), Failure> {
-        let outcome = serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&s.outcome))
-            .unwrap_or_default();
-        let context = (!s.context.is_empty()).then(|| {
-            serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&s.context))
-                .unwrap_or_default()
-        });
-        sqlx::query!(
-            "UPDATE central.tool_call_attempts \
-             SET outcome = $7::jsonb, context = COALESCE($8::jsonb, context), \
-             updated_at = clock_timestamp() \
-             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
-             AND step_attempt_id = $4 AND tool_call_id = $5 AND id = $6",
-            uuid_of(s.workspace_id.as_bytes()),
-            uuid_of(s.task_id.as_bytes()),
-            uuid_of(s.run_id.as_bytes()),
-            uuid_of(s.attempt_id.as_bytes()),
-            uuid_of(s.tool_call_id.as_bytes()),
-            uuid_of(s.tool_attempt_id.as_bytes()),
-            outcome,
-            context,
-        )
-        .execute(&mut **tx)
-        .await
-        .ctx("execution: apply tool settlement")?;
-        Ok(())
-    }
-
-    /// `applyLeases` — insert / claim-expired / heartbeat per durable
-    /// lease fact, fenced by the change-set generation.
-    async fn apply_lease(
-        tx: &mut Transaction<'_, Postgres>,
-        scope: &TrustedScope,
-        lease: &Lease,
-    ) -> Result<(), Failure> {
-        let persisted =
-            read_persisted_lease_for_update(tx, lease.workspace_id, lease.run_id).await?;
-        let (w, r) = (
-            uuid_of(lease.workspace_id.as_bytes()),
-            uuid_of(lease.run_id.as_bytes()),
-        );
-        let verifier = sha256(&lease.credential.0);
-        match persisted {
-            None => {
-                sqlx::query!(
-                    "INSERT INTO central.execution_ownership (\
-                     id, workspace_id, owner_scope, owner_identity, heartbeat_at, \
-                     claimed_run_id, claimed_step_id, claimed_step_attempt_id, \
-                     run_id, lease_token_hash, fencing_generation, lease_expires_at, \
-                     created_at, updated_at) \
-                     VALUES ($1, $2, 'execution', $3, clock_timestamp(), \
-                     $4, $5, $6, $4, $7, $8, $9, clock_timestamp(), clock_timestamp())",
-                    uuid::Uuid::now_v7(),
-                    w,
-                    scope.principal_id,
-                    r,
-                    Option::<uuid::Uuid>::None,
-                    Option::<uuid::Uuid>::None,
-                    &verifier[..],
-                    lease.generation,
-                    lease.expires_at,
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: insert lease")?;
-                Ok(())
-            }
-            Some(row) if ct_eq(&verifier, &row.verifier) && row.generation == lease.generation => {
-                let done = sqlx::query!(
-                    "UPDATE central.execution_ownership \
-                     SET heartbeat_at = clock_timestamp(), lease_expires_at = $3, \
-                     updated_at = clock_timestamp() \
-                     WHERE workspace_id = $1 AND run_id = $2 \
-                     AND lease_token_hash = $4 AND fencing_generation = $5 \
-                     AND lease_expires_at > clock_timestamp()",
-                    w,
-                    r,
-                    lease.expires_at,
-                    &verifier[..],
-                    lease.generation,
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: heartbeat lease")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(denied("LEASE_FENCED"));
+        for lease in &req.change_set.leases {
+            let persisted =
+                read_persisted_lease_for_update(tx, lease.workspace_id, lease.run_id).await?;
+            let (w, r) = (
+                uuid_of(lease.workspace_id.as_bytes()),
+                uuid_of(lease.run_id.as_bytes()),
+            );
+            let verifier = sha256(&lease.credential.0);
+            match persisted {
+                None => {
+                    if lease.generation != 1 {
+                        return Err(conflict("STALE_LEASE_FENCE"));
+                    }
+                    sqlx::query!(
+                        "INSERT INTO central.execution_ownership (\
+                         id, workspace_id, owner_scope, owner_identity, heartbeat_at, \
+                         claimed_run_id, claimed_step_id, claimed_step_attempt_id, \
+                         run_id, lease_token_hash, fencing_generation, lease_expires_at, \
+                         created_at, updated_at) \
+                         VALUES ($1, $2, $3, $4, clock_timestamp(), \
+                         $5, $6, $7, $5, $8, $9, \
+                         clock_timestamp() + interval '30 seconds', \
+                         clock_timestamp(), clock_timestamp())",
+                        uuid::Uuid::now_v7(),
+                        w,
+                        format!("run:{}", uuid::Uuid::from_bytes(*lease.run_id.as_bytes())),
+                        req.principal_id,
+                        r,
+                        opt_step_uuid(req.result.step_id),
+                        opt_attempt_uuid(req.result.attempt_id),
+                        &verifier[..],
+                        lease.generation,
+                    )
+                    .execute(&mut **tx)
+                    .await
+                    .ctx("execution: insert lease")?;
                 }
-                Ok(())
-            }
-            Some(row) => {
-                // Fencing take-over is only legal past expiry.
-                let done = sqlx::query!(
-                    "UPDATE central.execution_ownership \
-                     SET owner_identity = $3, heartbeat_at = clock_timestamp(), \
-                     claimed_step_id = $4, claimed_step_attempt_id = $5, \
-                     lease_token_hash = $6, fencing_generation = $7, \
-                     lease_expires_at = $8, updated_at = clock_timestamp() \
-                     WHERE workspace_id = $1 AND run_id = $2 \
-                     AND fencing_generation = $9 \
-                     AND lease_expires_at <= clock_timestamp()",
-                    w,
-                    r,
-                    scope.principal_id,
-                    opt_step_uuid(row.step_id),
-                    opt_attempt_uuid(row.attempt_id),
-                    &verifier[..],
-                    lease.generation,
-                    lease.expires_at,
-                    row.generation,
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: claim expired lease")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(denied("LEASE_FENCED"));
+                Some(row)
+                    if row.generation == lease.generation && ct_eq(&verifier, &row.verifier) =>
+                {
+                    let done = sqlx::query!(
+                        "UPDATE central.execution_ownership \
+                         SET heartbeat_at = clock_timestamp(), \
+                         lease_expires_at = clock_timestamp() + interval '30 seconds', \
+                         updated_at = clock_timestamp() \
+                         WHERE workspace_id = $1 AND run_id = $2 \
+                         AND lease_token_hash = $3 AND fencing_generation = $4 \
+                         AND lease_expires_at > clock_timestamp()",
+                        w,
+                        r,
+                        &verifier[..],
+                        lease.generation,
+                    )
+                    .execute(&mut **tx)
+                    .await
+                    .ctx("execution: heartbeat lease")?
+                    .rows_affected();
+                    if done != 1 {
+                        return Err(conflict("STALE_LEASE_FENCE"));
+                    }
                 }
-                Ok(())
+                Some(row) if lease.generation == row.generation + 1 => {
+                    let done = sqlx::query!(
+                        "UPDATE central.execution_ownership \
+                         SET owner_identity = $3, heartbeat_at = clock_timestamp(), \
+                         claimed_step_id = $4, claimed_step_attempt_id = $5, \
+                         lease_token_hash = $6, fencing_generation = $7, \
+                         lease_expires_at = clock_timestamp() + interval '30 seconds', \
+                         updated_at = clock_timestamp() \
+                         WHERE workspace_id = $1 AND run_id = $2 \
+                         AND fencing_generation = $8 \
+                         AND lease_expires_at <= clock_timestamp()",
+                        w,
+                        r,
+                        req.principal_id,
+                        opt_step_uuid(req.result.step_id),
+                        opt_attempt_uuid(req.result.attempt_id),
+                        &verifier[..],
+                        lease.generation,
+                        row.generation,
+                    )
+                    .execute(&mut **tx)
+                    .await
+                    .ctx("execution: claim expired lease")?
+                    .rows_affected();
+                    if done != 1 {
+                        return Err(conflict("STALE_LEASE_FENCE"));
+                    }
+                }
+                Some(_) => return Err(conflict("STALE_LEASE_FENCE")),
             }
         }
-    }
-
-    async fn apply_lease_release(
-        tx: &mut Transaction<'_, Postgres>,
-        release: &central_execution::domain::LeaseRelease,
-    ) -> Result<(), Failure> {
-        let verifier = sha256(&release.credential.0);
-        let done = sqlx::query!(
-            "UPDATE central.execution_ownership \
-             SET claimed_run_id = run_id, claimed_step_id = NULL, \
-             claimed_step_attempt_id = NULL, owner_scope = NULL, owner_identity = NULL, \
-             heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp(), \
-             updated_at = clock_timestamp() \
-             WHERE workspace_id = $1 AND run_id = $2 \
-             AND lease_token_hash = $3 AND fencing_generation = $4 \
-             AND lease_expires_at > clock_timestamp()",
-            uuid_of(release.workspace_id.as_bytes()),
-            uuid_of(release.run_id.as_bytes()),
-            &verifier[..],
-            release.generation,
-        )
-        .execute(&mut **tx)
-        .await
-        .ctx("execution: release lease")?
-        .rows_affected();
-        if done != 1 {
-            return Err(denied("LEASE_FENCED"));
+        for release in &req.change_set.lease_releases {
+            let verifier = sha256(&release.credential.0);
+            let done = sqlx::query!(
+                "UPDATE central.execution_ownership \
+                 SET claimed_run_id = run_id, claimed_step_id = NULL, \
+                 claimed_step_attempt_id = NULL, owner_scope = NULL, owner_identity = NULL, \
+                 heartbeat_at = clock_timestamp(), lease_expires_at = clock_timestamp(), \
+                 updated_at = clock_timestamp() \
+                 WHERE workspace_id = $1 AND run_id = $2 \
+                 AND lease_token_hash = $3 AND fencing_generation = $4 \
+                 AND lease_expires_at > clock_timestamp()",
+                uuid_of(release.workspace_id.as_bytes()),
+                uuid_of(release.run_id.as_bytes()),
+                &verifier[..],
+                release.generation,
+            )
+            .execute(&mut **tx)
+            .await
+            .ctx("execution: release lease")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("STALE_LEASE_FENCE"));
+            }
         }
         Ok(())
     }
 
-    async fn apply_lease_assertion(
+    /// `assertNoActiveLease` — the request/change-set fence that no
+    /// unexpired lease exists on the run.
+    async fn assert_no_active_lease(
         tx: &mut Transaction<'_, Postgres>,
-        assertion: &central_execution::domain::LeaseAssertion,
+        ws: WorkspaceId,
+        rid: RunId,
     ) -> Result<(), Failure> {
-        if !assertion.no_active {
-            return Ok(());
-        }
         let row = sqlx::query!(
             "SELECT NOT EXISTS ( \
                SELECT 1 FROM central.execution_ownership \
                WHERE workspace_id = $1 AND run_id = $2 \
                AND lease_expires_at > clock_timestamp() \
              ) AS \"ok!\"",
-            uuid_of(assertion.workspace_id.as_bytes()),
-            uuid_of(assertion.run_id.as_bytes()),
+            uuid_of(ws.as_bytes()),
+            uuid_of(rid.as_bytes()),
         )
         .fetch_one(&mut **tx)
         .await
         .ctx("execution: assert no active lease")?;
         if !row.ok {
-            return Err(conflict("LEASE_ACTIVE"));
+            return Err(conflict("ACTIVE_LEASE_CONFLICT"));
         }
         Ok(())
     }
 
-    async fn apply_attempt_assertion(
+    /// `persistAttemptAssertions` — each assertion pins the parent
+    /// attempt's identity, logical operation, version and state.
+    async fn persist_attempt_assertions(
         tx: &mut Transaction<'_, Postgres>,
-        a: &StepAttemptAssertion,
+        assertions: &[StepAttemptAssertion],
     ) -> Result<(), Failure> {
-        let row = sqlx::query!(
-            "SELECT 1 AS one FROM central.step_attempts \
-             WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
-             AND step_id = $4 AND id = $5 AND logical_operation_id = $6 \
-             AND version = $7 AND state = $8 FOR UPDATE",
-            uuid_of(a.workspace_id.as_bytes()),
-            uuid_of(a.task_id.as_bytes()),
-            uuid_of(a.run_id.as_bytes()),
-            uuid_of(a.step_id.as_bytes()),
-            uuid_of(a.id.as_bytes()),
-            uuid_for_logical(&a.logical_operation_id),
-            a.version,
-            a.state.as_str(),
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .ctx("execution: assert attempt")?;
-        if row.is_none() {
-            return Err(conflict("VERSION_CONFLICT"));
+        for a in assertions {
+            let row = sqlx::query!(
+                "SELECT 1 AS one FROM central.step_attempts \
+                 WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 \
+                 AND step_id = $4 AND id = $5 AND logical_operation_id = $6 \
+                 AND version = $7 AND state = $8 FOR UPDATE",
+                uuid_of(a.workspace_id.as_bytes()),
+                uuid_of(a.task_id.as_bytes()),
+                uuid_of(a.run_id.as_bytes()),
+                uuid_of(a.step_id.as_bytes()),
+                uuid_of(a.id.as_bytes()),
+                uuid_for_logical(&a.logical_operation_id),
+                a.version,
+                a.state.as_str(),
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .ctx("execution: assert attempt")?;
+            if row.is_none() {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+            }
         }
         Ok(())
     }
 
-    /// `applyTaskTransition` — embedded task change set with the same
-    /// CAS + event insertion the task adapter performs.
+    /// `applyTaskChangeSet` — the embedded task transition: the task
+    /// row and each run row update under their expected versions; a
+    /// missing row or version drift is a conflict. Task lifecycle
+    /// events are persisted by [`Self::persist_evidence`].
     async fn apply_task_transition(
         tx: &mut Transaction<'_, Postgres>,
         ws: WorkspaceId,
         change_set: &TaskChangeSet,
     ) -> Result<(), Failure> {
+        if change_set.task.id.is_nil() {
+            return Ok(());
+        }
         let (w, t) = (
             uuid_of(ws.as_bytes()),
             uuid_of(change_set.task.id.as_bytes()),
@@ -1256,108 +1437,137 @@ impl Store {
         .ctx("execution: apply task transition")?
         .rows_affected();
         if done != 1 {
-            return Err(conflict("VERSION_CONFLICT"));
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
         }
         for run in &change_set.runs {
-            let expected = change_set
-                .run_expected_versions
-                .get(&run.id)
-                .copied()
-                .unwrap_or(0);
-            if expected <= 0 {
-                sqlx::query!(
-                    "INSERT INTO central.runs (\
-                     id, workspace_id, task_id, version, status, run_index, \
-                     waiting_reason, failure_reason, ownership_token, \
-                     run_key, request_fingerprint, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''), \
-                     NULLIF($9, ''), NULLIF($10, ''), $11, \
-                     clock_timestamp(), clock_timestamp()) \
-                     ON CONFLICT (id) DO NOTHING",
-                    uuid_of(run.id.as_bytes()),
-                    w,
-                    t,
-                    run.version,
-                    run.status.as_str(),
-                    run.index,
-                    wait_reason_value(run.waiting_reason),
-                    run.failure_reason,
-                    run.ownership_token,
-                    run.run_key,
-                    run.request_fingerprint.as_ref().map(|f| &f[..]),
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: insert transitioned run")?;
-            } else {
-                let done = sqlx::query!(
-                    "UPDATE central.runs \
-                     SET version = $4, status = $5, run_index = $6, \
-                     waiting_reason = NULLIF($7, ''), failure_reason = NULLIF($8, ''), \
-                     ownership_token = NULLIF($9, ''), updated_at = clock_timestamp() \
-                     WHERE workspace_id = $1 AND task_id = $2 \
-                     AND id = $3 AND version = $10",
-                    w,
-                    t,
-                    uuid_of(run.id.as_bytes()),
-                    run.version,
-                    run.status.as_str(),
-                    run.index,
-                    wait_reason_value(run.waiting_reason),
-                    run.failure_reason,
-                    run.ownership_token,
-                    expected,
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: update transitioned run")?
-                .rows_affected();
-                if done != 1 {
-                    return Err(conflict("VERSION_CONFLICT"));
-                }
-            }
-        }
-        // Task lifecycle events ride the same event_sequence lane.
-        for intent in &change_set.events {
-            let sequence = reserve_event_sequence(tx, ws).await?;
-            let payload = event_intent_payload(intent);
-            sqlx::query!(
-                "INSERT INTO central.events (\
-                 id, workspace_id, event_sequence, event_type, aggregate_id, \
-                 aggregate_version, command_id, run_id, payload, \
-                 occurred_at, task_id, kind, state, producer_id, \
-                 policy_version, eligible_after, legal_hold) \
-                 VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, \
-                 clock_timestamp(), $5, $4, 'recorded', \
-                 'central.task.lifecycle.v1', 1, \
-                 clock_timestamp() + interval '90 days', false)",
-                uuid::Uuid::now_v7(),
+            let Some(expected) = change_set.run_expected_versions.get(&run.id).copied() else {
+                return Err(invalid("MISSING_RUN_EXPECTED_VERSION"));
+            };
+            let done = sqlx::query!(
+                "UPDATE central.runs \
+                 SET version = $4, status = $5, run_index = $6, \
+                 waiting_reason = NULLIF($7, ''), failure_reason = NULLIF($8, ''), \
+                 ownership_token = NULLIF($9, ''), updated_at = clock_timestamp() \
+                 WHERE workspace_id = $1 AND task_id = $2 \
+                 AND id = $3 AND version = $10",
                 w,
-                sequence,
-                intent.kind.as_str(),
                 t,
-                task.version,
-                opt_uuid_of(intent.run_id, |i| i.as_bytes()),
-                payload,
+                uuid_of(run.id.as_bytes()),
+                run.version,
+                run.status.as_str(),
+                run.index,
+                wait_reason_value(run.waiting_reason),
+                run.failure_reason,
+                run.ownership_token,
+                expected,
             )
             .execute(&mut **tx)
             .await
-            .ctx("execution: insert task event")?;
+            .ctx("execution: update transitioned run")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+            }
         }
         Ok(())
     }
 
-    /// `applyEvents` — one sequence reservation per intent; the
-    /// `(workspace, sequence)` unique index is the order proof.
-    async fn apply_events(
+    /// `persistEvidence` — task-transition events first (each with a
+    /// `task.lifecycle` outbox intent), then the command's event and
+    /// outbox intents, then reconciliation evidence events. One
+    /// sequence reservation per row; the `(workspace, sequence)` unique
+    /// index is the order proof.
+    async fn persist_evidence(
         tx: &mut Transaction<'_, Postgres>,
-        ws: WorkspaceId,
-        aggregate_version: i64,
-        producer: &str,
-        events: &[EventIntent],
+        req: &CommitRequest,
     ) -> Result<(), Failure> {
+        let ws = req.scope.workspace_id;
         let w = uuid_of(ws.as_bytes());
-        for intent in events {
+        let transition = req
+            .change_set
+            .task_transition
+            .as_ref()
+            .map(|t| &t.change_set);
+        let task_version = transition
+            .filter(|c| !c.task.id.is_nil())
+            .map_or(req.expected_versions.task, |c| c.task.version);
+        let task_events: &[central_task::domain::TaskEventIntent] =
+            transition.map_or(&[], |c| &c.events);
+        for intent in task_events {
+            let sequence = reserve_event_sequence(tx, ws).await?;
+            let id = uuid::Uuid::now_v7();
+            let mut payload = serde_json::json!({
+                "schema_version": 1,
+                "type": intent.kind.as_str(),
+                "occurred_at": go_rfc3339_local(intent.occurred_at),
+            });
+            if let Some(reason) = intent.reason {
+                payload["reason"] = serde_json::Value::from(reason.as_str());
+            }
+            if !intent.detail.is_empty() {
+                payload["detail"] = serde_json::Value::from(intent.detail.as_str());
+            }
+            let run = opt_uuid_of(intent.run_id, |i| i.as_bytes());
+            sqlx::query!(
+                "INSERT INTO central.events (\
+                 id, workspace_id, event_sequence, event_type, aggregate_id, \
+                 aggregate_version, command_id, run_id, payload, occurred_at, \
+                 task_id, step_id, attempt_id, kind, state, producer_id, \
+                 policy_version, eligible_after, legal_hold) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                 $8, $9::jsonb, clock_timestamp(), $5, NULL, NULL, \
+                 $4, 'recorded', $10, 1, \
+                 clock_timestamp() + interval '90 days', false)",
+                id,
+                w,
+                sequence,
+                intent.kind.as_str(),
+                uuid_of(intent.task_id.as_bytes()),
+                task_version,
+                id,
+                run,
+                payload,
+                req.principal_id,
+            )
+            .execute(&mut **tx)
+            .await
+            .ctx("execution: insert task event")?;
+            let dedup = format!(
+                "task:{}:{}:{}:{}",
+                uuid::Uuid::from_bytes(*intent.task_id.as_bytes()),
+                task_version,
+                intent.kind.as_str(),
+                run.unwrap_or_default()
+            );
+            let outbox_payload = serde_json::json!({
+                "schema_version": 1,
+                "event_id": id,
+                "catalog_type": "task.lifecycle",
+                "deduplication_key": dedup,
+            });
+            sqlx::query!(
+                "INSERT INTO central.outbox (\
+                 id, workspace_id, event_id, delivery_state, due_at, attempt_count, \
+                 created_at, updated_at, catalog_type, deduplication_key, \
+                 producer_id, payload, visible_at, policy_version, \
+                 eligible_after, legal_hold) \
+                 VALUES ($1, $2, $3, 'pending', clock_timestamp(), 0, \
+                 clock_timestamp(), clock_timestamp(), 'task.lifecycle', $4, $5, \
+                 $6::jsonb, clock_timestamp(), 1, \
+                 clock_timestamp() + interval '7 days', false)",
+                uuid::Uuid::now_v7(),
+                w,
+                id,
+                dedup,
+                req.principal_id,
+                outbox_payload,
+            )
+            .execute(&mut **tx)
+            .await
+            .ctx("execution: insert task outbox")?;
+            Self::upsert_outbox_workspace_work(tx, ws).await?;
+        }
+        for event in &req.change_set.events {
             let sequence = reserve_event_sequence(tx, ws).await?;
             sqlx::query!(
                 "INSERT INTO central.events (\
@@ -1365,42 +1575,29 @@ impl Store {
                  aggregate_version, command_id, run_id, payload, occurred_at, \
                  task_id, step_id, attempt_id, kind, state, producer_id, \
                  policy_version, eligible_after, legal_hold) \
-                 VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8::jsonb, \
+                 VALUES ($1, $2, $3, $4, $5, $6, $1, $7, $8::jsonb, \
                  clock_timestamp(), $5, $9, $10, $4, 'recorded', $11, 1, \
                  clock_timestamp() + interval '90 days', false)",
-                uuid_of(intent.id.as_bytes()),
-                w,
+                uuid_of(event.id.as_bytes()),
+                uuid_of(event.workspace_id.as_bytes()),
                 sequence,
-                intent.kind,
-                uuid_of(intent.task_id.as_bytes()),
-                aggregate_version,
-                opt_run_uuid(intent.run_id),
-                serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&intent.payload))
+                event.kind,
+                uuid_of(event.task_id.as_bytes()),
+                task_version,
+                opt_run_uuid(event.run_id),
+                serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&event.payload))
                     .unwrap_or_default(),
-                opt_step_uuid(intent.step_id),
-                opt_attempt_uuid(intent.attempt_id),
-                producer,
+                opt_step_uuid(event.step_id),
+                opt_attempt_uuid(event.attempt_id),
+                req.principal_id,
             )
             .execute(&mut **tx)
             .await
             .ctx("execution: insert event")?;
         }
-        Ok(())
-    }
-
-    /// `applyOutbox` — pending rows dedup'd by
-    /// `(workspace, catalog_type, deduplication_key)`; a conflicting row
-    /// is a caller-visible conflict, and each touched workspace's
-    /// scheduler row moves in the same transaction.
-    async fn apply_outbox(
-        tx: &mut Transaction<'_, Postgres>,
-        ws: WorkspaceId,
-        intents: &[OutboxIntent],
-    ) -> Result<(), Failure> {
-        let w = uuid_of(ws.as_bytes());
         let mut touched = std::collections::BTreeSet::new();
-        for intent in intents {
-            let done = sqlx::query!(
+        for outbox in &req.change_set.outbox {
+            sqlx::query!(
                 "INSERT INTO central.outbox (\
                  id, workspace_id, event_id, delivery_state, due_at, attempt_count, \
                  created_at, updated_at, catalog_type, deduplication_key, \
@@ -1409,40 +1606,83 @@ impl Store {
                  VALUES ($1, $2, $3, 'pending', clock_timestamp(), 0, \
                  clock_timestamp(), clock_timestamp(), $4, $5, $6, $7::jsonb, \
                  clock_timestamp(), 1, clock_timestamp() + interval '7 days', false)",
-                uuid_of(intent.id.as_bytes()),
-                w,
-                uuid_of(intent.event_id.as_bytes()),
-                intent.catalog_type,
-                intent.deduplication_key,
-                intent.producer_id,
-                serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&intent.payload))
+                uuid_of(outbox.id.as_bytes()),
+                uuid_of(outbox.workspace_id.as_bytes()),
+                uuid_of(outbox.event_id.as_bytes()),
+                outbox.catalog_type,
+                outbox.deduplication_key,
+                outbox.producer_id,
+                serde_json::from_slice::<serde_json::Value>(&go_json_escapes(&outbox.payload))
                     .unwrap_or_default(),
             )
             .execute(&mut **tx)
-            .await;
-            match done {
-                Ok(r) => {
-                    touched.insert(intent.workspace_id);
-                    let _ = r;
-                }
-                Err(e) => return Err(classify_sqlx(&e)),
-            }
+            .await
+            .map_err(|e| classify_sqlx(&e))?;
+            touched.insert(outbox.workspace_id);
         }
         for workspace in touched {
+            Self::upsert_outbox_workspace_work(tx, workspace).await?;
+        }
+        for reconciliation in &req.change_set.reconciliations {
+            let sequence = reserve_event_sequence(tx, ws).await?;
+            let evidence: Vec<serde_json::Value> = reconciliation
+                .evidence
+                .iter()
+                .map(|e| serde_json::json!({"kind": e.kind.as_str(), "reference": e.reference}))
+                .collect();
+            let payload = serde_json::json!({
+                "schema_version": 1,
+                "disposition": reconciliation.disposition.as_str(),
+                "evidence": evidence,
+            });
+            let id = uuid::Uuid::now_v7();
             sqlx::query!(
-                "INSERT INTO central.outbox_workspace_work (workspace_id, next_visible_at) \
-                 VALUES ($1, clock_timestamp()) \
-                 ON CONFLICT (workspace_id) DO UPDATE \
-                 SET next_visible_at = LEAST(\
-                   central.outbox_workspace_work.next_visible_at, \
-                   EXCLUDED.next_visible_at), \
-                 version = central.outbox_workspace_work.version + 1",
-                uuid_of(workspace.as_bytes()),
+                "INSERT INTO central.events (\
+                 id, workspace_id, event_sequence, event_type, aggregate_id, \
+                 aggregate_version, command_id, run_id, payload, occurred_at, \
+                 task_id, step_id, attempt_id, kind, state, producer_id, \
+                 policy_version, eligible_after, legal_hold) \
+                 VALUES ($1, $2, $3, 'execution.reconciliation.evidence', $4, $5, \
+                 $1, $6, $7::jsonb, clock_timestamp(), $4, $8, $9, \
+                 'execution.reconciliation.evidence', 'recorded', $10, 1, \
+                 clock_timestamp() + interval '90 days', false)",
+                id,
+                uuid_of(reconciliation.workspace_id.as_bytes()),
+                sequence,
+                uuid_of(reconciliation.task_id.as_bytes()),
+                req.expected_versions.task,
+                uuid_of(reconciliation.run_id.as_bytes()),
+                payload,
+                uuid_of(reconciliation.step_id.as_bytes()),
+                uuid_of(reconciliation.attempt_id.as_bytes()),
+                req.principal_id,
             )
             .execute(&mut **tx)
             .await
-            .ctx("execution: upsert outbox workspace work")?;
+            .ctx("execution: insert reconciliation evidence")?;
         }
+        Ok(())
+    }
+
+    /// `queryUpsertOutboxWorkspaceWork` — nudge the outbox scheduler's
+    /// workspace row forward in the same transaction.
+    async fn upsert_outbox_workspace_work(
+        tx: &mut Transaction<'_, Postgres>,
+        ws: WorkspaceId,
+    ) -> Result<(), Failure> {
+        sqlx::query!(
+            "INSERT INTO central.outbox_workspace_work (workspace_id, next_visible_at) \
+             VALUES ($1, clock_timestamp()) \
+             ON CONFLICT (workspace_id) DO UPDATE \
+             SET next_visible_at = LEAST(\
+               central.outbox_workspace_work.next_visible_at, \
+               EXCLUDED.next_visible_at), \
+             version = central.outbox_workspace_work.version + 1",
+            uuid_of(ws.as_bytes()),
+        )
+        .execute(&mut **tx)
+        .await
+        .ctx("execution: upsert outbox workspace work")?;
         Ok(())
     }
 
@@ -1472,7 +1712,7 @@ impl Store {
         .await
         .ctx("execution: lock recovery coordinator")?;
         if row.is_none() {
-            return Err(denied("RECOVERY_COORDINATOR_FENCED"));
+            return Err(conflict("STALE_RECOVERY_FENCE"));
         }
         Ok(())
     }
@@ -1501,221 +1741,56 @@ impl Store {
         .await
         .ctx("execution: renew recovery coordinator")?;
         row.map(|r| r.lease_expires_at)
-            .ok_or_else(|| denied("RECOVERY_COORDINATOR_FENCED"))
+            .ok_or_else(|| conflict("STALE_RECOVERY_FENCE"))
     }
 
-    /// `scanRecoveryWorkspace` — the adapter-owned bounded keyset scan:
-    /// reconciles every pre-watermark run in the claimed workspace.
-    async fn scan_recovery_workspace(
-        tx: &mut Transaction<'_, Postgres>,
-        generation: i64,
-        work: &RecoveryWorkspaceWork,
-        cursor_created_at: Option<OffsetDateTime>,
-        cursor_run_id: Option<uuid::Uuid>,
-        claim_hash: &[u8; 32],
-        domain: &str,
-    ) -> Result<(), Failure> {
-        let ws = uuid_of(work.workspace_id.as_bytes());
-        // A NULL cursor means the scan starts from the watermark's
-        // first run (upstream `cursor IS NULL` predicate arm).
-        let mut cursor_at = cursor_created_at;
-        let mut cursor_run = cursor_run_id;
-        loop {
-            let runs = sqlx::query!(
-                "SELECT r.id, r.task_id, r.created_at, r.version \
-                 FROM central.runs r \
-                 JOIN central.recovery_epoch_workspaces w \
-                   ON w.epoch_generation = $1 AND w.workspace_id = r.workspace_id \
-                 JOIN central.recovery_epochs e \
-                   ON e.epoch_generation = w.epoch_generation AND e.coordinator_domain = $6 \
-                 WHERE r.workspace_id = $2 AND r.reconciled_epoch < $1 \
-                   AND (r.created_at < w.watermark_created_at \
-                        OR (r.created_at = w.watermark_created_at AND r.id <= w.watermark_run_id)) \
-                   AND ($3::timestamptz IS NULL \
-                        OR r.created_at > $3::timestamptz \
-                        OR (r.created_at = $3::timestamptz AND r.id > $4::uuid)) \
-                 ORDER BY r.created_at, r.id LIMIT $5",
-                generation,
-                ws,
-                cursor_at,
-                cursor_run,
-                RECOVERY_SCAN_BATCH,
-                domain,
-            )
-            .fetch_all(&mut **tx)
-            .await
-            .ctx("execution: select recovery runs")?;
-            if runs.is_empty() {
-                return Ok(());
-            }
-            for run in &runs {
-                Self::reconcile_recovery_run(tx, generation, work.workspace_id, run.id, domain)
-                    .await?;
-                let done = sqlx::query!(
-                    "UPDATE central.runs \
-                     SET reconciled_epoch = $1, updated_at = clock_timestamp() \
-                     WHERE workspace_id = $2 AND id = $3 \
-                     AND reconciled_epoch < $1 \
-                     AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch \
-                       WHERE epoch.epoch_generation = $1 AND epoch.coordinator_domain = $4)",
-                    generation,
-                    ws,
-                    run.id,
-                    domain,
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: mark run reconciled")?;
-                if done.rows_affected() == 0 {
-                    return Err(conflict("STALE_RECOVERY_FENCE"));
-                }
-                sqlx::query!(
-                    "UPDATE central.recovery_epoch_workspaces AS work \
-                     SET cursor_created_at = $4, cursor_run_id = $5, \
-                     scanned_count = scanned_count + 1, \
-                     reconciled_count = reconciled_count + 1, \
-                     claim_expires_at = clock_timestamp() + interval '30 seconds', \
-                     retry_not_before = NULL, failure_class = NULL, failure_reason = NULL, \
-                     updated_at = clock_timestamp() \
-                     WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
-                     AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
-                     AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch \
-                       WHERE epoch.epoch_generation = work.epoch_generation \
-                         AND epoch.coordinator_domain = $6)",
-                    generation,
-                    ws,
-                    &claim_hash[..],
-                    run.created_at,
-                    run.id,
-                    domain,
-                )
-                .execute(&mut **tx)
-                .await
-                .ctx("execution: advance recovery scan")?;
-                cursor_at = Some(run.created_at);
-                cursor_run = Some(run.id);
-            }
-        }
+    // -----------------------------------------------------------------
+    // Per-run recovery decisions — the upstream
+    // `persistRecoveryRunDecision` port. Each run's task/run/step/
+    // attempt rows are locked `FOR UPDATE` (lock order task → run →
+    // step → attempt) and the evaluated domain decision is persisted in
+    // the same transaction as the scan-cursor advance.
+    // -----------------------------------------------------------------
+
+    /// Harness phase 3e decision 4 — a cancelling task/run never waits
+    /// on reconciliation; the cancel intent is already durable.
+    fn recovery_keeps_cancelling(
+        task: &central_task::domain::Task,
+        run: &central_task::domain::Run,
+    ) -> bool {
+        task.status == central_task::domain::TaskStatus::Cancelling
+            && run.status == central_task::domain::RunStatus::Cancelling
     }
 
-    /// `reconcileRun` — one pre-watermark run: cancel its prepared
-    /// successor or quarantine the live attempt/step/tool chain, expire
-    /// the run lease past its grace, then mark task+run waiting on
-    /// reconciliation.
-    async fn reconcile_recovery_run(
+    /// `recoveryRunHasActiveLease` — `Some(retry_at)` when a lease (or
+    /// its 5-second stale grace) still protects the run.
+    async fn active_recovery_lease_grace(
         tx: &mut Transaction<'_, Postgres>,
-        _generation: i64,
-        workspace_id: WorkspaceId,
-        run_id: uuid::Uuid,
-        _domain: &str,
-    ) -> Result<(), Failure> {
-        let ws = uuid_of(workspace_id.as_bytes());
-        // The newest live attempt candidate decides the disposition.
-        let candidate = sqlx::query!(
-            "SELECT a.id, a.step_id FROM central.step_attempts a \
-             WHERE a.workspace_id = $1 AND a.run_id = $2 \
-             AND a.state IN ('prepared','invoked','settling','reconciliation') \
-             ORDER BY a.updated_at DESC, a.id DESC LIMIT 1",
-            ws,
-            run_id,
-        )
-        .fetch_optional(&mut **tx)
-        .await
-        .ctx("execution: read recovery attempt candidate")?;
-        // The lease grace (expiry + 5s) must have passed before the run
-        // can be rewritten — otherwise the row waits.
-        let lease = sqlx::query!(
-            "SELECT lease_expires_at, clock_timestamp() AS \"now!\" \
+        ws: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<Option<OffsetDateTime>, Failure> {
+        let row = sqlx::query!(
+            "SELECT lease_expires_at + interval '5 seconds' AS \"grace!\" \
              FROM central.execution_ownership \
              WHERE workspace_id = $1 AND run_id = $2 \
              AND lease_expires_at + interval '5 seconds' > clock_timestamp() \
              FOR UPDATE",
-            ws,
-            run_id,
+            uuid_of(ws.as_bytes()),
+            uuid_of(run_id.as_bytes()),
         )
         .fetch_optional(&mut **tx)
         .await
-        .ctx("execution: read recovery lease")?;
-        if lease.is_some() {
-            return Err(conflict("RECOVERY_LEASE_GRACE"));
-        }
-        if let Some(c) = candidate {
-            sqlx::query!(
-                "UPDATE central.step_attempts \
-                 SET state = 'cancelled', version = version + 1, \
-                 updated_at = clock_timestamp() \
-                 WHERE workspace_id = $1 AND run_id = $2 AND id = $3 AND state = 'prepared'",
-                ws,
-                run_id,
-                c.id,
-            )
-            .execute(&mut **tx)
-            .await
-            .ctx("execution: cancel prepared attempt")?;
-            sqlx::query!(
-                "UPDATE central.step_attempts \
-                 SET state = 'reconciliation', version = version + 1, \
-                 updated_at = clock_timestamp() \
-                 WHERE workspace_id = $1 AND run_id = $2 AND id = $3 \
-                 AND state IN ('invoked','settling')",
-                ws,
-                run_id,
-                c.id,
-            )
-            .execute(&mut **tx)
-            .await
-            .ctx("execution: reconcile attempt")?;
-            sqlx::query!(
-                "UPDATE central.steps \
-                 SET state = 'cancelled', version = version + 1, \
-                 updated_at = clock_timestamp() \
-                 WHERE workspace_id = $1 AND run_id = $2 AND id = $3 \
-                 AND state IN ('queued','running','waiting')",
-                ws,
-                run_id,
-                c.step_id,
-            )
-            .execute(&mut **tx)
-            .await
-            .ctx("execution: cancel prepared step")?;
-            sqlx::query!(
-                "UPDATE central.steps \
-                 SET state = 'reconciliation', version = version + 1, \
-                 updated_at = clock_timestamp() \
-                 WHERE workspace_id = $1 AND run_id = $2 AND id = $3 \
-                 AND state <> 'reconciliation' AND state <> 'cancelled'",
-                ws,
-                run_id,
-                c.step_id,
-            )
-            .execute(&mut **tx)
-            .await
-            .ctx("execution: reconcile step")?;
-            sqlx::query!(
-                "UPDATE central.tool_call_attempts \
-                 SET state = 'reconciliation', version = version + 1, \
-                 updated_at = clock_timestamp() \
-                 WHERE workspace_id = $1 AND run_id = $2 \
-                 AND state IN ('invoked','settling')",
-                ws,
-                run_id,
-            )
-            .execute(&mut **tx)
-            .await
-            .ctx("execution: reconcile tool attempts")?;
-            sqlx::query!(
-                "UPDATE central.tool_calls \
-                 SET state = 'reconciliation', version = version + 1, \
-                 updated_at = clock_timestamp() \
-                 WHERE workspace_id = $1 AND run_id = $2 \
-                 AND state IN ('invoked','settling')",
-                ws,
-                run_id,
-            )
-            .execute(&mut **tx)
-            .await
-            .ctx("execution: reconcile tool calls")?;
-        }
+        .ctx("execution: read active recovery lease")?;
+        Ok(row.map(|r| r.grace))
+    }
+
+    /// `queryExpireRecoveryLease` — clears the claim fields and stamps
+    /// the lease expired; only fires past the grace window.
+    async fn expire_recovery_lease(
+        tx: &mut Transaction<'_, Postgres>,
+        ws: WorkspaceId,
+        run_id: RunId,
+    ) -> Result<(), Failure> {
         sqlx::query!(
             "UPDATE central.execution_ownership \
              SET claimed_run_id = run_id, claimed_step_id = NULL, \
@@ -1724,52 +1799,1259 @@ impl Store {
              updated_at = clock_timestamp() \
              WHERE workspace_id = $1 AND run_id = $2 \
              AND lease_expires_at + interval '5 seconds' <= clock_timestamp()",
-            ws,
-            run_id,
+            uuid_of(ws.as_bytes()),
+            uuid_of(run_id.as_bytes()),
         )
         .execute(&mut **tx)
         .await
         .ctx("execution: expire recovery lease")?;
-        // Task + run wait on reconciliation (version bumps only on an
-        // actual state change — upstream's conditional increment).
-        let task_id = sqlx::query!(
-            "SELECT task_id FROM central.runs WHERE workspace_id = $1 AND id = $2",
-            ws,
-            run_id,
+        Ok(())
+    }
+
+    /// `readRecoveryCompletionReceipt` — the attempt-scoped receipt,
+    /// joined to the locked attempt's invocation identity. `None`
+    /// covers both "no receipt" and contradictory evidence (upstream
+    /// wraps validation contradictions into the not-settled path).
+    async fn read_recovery_completion_receipt(
+        tx: &mut Transaction<'_, Postgres>,
+        ws: WorkspaceId,
+        attempt_id: StepAttemptId,
+    ) -> Result<Option<central_execution::harness_run::CompletionReceipt>, Failure> {
+        let row = sqlx::query!(
+            "SELECT r.id, r.task_id, r.run_id, r.step_id, \
+             r.logical_operation_id, r.physical_attempt_id, r.invocation_id, \
+             r.invocation_generation, r.final_state, r.outcome::text AS \"outcome!\", \
+             r.context::text AS \"context?\", r.producer_id \
+             FROM central.execution_completion_receipts r \
+             JOIN central.step_attempts a \
+               ON a.workspace_id = r.workspace_id AND a.id = r.step_attempt_id \
+             WHERE r.workspace_id = $1 AND r.step_attempt_id = $2 \
+             AND r.invocation_id = a.invocation_id \
+             AND r.invocation_generation = a.invocation_generation \
+             LIMIT 1",
+            uuid_of(ws.as_bytes()),
+            uuid_of(attempt_id.as_bytes()),
         )
         .fetch_optional(&mut **tx)
         .await
-        .ctx("execution: read run task")?;
-        sqlx::query!(
-            "UPDATE central.tasks \
-             SET status = 'waiting', waiting_reason = 'reconciliation', \
-             version = version + CASE \
-               WHEN status = 'waiting' AND waiting_reason = 'reconciliation' THEN 0 ELSE 1 END, \
-             updated_at = clock_timestamp() \
-             WHERE workspace_id = $1 AND id = $2 \
-             AND status IN ('queued','running','waiting')",
+        .ctx("execution: read recovery completion receipt")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // Any decode/validation drift is contradictory evidence — the
+        // caller falls back to the reconciliation-required path.
+        let receipt = (|| -> Result<central_execution::harness_run::CompletionReceipt, Failure> {
+            let final_state = central_execution::domain::AttemptState::parse(&row.final_state)
+                .ok_or_else(|| corrupt("a stored receipt final_state is outside the vocabulary"))?;
+            let outcome = serde_json::from_str::<serde_json::Value>(&row.outcome)
+                .ok()
+                .and_then(|v| serde_json::to_vec(&v).ok())
+                .ok_or_else(|| corrupt("a stored receipt outcome is not JSON"))?;
+            let context = match &row.context {
+                Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .and_then(|v| serde_json::to_vec(&v).ok())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            Ok(central_execution::harness_run::CompletionReceipt {
+                workspace_id: ws,
+                task_id: TaskId::from_trusted_db_bytes(*row.task_id.as_bytes()),
+                run_id: RunId::from_trusted_db_bytes(*row.run_id.as_bytes()),
+                step_id: StepId::from_trusted_db_bytes(*row.step_id.as_bytes()),
+                attempt_id,
+                logical_operation_id: LogicalOperationId(*row.logical_operation_id.as_bytes()),
+                physical_attempt_id: central_execution::domain::PhysicalAttemptId(
+                    *row.physical_attempt_id.as_bytes(),
+                ),
+                invocation_id: central_execution::domain::InvocationId(
+                    *row.invocation_id.as_bytes(),
+                ),
+                invocation_generation: row.invocation_generation,
+                final_state,
+                outcome,
+                context,
+                b09_references: Vec::new(),
+                producer_id: row.producer_id,
+            })
+        })();
+        let mut receipt = match receipt {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let references = sqlx::query!(
+            "SELECT evidence_kind, evidence_id \
+             FROM central.provider_completion_references \
+             WHERE workspace_id = $1 AND completion_receipt_id = $2 \
+             ORDER BY evidence_kind, evidence_id",
+            uuid_of(ws.as_bytes()),
+            row.id,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .ctx("execution: read recovery receipt evidence")?;
+        receipt.b09_references = references
+            .into_iter()
+            .map(|r| B09EvidenceReference {
+                kind: r.evidence_kind,
+                id: r.evidence_id,
+            })
+            .collect();
+        if receipt.validate().is_err() {
+            return Ok(None);
+        }
+        Ok(Some(receipt))
+    }
+
+    /// `persistRecoveryCompletion` — evaluate the durable completion
+    /// receipt against the locked aggregate and persist the whole
+    /// evaluated change set. `Ok(None)` = "not settled": the caller
+    /// takes the reconciliation-required path (upstream maps any
+    /// domain rejection there — contradictory evidence, not adapter
+    /// failure).
+    async fn persist_recovery_completion(
+        tx: &mut Transaction<'_, Postgres>,
+        ws: WorkspaceId,
+        task: &central_task::domain::Task,
+        run: &central_task::domain::Run,
+        current: &StepAttempt,
+    ) -> Result<Option<(String, i64)>, Failure> {
+        let Some(receipt) = Self::read_recovery_completion_receipt(tx, ws, current.id).await?
+        else {
+            return Ok(None);
+        };
+        let step = read_step(tx, ws, task.id, run.id, current.step_id, true).await?;
+        let attempt =
+            read_attempt(tx, ws, task.id, run.id, current.step_id, current.id, true).await?;
+        let tool_calls = read_tool_calls(tx, ws, current.id).await?;
+        let tool_attempts = read_tool_attempts(tx, ws, current.id).await?;
+        let now = db_now(tx).await?;
+        let state = ExecutionState {
+            task: central_task::domain::TaskAggregate {
+                task: task.clone(),
+                current_run: Some(run.clone()),
+            },
+            step: Some(step),
+            attempt: Some(attempt),
+            tool_calls,
+            tool_attempts,
+            lease: None,
+            approval: None,
+        };
+        let change = match central_execution::harness_run::evaluate_recovery_completion(
+            &state, &receipt, now,
+        ) {
+            Ok(change) => change,
+            // Any domain rejection is contradictory durable evidence —
+            // upstream returns not-settled so the run reconciles.
+            Err(_) => return Ok(None),
+        };
+        let req = Self::recovery_commit_request(
             ws,
-            task_id.map(|t| t.task_id).unwrap_or_default(),
+            ExpectedVersions {
+                task: task.version,
+                run: run.version,
+                step: state.step.as_ref().map_or(0, |s| s.version),
+                attempt: state.attempt.as_ref().map_or(0, |a| a.version),
+                tool_call: state.tool_calls.first().map_or(0, |c| c.version),
+                tool_attempt: state.tool_attempts.first().map_or(0, |a| a.version),
+                ..ExpectedVersions::default()
+            },
+            change,
+        )?;
+        if let Some(transition) = &req.change_set.task_transition {
+            Self::apply_task_transition(tx, ws, &transition.change_set).await?;
+        }
+        Self::persist_steps(tx, &req).await?;
+        Self::persist_settlements(tx, &req).await?;
+        Self::persist_attempts(tx, &req).await?;
+        Self::persist_tool_calls(tx, &req).await?;
+        Self::persist_tool_attempts(tx, &req).await?;
+        Self::persist_evidence(tx, &req).await?;
+        Self::expire_recovery_lease(tx, ws, run.id).await?;
+        let version = req
+            .change_set
+            .task_transition
+            .as_ref()
+            .map_or(task.version, |t| t.change_set.task.version);
+        Ok(Some((
+            format!("completion_{}", receipt.final_state.as_str()),
+            version,
+        )))
+    }
+
+    /// The synthetic recovery `CommitRequest` — same shape upstream
+    /// builds for `persistRecovery*`: the recovery coordinator scope,
+    /// the domain's evaluated change set, and the locked rows'
+    /// versions as the CAS fence.
+    fn recovery_commit_request(
+        ws: WorkspaceId,
+        expected: ExpectedVersions,
+        change_set: central_execution::domain::ExecutionChangeSet,
+    ) -> Result<CommitRequest, Failure> {
+        Ok(CommitRequest {
+            scope: TrustedScope::new(
+                "central.execution.recovery.v1",
+                ws,
+                &[central_execution::domain::Capability::RecoveryCoordinator],
+            )
+            .map_err(|_| invalid("INVALID_RECOVERY_SCOPE"))?,
+            command_scope: String::new(),
+            idempotency_key: String::new(),
+            fingerprint: [0; 32],
+            principal_id: "central.execution.recovery.v1".to_owned(),
+            capability: central_execution::domain::Capability::RecoveryCoordinator,
+            receipt_binding: central_execution::port::ReceiptBinding {
+                task_id: central_foundation::identity::TaskId::from_trusted_db_bytes([0; 16]),
+                run_id: RunId::from_trusted_db_bytes([0; 16]),
+                step_id: StepId::from_trusted_db_bytes([0; 16]),
+                attempt_id: StepAttemptId::from_trusted_db_bytes([0; 16]),
+                logical_operation: LogicalOperationId([0; 16]),
+            },
+            expected_versions: expected,
+            require_recovery_claimable: false,
+            lease_credential: LeaseCredential::default(),
+            lease_generation: 0,
+            assert_no_active_lease: false,
+            result: central_execution::port::DurableResult {
+                workspace_id: ws,
+                task_id: central_foundation::identity::TaskId::from_trusted_db_bytes([0; 16]),
+                run_id: RunId::from_trusted_db_bytes([0; 16]),
+                step_id: StepId::from_trusted_db_bytes([0; 16]),
+                attempt_id: StepAttemptId::from_trusted_db_bytes([0; 16]),
+                event_id: central_foundation::identity::ExecutionEventId::from_trusted_db_bytes(
+                    [0; 16],
+                ),
+                event_kind: String::new(),
+                approval_action: None,
+            },
+            change_set,
+        })
+    }
+
+    /// `persistRecoveryCancellation` — `evaluate_recovery_cancellation`
+    /// for a prepared attempt in a cancelling task/run. The emitted
+    /// no-active-lease assertions are re-checked inside this
+    /// transaction; a live lease is a contradiction that quarantines.
+    async fn persist_recovery_cancellation(
+        tx: &mut Transaction<'_, Postgres>,
+        ws: WorkspaceId,
+        task: &central_task::domain::Task,
+        run: &central_task::domain::Run,
+        step: &Step,
+        current: &StepAttempt,
+    ) -> Result<i64, Failure> {
+        let tool_calls = read_tool_calls(tx, ws, current.id).await?;
+        let tool_attempts = read_tool_attempts(tx, ws, current.id).await?;
+        let now = db_now(tx).await?;
+        let change = central_execution::harness_run::evaluate_recovery_cancellation(
+            &ExecutionState {
+                task: central_task::domain::TaskAggregate {
+                    task: task.clone(),
+                    current_run: Some(run.clone()),
+                },
+                step: Some(step.clone()),
+                attempt: Some(current.clone()),
+                tool_calls: tool_calls.clone(),
+                tool_attempts: tool_attempts.clone(),
+                lease: None,
+                approval: None,
+            },
+            now,
+        )?;
+        for assertion in &change.lease_assertions {
+            if !assertion.no_active || assertion.workspace_id != ws || assertion.run_id != run.id {
+                return Err(invalid("INVALID_LEASE_ASSERTION"));
+            }
+            let absent = sqlx::query!(
+                "SELECT NOT EXISTS ( \
+                   SELECT 1 FROM central.execution_ownership \
+                   WHERE workspace_id = $1 AND run_id = $2 \
+                   AND lease_expires_at > clock_timestamp() \
+                 ) AS \"ok!\"",
+                uuid_of(assertion.workspace_id.as_bytes()),
+                uuid_of(assertion.run_id.as_bytes()),
+            )
+            .fetch_one(&mut **tx)
+            .await
+            .ctx("execution: assert no active recovery lease")?;
+            if !absent.ok {
+                return Err(conflict("ACTIVE_LEASE_CONFLICT"));
+            }
+        }
+        let req = Self::recovery_commit_request(
+            ws,
+            ExpectedVersions {
+                task: task.version,
+                run: run.version,
+                step: step.version,
+                attempt: current.version,
+                tool_call: tool_calls.first().map_or(0, |c| c.version),
+                tool_attempt: tool_attempts.first().map_or(0, |a| a.version),
+                ..ExpectedVersions::default()
+            },
+            change,
+        )?;
+        if let Some(transition) = &req.change_set.task_transition {
+            Self::apply_task_transition(tx, ws, &transition.change_set).await?;
+        }
+        Self::persist_steps(tx, &req).await?;
+        Self::persist_attempts(tx, &req).await?;
+        Self::persist_tool_calls(tx, &req).await?;
+        Self::persist_tool_attempts(tx, &req).await?;
+        Self::persist_evidence(tx, &req).await?;
+        Self::expire_recovery_lease(tx, ws, run.id).await?;
+        Ok(req
+            .change_set
+            .task_transition
+            .as_ref()
+            .map_or(task.version, |t| t.change_set.task.version))
+    }
+
+    /// `persistRecoveryWaitingState` — the task-domain `Wait`
+    /// transition onto `reconciliation`; a no-op when the aggregate
+    /// already waits (or keeps cancelling) and
+    /// `TASK_TRANSITION_REJECTED` when the domain refuses.
+    async fn persist_recovery_waiting_state(
+        tx: &mut Transaction<'_, Postgres>,
+        ws: WorkspaceId,
+        task: &central_task::domain::Task,
+        run: &central_task::domain::Run,
+    ) -> Result<i64, Failure> {
+        if Self::recovery_keeps_cancelling(task, run) {
+            return Ok(task.version);
+        }
+        let already = task.status == central_task::domain::TaskStatus::Waiting
+            && run.status == central_task::domain::RunStatus::Waiting
+            && task.waiting_reason == Some(central_task::domain::WaitingReason::Reconciliation)
+            && run.waiting_reason == Some(central_task::domain::WaitingReason::Reconciliation);
+        if already {
+            return Ok(task.version);
+        }
+        let now = db_now(tx).await?;
+        let transition = central_task::execution_facade::evaluate_execution_transition(
+            central_task::execution_facade::ExecutionTransition::Wait(
+                central_task::execution_facade::ExecutionWaitRequest {
+                    aggregate: central_task::domain::TaskAggregate {
+                        task: task.clone(),
+                        current_run: Some(run.clone()),
+                    },
+                    reason: Some(central_task::domain::WaitingReason::Reconciliation),
+                    detail: "recovery requires reconciliation".to_owned(),
+                    now,
+                    expected_task_version: task.version,
+                    expected_run_version: run.version,
+                },
+            ),
+        )
+        .map_err(|_| denied("TASK_TRANSITION_REJECTED"))?;
+        Self::apply_task_transition(tx, ws, &transition.change_set).await?;
+        Ok(transition.change_set.task.version)
+    }
+
+    /// `persistRecoveryRunDecision` — the per-run decision ladder. The
+    /// task and run rows are already locked by the caller; this locks
+    /// step/attempt next (upstream lock order) and returns
+    /// `(decision, step_id, attempt_id, aggregate_version)` for the
+    /// evidence row.
+    async fn persist_recovery_run_decision(
+        tx: &mut Transaction<'_, Postgres>,
+        epoch_generation: i64,
+        ws: WorkspaceId,
+        task: &central_task::domain::Task,
+        run: &central_task::domain::Run,
+    ) -> Result<(String, Option<StepId>, Option<StepAttemptId>, i64), Failure> {
+        let w = uuid_of(ws.as_bytes());
+        let rid = uuid_of(run.id.as_bytes());
+        let candidate = sqlx::query!(
+            "SELECT a.id, a.step_id FROM central.step_attempts a \
+             WHERE a.workspace_id = $1 AND a.run_id = $2 \
+             AND a.state IN ('prepared','invoked','settling','reconciliation') \
+             ORDER BY a.updated_at DESC, a.id DESC LIMIT 1",
+            w,
+            rid,
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .ctx("execution: read recovery attempt candidate")?;
+        let Some(candidate) = candidate else {
+            return Ok((
+                "verified_no_unsettled_attempt".to_owned(),
+                None,
+                None,
+                task.version,
+            ));
+        };
+        let step_id = StepId::from_trusted_db_bytes(*candidate.step_id.as_bytes());
+        let attempt_id = StepAttemptId::from_trusted_db_bytes(*candidate.id.as_bytes());
+        let step = read_step(tx, ws, task.id, run.id, step_id, true).await?;
+        let current = read_attempt(tx, ws, task.id, run.id, step_id, attempt_id, true).await?;
+        use central_execution::domain::AttemptState;
+        match current.state {
+            AttemptState::AttemptPrepared => {
+                // Phase 3e decision 5: a cancellation that beat
+                // `MarkInvoked` settles before any successor handling.
+                if Self::recovery_keeps_cancelling(task, run) {
+                    let version =
+                        Self::persist_recovery_cancellation(tx, ws, task, run, &step, &current)
+                            .await?;
+                    return Ok((
+                        "cancellation_settled".to_owned(),
+                        Some(step_id),
+                        Some(attempt_id),
+                        version,
+                    ));
+                }
+                if !current.predecessor_id.is_nil() {
+                    return Ok((
+                        "prepared_successor_preserved".to_owned(),
+                        Some(step_id),
+                        Some(attempt_id),
+                        task.version,
+                    ));
+                }
+                // Phase 3e decision 3: mint the fenced prepared
+                // successor. The predecessor's state-guarded update
+                // runs before the insert because the non-deferrable
+                // one-active-attempt index cannot see both rows.
+                let successor = central_execution::harness_run::cancel_prepared_for_recovery(
+                    &current,
+                    central_execution::harness_run::RecoveryFence {
+                        generation: epoch_generation,
+                        successor_id: StepAttemptId::new(),
+                    },
+                )?;
+                let done = sqlx::query!(
+                    "UPDATE central.step_attempts \
+                     SET state = 'cancelled', version = version + 1, \
+                     updated_at = clock_timestamp() \
+                     WHERE workspace_id = $1 AND run_id = $2 \
+                     AND id = $3 AND state = 'prepared'",
+                    w,
+                    rid,
+                    uuid_of(current.id.as_bytes()),
+                )
+                .execute(&mut **tx)
+                .await
+                .ctx("execution: cancel prepared recovery attempt")?
+                .rows_affected();
+                if done != 1 {
+                    return Err(conflict("RECOVERY_ATTEMPT_CHANGED"));
+                }
+                let done = sqlx::query!(
+                    "INSERT INTO central.step_attempts (\
+                     id, workspace_id, step_id, task_id, run_id, version, \
+                     logical_operation_id, physical_attempt_id, invocation_id, \
+                     invocation_generation, predecessor_id, sequence, state, \
+                     created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, \
+                     $9, $10, $11, clock_timestamp(), clock_timestamp()) \
+                     ON CONFLICT (id) DO NOTHING",
+                    uuid_of(successor.id.as_bytes()),
+                    uuid_of(successor.workspace_id.as_bytes()),
+                    uuid_of(successor.step_id.as_bytes()),
+                    uuid_of(successor.task_id.as_bytes()),
+                    uuid_of(successor.run_id.as_bytes()),
+                    successor.version,
+                    uuid_for_logical(&successor.logical_operation_id),
+                    uuid_for_physical(&successor.physical_attempt_id),
+                    opt_attempt_uuid(successor.predecessor_id),
+                    successor.sequence,
+                    successor.state.as_str(),
+                )
+                .execute(&mut **tx)
+                .await
+                .ctx("execution: insert prepared recovery successor")?
+                .rows_affected();
+                if done != 1 {
+                    return Err(conflict("RECOVERY_SUCCESSOR_CONFLICT"));
+                }
+                Self::expire_recovery_lease(tx, ws, run.id).await?;
+                Ok((
+                    "prepared_successor_created".to_owned(),
+                    Some(step_id),
+                    Some(successor.id),
+                    task.version,
+                ))
+            }
+            AttemptState::AttemptInvoked | AttemptState::AttemptSettling => {
+                if let Some((decision, version)) =
+                    Self::persist_recovery_completion(tx, ws, task, run, &current).await?
+                {
+                    return Ok((decision, Some(step_id), Some(attempt_id), version));
+                }
+                // Ambiguous chain — move the whole projection to
+                // reconciliation (upstream `queryReconcile*` exact-row
+                // checks), wait on it, then expire the lease.
+                let done = sqlx::query!(
+                    "UPDATE central.steps \
+                     SET state = 'reconciliation', version = version + 1, \
+                     updated_at = clock_timestamp() \
+                     WHERE workspace_id = $1 AND run_id = $2 AND id = $3 \
+                     AND state <> 'reconciliation'",
+                    w,
+                    rid,
+                    uuid_of(step_id.as_bytes()),
+                )
+                .execute(&mut **tx)
+                .await
+                .ctx("execution: reconcile recovery step")?
+                .rows_affected();
+                if done != 1 {
+                    return Err(conflict("RECOVERY_STEP_CHANGED"));
+                }
+                let done = sqlx::query!(
+                    "UPDATE central.step_attempts \
+                     SET state = 'reconciliation', version = version + 1, \
+                     updated_at = clock_timestamp() \
+                     WHERE workspace_id = $1 AND run_id = $2 AND id = $3 \
+                     AND state IN ('invoked','settling')",
+                    w,
+                    rid,
+                    uuid_of(attempt_id.as_bytes()),
+                )
+                .execute(&mut **tx)
+                .await
+                .ctx("execution: reconcile ambiguous recovery attempt")?
+                .rows_affected();
+                if done != 1 {
+                    return Err(conflict("RECOVERY_ATTEMPT_CHANGED"));
+                }
+                sqlx::query!(
+                    "UPDATE central.tool_calls \
+                     SET state = 'reconciliation', version = version + 1, \
+                     updated_at = clock_timestamp() \
+                     WHERE workspace_id = $1 AND run_id = $2 \
+                     AND state IN ('invoked','settling')",
+                    w,
+                    rid,
+                )
+                .execute(&mut **tx)
+                .await
+                .ctx("execution: reconcile recovery tool calls")?;
+                sqlx::query!(
+                    "UPDATE central.tool_call_attempts \
+                     SET state = 'reconciliation', version = version + 1, \
+                     updated_at = clock_timestamp() \
+                     WHERE workspace_id = $1 AND run_id = $2 \
+                     AND state IN ('invoked','settling')",
+                    w,
+                    rid,
+                )
+                .execute(&mut **tx)
+                .await
+                .ctx("execution: reconcile recovery tool attempts")?;
+                let version = Self::persist_recovery_waiting_state(tx, ws, task, run).await?;
+                Self::expire_recovery_lease(tx, ws, run.id).await?;
+                let decision = if Self::recovery_keeps_cancelling(task, run) {
+                    "reconciliation_required_cancelling"
+                } else {
+                    "reconciliation_required"
+                };
+                Ok((
+                    decision.to_owned(),
+                    Some(step_id),
+                    Some(attempt_id),
+                    version,
+                ))
+            }
+            AttemptState::AttemptReconciliation => {
+                if step.state != central_execution::domain::StepState::StepReconciliation {
+                    return Err(invalid("INVALID_RECOVERY_STEP_STATE"));
+                }
+                let version = Self::persist_recovery_waiting_state(tx, ws, task, run).await?;
+                Ok((
+                    "reconciliation_preserved".to_owned(),
+                    Some(step_id),
+                    Some(attempt_id),
+                    version,
+                ))
+            }
+            _ => Err(invalid("INVALID_RECOVERY_ATTEMPT_STATE")),
+        }
+    }
+
+    /// `recoveryDecisionRequiresReconciliation` — only the two
+    /// reconciliation-required decisions emit outbox work (upstream
+    /// `reconciliation_preserved` deliberately does not re-emit).
+    fn recovery_decision_requires_reconciliation(decision: &str) -> bool {
+        matches!(
+            decision,
+            "reconciliation_required" | "reconciliation_required_cancelling"
+        )
+    }
+
+    /// `insertRecoveryRunEvidence` — the durable
+    /// `execution.recovery.<decision>` event plus, for
+    /// reconciliation-required decisions, the
+    /// `execution.reconciliation.required` outbox row and workspace
+    /// work upsert — all inside the scan transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_recovery_run_evidence(
+        tx: &mut Transaction<'_, Postgres>,
+        epoch_generation: i64,
+        ws: WorkspaceId,
+        task_id: TaskId,
+        run_id: RunId,
+        step_id: Option<StepId>,
+        attempt_id: Option<StepAttemptId>,
+        decision: &str,
+        aggregate_version: i64,
+    ) -> Result<(), Failure> {
+        // Upstream locks the workspace event counter once per batch;
+        // re-locking inside the same transaction is a no-op.
+        lock_event_counter(tx, ws).await?;
+        let sequence = reserve_event_sequence(tx, ws).await?;
+        #[derive(serde::Serialize)]
+        struct RecoveryRunEvidence<'a> {
+            schema_version: u8,
+            epoch_generation: i64,
+            decision: &'a str,
+            run_id: String,
+        }
+        let event_id = uuid::Uuid::now_v7();
+        let payload = serde_json::to_vec(&RecoveryRunEvidence {
+            schema_version: 1,
+            epoch_generation,
+            decision,
+            run_id: run_id.to_string(),
+        })
+        .map_err(|_| corrupt("recovery run evidence payload is not encodable"))?;
+        let kind = format!("execution.recovery.{decision}");
+        sqlx::query!(
+            "INSERT INTO central.events (\
+             id, workspace_id, event_sequence, event_type, aggregate_id, \
+             aggregate_version, command_id, run_id, payload, occurred_at, \
+             task_id, step_id, attempt_id, kind, state, producer_id, \
+             policy_version, eligible_after, legal_hold) \
+             VALUES ($1, $2, $3, $4, $5, $6, $1, $7, $8::jsonb, \
+             clock_timestamp(), $5, $9, $10, $4, 'recorded', \
+             'central.execution.recovery.v1', 1, \
+             clock_timestamp() + interval '90 days', false)",
+            event_id,
+            uuid_of(ws.as_bytes()),
+            sequence,
+            kind,
+            uuid_of(task_id.as_bytes()),
+            aggregate_version,
+            uuid_of(run_id.as_bytes()),
+            serde_json::from_slice::<serde_json::Value>(&payload).unwrap_or_default(),
+            opt_uuid_of(step_id, |i| i.as_bytes()),
+            opt_uuid_of(attempt_id, |i| i.as_bytes()),
         )
         .execute(&mut **tx)
         .await
-        .ctx("execution: wait recovery task")?;
+        .ctx("execution: insert recovery run evidence")?;
+        if !Self::recovery_decision_requires_reconciliation(decision) {
+            return Ok(());
+        }
+        let outbox_id = uuid::Uuid::now_v7();
+        let deduplication_key = format!("recovery:{epoch_generation}:{run_id}");
+        // Go marshals map keys sorted — BTreeMap gives the identical
+        // byte layout upstream persists.
+        let outbox_payload = serde_json::to_vec(&serde_json::json!({
+            "catalog_type": central_execution::domain::OUTBOX_RECONCILIATION_REQUIRED,
+            "deduplication_key": deduplication_key,
+            "event_id": event_id.to_string(),
+            "schema_version": 1,
+        }))
+        .map_err(|_| corrupt("recovery outbox payload is not encodable"))?;
         sqlx::query!(
-            "UPDATE central.runs \
-             SET status = 'waiting', waiting_reason = 'reconciliation', \
-             version = version + CASE \
-               WHEN status = 'waiting' AND waiting_reason = 'reconciliation' THEN 0 ELSE 1 END, \
-             updated_at = clock_timestamp() \
-             WHERE workspace_id = $1 AND id = $2 \
-             AND status IN ('queued','running','waiting')",
-            ws,
-            run_id,
+            "INSERT INTO central.outbox (\
+             id, workspace_id, event_id, delivery_state, due_at, attempt_count, \
+             created_at, updated_at, catalog_type, deduplication_key, \
+             producer_id, payload, visible_at, policy_version, \
+             eligible_after, legal_hold) \
+             VALUES ($1, $2, $3, 'pending', clock_timestamp(), 0, \
+             clock_timestamp(), clock_timestamp(), $4, $5, \
+             'central.execution.recovery.v1', $6::jsonb, \
+             clock_timestamp(), 1, clock_timestamp() + interval '7 days', false)",
+            outbox_id,
+            uuid_of(ws.as_bytes()),
+            event_id,
+            central_execution::domain::OUTBOX_RECONCILIATION_REQUIRED,
+            deduplication_key,
+            serde_json::from_slice::<serde_json::Value>(&outbox_payload).unwrap_or_default(),
         )
         .execute(&mut **tx)
         .await
-        .ctx("execution: wait recovery run")?;
+        .ctx("execution: insert recovery reconciliation outbox")?;
+        sqlx::query!(
+            "INSERT INTO central.outbox_workspace_work (workspace_id, next_visible_at) \
+             VALUES ($1, clock_timestamp()) \
+             ON CONFLICT (workspace_id) DO UPDATE \
+             SET next_visible_at = LEAST(\
+               central.outbox_workspace_work.next_visible_at, \
+               EXCLUDED.next_visible_at), \
+             version = central.outbox_workspace_work.version + 1",
+            uuid_of(ws.as_bytes()),
+        )
+        .execute(&mut **tx)
+        .await
+        .ctx("execution: upsert recovery outbox work")?;
         Ok(())
     }
+
+    /// `scanRecoveryWorkspaceBatch` — one bounded keyset batch in its
+    /// own fenced transaction (upstream: renew coordinator lease → lock
+    /// epoch → lock + renew the claim row → select ≤ `batch` runs →
+    /// per-run decision + evidence + cursor advance + reconciled mark).
+    /// Returns the remaining-work verdict; a live lease grace aborts
+    /// the batch (rollback) and reports the database-derived wait.
+    async fn scan_recovery_workspace_batch(
+        &self,
+        request: &CompleteRecoveryWorkspaceRequest,
+    ) -> Result<RecoveryBatchOutcome, Failure> {
+        let claim_hash = sha256(&request.claim_token);
+        let domain = request.lease.recovery_domain.as_str();
+        let ws = request.workspace_id;
+        let mut tx = begin_recovery_scan(&self.pool).await?;
+        Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
+        let epoch = read_locked_recovery_epoch_for_claim(
+            &mut tx,
+            request.epoch_generation,
+            request.lease.fence.generation,
+            domain,
+        )
+        .await?;
+        if !matches!(
+            epoch.state,
+            RecoveryEpochState::RecoveryEpochOpen | RecoveryEpochState::RecoveryEpochRunning
+        ) {
+            return Err(conflict("RECOVERY_EPOCH_QUARANTINED"));
+        }
+        // `queryLockRecoveryWorkspaceClaim` — the claim row under the
+        // presented token, `FOR UPDATE OF work`.
+        let work_row = sqlx::query!(
+            "SELECT work.cursor_created_at, work.cursor_run_id \
+             FROM central.recovery_epoch_workspaces AS work \
+             JOIN central.recovery_epochs AS epoch \
+               ON epoch.epoch_generation = work.epoch_generation \
+              AND epoch.coordinator_domain = $4 \
+             WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
+             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+             FOR UPDATE OF work",
+            request.epoch_generation,
+            uuid_of(ws.as_bytes()),
+            &claim_hash[..],
+            domain,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .ctx("execution: lock recovery workspace claim")?
+        .ok_or_else(|| conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"))?;
+        // `queryRenewRecoveryWorkspaceClaim` — extends the claim TTL.
+        let renewed = sqlx::query!(
+            "UPDATE central.recovery_epoch_workspaces AS work \
+             SET claim_expires_at = clock_timestamp() + interval '30 seconds', \
+             updated_at = clock_timestamp() \
+             WHERE work.epoch_generation = $1 AND workspace_id = $2 \
+             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+             AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch \
+               WHERE epoch.epoch_generation = work.epoch_generation \
+                 AND epoch.coordinator_domain = $4) \
+             RETURNING claim_expires_at",
+            request.epoch_generation,
+            uuid_of(ws.as_bytes()),
+            &claim_hash[..],
+            domain,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .ctx("execution: renew recovery workspace claim")?;
+        if renewed.is_none() {
+            return Err(conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"));
+        }
+        // `querySelectRecoveryRunsAfterCursor` — the watermark-bounded
+        // keyset page (a NULL cursor reads from the watermark's start).
+        let runs = sqlx::query!(
+            "SELECT r.id, r.task_id, r.created_at, r.version \
+             FROM central.runs r \
+             JOIN central.recovery_epoch_workspaces w \
+               ON w.epoch_generation = $1 AND w.workspace_id = r.workspace_id \
+             JOIN central.recovery_epochs e \
+               ON e.epoch_generation = w.epoch_generation AND e.coordinator_domain = $6 \
+             WHERE r.workspace_id = $2 AND r.reconciled_epoch < $1 \
+               AND (r.created_at < w.watermark_created_at \
+                    OR (r.created_at = w.watermark_created_at AND r.id <= w.watermark_run_id)) \
+               AND ($3::timestamptz IS NULL \
+                    OR r.created_at > $3::timestamptz \
+                    OR (r.created_at = $3::timestamptz AND r.id > $4::uuid)) \
+             ORDER BY r.created_at, r.id LIMIT $5",
+            request.epoch_generation,
+            uuid_of(ws.as_bytes()),
+            work_row.cursor_created_at,
+            work_row.cursor_run_id,
+            RECOVERY_SCAN_BATCH,
+            domain,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .ctx("execution: select recovery run batch")?;
+        if !runs.is_empty() {
+            // Upstream locks the workspace event counter once per batch.
+            lock_event_counter(&mut tx, ws).await?;
+        }
+        for row in &runs {
+            let task_id = TaskId::from_trusted_db_bytes(*row.task_id.as_bytes());
+            let run_id = RunId::from_trusted_db_bytes(*row.id.as_bytes());
+            // Lock order: task → run (both `FOR UPDATE`) before the
+            // candidate's step/attempt locks inside the decision.
+            let task = read_task(&mut tx, ws, task_id, true).await?;
+            let run = read_run(&mut tx, ws, task_id, run_id, true).await?;
+            if let Some(retry_at) = Self::active_recovery_lease_grace(&mut tx, ws, run_id).await? {
+                // A live lease (or grace) is not a failure: the batch
+                // tx rolls back untouched and the caller schedules the
+                // lease wait without spending the retry budget.
+                return Ok(RecoveryBatchOutcome::LeaseWait(retry_at));
+            }
+            let (decision, step_id, attempt_id, aggregate_version) =
+                Self::persist_recovery_run_decision(
+                    &mut tx,
+                    request.epoch_generation,
+                    ws,
+                    &task,
+                    &run,
+                )
+                .await?;
+            Self::insert_recovery_run_evidence(
+                &mut tx,
+                request.epoch_generation,
+                ws,
+                task_id,
+                run_id,
+                step_id,
+                attempt_id,
+                &decision,
+                aggregate_version,
+            )
+            .await?;
+            // `queryAdvanceRecoveryWorkspaceScan` — cursor + counters +
+            // claim renewal in one fenced statement.
+            let done = sqlx::query!(
+                "UPDATE central.recovery_epoch_workspaces AS work \
+                 SET cursor_created_at = $4, cursor_run_id = $5, \
+                 scanned_count = scanned_count + 1, \
+                 reconciled_count = reconciled_count + 1, \
+                 claim_expires_at = clock_timestamp() + interval '30 seconds', \
+                 retry_not_before = NULL, failure_class = NULL, failure_reason = NULL, \
+                 updated_at = clock_timestamp() \
+                 WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
+                 AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+                 AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch \
+                   WHERE epoch.epoch_generation = work.epoch_generation \
+                     AND epoch.coordinator_domain = $6)",
+                request.epoch_generation,
+                uuid_of(ws.as_bytes()),
+                &claim_hash[..],
+                row.created_at,
+                row.id,
+                domain,
+            )
+            .execute(&mut *tx)
+            .await
+            .ctx("execution: advance recovery workspace scan")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"));
+            }
+            // `queryMarkRecoveryRunReconciled` — exactly one row or the
+            // run changed under us.
+            let done = sqlx::query!(
+                "UPDATE central.runs \
+                 SET reconciled_epoch = $1, updated_at = clock_timestamp() \
+                 WHERE workspace_id = $2 AND id = $3 \
+                 AND reconciled_epoch < $1 \
+                 AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch \
+                   WHERE epoch.epoch_generation = $1 AND epoch.coordinator_domain = $4)",
+                request.epoch_generation,
+                uuid_of(ws.as_bytes()),
+                row.id,
+                domain,
+            )
+            .execute(&mut *tx)
+            .await
+            .ctx("execution: mark recovery run reconciled")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("RECOVERY_RUN_CHANGED"));
+            }
+        }
+        // `queryCountRecoveryRunsRemaining` — the workspace completes
+        // only when no pre-watermark run remains unreconciled.
+        let remaining = sqlx::query!(
+            "SELECT count(*) AS \"count!\" \
+             FROM central.runs r \
+             JOIN central.recovery_epoch_workspaces w \
+               ON w.epoch_generation = $1 AND w.workspace_id = r.workspace_id \
+             JOIN central.recovery_epochs e \
+               ON e.epoch_generation = w.epoch_generation AND e.coordinator_domain = $3 \
+             WHERE r.workspace_id = $2 AND r.reconciled_epoch < $1 \
+               AND (r.created_at < w.watermark_created_at \
+                    OR (r.created_at = w.watermark_created_at AND r.id <= w.watermark_run_id))",
+            request.epoch_generation,
+            uuid_of(ws.as_bytes()),
+            domain,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .ctx("execution: count recovery runs remaining")?
+        .count;
+        if remaining == 0 {
+            // `queryFinishRecoveryWorkspace`.
+            let done = sqlx::query!(
+                "UPDATE central.recovery_epoch_workspaces AS work \
+                 SET delivery_state = 'completed', claim_token_hash = NULL, \
+                 claim_expires_at = NULL, retry_not_before = NULL, \
+                 failure_class = NULL, failure_reason = NULL, \
+                 updated_at = clock_timestamp() \
+                 WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
+                 AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+                 AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch \
+                   WHERE epoch.epoch_generation = work.epoch_generation \
+                     AND epoch.coordinator_domain = $4)",
+                request.epoch_generation,
+                uuid_of(ws.as_bytes()),
+                &claim_hash[..],
+                domain,
+            )
+            .execute(&mut *tx)
+            .await
+            .ctx("execution: finish recovery workspace")?
+            .rows_affected();
+            if done != 1 {
+                return Err(conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"));
+            }
+            // `queryCountIncompleteRecoveryWorkspaces` +
+            // `queryFinishRecoveryEpoch` — the epoch completes when no
+            // pending/claimed/failed workspace remains.
+            let incomplete = sqlx::query!(
+                "SELECT count(*) AS \"count!\" \
+                 FROM central.recovery_epoch_workspaces AS work \
+                 JOIN central.recovery_epochs AS epoch \
+                   ON epoch.epoch_generation = work.epoch_generation \
+                  AND epoch.coordinator_domain = $2 \
+                 WHERE work.epoch_generation = $1 \
+                 AND work.delivery_state IN ('pending','claimed','failed')",
+                request.epoch_generation,
+                domain,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .ctx("execution: count incomplete recovery workspaces")?
+            .count;
+            sqlx::query!(
+                "UPDATE central.recovery_epochs \
+                 SET state = $2, \
+                 completed_at = CASE WHEN $3 THEN clock_timestamp() ELSE NULL END, \
+                 updated_at = clock_timestamp() \
+                 WHERE epoch_generation = $1 AND coordinator_domain = $4",
+                request.epoch_generation,
+                if incomplete == 0 {
+                    "completed"
+                } else {
+                    "running"
+                },
+                incomplete == 0,
+                domain,
+            )
+            .execute(&mut *tx)
+            .await
+            .ctx("execution: finish recovery epoch")?;
+        }
+        tx.commit()
+            .await
+            .ctx("execution: commit recovery scan batch")?;
+        Ok(RecoveryBatchOutcome::Progress {
+            completed: remaining == 0,
+        })
+    }
+
+    /// `scheduleRecoveryWorkspaceRetry` — bumps `retry_attempt` and
+    /// records the bounded backoff under the held claim. `Ok(None)`
+    /// means the budget is spent and the caller quarantines.
+    async fn schedule_recovery_workspace_retry(
+        &self,
+        request: &CompleteRecoveryWorkspaceRequest,
+    ) -> Result<Option<std::time::Duration>, Failure> {
+        let claim_hash = sha256(&request.claim_token);
+        let domain = request.lease.recovery_domain.as_str();
+        let mut tx = begin(&self.pool).await?;
+        Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
+        read_locked_recovery_epoch_for_claim(
+            &mut tx,
+            request.epoch_generation,
+            request.lease.fence.generation,
+            domain,
+        )
+        .await?;
+        let current = sqlx::query!(
+            "SELECT work.retry_attempt \
+             FROM central.recovery_epoch_workspaces AS work \
+             JOIN central.recovery_epochs AS epoch \
+               ON epoch.epoch_generation = work.epoch_generation \
+              AND epoch.coordinator_domain = $4 \
+             WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
+             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+             FOR UPDATE OF work",
+            request.epoch_generation,
+            uuid_of(request.workspace_id.as_bytes()),
+            &claim_hash[..],
+            domain,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .ctx("execution: read recovery retry attempt")?
+        .ok_or_else(|| conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"))?;
+        if current.retry_attempt >= RECOVERY_RETRY_LIMIT {
+            tx.commit()
+                .await
+                .ctx("execution: commit exhausted recovery retry")?;
+            return Ok(None);
+        }
+        // Upstream `recoveryRetryBackoff`: 100ms doubling to a 5s cap
+        // plus ≤25% jitter.
+        let base_ms = 100i64.saturating_mul(
+            2i64.saturating_pow(
+                u32::try_from(current.retry_attempt + 1)
+                    .unwrap_or(31)
+                    .min(31),
+            ),
+        );
+        let jitter_ms = base_ms / 4 * i64::from(uuid::Uuid::now_v7().as_bytes()[0]) / 255;
+        let delay_ms = (base_ms + jitter_ms).clamp(100, 5000);
+        let attempt = sqlx::query!(
+            "UPDATE central.recovery_epoch_workspaces AS work \
+             SET retry_attempt = retry_attempt + 1, \
+             retry_not_before = clock_timestamp() + $4::interval, \
+             failure_class = $5, failure_reason = $6, \
+             claim_expires_at = clock_timestamp() + interval '30 seconds', \
+             updated_at = clock_timestamp() \
+             WHERE work.epoch_generation = $1 AND workspace_id = $2 \
+             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+             AND work.retry_attempt < 5 \
+             AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch \
+               WHERE epoch.epoch_generation = work.epoch_generation \
+                 AND epoch.coordinator_domain = $7) \
+             RETURNING retry_attempt",
+            request.epoch_generation,
+            uuid_of(request.workspace_id.as_bytes()),
+            &claim_hash[..],
+            sqlx::postgres::types::PgInterval::try_from(std::time::Duration::from_millis(
+                delay_ms as u64,
+            ))
+            .unwrap_or_default(),
+            "retryable_database",
+            "transient recovery scan failure",
+            domain,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .ctx("execution: schedule recovery retry")?
+        .ok_or_else(|| conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"))?;
+        if attempt.retry_attempt > RECOVERY_RETRY_LIMIT {
+            return Err(invalid("INVALID_RECOVERY_RETRY_STATE"));
+        }
+        tx.commit().await.ctx("execution: commit recovery retry")?;
+        Ok(Some(std::time::Duration::from_millis(delay_ms as u64)))
+    }
+
+    /// `scheduleRecoveryWorkspaceLeaseWait` — records the
+    /// database-derived point the run may be inspected again. A live
+    /// lease is not a failure and never consumes the retry budget.
+    async fn schedule_recovery_workspace_lease_wait(
+        &self,
+        request: &CompleteRecoveryWorkspaceRequest,
+        due: OffsetDateTime,
+    ) -> Result<std::time::Duration, Failure> {
+        let claim_hash = sha256(&request.claim_token);
+        let domain = request.lease.recovery_domain.as_str();
+        let mut tx = begin(&self.pool).await?;
+        Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
+        read_locked_recovery_epoch_for_claim(
+            &mut tx,
+            request.epoch_generation,
+            request.lease.fence.generation,
+            domain,
+        )
+        .await?;
+        let row = sqlx::query!(
+            "UPDATE central.recovery_epoch_workspaces AS work \
+             SET retry_not_before = GREATEST($4::timestamptz, clock_timestamp()), \
+             failure_class = 'lease_grace', \
+             failure_reason = 'execution lease recovery grace is active', \
+             claim_expires_at = clock_timestamp() + interval '30 seconds', \
+             updated_at = clock_timestamp() \
+             WHERE work.epoch_generation = $1 AND workspace_id = $2 \
+             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+             AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch \
+               WHERE epoch.epoch_generation = work.epoch_generation \
+                 AND epoch.coordinator_domain = $5) \
+             RETURNING retry_not_before, clock_timestamp() AS \"now!\"",
+            request.epoch_generation,
+            uuid_of(request.workspace_id.as_bytes()),
+            &claim_hash[..],
+            due,
+            domain,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .ctx("execution: schedule recovery lease wait")?
+        .ok_or_else(|| conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"))?;
+        tx.commit()
+            .await
+            .ctx("execution: commit recovery lease wait")?;
+        let delay = row
+            .retry_not_before
+            .map(|t| (t - row.now).whole_milliseconds())
+            .unwrap_or(0);
+        Ok(std::time::Duration::from_millis(
+            u64::try_from(delay.max(0)).unwrap_or(0),
+        ))
+    }
+
+    /// `renewRecoveryHandles` — the mid-wait coordinator renew plus
+    /// claim refresh so a long lease wait cannot let the fences lapse.
+    async fn renew_recovery_handles(
+        &self,
+        request: &CompleteRecoveryWorkspaceRequest,
+    ) -> Result<(), Failure> {
+        let claim_hash = sha256(&request.claim_token);
+        let domain = request.lease.recovery_domain.as_str();
+        let mut tx = begin(&self.pool).await?;
+        Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
+        read_locked_recovery_epoch_for_claim(
+            &mut tx,
+            request.epoch_generation,
+            request.lease.fence.generation,
+            domain,
+        )
+        .await?;
+        let renewed = sqlx::query!(
+            "UPDATE central.recovery_epoch_workspaces AS work \
+             SET claim_expires_at = clock_timestamp() + interval '30 seconds', \
+             updated_at = clock_timestamp() \
+             WHERE work.epoch_generation = $1 AND workspace_id = $2 \
+             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+             AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch \
+               WHERE epoch.epoch_generation = work.epoch_generation \
+                 AND epoch.coordinator_domain = $4) \
+             RETURNING claim_expires_at",
+            request.epoch_generation,
+            uuid_of(request.workspace_id.as_bytes()),
+            &claim_hash[..],
+            domain,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .ctx("execution: renew recovery workspace claim")?;
+        if renewed.is_none() {
+            return Err(conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"));
+        }
+        tx.commit()
+            .await
+            .ctx("execution: commit recovery renewal")?;
+        Ok(())
+    }
+
+    /// `waitForRecoveryRetry` — sleeps the scheduled delay in
+    /// renewal-interval chunks, re-fencing the handles between chunks.
+    async fn wait_for_recovery_retry(
+        &self,
+        request: &CompleteRecoveryWorkspaceRequest,
+        delay: std::time::Duration,
+    ) -> Result<(), Failure> {
+        let mut remaining = delay;
+        while !remaining.is_zero() {
+            let chunk = remaining.min(RECOVERY_RENEW_INTERVAL);
+            tokio::time::sleep(chunk).await;
+            remaining = remaining.saturating_sub(chunk);
+            if !remaining.is_zero() {
+                self.renew_recovery_handles(request).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `failRecoveryWorkspace` — the degraded path in its own
+    /// transaction (upstream: renew lease, lock epoch, fail the claimed
+    /// row, degrade the epoch).
+    async fn fail_recovery_workspace(
+        &self,
+        request: &CompleteRecoveryWorkspaceRequest,
+    ) -> Result<(), Failure> {
+        let claim_hash = sha256(&request.claim_token);
+        let domain = request.lease.recovery_domain.as_str();
+        let mut tx = begin(&self.pool).await?;
+        Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
+        read_locked_recovery_epoch_for_claim(
+            &mut tx,
+            request.epoch_generation,
+            request.lease.fence.generation,
+            domain,
+        )
+        .await?;
+        let done = sqlx::query!(
+            "UPDATE central.recovery_epoch_workspaces AS work \
+             SET delivery_state = 'failed', claim_token_hash = NULL, \
+             claim_expires_at = NULL, retry_not_before = NULL, \
+             failure_class = $4, failure_reason = $5, \
+             updated_at = clock_timestamp() \
+             WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
+             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
+             AND EXISTS (SELECT 1 FROM central.recovery_epochs epoch \
+               WHERE epoch.epoch_generation = work.epoch_generation \
+                 AND epoch.coordinator_domain = $6)",
+            request.epoch_generation,
+            uuid_of(request.workspace_id.as_bytes()),
+            &claim_hash[..],
+            request.failure_class.trim(),
+            request.failure_reason.trim(),
+            domain,
+        )
+        .execute(&mut *tx)
+        .await
+        .ctx("execution: fail recovery workspace")?
+        .rows_affected();
+        if done != 1 {
+            return Err(conflict("RECOVERY_WORKSPACE_NOT_CLAIMED"));
+        }
+        sqlx::query!(
+            "UPDATE central.recovery_epochs \
+             SET state = 'degraded', completed_at = NULL, \
+             updated_at = clock_timestamp() \
+             WHERE epoch_generation = $1 AND coordinator_domain = $2",
+            request.epoch_generation,
+            domain,
+        )
+        .execute(&mut *tx)
+        .await
+        .ctx("execution: degrade recovery epoch")?;
+        tx.commit()
+            .await
+            .ctx("execution: commit failed recovery workspace")?;
+        Ok(())
+    }
+}
+
+/// The scan batch verdict — `Progress` carries whether the workspace's
+/// pre-watermark runs are all reconciled; `LeaseWait` aborts the batch
+/// (its transaction rolls back untouched) and reports the
+/// database-derived instant recovery may inspect the run again.
+enum RecoveryBatchOutcome {
+    Progress { completed: bool },
+    LeaseWait(OffsetDateTime),
+}
+
+/// `isRetryableRecoveryScan` — the sanitized-Failure equivalent:
+/// ambiguous (serialization/deadlock/lock-timeout), unavailable
+/// (connection/resource), and cancelled (`57014`) kinds are the
+/// retryable lane; every domain failure quarantines instead.
+fn is_retryable_recovery_scan(err: &Failure) -> bool {
+    matches!(
+        err.kind(),
+        FailureKind::Ambiguous | FailureKind::Unavailable | FailureKind::Cancelled
+    )
 }
 
 struct ReceiptRow {
@@ -1793,6 +3075,418 @@ fn binding_task_ws(payload: &serde_json::Value) -> Result<WorkspaceId, Failure> 
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .map(|u| WorkspaceId::from_trusted_db_bytes(*u.as_bytes()))
         .ok_or_else(|| corrupt("a stored receipt payload is missing WorkspaceID"))
+}
+
+impl Store {
+    /// `commandEventKind` — the closed command→event table. Unknown
+    /// scopes answer `None`; `execution.complete_with_receipt` is the
+    /// Rust app's receipt-driven settle and shares `execution.settle`'s
+    /// evidence shape (upstream has no caller for it — the in-scan
+    /// completion path persists its change set directly).
+    fn command_event_kind(scope: &str) -> Option<&'static str> {
+        use central_execution::domain as d;
+        Some(match scope {
+            "execution.prepare" => d::EVENT_ATTEMPT_PREPARED,
+            "execution.claim" => d::EVENT_ATTEMPT_CLAIMED,
+            "execution.heartbeat" => d::EVENT_ATTEMPT_HEARTBEAT,
+            "execution.mark_invoked" => d::EVENT_ATTEMPT_INVOKED,
+            "execution.prepare_tool_call" => d::EVENT_TOOL_CALL_PREPARED,
+            "execution.mark_tool_call_invoked" => d::EVENT_TOOL_CALL_INVOKED,
+            "execution.settle_tool_call" => d::EVENT_TOOL_CALL_SETTLED,
+            "execution.settle" | "execution.complete_with_receipt" => d::EVENT_ATTEMPT_SETTLED,
+            "execution.cancel" | "execution.settle_cancellation" => d::EVENT_ATTEMPT_CANCELLED,
+            "execution.enter_reconciliation" => d::EVENT_ATTEMPT_RECONCILIATION,
+            "execution.schedule_retry" => d::EVENT_ATTEMPT_RETRY_SCHEDULED,
+            "execution.record_checkpoint" => d::EVENT_CHECKPOINT_RECORDED,
+            "execution.record_approval" => d::EVENT_APPROVAL_RECORDED,
+            "execution.resolve_approval" => d::EVENT_APPROVAL_RESOLVED,
+            "execution.expire_approval" => d::EVENT_APPROVAL_EXPIRED,
+            "execution.create_approval_successor" => d::EVENT_APPROVAL_SUCCESSOR,
+            "execution.resolve_reconciliation" => d::EVENT_RECONCILIATION_RESOLVED,
+            "execution.start_harness_run" => d::EVENT_HARNESS_RUN_STARTED,
+            "execution.abandon_prepared" => d::EVENT_ATTEMPT_ABANDONED,
+            "execution.resume_reconciled_attempt" => d::EVENT_ATTEMPT_RESUMED,
+            _ => return None,
+        })
+    }
+
+    /// `commandOutboxCatalog` — the closed command→catalog table.
+    fn command_outbox_catalog(scope: &str) -> Option<&'static str> {
+        use central_execution::domain as d;
+        Some(match scope {
+            "execution.prepare" => d::OUTBOX_ATTEMPT_PREPARED,
+            "execution.claim"
+            | "execution.heartbeat"
+            | "execution.mark_invoked"
+            | "execution.start_harness_run" => d::OUTBOX_ATTEMPT_CLAIMED,
+            "execution.prepare_tool_call" => d::OUTBOX_TOOL_CALL_PREPARED,
+            "execution.mark_tool_call_invoked" => d::OUTBOX_TOOL_CALL_INVOKED,
+            "execution.settle_tool_call" => d::OUTBOX_TOOL_CALL_SETTLED,
+            "execution.settle"
+            | "execution.cancel"
+            | "execution.settle_cancellation"
+            | "execution.resolve_reconciliation"
+            | "execution.schedule_retry"
+            | "execution.abandon_prepared"
+            | "execution.resume_reconciled_attempt"
+            | "execution.complete_with_receipt" => d::OUTBOX_ATTEMPT_SETTLED,
+            "execution.enter_reconciliation" => d::OUTBOX_RECONCILIATION_REQUIRED,
+            "execution.record_checkpoint" => d::OUTBOX_CHECKPOINT_RECORDED,
+            "execution.record_approval"
+            | "execution.resolve_approval"
+            | "execution.expire_approval"
+            | "execution.create_approval_successor" => d::OUTBOX_APPROVAL_RECORDED,
+            _ => return None,
+        })
+    }
+
+    /// `validateReceiptBinding` — the binding must name the same
+    /// durable target the result carries.
+    fn validate_receipt_binding(
+        binding: &central_execution::port::ReceiptBinding,
+        result: &DurableResult,
+    ) -> Result<(), Failure> {
+        if binding.task_id.is_nil()
+            || binding.run_id.is_nil()
+            || binding.step_id.is_nil()
+            || binding.attempt_id.is_nil()
+            || binding.logical_operation.is_nil()
+            || binding.task_id != result.task_id
+            || binding.run_id != result.run_id
+            || binding.step_id != result.step_id
+            || binding.attempt_id != result.attempt_id
+        {
+            return Err(invalid("INVALID_RECEIPT_BINDING"));
+        }
+        Ok(())
+    }
+
+    /// `validateChangeSetOwnership` — every durable record must be
+    /// scoped to the command's workspace/task/run, events must be
+    /// unique and carry the durable result's event leg, and outbox
+    /// intents must reference an event in the same change set.
+    fn validate_change_set_ownership(req: &CommitRequest) -> Result<(), Failure> {
+        let ws = req.scope.workspace_id;
+        let cs = &req.change_set;
+        let result = &req.result;
+        let scope_err = || denied("SCOPE_MISMATCH");
+        for step in &cs.steps {
+            if step.workspace_id != ws
+                || step.task_id != result.task_id
+                || step.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for attempt in &cs.attempts {
+            if attempt.workspace_id != ws
+                || attempt.task_id != result.task_id
+                || attempt.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for call in &cs.tool_calls {
+            if call.workspace_id != ws
+                || call.task_id != result.task_id
+                || call.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for attempt in &cs.tool_attempts {
+            if attempt.workspace_id != ws
+                || attempt.task_id != result.task_id
+                || attempt.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for approval in &cs.approvals {
+            if approval.workspace_id != ws
+                || approval.task_id != result.task_id
+                || approval.run_id != result.run_id
+                || approval.step_id != result.step_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for checkpoint in &cs.checkpoints {
+            if checkpoint.workspace_id != ws
+                || checkpoint.task_id != result.task_id
+                || checkpoint.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for settlement in &cs.settlements {
+            if settlement.workspace_id != ws
+                || settlement.task_id != result.task_id
+                || settlement.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for settlement in &cs.tool_settlements {
+            if settlement.workspace_id != ws
+                || settlement.task_id != result.task_id
+                || settlement.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for reconciliation in &cs.reconciliations {
+            if reconciliation.workspace_id != ws
+                || reconciliation.task_id != result.task_id
+                || reconciliation.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        for lease in &cs.leases {
+            if lease.workspace_id != ws || lease.run_id != result.run_id {
+                return Err(scope_err());
+            }
+        }
+        for release in &cs.lease_releases {
+            if release.workspace_id != ws || release.run_id != result.run_id {
+                return Err(scope_err());
+            }
+        }
+        for assertion in &cs.lease_assertions {
+            if assertion.workspace_id != ws || assertion.run_id != result.run_id {
+                return Err(scope_err());
+            }
+        }
+        for assertion in &cs.attempt_assertions {
+            if assertion.workspace_id != ws
+                || assertion.task_id != result.task_id
+                || assertion.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+        }
+        // Events: unique ids, scope-bound legs, and the result's event
+        // leg must be present with a matching kind.
+        let mut seen_events = std::collections::BTreeSet::new();
+        let mut result_leg = false;
+        for event in &cs.events {
+            if event.workspace_id != ws
+                || event.task_id != result.task_id
+                || event.run_id != result.run_id
+            {
+                return Err(scope_err());
+            }
+            if !seen_events.insert(event.id) {
+                return Err(invalid("DUPLICATE_EVENT"));
+            }
+            if event.id == result.event_id && event.kind == result.event_kind {
+                result_leg = true;
+            }
+        }
+        if !result_leg {
+            return Err(invalid("INVALID_DURABLE_RESULT"));
+        }
+        for outbox in &cs.outbox {
+            if outbox.workspace_id != ws {
+                return Err(scope_err());
+            }
+            if !seen_events.contains(&outbox.event_id) {
+                return Err(invalid("OUTBOX_EVENT_MISMATCH"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `validateApprovalActionBinding` — the persisted approval action
+    /// is only legal on the successor scope and must describe the
+    /// change set's step/approval rows.
+    fn validate_approval_action_binding(req: &CommitRequest) -> Result<(), Failure> {
+        let Some(action) = &req.result.approval_action else {
+            if req.command_scope == "execution.create_approval_successor" {
+                return Err(invalid("INVALID_DURABLE_RESULT"));
+            }
+            return Ok(());
+        };
+        if req.command_scope != "execution.create_approval_successor"
+            || req.change_set.steps.len() != 1
+            || req.change_set.approvals.len() != 1
+        {
+            return Err(invalid("INVALID_DURABLE_RESULT"));
+        }
+        let step = &req.change_set.steps[0];
+        let approval = &req.change_set.approvals[0];
+        let authorized = req
+            .scope
+            .allows(central_execution::domain::Capability::Approver);
+        if authorized != action.authorized
+            || action.step_id != step.id
+            || action.approval_id != approval.id
+            || action.approval_subject_version != approval.subject.version
+        {
+            return Err(invalid("INVALID_DURABLE_RESULT"));
+        }
+        if authorized
+            && (action.action
+                != Some(central_execution::domain::ApprovalAction::ActionResolveApproval)
+                || action.required_capability
+                    != Some(central_execution::domain::Capability::Approver)
+                || action.logical_operation_id != approval.subject.logical_operation_id
+                || action.expected_versions.task != req.expected_versions.task
+                || action.expected_versions.run != req.expected_versions.run
+                || action.expected_versions.step != step.version
+                || action.expected_versions.attempt != 0
+                || action.expected_versions.tool_call != 0
+                || action.expected_versions.tool_attempt != 0
+                || action.expected_versions.approval != approval.version)
+        {
+            return Err(invalid("INVALID_DURABLE_RESULT"));
+        }
+        Ok(())
+    }
+
+    /// `validateCommandFencePolicy` — the event/outbox evidence legs
+    /// must match the closed scope tables, and each scope family's
+    /// lease-intent shape is enforced exactly as upstream.
+    fn validate_command_fence_policy(req: &CommitRequest) -> Result<(), Failure> {
+        let cs = &req.change_set;
+        if cs.events.len() != 1
+            || cs.outbox.len() != 1
+            || Some(cs.events[0].kind) != Self::command_event_kind(&req.command_scope)
+            || Some(cs.outbox[0].catalog_type) != Self::command_outbox_catalog(&req.command_scope)
+        {
+            return Err(invalid("COMMAND_SCOPE_EVIDENCE_MISMATCH"));
+        }
+        let active =
+            req.lease_credential.valid() && req.lease_generation > 0 && !req.assert_no_active_lease;
+        let no_active = req.assert_no_active_lease
+            && !req.lease_credential.valid()
+            && req.lease_generation == 0;
+        let mut change_asserts_no_active = false;
+        for assertion in &cs.lease_assertions {
+            if assertion.workspace_id == req.scope.workspace_id
+                && assertion.run_id == req.result.run_id
+                && assertion.no_active
+            {
+                change_asserts_no_active = true;
+            }
+        }
+        let change_releases_lease = !cs.lease_releases.is_empty();
+        match req.command_scope.as_str() {
+            "execution.heartbeat"
+            | "execution.mark_invoked"
+            | "execution.prepare_tool_call"
+            | "execution.mark_tool_call_invoked"
+            | "execution.settle_tool_call"
+            | "execution.record_checkpoint" => {
+                if !active || change_releases_lease || change_asserts_no_active {
+                    return Err(invalid("LEASE_FENCE_REQUIRED"));
+                }
+            }
+            "execution.settle"
+            | "execution.enter_reconciliation"
+            | "execution.schedule_retry"
+            | "execution.abandon_prepared" => {
+                if !active || !change_releases_lease || change_asserts_no_active {
+                    return Err(invalid("LEASE_FENCE_REQUIRED"));
+                }
+            }
+            "execution.cancel"
+            | "execution.settle_cancellation"
+            | "execution.resolve_reconciliation"
+            | "execution.resolve_approval"
+            | "execution.expire_approval" => {
+                if !(active != no_active)
+                    || no_active != change_asserts_no_active
+                    || active != change_releases_lease
+                {
+                    return Err(invalid("LEASE_FENCE_REQUIRED"));
+                }
+            }
+            "execution.claim" | "execution.start_harness_run" => {
+                if active
+                    || no_active
+                    || cs.leases.len() != 1
+                    || !cs.leases[0].credential.valid()
+                    || change_releases_lease
+                    || change_asserts_no_active
+                {
+                    return Err(invalid("LEASE_GRANT_REQUIRED"));
+                }
+            }
+            "execution.prepare"
+            | "execution.record_approval"
+            | "execution.create_approval_successor"
+            | "execution.resume_reconciled_attempt" => {
+                if !no_active
+                    || !change_asserts_no_active
+                    || active
+                    || !cs.leases.is_empty()
+                    || change_releases_lease
+                {
+                    return Err(invalid("LEASE_FENCE_REQUIRED"));
+                }
+            }
+            _ => return Err(invalid("UNSUPPORTED_COMMAND_SCOPE")),
+        }
+        Ok(())
+    }
+
+    /// `validateRequest` — the full pre-transaction request gate
+    /// upstream runs before the advisory lock: metadata, fence
+    /// pairing, durable result, change-set ownership, the domain's
+    /// change-set revalidation, approval action, command fence policy,
+    /// claim-admission pairing, and the receipt binding.
+    fn validate_request(req: &CommitRequest) -> Result<(), Failure> {
+        if req.scope.workspace_id.is_nil()
+            || req.scope.principal_id != req.principal_id
+            || !req.scope.allows(req.capability)
+            || req.command_scope.trim().is_empty()
+            || req.idempotency_key.trim().is_empty()
+            || !central_execution::domain::fingerprint_valid(&req.fingerprint)
+        {
+            return Err(invalid("INVALID_COMMAND_METADATA"));
+        }
+        if req.lease_credential.valid() != (req.lease_generation != 0)
+            || (req.assert_no_active_lease && req.lease_generation != 0)
+        {
+            return Err(invalid("INVALID_LEASE_FENCE"));
+        }
+        if req.result.workspace_id != req.scope.workspace_id || req.result.event_id.is_nil() {
+            return Err(invalid("INVALID_DURABLE_RESULT"));
+        }
+        Self::validate_change_set_ownership(req)?;
+        // The persistence boundary revalidates the evaluator-approved
+        // change set — a direct adapter caller cannot smuggle oversized
+        // or unknown nested payloads through.
+        central_execution::domain::build_execution_change_set(req.change_set.clone())?;
+        Self::validate_approval_action_binding(req)?;
+        Self::validate_command_fence_policy(req)?;
+        let grants_lease = req.command_scope == "execution.claim"
+            || req.command_scope == "execution.start_harness_run";
+        if grants_lease != req.require_recovery_claimable {
+            return Err(invalid("INVALID_RECOVERY_CLAIM_ADMISSION"));
+        }
+        Self::validate_receipt_binding(&req.receipt_binding, &req.result)
+    }
+}
+
+/// RFC3339Nano for persisted event payloads (Go `time.Time` JSON form).
+fn go_rfc3339_local(t: OffsetDateTime) -> String {
+    let t = t.to_offset(time::UtcOffset::UTC);
+    let base = t
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+        .replace("+00:00", "Z");
+    let nanos = t.nanosecond();
+    if nanos == 0 {
+        return base;
+    }
+    let mut frac = format!("{nanos:09}");
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    base.replace('Z', &format!(".{frac}Z"))
 }
 
 fn epoch_state(state: &str) -> RecoveryEpochState {
@@ -1825,20 +3519,10 @@ impl CompositeStore for Store {
     /// `Commit` — the atomic fenced commit (see module docs for the
     /// lock order). Receipt replay returns `replayed: true`.
     async fn commit(&self, request: CommitRequest) -> Result<CommitResult, Failure> {
-        // CommitRequest.validate (upstream Validate): scope/key/fence.
-        if request.scope.workspace_id.is_nil()
-            || request.command_scope.trim().is_empty()
-            || request.idempotency_key.trim().is_empty()
-            || request.principal_id != request.scope.principal_id
-            || request.receipt_binding.task_id.is_nil()
-        {
-            return Err(invalid("INVALID_COMMIT_REQUEST"));
-        }
-        if request.lease_credential.valid() == (request.lease_generation <= 0)
-            || (request.lease_credential.valid() && request.assert_no_active_lease)
-        {
-            return Err(invalid("INVALID_COMMAND_FENCE"));
-        }
+        // `validateRequest` — the full pre-transaction gate (upstream
+        // runs it before the advisory lock so a malformed request
+        // never opens a write transaction).
+        Self::validate_request(&request)?;
         let ws = request.scope.workspace_id;
         let binding = &request.receipt_binding;
         let expected = request.expected_versions;
@@ -1871,27 +3555,41 @@ impl CompositeStore for Store {
             ) {
                 return Err(conflict("REASON_REQUEST_CONFLICT"));
             }
-            let payload = row.result_payload.clone();
-            let result = Self::decode_result_payload(&payload, binding, row.result_reference, "")?;
-            // Recover the stored event kind for the replayed result.
-            let kind = sqlx::query!(
-                "SELECT kind FROM central.events WHERE workspace_id = $1 AND id = $2",
+            // Upstream `replayReceipt` reads the referenced event and
+            // re-binds its legs against the receipt's stored binding —
+            // a missing event is corruption, never a silent "" kind.
+            let event = sqlx::query!(
+                "SELECT kind, task_id, run_id, step_id, attempt_id \
+                 FROM central.events WHERE workspace_id = $1 AND id = $2",
                 uuid_of(ws.as_bytes()),
                 row.result_reference,
             )
             .fetch_optional(&mut *tx)
             .await
             .ctx("execution: read receipt event")?
-            .map(|r| r.kind)
-            .unwrap_or_default();
+            .ok_or_else(|| corrupt("a stored receipt references a missing event"))?;
+            if event.task_id != Some(uuid_of(binding.task_id.as_bytes()))
+                || event.run_id != Some(uuid_of(binding.run_id.as_bytes()))
+                || event.step_id != opt_step_uuid(binding.step_id)
+                || event.attempt_id != opt_attempt_uuid(binding.attempt_id)
+            {
+                return Err(conflict("REASON_REQUEST_CONFLICT"));
+            }
+            let payload = row.result_payload.clone();
+            let result =
+                Self::decode_result_payload(&payload, binding, row.result_reference, &event.kind)?;
             tx.commit().await.ctx("execution: commit replay")?;
             return Ok(CommitResult {
-                result: DurableResult {
-                    event_kind: kind,
-                    ..result
-                },
+                result,
                 replayed: true,
             });
+        }
+        // `enforceRecoveryClaimAdmission` — a claim-scoped commit is
+        // only admissible while the run stays claimable in the open
+        // epoch's view.
+        if request.require_recovery_claimable {
+            Self::enforce_recovery_claim_admission(&mut tx, ws, binding.task_id, binding.run_id)
+                .await?;
         }
         // Lock order step 1: workspace event counter (also proves the
         // workspace row exists via FK).
@@ -1902,127 +3600,71 @@ impl CompositeStore for Store {
                 e
             }
         })?;
-        // Tasks → runs.
-        let task = read_task(&mut tx, ws, binding.task_id, true).await?;
-        if expected.task > 0 && task.version != expected.task {
-            return Err(conflict("VERSION_CONFLICT"));
-        }
-        let run = read_run(&mut tx, ws, binding.task_id, binding.run_id, true).await?;
-        if expected.run > 0 && run.version != expected.run {
-            return Err(conflict("VERSION_CONFLICT"));
-        }
-        // Command fence policy.
-        if request.require_recovery_claimable {
-            Self::enforce_recovery_claim_admission(&mut tx, ws, binding.task_id, binding.run_id)
-                .await?;
-        }
-        if request.lease_credential.valid() {
-            Self::enforce_lease_fence(
-                &mut tx,
-                ws,
-                binding.run_id,
-                binding.step_id,
-                binding.attempt_id,
-                &request.lease_credential,
-                request.lease_generation,
-            )
-            .await?;
-        }
-        if request.assert_no_active_lease {
-            Self::apply_lease_assertion(
-                &mut tx,
-                &central_execution::domain::LeaseAssertion {
-                    workspace_id: ws,
-                    run_id: binding.run_id,
-                    no_active: true,
-                },
-            )
-            .await?;
-        }
-        // Expected-version guards on the rest of the binding.
-        if expected.step > 0 && !binding.step_id.is_nil() {
-            let v = Self::lock_step_target(
-                &mut tx,
-                ws,
-                binding.task_id,
-                binding.run_id,
-                binding.step_id,
-            )
-            .await?;
-            if v != expected.step {
-                return Err(conflict("VERSION_CONFLICT"));
-            }
-        }
-        if expected.attempt > 0 && !binding.attempt_id.is_nil() {
-            let v = Self::lock_attempt_target(
-                &mut tx,
-                ws,
-                binding.task_id,
-                binding.run_id,
-                binding.step_id,
-                binding.attempt_id,
-            )
-            .await?;
-            if v != expected.attempt {
-                return Err(conflict("VERSION_CONFLICT"));
-            }
-        }
-        // Change set — the documented order.
-        let cs = &request.change_set;
-        if let Some(transition) = &cs.task_transition {
-            Self::apply_task_transition(&mut tx, ws, &transition.change_set).await?;
-        }
-        for step in &cs.steps {
-            Self::apply_step(&mut tx, step).await?;
-        }
-        for attempt in &cs.attempts {
-            Self::apply_attempt(&mut tx, attempt).await?;
-        }
-        for call in &cs.tool_calls {
-            Self::apply_tool_call(&mut tx, call).await?;
-        }
-        for attempt in &cs.tool_attempts {
-            Self::apply_tool_attempt(&mut tx, attempt).await?;
-        }
-        for approval in &cs.approvals {
-            Self::apply_approval(&mut tx, approval).await?;
-        }
-        for checkpoint in &cs.checkpoints {
-            Self::apply_checkpoint(&mut tx, checkpoint).await?;
-        }
-        for settlement in &cs.settlements {
-            Self::apply_settlement(&mut tx, settlement).await?;
-        }
-        for settlement in &cs.tool_settlements {
-            Self::apply_tool_settlement(&mut tx, settlement).await?;
-        }
-        // Reconciliation records are carried by the emitted events;
-        // the state transitions they cause are already in steps/attempts.
-        for lease in &cs.leases {
-            Self::apply_lease(&mut tx, &request.scope, lease).await?;
-        }
-        for release in &cs.lease_releases {
-            Self::apply_lease_release(&mut tx, release).await?;
-        }
-        for assertion in &cs.lease_assertions {
-            Self::apply_lease_assertion(&mut tx, assertion).await?;
-        }
-        for assertion in &cs.attempt_assertions {
-            Self::apply_attempt_assertion(&mut tx, assertion).await?;
-        }
-        let aggregate_version = cs
+        // `lockAndCheckTaskRun` — the task transition may rebind the
+        // aggregate ids; both rows are locked and version-checked.
+        let transition = request
+            .change_set
             .task_transition
             .as_ref()
-            .map_or(task.version, |t| t.change_set.task.version);
-        Self::apply_events(
-            &mut tx,
-            ws,
-            aggregate_version,
-            &request.principal_id,
-            &cs.events,
-        )
-        .await?;
-        Self::apply_outbox(&mut tx, ws, &cs.outbox).await?;
+            .map(|t| &t.change_set);
+        let task_id = transition
+            .map(|c| c.task.id)
+            .filter(|id| !id.is_nil())
+            .unwrap_or(binding.task_id);
+        let run_id = transition
+            .and_then(|c| c.runs.first())
+            .map_or(binding.run_id, |r| r.id);
+        if task_id.is_nil() || run_id.is_nil() {
+            return Err(invalid("STATE_SCOPE_MISMATCH"));
+        }
+        let task = read_task(&mut tx, ws, task_id, true).await?;
+        if task.version != expected.task {
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+        }
+        let _run = read_run(&mut tx, ws, task_id, run_id, true).await?;
+        if _run.version != expected.run {
+            return Err(conflict("EXPECTED_VERSION_CONFLICT"));
+        }
+        // `enforceFence` — an active lease must present its proven
+        // bearer; an asserted-absent lease must stay absent.
+        if request.lease_generation != 0 {
+            let persisted = read_persisted_lease_for_update(&mut tx, ws, binding.run_id).await?;
+            let Some(lease) = persisted else {
+                return Err(conflict("STALE_LEASE_FENCE"));
+            };
+            let now = db_now(&mut tx).await?;
+            let presented = sha256(&request.lease_credential.0);
+            if lease.generation != request.lease_generation
+                || !ct_eq(&lease.verifier, &presented)
+                || lease.expires_at <= now
+                || lease.step_id != binding.step_id
+                || lease.attempt_id != binding.attempt_id
+            {
+                return Err(conflict("STALE_LEASE_FENCE"));
+            }
+        }
+        if request.assert_no_active_lease {
+            Self::assert_no_active_lease(&mut tx, ws, binding.run_id).await?;
+        }
+        // `lockAndValidateReceiptTarget` — locks step + attempt and
+        // proves the binding's identities against the durable rows
+        // (logical operation, exact expected versions, the
+        // prepared/start-harness insertion shape).
+        Self::lock_and_validate_receipt_target(&mut tx, &request).await?;
+        // Change set — the upstream `commitNew` order.
+        if let Some(transition) = &request.change_set.task_transition {
+            Self::apply_task_transition(&mut tx, ws, &transition.change_set).await?;
+        }
+        Self::persist_steps(&mut tx, &request).await?;
+        Self::persist_settlements(&mut tx, &request).await?;
+        Self::persist_attempts(&mut tx, &request).await?;
+        Self::persist_tool_calls(&mut tx, &request).await?;
+        Self::persist_tool_attempts(&mut tx, &request).await?;
+        Self::persist_attempt_assertions(&mut tx, &request.change_set.attempt_assertions).await?;
+        Self::persist_approvals(&mut tx, &request).await?;
+        Self::persist_checkpoints(&mut tx, &request).await?;
+        Self::persist_leases(&mut tx, &request).await?;
+        Self::persist_evidence(&mut tx, &request).await?;
         Self::insert_receipt(&mut tx, &request, digest).await?;
         tx.commit().await.ctx("execution: commit")?;
         Ok(CommitResult {
@@ -2160,7 +3802,8 @@ impl CompositeExecutionStore for Store {
             return Err(conflict("REASON_REQUEST_CONFLICT"));
         }
         let event = sqlx::query!(
-            "SELECT kind FROM central.events WHERE workspace_id = $1 AND id = $2",
+            "SELECT kind, task_id, run_id, step_id, attempt_id \
+             FROM central.events WHERE workspace_id = $1 AND id = $2",
             uuid_of(ws.as_bytes()),
             row.result_reference,
         )
@@ -2168,6 +3811,13 @@ impl CompositeExecutionStore for Store {
         .await
         .ctx("execution: read receipt event")?
         .ok_or_else(|| corrupt("a stored receipt references a missing event"))?;
+        if event.task_id != Some(uuid_of(request.binding.task_id.as_bytes()))
+            || event.run_id != Some(uuid_of(request.binding.run_id.as_bytes()))
+            || event.step_id != opt_step_uuid(request.binding.step_id)
+            || event.attempt_id != opt_attempt_uuid(request.binding.attempt_id)
+        {
+            return Err(conflict("REASON_REQUEST_CONFLICT"));
+        }
         let payload = row.result_payload.clone();
         let result = Self::decode_result_payload(
             &payload,
@@ -2592,167 +4242,78 @@ impl RecoveryStore for Store {
         Ok(claims)
     }
 
-    /// `CompleteRecoveryWorkspace` — verifies the claim token, runs
-    /// the adapter-owned scan, then completes or degrades the row and
-    /// closes the epoch when no incomplete workspaces remain.
+    /// `CompleteRecoveryWorkspace` — the batch loop upstream drives:
+    /// each bounded keyset batch commits in its own fenced
+    /// transaction. A live lease grace is scheduled and waited without
+    /// spending the retry budget; a retryable scan failure takes the
+    /// bounded backoff lane; anything else quarantines the workspace
+    /// (and degrades the epoch) unless it is a pure fence/claim loss.
     async fn complete_recovery_workspace(
         &self,
         request: CompleteRecoveryWorkspaceRequest,
     ) -> Result<(), Failure> {
-        if request.lease.recovery_domain != RECOVERY_DOMAIN
-            || request.workspace_id.is_nil()
-            || request.claim_token.is_empty()
+        // `validateRecoveryLease` + the request envelope checks.
+        if request.lease.recovery_domain.trim().is_empty()
+            || request.lease.instance_id.is_nil()
+            || request.lease.fence.generation <= 0
+            || request.lease.claim_token.len() != 32
         {
-            return Err(invalid("INVALID_RECOVERY_COMPLETE_REQUEST"));
+            return Err(invalid("INVALID_RECOVERY_COORDINATOR"));
         }
-        let claim_hash = sha256(&request.claim_token);
-        let mut tx = begin_recovery_scan(&self.pool).await?;
-        Self::lock_recovery_coordinator(&mut tx, &request.lease).await?;
-        assert_recovery_epoch_domain(
-            &mut tx,
-            request.epoch_generation,
-            request.lease.fence.generation,
-            &request.lease.recovery_domain,
-        )
-        .await?;
-        // Lock the claimed row under the exact claim token.
-        let work_row = sqlx::query!(
-            "SELECT work.delivery_state, work.watermark_created_at, work.watermark_run_id, \
-             work.cursor_created_at, work.cursor_run_id, work.scanned_count, \
-             work.reconciled_count \
-             FROM central.recovery_epoch_workspaces AS work \
-             JOIN central.recovery_epochs AS epoch \
-               ON epoch.epoch_generation = work.epoch_generation \
-              AND epoch.coordinator_domain = $4 \
-             WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
-             AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
-             FOR UPDATE OF work",
-            request.epoch_generation,
-            uuid_of(request.workspace_id.as_bytes()),
-            &claim_hash[..],
-            request.lease.recovery_domain,
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .ctx("execution: lock recovery workspace claim")?;
-        let Some(work_row) = work_row else {
-            return Err(denied("RECOVERY_CLAIM_FENCED"));
-        };
-        let work = RecoveryWorkspaceWork {
-            epoch_generation: request.epoch_generation,
-            workspace_id: request.workspace_id,
-            state: RecoveryWorkspaceState::RecoveryWorkspaceClaimed,
-            watermark_created_at: work_row.watermark_created_at,
-            watermark_run_id: RunId::from_trusted_db_bytes(*work_row.watermark_run_id.as_bytes()),
-            cursor_created_at: work_row
-                .cursor_created_at
-                .unwrap_or(work_row.watermark_created_at),
-            cursor_run_id: work_row.cursor_run_id.map_or_else(
-                || RunId::from_trusted_db_bytes([0; 16]),
-                |u| RunId::from_trusted_db_bytes(*u.as_bytes()),
-            ),
-            scanned_count: work_row.scanned_count,
-            reconciled_count: work_row.reconciled_count,
-            retry_attempt: 0,
-            failure_class: String::new(),
-            failure_reason: String::new(),
-        };
+        if request.epoch_generation <= 0
+            || request.workspace_id.is_nil()
+            || request.claim_token.len() != 32
+        {
+            return Err(invalid("INVALID_RECOVERY_WORKSPACE"));
+        }
         if request.degraded {
-            sqlx::query!(
-                "UPDATE central.recovery_epoch_workspaces AS work \
-                 SET delivery_state = 'failed', claim_token_hash = NULL, \
-                 claim_expires_at = NULL, retry_not_before = NULL, \
-                 failure_class = $4, failure_reason = $5, \
-                 updated_at = clock_timestamp() \
-                 WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
-                 AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
-                 AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch \
-                   WHERE epoch.epoch_generation = work.epoch_generation \
-                     AND epoch.coordinator_domain = $6)",
-                request.epoch_generation,
-                uuid_of(request.workspace_id.as_bytes()),
-                &claim_hash[..],
-                request.failure_class,
-                request.failure_reason,
-                request.lease.recovery_domain,
-            )
-            .execute(&mut *tx)
-            .await
-            .ctx("execution: fail recovery workspace")?;
-        } else {
-            Self::scan_recovery_workspace(
-                &mut tx,
-                request.epoch_generation,
-                &work,
-                work_row.cursor_created_at,
-                work_row.cursor_run_id,
-                &claim_hash,
-                &request.lease.recovery_domain,
-            )
-            .await?;
-            sqlx::query!(
-                "UPDATE central.recovery_epoch_workspaces AS work \
-                 SET delivery_state = 'completed', claim_token_hash = NULL, \
-                 claim_expires_at = NULL, retry_not_before = NULL, \
-                 failure_class = NULL, failure_reason = NULL, \
-                 updated_at = clock_timestamp() \
-                 WHERE work.epoch_generation = $1 AND work.workspace_id = $2 \
-                 AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 \
-                 AND EXISTS (SELECT 1 FROM central.recovery_epochs AS epoch \
-                   WHERE epoch.epoch_generation = work.epoch_generation \
-                     AND epoch.coordinator_domain = $4)",
-                request.epoch_generation,
-                uuid_of(request.workspace_id.as_bytes()),
-                &claim_hash[..],
-                request.lease.recovery_domain,
-            )
-            .execute(&mut *tx)
-            .await
-            .ctx("execution: finish recovery workspace")?;
+            if request.failure_class.trim().is_empty() || request.failure_reason.trim().is_empty() {
+                return Err(invalid("INVALID_RECOVERY_FAILURE"));
+            }
+            return self.fail_recovery_workspace(&request).await;
         }
-        // Close the epoch when nothing incomplete remains.
-        let remaining = sqlx::query!(
-            "SELECT count(*) AS \"count!\" \
-             FROM central.recovery_epoch_workspaces AS work \
-             JOIN central.recovery_epochs AS epoch \
-               ON epoch.epoch_generation = work.epoch_generation \
-              AND epoch.coordinator_domain = $2 \
-             WHERE work.epoch_generation = $1 \
-             AND work.delivery_state IN ('pending','claimed','failed')",
-            request.epoch_generation,
-            request.lease.recovery_domain,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .ctx("execution: count incomplete workspaces")?;
-        if remaining.count == 0 {
-            sqlx::query!(
-                "UPDATE central.recovery_epochs \
-                 SET state = 'completed', completed_at = clock_timestamp(), \
-                 updated_at = clock_timestamp() \
-                 WHERE epoch_generation = $1 AND coordinator_domain = $2",
-                request.epoch_generation,
-                request.lease.recovery_domain,
-            )
-            .execute(&mut *tx)
-            .await
-            .ctx("execution: finish recovery epoch")?;
-        } else if request.degraded {
-            sqlx::query!(
-                "UPDATE central.recovery_epochs \
-                 SET state = 'degraded', updated_at = clock_timestamp() \
-                 WHERE epoch_generation = $1 AND coordinator_domain = $2 \
-                 AND state <> 'completed'",
-                request.epoch_generation,
-                request.lease.recovery_domain,
-            )
-            .execute(&mut *tx)
-            .await
-            .ctx("execution: degrade recovery epoch")?;
+        loop {
+            match self.scan_recovery_workspace_batch(&request).await {
+                Ok(RecoveryBatchOutcome::Progress { completed: true }) => return Ok(()),
+                Ok(RecoveryBatchOutcome::Progress { completed: false }) => {}
+                Ok(RecoveryBatchOutcome::LeaseWait(retry_at)) => {
+                    let delay = self
+                        .schedule_recovery_workspace_lease_wait(&request, retry_at)
+                        .await?;
+                    self.wait_for_recovery_retry(&request, delay).await?;
+                }
+                Err(err) => {
+                    // Retryable database failure → the bounded backoff
+                    // lane; an exhausted budget quarantines.
+                    if is_retryable_recovery_scan(&err) {
+                        let scheduled = self.schedule_recovery_workspace_retry(&request).await?;
+                        if let Some(delay) = scheduled {
+                            self.wait_for_recovery_retry(&request, delay).await?;
+                            continue;
+                        }
+                        let mut failed = request.clone();
+                        failed.degraded = true;
+                        failed.failure_class = "retry_exhausted".to_owned();
+                        failed.failure_reason = "recovery retry budget exhausted".to_owned();
+                        self.fail_recovery_workspace(&failed).await?;
+                        return Err(conflict("RECOVERY_WORKSPACE_QUARANTINED"));
+                    }
+                    // Fence/claim losses surface as-is; every other
+                    // failure quarantines the workspace + epoch.
+                    if err.code() != "STALE_RECOVERY_FENCE"
+                        && err.code() != "RECOVERY_WORKSPACE_NOT_CLAIMED"
+                    {
+                        let mut failed = request.clone();
+                        failed.degraded = true;
+                        failed.failure_class = "scan_error".to_owned();
+                        failed.failure_reason = "recovery workspace scan failed".to_owned();
+                        self.fail_recovery_workspace(&failed).await?;
+                        return Err(conflict("RECOVERY_WORKSPACE_QUARANTINED"));
+                    }
+                    return Err(err);
+                }
+            }
         }
-        Self::renew_recovery_coordinator(&mut tx, &request.lease).await?;
-        tx.commit().await.ctx("execution: commit complete")?;
-        Ok(())
     }
 
     /// `ResumeRecoveryEpoch` — operator resume of a degraded epoch:

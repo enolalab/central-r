@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"successor!\", (SELECT count(*) FROM central.step_attempts WHERE workspace_id = $2 AND run_id = $3) AS \"attempts!\", (SELECT count(*) FROM central.events WHERE workspace_id = $2 AND kind = 'execution.recovery.prepared_successor_preserved') AS \"evidence!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "successor!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "attempts!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "evidence!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "84c89f95d750aef99e24b37224e10e00f62bc80addcf1684eb5b05454a275e6a"
+}

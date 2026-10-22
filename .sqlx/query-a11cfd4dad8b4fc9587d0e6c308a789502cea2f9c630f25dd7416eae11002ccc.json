@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", (SELECT status FROM central.tasks WHERE id = $2) AS \"task!\", (SELECT count(*) FROM central.events WHERE workspace_id = $3 AND kind = 'execution.recovery.reconciliation_preserved') AS \"evidence!\", (SELECT count(*) FROM central.outbox WHERE workspace_id = $3 AND catalog_type = 'execution.reconciliation.required') AS \"outbox!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "attempt!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "task!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "evidence!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "outbox!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "a11cfd4dad8b4fc9587d0e6c308a789502cea2f9c630f25dd7416eae11002ccc"
+}

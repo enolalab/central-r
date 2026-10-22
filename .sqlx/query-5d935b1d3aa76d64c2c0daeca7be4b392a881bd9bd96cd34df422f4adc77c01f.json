@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT logical_operation_id, version FROM central.step_attempts WHERE workspace_id = $1 AND task_id = $2 AND run_id = $3 AND step_id = $4 AND id = $5 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "logical_operation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5d935b1d3aa76d64c2c0daeca7be4b392a881bd9bd96cd34df422f4adc77c01f"
+}

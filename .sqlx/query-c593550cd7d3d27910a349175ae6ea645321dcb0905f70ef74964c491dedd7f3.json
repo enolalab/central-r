@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT work.cursor_created_at, work.cursor_run_id FROM central.recovery_epoch_workspaces AS work JOIN central.recovery_epochs AS epoch ON epoch.epoch_generation = work.epoch_generation AND epoch.coordinator_domain = $4 WHERE work.epoch_generation = $1 AND work.workspace_id = $2 AND work.delivery_state = 'claimed' AND work.claim_token_hash = $3 FOR UPDATE OF work",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cursor_created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "cursor_run_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "c593550cd7d3d27910a349175ae6ea645321dcb0905f70ef74964c491dedd7f3"
+}

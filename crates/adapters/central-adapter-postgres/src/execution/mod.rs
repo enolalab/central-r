@@ -90,6 +90,10 @@ pub(crate) const RESUME_SCOPE: &str = "execution.resume_recovery";
 pub(crate) const RECOVERY_DOMAIN: &str = "central.execution.recovery.v1";
 /// Recovery scan page size (upstream `scanRecoveryWorkspaceBatch(ctx, req, 100)`).
 pub(crate) const RECOVERY_SCAN_BATCH: i64 = 100;
+/// Bounded per-workspace scan retry budget (upstream `recoveryRetryLimit`).
+pub(crate) const RECOVERY_RETRY_LIMIT: i64 = 5;
+/// Coordinator-handle renewal cadence inside `waitForRecoveryRetry`.
+pub(crate) const RECOVERY_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Transaction openers.

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.execution_ownership (id, workspace_id, owner_scope, owner_identity, heartbeat_at, claimed_run_id, claimed_step_id, claimed_step_attempt_id, run_id, lease_token_hash, fencing_generation, lease_expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, clock_timestamp(), $5, $6, $7, $5, $8, $9, clock_timestamp() + interval '30 seconds', clock_timestamp(), clock_timestamp())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e6a83c3e4aba3c2215e0cc0cb5f423f5a2c733d490964e56ab48a66a4d87cf14"
+}

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"count!\" FROM central.runs r JOIN central.recovery_epoch_workspaces w ON w.epoch_generation = $1 AND w.workspace_id = r.workspace_id JOIN central.recovery_epochs e ON e.epoch_generation = w.epoch_generation AND e.coordinator_domain = $3 WHERE r.workspace_id = $2 AND r.reconciled_epoch < $1 AND (r.created_at < w.watermark_created_at OR (r.created_at = w.watermark_created_at AND r.id <= w.watermark_run_id))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7d77128b540e5183a4eb270b65206040f8bb9d5905fa0d72a7c77ed589d5ff8a"
+}

@@ -766,29 +766,6 @@ pub(crate) async fn read_incomplete_recovery_epoch(
     Ok(row.map(epoch_from_row))
 }
 
-/// `queryAssertRecoveryEpochDomain` — existence check under the fence.
-pub(crate) async fn assert_recovery_epoch_domain(
-    tx: &mut Transaction<'_, Postgres>,
-    generation: i64,
-    fence: i64,
-    domain: &str,
-) -> Result<(), Failure> {
-    let row = sqlx::query!(
-        "SELECT 1 AS one FROM central.recovery_epochs \
-         WHERE epoch_generation = $1 AND coordinator_fence = $2 AND coordinator_domain = $3",
-        generation,
-        fence,
-        domain,
-    )
-    .fetch_optional(&mut **tx)
-    .await
-    .ctx("execution: assert recovery epoch domain")?;
-    if row.is_none() {
-        return Err(conflict("STALE_RECOVERY_FENCE"));
-    }
-    Ok(())
-}
-
 struct WorkRow {
     workspace_id: uuid::Uuid,
     delivery_state: String,

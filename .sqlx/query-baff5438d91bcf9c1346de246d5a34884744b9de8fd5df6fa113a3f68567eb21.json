@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"predecessor!\", (SELECT count(*) FROM central.step_attempts WHERE workspace_id = $2 AND predecessor_id = $1 AND state = 'prepared') AS \"successors!\", (SELECT count(*) FROM central.events WHERE workspace_id = $2 AND kind = 'execution.recovery.prepared_successor_created') AS \"evidence!\", (SELECT reconciled_epoch FROM central.runs WHERE id = $3) AS \"reconciled!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "predecessor!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "successors!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "evidence!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "reconciled!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "baff5438d91bcf9c1346de246d5a34884744b9de8fd5df6fa113a3f68567eb21"
+}

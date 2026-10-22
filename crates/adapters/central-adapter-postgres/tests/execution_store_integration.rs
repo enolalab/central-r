@@ -14,8 +14,8 @@ use central_adapter_postgres::execution::Store;
 use central_adapter_postgres::migrate::BaselineInstaller;
 use central_execution::domain::{
     self, AttemptState, Capability, EventIntent, ExecutionChangeSet, ExpectedVersions, Lease,
-    LeaseCredential, LogicalOperationId, OutboxIntent, PhysicalAttemptId, Step, StepAttempt,
-    StepState, TrustedScope,
+    LeaseAssertion, LeaseCredential, LogicalOperationId, OutboxIntent, PhysicalAttemptId, Step,
+    StepAttempt, StepState, TrustedScope,
 };
 use central_execution::harness_run::{
     B09EvidenceReference, DispatchCase, ListDispatchableRunsRequest,
@@ -162,48 +162,83 @@ fn attempt(step: &Step) -> StepAttempt {
     }
 }
 
-fn event_intent(ws: WorkspaceId, task_id: TaskId, run_id: RunId) -> EventIntent {
+/// Command event leg — the persisted event must carry the binding's
+/// step/attempt ids (receipt replay re-binds them) and a payload that
+/// survives the closed event schema (`schema_version`/`type` only).
+fn event_intent(
+    ws: WorkspaceId,
+    task_id: TaskId,
+    run_id: RunId,
+    step_id: StepId,
+    attempt_id: StepAttemptId,
+    kind: domain::EventKind,
+) -> EventIntent {
     EventIntent {
         id: ExecutionEventId::new(),
         workspace_id: ws,
         task_id,
         run_id,
-        step_id: StepId::from_trusted_db_bytes([0; 16]),
-        attempt_id: StepAttemptId::from_trusted_db_bytes([0; 16]),
+        step_id,
+        attempt_id,
         tool_call_id: central_foundation::identity::ToolCallId::from_trusted_db_bytes([0; 16]),
         tool_attempt_id: central_foundation::identity::ToolCallAttemptId::from_trusted_db_bytes(
             [0; 16],
         ),
-        kind: domain::EVENT_ATTEMPT_PREPARED,
-        payload: br#"{"k":"v"}"#.to_vec(),
+        kind,
+        payload: serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "type": kind,
+        }))
+        .unwrap_or_default(),
         occurred_at: NOW,
     }
 }
 
-fn outbox_intent(ws: WorkspaceId, event_id: ExecutionEventId, dedup: &str) -> OutboxIntent {
+/// Outbox leg — `catalog_type` is the command's closed catalog entry
+/// and the payload stays inside the outbox schema.
+fn outbox_intent(
+    ws: WorkspaceId,
+    event: &EventIntent,
+    dedup: &str,
+    catalog: domain::OutboxCatalogType,
+) -> OutboxIntent {
     OutboxIntent {
         id: OutboxId::new(),
         workspace_id: ws,
-        event_id,
-        catalog_type: "execution.test",
-        payload: br#"{"o":1}"#.to_vec(),
+        event_id: event.id,
+        catalog_type: catalog,
+        payload: serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "event_id": uuid_of!(event.id).to_string(),
+            "catalog_type": catalog,
+            "deduplication_key": dedup,
+        }))
+        .unwrap_or_default(),
         deduplication_key: dedup.to_owned(),
         producer_id: "exec-test".to_owned(),
         created_at: NOW,
     }
 }
 
+/// Command request — `command_scope` is a real upstream scope and the
+/// durable result's event leg is the change set's command event
+/// (`validateChangeSetOwnership` requires it).
 fn commit_req(
     ws: WorkspaceId,
     task_id: TaskId,
     run_id: RunId,
+    command_scope: &str,
     binding: ReceiptBinding,
     change_set: ExecutionChangeSet,
     key: &str,
 ) -> CommitRequest {
+    let (event_id, event_kind) = change_set.events.first().map_or_else(
+        || (ExecutionEventId::from_trusted_db_bytes([0; 16]), ""),
+        |e| (e.id, e.kind),
+    );
     CommitRequest {
         scope: scope(ws),
-        command_scope: "execution.test".to_owned(),
+        command_scope: command_scope.to_owned(),
         idempotency_key: key.to_owned(),
         fingerprint: [9u8; 32],
         principal_id: "exec-principal".to_owned(),
@@ -224,12 +259,63 @@ fn commit_req(
             run_id,
             step_id: binding.step_id,
             attempt_id: binding.attempt_id,
-            event_id: ExecutionEventId::new(),
-            event_kind: "execution.test.committed".to_owned(),
+            event_id,
+            event_kind: event_kind.to_owned(),
             approval_action: None,
         },
         change_set,
     }
+}
+
+/// A complete `execution.prepare` commit request — the upstream
+/// insertion-shaped command: fresh step + attempt, one
+/// `attempt_prepared` event with its outbox leg, and the
+/// no-active-lease assertion the prepare fence requires.
+fn prepare_request(
+    ws: WorkspaceId,
+    task_id: TaskId,
+    run_id: RunId,
+    key: &str,
+) -> (CommitRequest, Step, StepAttempt, OutboxIntent) {
+    let step = step(ws, task_id, run_id);
+    let att = attempt(&step);
+    let event = event_intent(
+        ws,
+        task_id,
+        run_id,
+        step.id,
+        att.id,
+        domain::EVENT_ATTEMPT_PREPARED,
+    );
+    let outbox = outbox_intent(
+        ws,
+        &event,
+        &format!("execution.prepare:{key}"),
+        domain::OUTBOX_ATTEMPT_PREPARED,
+    );
+    let mut cs = ExecutionChangeSet::new();
+    cs.steps.push(step.clone());
+    cs.attempts.push(att.clone());
+    cs.events.push(event);
+    cs.outbox.push(outbox.clone());
+    cs.lease_assertions.push(LeaseAssertion {
+        workspace_id: ws,
+        run_id,
+        no_active: true,
+    });
+    let binding = ReceiptBinding {
+        task_id,
+        run_id,
+        step_id: step.id,
+        attempt_id: att.id,
+        logical_operation: att.logical_operation_id,
+    };
+    (
+        commit_req(ws, task_id, run_id, "execution.prepare", binding, cs, key),
+        step,
+        att,
+        outbox,
+    )
 }
 
 /// Submit a task through the task store (the task half of the atomic
@@ -278,27 +364,10 @@ async fn commit_persists_rows_events_outbox_and_replays() -> Result<()> {
     let committed = submit_task(&pool, ws, "commit-task").await?;
     let run_id = run_id_of(&committed);
 
-    let step = step(ws, committed.task.id, run_id);
-    let att = attempt(&step);
-    let event = event_intent(ws, committed.task.id, run_id);
-    let outbox = outbox_intent(ws, event.id, "execution.test:k1");
-    let mut cs = ExecutionChangeSet::new();
-    cs.steps.push(step.clone());
-    cs.attempts.push(att.clone());
-    cs.events.push(event.clone());
-    cs.outbox.push(outbox);
-    let binding = ReceiptBinding {
-        task_id: committed.task.id,
-        run_id,
-        step_id: step.id,
-        attempt_id: att.id,
-        logical_operation: att.logical_operation_id,
-    };
-    // The durable result's event id is the committed event — the
-    // receipt's result_reference must name a real durable event.
-    let mut req = commit_req(ws, committed.task.id, run_id, binding.clone(), cs, "k1");
-    req.result.event_id = event.id;
-    req.result.event_kind = event.kind.to_owned();
+    // `execution.prepare` — the upstream insertion-shaped command.
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "k1");
+    let event_id = req.result.event_id;
+    let binding = req.receipt_binding.clone();
     let result = store.commit(req.clone()).await?;
     assert!(!result.replayed);
 
@@ -309,13 +378,13 @@ async fn commit_persists_rows_events_outbox_and_replays() -> Result<()> {
          (SELECT count(*) FROM central.step_attempts WHERE id = $2) AS \"attempts!\", \
          (SELECT count(*) FROM central.events WHERE id = $3) AS \"events!\", \
          (SELECT count(*) FROM central.outbox WHERE workspace_id = $4 \
-           AND deduplication_key = 'execution.test:k1') AS \"outbox!\", \
+           AND deduplication_key = 'execution.prepare:k1') AS \"outbox!\", \
          (SELECT count(*) FROM central.execution_command_receipts \
-           WHERE workspace_id = $4 AND command_scope = 'execution.test' \
+           WHERE workspace_id = $4 AND command_scope = 'execution.prepare' \
            AND idempotency_key = 'k1') AS \"receipts!\"",
         uuid_of!(step.id),
         uuid_of!(att.id),
-        uuid_of!(event.id),
+        uuid_of!(event_id),
         uuid_of!(ws),
     )
     .fetch_one(&pool)
@@ -356,7 +425,7 @@ async fn commit_persists_rows_events_outbox_and_replays() -> Result<()> {
     let lookup = store
         .lookup_receipt(ReceiptLookupRequest {
             scope: scope(ws),
-            command_scope: "execution.test".to_owned(),
+            command_scope: "execution.prepare".to_owned(),
             idempotency_key: "k1".to_owned(),
             fingerprint: [9u8; 32],
             principal_id: "exec-principal".to_owned(),
@@ -389,30 +458,12 @@ async fn conflicting_receipt_fingerprint_is_a_conflict() -> Result<()> {
     let store = Store::new(pool.clone());
     let committed = submit_task(&pool, ws, "conflict-task").await?;
     let run_id = run_id_of(&committed);
-    let step = step(ws, committed.task.id, run_id);
-    let att = attempt(&step);
-    let mut cs = ExecutionChangeSet::new();
-    cs.steps.push(step.clone());
-    cs.attempts.push(att.clone());
-    let binding = ReceiptBinding {
-        task_id: committed.task.id,
-        run_id,
-        step_id: step.id,
-        attempt_id: att.id,
-        logical_operation: att.logical_operation_id,
-    };
-    let mut first = commit_req(ws, committed.task.id, run_id, binding.clone(), cs, "dup");
-    first.result.event_id = ExecutionEventId::new();
+    let (first, _, _, _) = prepare_request(ws, committed.task.id, run_id, "dup");
     store.commit(first).await?;
-    // Same identity, different fingerprint → request conflict.
-    let mut req = commit_req(
-        ws,
-        committed.task.id,
-        run_id,
-        binding,
-        ExecutionChangeSet::new(),
-        "dup",
-    );
+    // Same receipt identity, different fingerprint → request conflict.
+    // The second request stays validation-clean so the mismatch is the
+    // receipt's fingerprint check, not the pre-transaction gate.
+    let (mut req, _, _, _) = prepare_request(ws, committed.task.id, run_id, "dup");
     req.fingerprint = [1u8; 32];
     let err = store.commit(req).await.unwrap_err();
     assert_eq!(err.kind(), FailureKind::Conflict);
@@ -432,14 +483,34 @@ async fn lease_upsert_fences_and_validates() -> Result<()> {
     let store = Store::new(pool.clone());
     let committed = submit_task(&pool, ws, "lease-task").await?;
     let run_id = run_id_of(&committed);
-    let step = step(ws, committed.task.id, run_id);
-    let att = attempt(&step);
 
+    // `execution.prepare` inserts the step + attempt under the
+    // no-active-lease fence…
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prepare");
+    let binding = req.receipt_binding.clone();
+    store.commit(req).await?;
+
+    // …then `execution.claim` grants the lease (the claim-scoped fence
+    // requires exactly one durable lease grant).
     let credential = store.issue_lease_credential()?;
     let expires = OffsetDateTime::now_utc() + time::Duration::seconds(30);
+    let claim_event = event_intent(
+        ws,
+        committed.task.id,
+        run_id,
+        step.id,
+        att.id,
+        domain::EVENT_ATTEMPT_CLAIMED,
+    );
+    let claim_outbox = outbox_intent(
+        ws,
+        &claim_event,
+        "execution.claim:claim",
+        domain::OUTBOX_ATTEMPT_CLAIMED,
+    );
     let mut cs = ExecutionChangeSet::new();
-    cs.steps.push(step.clone());
-    cs.attempts.push(att.clone());
+    cs.events.push(claim_event);
+    cs.outbox.push(claim_outbox);
     cs.leases.push(Lease {
         workspace_id: ws,
         run_id,
@@ -448,23 +519,20 @@ async fn lease_upsert_fences_and_validates() -> Result<()> {
         expires_at: expires,
         updated_at: expires,
     });
-    let binding = ReceiptBinding {
-        task_id: committed.task.id,
+    let mut claim_req = commit_req(
+        ws,
+        committed.task.id,
         run_id,
-        step_id: step.id,
-        attempt_id: att.id,
-        logical_operation: att.logical_operation_id,
-    };
-    store
-        .commit(commit_req(
-            ws,
-            committed.task.id,
-            run_id,
-            binding.clone(),
-            cs,
-            "claim",
-        ))
-        .await?;
+        "execution.claim",
+        binding.clone(),
+        cs,
+        "claim",
+    );
+    claim_req.assert_no_active_lease = false;
+    claim_req.require_recovery_claimable = true;
+    claim_req.expected_versions.step = 1;
+    claim_req.expected_versions.attempt = 1;
+    store.commit(claim_req).await?;
 
     // The minted bearer validates.
     store
@@ -498,31 +566,44 @@ async fn lease_upsert_fences_and_validates() -> Result<()> {
     assert_eq!(err.kind(), FailureKind::Denied);
 
     // A live lease rejects the assert_no_active_lease commit fence.
-    let mut req = commit_req(
+    let (req, _, _, _) = prepare_request(ws, committed.task.id, run_id, "assert-no-lease");
+    let err = store.commit(req).await.unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "ACTIVE_LEASE_CONFLICT");
+
+    // …while the proven bearer clears the fence path (`heartbeat`'s
+    // policy requires the active-lease credential).
+    let beat_event = event_intent(
         ws,
         committed.task.id,
         run_id,
-        binding.clone(),
-        ExecutionChangeSet::new(),
-        "assert-no-lease",
+        step.id,
+        att.id,
+        domain::EVENT_ATTEMPT_HEARTBEAT,
     );
-    req.assert_no_active_lease = true;
-    let err = store.commit(req).await.unwrap_err();
-    assert_eq!(err.kind(), FailureKind::Conflict);
-    assert_eq!(err.code(), "LEASE_ACTIVE");
-
-    // …while the proven bearer clears the fence path.
+    let beat_outbox = outbox_intent(
+        ws,
+        &beat_event,
+        "execution.heartbeat:fenced-claim",
+        domain::OUTBOX_ATTEMPT_CLAIMED,
+    );
+    let mut cs = ExecutionChangeSet::new();
+    cs.events.push(beat_event);
+    cs.outbox.push(beat_outbox);
     let mut fenced_req = commit_req(
         ws,
         committed.task.id,
         run_id,
+        "execution.heartbeat",
         binding,
-        ExecutionChangeSet::new(),
+        cs,
         "fenced-claim",
     );
     fenced_req.assert_no_active_lease = false;
     fenced_req.lease_credential = credential;
     fenced_req.lease_generation = 1;
+    fenced_req.expected_versions.step = 1;
+    fenced_req.expected_versions.attempt = 1;
     store.commit(fenced_req).await?;
     Ok(())
 }
@@ -710,32 +791,8 @@ async fn publish_outbox_marks_dispatched_and_b09_references_persist() -> Result<
     let store = Store::new(pool.clone());
     let committed = submit_task(&pool, ws, "outbox-task").await?;
     let run_id = run_id_of(&committed);
-    let step = step(ws, committed.task.id, run_id);
-    let att = attempt(&step);
-    let event = event_intent(ws, committed.task.id, run_id);
-    let outbox = outbox_intent(ws, event.id, "execution.test:pub");
-    let mut cs = ExecutionChangeSet::new();
-    cs.steps.push(step.clone());
-    cs.attempts.push(att.clone());
-    cs.events.push(event);
-    cs.outbox.push(outbox.clone());
-    let binding = ReceiptBinding {
-        task_id: committed.task.id,
-        run_id,
-        step_id: step.id,
-        attempt_id: att.id,
-        logical_operation: att.logical_operation_id,
-    };
-    store
-        .commit(commit_req(
-            ws,
-            committed.task.id,
-            run_id,
-            binding,
-            cs,
-            "pub",
-        ))
-        .await?;
+    let (req, step, att, outbox) = prepare_request(ws, committed.task.id, run_id, "pub");
+    store.commit(req).await?;
     store
         .publish_outbox(scope(ws), vec![outbox.clone()])
         .await?;
@@ -791,5 +848,671 @@ async fn publish_outbox_marks_dispatched_and_b09_references_persist() -> Result<
     .await
     .map_err(|e| classify_sqlx(&e))?;
     assert_eq!(refs.n, 1);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// B08 recovery decision ladder — driven through the fenced scan
+// (acquire coordinator → start epoch → claim workspace → complete).
+// ---------------------------------------------------------------------------
+
+/// Full fenced scan for one claimed workspace; returns the epoch
+/// generation the runs were reconciled under.
+async fn drive_recovery_scan(store: &Store, ws: WorkspaceId) -> Result<i64> {
+    let lease = store
+        .acquire_recovery_coordinator(RecoveryCoordinatorAcquireRequest {
+            recovery_domain: "central.execution.recovery.v1".to_owned(),
+            instance_id: InstanceId::new(),
+        })
+        .await?;
+    let epoch = store
+        .start_recovery_epoch(StartRecoveryEpochRequest {
+            lease: lease.clone(),
+            batch_size: 10,
+        })
+        .await?;
+    let claims = store
+        .claim_recovery_workspaces(ClaimRecoveryWorkspaceRequest {
+            lease: lease.clone(),
+            epoch_generation: epoch.generation,
+            batch_size: 10,
+        })
+        .await?;
+    let claim = claims.into_iter().next().unwrap_or_default();
+    store
+        .complete_recovery_workspace(CompleteRecoveryWorkspaceRequest {
+            lease,
+            epoch_generation: epoch.generation,
+            workspace_id: ws,
+            claim_token: claim.claim_token,
+            degraded: false,
+            failure_class: String::new(),
+            failure_reason: String::new(),
+        })
+        .await?;
+    Ok(epoch.generation)
+}
+
+/// Fixture mutation: pin the aggregate's persisted status pair.
+async fn set_task_run_status(
+    pool: &PgPool,
+    task_id: TaskId,
+    run_id: RunId,
+    task_status: &str,
+    run_status: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE central.tasks SET status = $2 WHERE id = $1")
+        .bind(uuid_of!(task_id))
+        .bind(task_status)
+        .execute(pool)
+        .await
+        .map_err(|e| classify_sqlx(&e))?;
+    sqlx::query("UPDATE central.runs SET status = $2 WHERE id = $1")
+        .bind(uuid_of!(run_id))
+        .bind(run_status)
+        .execute(pool)
+        .await
+        .map_err(|e| classify_sqlx(&e))?;
+    Ok(())
+}
+
+/// Fixture mutation: mark the attempt `invoked` under `invocation` —
+/// the durable shape a live lease leaves behind when a run dies
+/// mid-invocation.
+async fn mark_attempt_invoked(
+    pool: &PgPool,
+    attempt_id: StepAttemptId,
+    invocation: uuid::Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE central.step_attempts SET state = 'invoked', \
+         invocation_id = $2, invocation_generation = 1, \
+         version = version + 1, updated_at = clock_timestamp() \
+         WHERE id = $1",
+    )
+    .bind(uuid_of!(attempt_id))
+    .bind(invocation)
+    .execute(pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    Ok(())
+}
+
+/// Fixture mutation: an `execution_completion_receipts` row under the
+/// given identities — the immutable B10 handoff evidence.
+#[allow(clippy::too_many_arguments)]
+async fn insert_completion_receipt(
+    pool: &PgPool,
+    ws: WorkspaceId,
+    task_id: TaskId,
+    run_id: RunId,
+    step_id: StepId,
+    attempt_id: StepAttemptId,
+    logical: LogicalOperationId,
+    physical: PhysicalAttemptId,
+    invocation: uuid::Uuid,
+    final_state: &str,
+    outcome: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO central.execution_completion_receipts (\
+         id, workspace_id, task_id, run_id, step_id, step_attempt_id, \
+         logical_operation_id, physical_attempt_id, invocation_id, \
+         invocation_generation, final_state, outcome, evidence_digest, \
+         producer_id, eligible_after) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, \
+         $11::jsonb, $12, 'exec-test', clock_timestamp() + interval '90 days')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid_of!(ws))
+    .bind(uuid_of!(task_id))
+    .bind(uuid_of!(run_id))
+    .bind(uuid_of!(step_id))
+    .bind(uuid_of!(attempt_id))
+    .bind(uuid::Uuid::from_bytes(logical.0))
+    .bind(uuid::Uuid::from_bytes(physical.0))
+    .bind(invocation)
+    .bind(final_state)
+    .bind(outcome)
+    .bind(&[7u8; 32][..])
+    .execute(pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_mints_fenced_prepared_successor() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "recsucc").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "recsucc-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, _step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+
+    let generation = drive_recovery_scan(&store, ws).await?;
+
+    // Decision `prepared_successor_created`: the lost attempt is
+    // cancelled and exactly one prepared successor carries its
+    // predecessor link; the decision is durable evidence.
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"predecessor!\", \
+         (SELECT count(*) FROM central.step_attempts WHERE workspace_id = $2 \
+           AND predecessor_id = $1 AND state = 'prepared') AS \"successors!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $2 \
+           AND kind = 'execution.recovery.prepared_successor_created') AS \"evidence!\", \
+         (SELECT reconciled_epoch FROM central.runs WHERE id = $3) AS \"reconciled!\"",
+        uuid_of!(att.id),
+        uuid_of!(ws),
+        uuid_of!(run_id),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.predecessor, "cancelled");
+    assert_eq!(row.successors, 1);
+    assert_eq!(row.evidence, 1);
+    assert_eq!(row.reconciled, generation);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_preserves_existing_prepared_successor() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "reckeep").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "reckeep-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+
+    // A prior pass already cancelled the predecessor and minted the
+    // successor — the durable shape recovery must not double-mint.
+    sqlx::query(
+        "UPDATE central.step_attempts SET state = 'cancelled', \
+         version = version + 1, updated_at = clock_timestamp() WHERE id = $1",
+    )
+    .bind(uuid_of!(att.id))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    let successor = StepAttemptId::new();
+    sqlx::query(
+        "INSERT INTO central.step_attempts (\
+         id, workspace_id, step_id, task_id, run_id, version, \
+         logical_operation_id, physical_attempt_id, invocation_id, \
+         invocation_generation, predecessor_id, sequence, state, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 1, $6, $7, NULL, NULL, $8, 2, \
+         'prepared', clock_timestamp(), clock_timestamp())",
+    )
+    .bind(uuid_of!(successor))
+    .bind(uuid_of!(ws))
+    .bind(uuid_of!(step.id))
+    .bind(uuid_of!(committed.task.id))
+    .bind(uuid_of!(run_id))
+    .bind(uuid::Uuid::from_bytes(att.logical_operation_id.0))
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid_of!(att.id))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+
+    drive_recovery_scan(&store, ws).await?;
+
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"successor!\", \
+         (SELECT count(*) FROM central.step_attempts WHERE workspace_id = $2 \
+           AND run_id = $3) AS \"attempts!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $2 \
+           AND kind = 'execution.recovery.prepared_successor_preserved') AS \"evidence!\"",
+        uuid_of!(successor),
+        uuid_of!(ws),
+        uuid_of!(run_id),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.successor, "prepared");
+    assert_eq!(row.attempts, 2);
+    assert_eq!(row.evidence, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_settles_prepared_cancellation() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "reccancel").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "reccancel-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+    set_task_run_status(&pool, committed.task.id, run_id, "cancelling", "cancelling").await?;
+
+    drive_recovery_scan(&store, ws).await?;
+
+    // Decision `cancellation_settled`: the attempt that never invoked
+    // and its step close `cancelled`; the task aggregate completes the
+    // cancel transition.
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", \
+         (SELECT state FROM central.steps WHERE id = $2) AS \"step!\", \
+         (SELECT status FROM central.tasks WHERE id = $3) AS \"task!\", \
+         (SELECT status FROM central.runs WHERE id = $4) AS \"run!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $5 \
+           AND kind = 'execution.recovery.cancellation_settled') AS \"evidence!\"",
+        uuid_of!(att.id),
+        uuid_of!(step.id),
+        uuid_of!(committed.task.id),
+        uuid_of!(run_id),
+        uuid_of!(ws),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.attempt, "cancelled");
+    assert_eq!(row.step, "cancelled");
+    assert_eq!(row.task, "cancelled");
+    assert_eq!(row.run, "cancelled");
+    assert_eq!(row.evidence, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_settles_invoked_from_completion_receipt() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "recsettle").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "recsettle-task").await?;
+    let run_id = run_id_of(&committed);
+    set_task_run_status(&pool, committed.task.id, run_id, "running", "running").await?;
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+    let invocation = uuid::Uuid::now_v7();
+    mark_attempt_invoked(&pool, att.id, invocation).await?;
+    insert_completion_receipt(
+        &pool,
+        ws,
+        committed.task.id,
+        run_id,
+        step.id,
+        att.id,
+        att.logical_operation_id,
+        att.physical_attempt_id,
+        invocation,
+        "succeeded",
+        r#"{"schema_version":1,"status":"succeeded"}"#,
+    )
+    .await?;
+
+    drive_recovery_scan(&store, ws).await?;
+
+    // Decision `completion_succeeded`: the receipt settles the
+    // attempt, the step, and the whole aggregate.
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", \
+         (SELECT outcome IS NOT NULL FROM central.step_attempts WHERE id = $1) AS \"settled!\", \
+         (SELECT state FROM central.steps WHERE id = $2) AS \"step!\", \
+         (SELECT status FROM central.tasks WHERE id = $3) AS \"task!\", \
+         (SELECT status FROM central.runs WHERE id = $4) AS \"run!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $5 \
+           AND kind = 'execution.recovery.completion_succeeded') AS \"evidence!\"",
+        uuid_of!(att.id),
+        uuid_of!(step.id),
+        uuid_of!(committed.task.id),
+        uuid_of!(run_id),
+        uuid_of!(ws),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.attempt, "succeeded");
+    assert!(row.settled);
+    assert_eq!(row.step, "succeeded");
+    assert_eq!(row.task, "completed");
+    assert_eq!(row.run, "succeeded");
+    assert_eq!(row.evidence, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_invoked_without_receipt_requires_reconciliation() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "recrecon").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "recrecon-task").await?;
+    let run_id = run_id_of(&committed);
+    set_task_run_status(&pool, committed.task.id, run_id, "running", "running").await?;
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+    mark_attempt_invoked(&pool, att.id, uuid::Uuid::now_v7()).await?;
+
+    drive_recovery_scan(&store, ws).await?;
+
+    // Decision `reconciliation_required`: the ambiguous projection
+    // closes to `reconciliation`, the aggregate waits on it, and the
+    // outbox carries the `execution.reconciliation.required` work.
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", \
+         (SELECT state FROM central.steps WHERE id = $2) AS \"step!\", \
+         (SELECT status FROM central.tasks WHERE id = $3) AS \"task!\", \
+         (SELECT waiting_reason FROM central.tasks WHERE id = $3) AS \"waiting!\", \
+         (SELECT status FROM central.runs WHERE id = $4) AS \"run!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $5 \
+           AND kind = 'execution.recovery.reconciliation_required') AS \"evidence!\", \
+         (SELECT count(*) FROM central.outbox WHERE workspace_id = $5 \
+           AND catalog_type = 'execution.reconciliation.required') AS \"outbox!\"",
+        uuid_of!(att.id),
+        uuid_of!(step.id),
+        uuid_of!(committed.task.id),
+        uuid_of!(run_id),
+        uuid_of!(ws),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.attempt, "reconciliation");
+    assert_eq!(row.step, "reconciliation");
+    assert_eq!(row.task, "waiting");
+    assert_eq!(row.waiting, "reconciliation");
+    assert_eq!(row.run, "waiting");
+    assert_eq!(row.evidence, 1);
+    assert_eq!(row.outbox, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_reconciles_contradictory_completion_receipt() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "recontr").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "recontr-task").await?;
+    let run_id = run_id_of(&committed);
+    set_task_run_status(&pool, committed.task.id, run_id, "running", "running").await?;
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+    let invocation = uuid::Uuid::now_v7();
+    mark_attempt_invoked(&pool, att.id, invocation).await?;
+    // The receipt's logical operation names a different operation —
+    // contradictory evidence never settles; it reconciles.
+    insert_completion_receipt(
+        &pool,
+        ws,
+        committed.task.id,
+        run_id,
+        step.id,
+        att.id,
+        LogicalOperationId::new(),
+        att.physical_attempt_id,
+        invocation,
+        "succeeded",
+        r#"{"schema_version":1,"status":"succeeded"}"#,
+    )
+    .await?;
+
+    drive_recovery_scan(&store, ws).await?;
+
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", \
+         (SELECT state FROM central.steps WHERE id = $2) AS \"step!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $3 \
+           AND kind = 'execution.recovery.reconciliation_required') AS \"evidence!\", \
+         (SELECT count(*) FROM central.outbox WHERE workspace_id = $3 \
+           AND catalog_type = 'execution.reconciliation.required') AS \"outbox!\"",
+        uuid_of!(att.id),
+        uuid_of!(step.id),
+        uuid_of!(ws),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.attempt, "reconciliation");
+    assert_eq!(row.step, "reconciliation");
+    assert_eq!(row.evidence, 1);
+    assert_eq!(row.outbox, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_preserves_existing_reconciliation() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "recpres").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "recpres-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+    // A prior pass already moved the projection to reconciliation and
+    // parked the aggregate on the reconciliation waiter.
+    sqlx::query(
+        "UPDATE central.step_attempts SET state = 'reconciliation', \
+         version = version + 1, updated_at = clock_timestamp() WHERE id = $1",
+    )
+    .bind(uuid_of!(att.id))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    sqlx::query(
+        "UPDATE central.steps SET state = 'reconciliation', \
+         version = version + 1, updated_at = clock_timestamp() WHERE id = $1",
+    )
+    .bind(uuid_of!(step.id))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    sqlx::query(
+        "UPDATE central.tasks SET status = 'waiting', \
+         waiting_reason = 'reconciliation' WHERE id = $1",
+    )
+    .bind(uuid_of!(committed.task.id))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    sqlx::query(
+        "UPDATE central.runs SET status = 'waiting', \
+         waiting_reason = 'reconciliation' WHERE id = $1",
+    )
+    .bind(uuid_of!(run_id))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+
+    drive_recovery_scan(&store, ws).await?;
+
+    // `reconciliation_preserved` deliberately does not re-emit the
+    // outbox work row.
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", \
+         (SELECT status FROM central.tasks WHERE id = $2) AS \"task!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $3 \
+           AND kind = 'execution.recovery.reconciliation_preserved') AS \"evidence!\", \
+         (SELECT count(*) FROM central.outbox WHERE workspace_id = $3 \
+           AND catalog_type = 'execution.reconciliation.required') AS \"outbox!\"",
+        uuid_of!(att.id),
+        uuid_of!(committed.task.id),
+        uuid_of!(ws),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.attempt, "reconciliation");
+    assert_eq!(row.task, "waiting");
+    assert_eq!(row.evidence, 1);
+    assert_eq!(row.outbox, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_leaves_terminal_attempt_untouched() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "recterm").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "recterm-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, _step, att, _) = prepare_request(ws, committed.task.id, run_id, "prep");
+    store.commit(req).await?;
+    // Terminal durable shape — recovery must never reopen it.
+    sqlx::query(
+        "UPDATE central.step_attempts SET state = 'succeeded', \
+         version = version + 1, updated_at = clock_timestamp() WHERE id = $1",
+    )
+    .bind(uuid_of!(att.id))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+
+    drive_recovery_scan(&store, ws).await?;
+
+    let row = sqlx::query!(
+        "SELECT (SELECT state FROM central.step_attempts WHERE id = $1) AS \"attempt!\", \
+         (SELECT count(*) FROM central.step_attempts WHERE workspace_id = $2 \
+           AND run_id = $3) AS \"attempts!\", \
+         (SELECT count(*) FROM central.events WHERE workspace_id = $2 \
+           AND kind = 'execution.recovery.verified_no_unsettled_attempt') AS \"evidence!\"",
+        uuid_of!(att.id),
+        uuid_of!(ws),
+        uuid_of!(run_id),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.attempt, "succeeded");
+    assert_eq!(row.attempts, 1);
+    assert_eq!(row.evidence, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_coordinator_fence_is_a_conflict() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "fence").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let stale = store
+        .acquire_recovery_coordinator(RecoveryCoordinatorAcquireRequest {
+            recovery_domain: "central.execution.recovery.v1".to_owned(),
+            instance_id: InstanceId::new(),
+        })
+        .await?;
+    // The live lease lapses; a different instance takes the domain
+    // over (fence +1) — the old lease is stale for every fenced call.
+    sqlx::query(
+        "UPDATE central.recovery_coordinators \
+         SET lease_expires_at = clock_timestamp() - interval '1 second'",
+    )
+    .execute(&mut mig)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    let _fresh = store
+        .acquire_recovery_coordinator(RecoveryCoordinatorAcquireRequest {
+            recovery_domain: "central.execution.recovery.v1".to_owned(),
+            instance_id: InstanceId::new(),
+        })
+        .await?;
+    let err = store
+        .start_recovery_epoch(StartRecoveryEpochRequest {
+            lease: stale,
+            batch_size: 10,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "STALE_RECOVERY_FENCE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn expected_version_conflict_rejects_commit() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "cas").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "cas-task").await?;
+    let run_id = run_id_of(&committed);
+    let (mut req, _, _, _) = prepare_request(ws, committed.task.id, run_id, "cas");
+    req.expected_versions.task = 99;
+    let err = store.commit(req).await.unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "EXPECTED_VERSION_CONFLICT");
+    Ok(())
+}
+
+#[tokio::test]
+async fn receipt_replay_of_missing_event_is_corruption() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "corrupt").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "corrupt-task").await?;
+    let run_id = run_id_of(&committed);
+    let (req, _, _, _) = prepare_request(ws, committed.task.id, run_id, "k1");
+    store.commit(req.clone()).await?;
+    // Corrupt the receipt's result reference — replay must surface
+    // corruption, never a silent empty result.
+    sqlx::query(
+        "UPDATE central.execution_command_receipts SET result_reference = $2 \
+         WHERE workspace_id = $1 AND idempotency_key = 'k1'",
+    )
+    .bind(uuid_of!(ws))
+    .bind(uuid::Uuid::now_v7())
+    .execute(&mut mig)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    let err = store.commit(req).await.unwrap_err();
+    assert_eq!(err.code(), "pg_data_corrupt");
     Ok(())
 }

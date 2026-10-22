@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT evidence_kind, evidence_id FROM central.provider_completion_references WHERE workspace_id = $1 AND completion_receipt_id = $2 ORDER BY evidence_kind, evidence_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "evidence_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "evidence_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "a640a9071459b1d66f6810a715403ee263f46274f124029771e1ba85d6e5d471"
+}
