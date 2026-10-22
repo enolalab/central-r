@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT workspace_id FROM central.artifacts WHERE state IN ('reserved', 'staging', 'verifying') AND ($1::uuid IS NULL OR workspace_id > $1::uuid) ORDER BY workspace_id LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "50d385715e2529c93599d1280faa4ed983006993d853baf7250cb3bf2bfa14af"
+}

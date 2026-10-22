@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifact_reconciliation_claims c SET claim_kind = 'normal', lease_expires_at = clock_timestamp(), updated_at = clock_timestamp() WHERE c.claim_kind = 'large' AND NOT EXISTS (SELECT 1 FROM central.artifacts a WHERE a.workspace_id = c.workspace_id AND a.id = c.artifact_id AND a.state NOT IN ('ready', 'rejected'))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "dad0e3c5c7c8cea0a8364aba5cfd9c01a3decd8760d2d3a6e232e2613b194910"
+}

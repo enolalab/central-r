@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.artifact_reconciliation_claims (artifact_id, workspace_id, claim_kind, coordinator_generation, claim_token_hash, lease_expires_at, attempt_count, created_at, updated_at) VALUES ($1, $2, 'large', $3, $4, clock_timestamp(), 1, clock_timestamp(), clock_timestamp()) ON CONFLICT (artifact_id) DO UPDATE SET claim_kind = 'large', coordinator_generation = EXCLUDED.coordinator_generation, claim_token_hash = EXCLUDED.claim_token_hash, lease_expires_at = clock_timestamp(), updated_at = clock_timestamp()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f2a9d9530c0772ec260081c3f166800c585b0181858a4c161deead8b91cad28c"
+}

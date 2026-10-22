@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.workspace_id, c.artifact_id, c.lease_expires_at FROM central.artifact_reconciliation_claims c JOIN central.artifacts a ON a.workspace_id = c.workspace_id AND a.id = c.artifact_id WHERE c.claim_kind = 'large' AND c.lease_expires_at <= $1 AND (c.next_eligible_at IS NULL OR c.next_eligible_at <= $1) AND a.state NOT IN ('ready', 'rejected') ORDER BY c.updated_at LIMIT 1 FOR UPDATE OF c SKIP LOCKED",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "lease_expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2b14b09ae6d8f695560c63b25176e67a1bed1740899941c6386d0662dbf722ca"
+}

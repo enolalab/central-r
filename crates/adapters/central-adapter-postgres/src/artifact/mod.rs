@@ -1,7 +1,8 @@
 //! PostgreSQL artifact lifecycle store — port of
 //! `internal/adapter/postgres/artifact/` (B10 store, two-phase
-//! workspace-scoped deletion, `ArtifactSummaryRead`, and the atomic
-//! `CompletionContributor`).
+//! workspace-scoped deletion, `ArtifactSummaryRead`, the atomic
+//! `CompletionContributor`, the fenced `ReconciliationStore`, and
+//! the b34 lineage stores).
 //!
 //! [`Store`] keeps every `sqlx` type inside the adapter and implements
 //! the `central-artifact` ports:
@@ -16,6 +17,16 @@
 //!   finalize-plus-execution-completion transaction: the B08 lease
 //!   fence, capacity settle, quota charge, and every event/outbox row
 //!   commit or roll back together.
+//! - [`port::ReconciliationStore`] — the round-robin workspace claim
+//!   cursor, the dedicated large-artifact claim lifecycle (with the
+//!   SB-G4 `UPDATE`-demotion in place of upstream's `DELETE`s, which
+//!   `central_runtime`'s grant does not admit), DB-clock staging
+//!   expiry, and the rejected-staging cleanup sweep.
+//! - [`port::ProduceEdgeStore`] / [`port::ReadEdgeStore`] /
+//!   [`port::LineageReader`] / [`port::ReadStore`] — the b34 lineage
+//!   journal over `central.artifact_produce_edges` and
+//!   `central.artifact_read_edges`, plus the `central artifact read`
+//!   authorization inputs.
 //!
 //! Completion lock ordering (postgresql-adapter-mapping §6, upstream
 //! `CommitArtifact`): `workspace_event_counters` → `workspaces` quota
@@ -38,7 +49,9 @@
 use central_foundation::failure::{Failure, FailureKind};
 
 mod commit;
+mod lineage_store;
 mod queries;
+mod reconcile;
 mod store;
 
 pub use store::Store;

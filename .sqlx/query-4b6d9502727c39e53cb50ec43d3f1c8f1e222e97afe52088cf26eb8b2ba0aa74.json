@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifact_reconciliation_claims SET claim_token_hash = $3, lease_expires_at = $4, attempt_count = attempt_count + 1, updated_at = clock_timestamp() WHERE workspace_id = $1 AND artifact_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4b6d9502727c39e53cb50ec43d3f1c8f1e222e97afe52088cf26eb8b2ba0aa74"
+}

@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id, a.workspace_id, a.run_id, a.state, COALESCE(a.ready_key, '') AS \"ready_key!\", COALESCE(encode(a.checksum_value, 'hex'), '') AS \"checksum!\" FROM central.artifact_produce_edges pe JOIN central.workflow_nodes n ON n.id = pe.node_id JOIN central.artifacts a ON a.id = pe.artifact_id WHERE n.node_key = $2 AND a.required_role = $3 AND ($1::uuid IS NULL OR pe.run_id = $1::uuid) ORDER BY pe.created_at, pe.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "ready_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "checksum!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "94c23bbed933930a76d91dced918e50d7b26f727199f296e6b62e0b65cf4ad65"
+}

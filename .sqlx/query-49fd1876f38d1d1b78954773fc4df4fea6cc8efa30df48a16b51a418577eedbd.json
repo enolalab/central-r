@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.artifact_read_edges (id, run_id, reader_node_id, attempt_id, artifact_id, declared, checksum) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (run_id, reader_node_id, attempt_id, artifact_id) DO NOTHING RETURNING id, run_id, reader_node_id, attempt_id, artifact_id, declared, checksum, created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "reader_node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "declared",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "checksum",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "49fd1876f38d1d1b78954773fc4df4fea6cc8efa30df48a16b51a418577eedbd"
+}

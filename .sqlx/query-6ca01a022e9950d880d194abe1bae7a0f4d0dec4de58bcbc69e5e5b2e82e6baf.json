@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifact_reconciliation_claims SET claim_kind = 'normal', lease_expires_at = clock_timestamp(), updated_at = clock_timestamp() WHERE workspace_id = $1 AND artifact_id = $2 AND claim_kind = 'large'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6ca01a022e9950d880d194abe1bae7a0f4d0dec4de58bcbc69e5e5b2e82e6baf"
+}

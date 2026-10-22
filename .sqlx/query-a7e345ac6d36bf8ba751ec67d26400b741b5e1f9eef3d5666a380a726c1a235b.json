@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts SET staging_key = NULL, updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2 AND state = 'rejected' AND staging_key IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a7e345ac6d36bf8ba751ec67d26400b741b5e1f9eef3d5666a380a726c1a235b"
+}
