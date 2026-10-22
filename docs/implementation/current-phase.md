@@ -1,18 +1,25 @@
 # Current Phase
 
-## Active slice: Phase R1 — Workspace Scaffold, Canonical SQL Extraction (`v0..b37`) & Durable Task/Execution Core
+## Active slice: Phase R2 — Verified Artifact Lifecycle & Object Storage
 
-`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R1 is the active implementation slice.** No Rust production code exists yet; the R0 documentation and contract baseline is the authority R1 implements against.
+`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R2 is the active implementation slice**; Phase R1 is complete (see below) and its workspace, durable core, and `bins/central` skeleton are the foundation R2 builds on.
 
-R1 scope (roadmap §4):
+R2 scope (roadmap §5): implement `central-artifact` and `central-adapter-s3` — the verified artifact lifecycle (staging reservation → streaming SHA-256 and size verification → ready-key promotion without overwrite → one durable finalization), required-Artifact readiness as the Task/Run completion guard, untrusted-body content policy, workspace-scoped two-phase deletion with tombstone, staging expiry and orphan reconciliation, quota admission, and `b34` lineage edges.
 
-- Initialize the Cargo Workspace — root `Cargo.toml` (`[workspace.dependencies]`, `[workspace.lints]`), `rust-toolchain.toml`, `deny.toml` — per [rust-application-boundaries.md](../architecture/rust-application-boundaries.md).
-- Implement `central-foundation` (UUIDv7 identity newtypes, Failure taxonomy and exit classes).
-- Extract the complete `v0..b37` SQL schema from the upstream Go `internal/adapter/postgres/migrate/*.go` files into canonical ordered `.sql` files under `migrations/` with an immutable SHA-256 checksum manifest — statement-for-statement, no new DDL, no semantic change ([postgresql-adapter-mapping.md](../persistence/postgresql-adapter-mapping.md)).
-- Implement Central's native migration runner in `central-adapter-postgres`: `central.schema_migrations` checksum ledger, single-session `pg_advisory_lock`, version-zero `VerifiedEmptyTarget` atomic baseline installer, dirty data-backfill resume without generic `Force`, and `reapply_incremental_runtime_grants` after `pg_restore`. The `sqlx` `migrate` feature and `_sqlx_migrations` are prohibited.
-- Build the core Phase 1 durable domains: `central-workspace`, `central-task`, `central-execution`, `central-event`, `central-checkpoint`, `central-authorization`, with `central-kernel` composition and `.sqlx/` offline query verification green across the workspace.
+Verification for every R2 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
 
-Verification for every R1 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+## Completed: Phase R1 — Workspace Scaffold, Canonical SQL Extraction (`v0..b37`) & Durable Task/Execution Core
+
+Phase R1 delivered, per roadmap §4 and the [R1 plan](../internal/superpowers/plans/2026-10-21-phase-r1-workspace-and-durable-core.md):
+
+- Cargo Workspace scaffold — root `Cargo.toml` (`[workspace.dependencies]`, `[workspace.lints]`), `rust-toolchain.toml`, `rustfmt.toml`, `deny.toml` — per [rust-application-boundaries.md](../architecture/rust-application-boundaries.md); `cargo deny check` clean.
+- `central-foundation`: UUIDv7 identity newtypes, the Failure taxonomy and exit classes, and the `central.local-result/v1` result envelope.
+- `migrations/`: the complete `v0..b37` ordered SQL corpus extracted statement-for-statement from the upstream Go-embedded DDL, plus the immutable SHA-256 checksum `manifest.json` ([postgresql-adapter-mapping.md](../persistence/postgresql-adapter-mapping.md)).
+- `central-adapter-postgres`: the native migration runner — `central.schema_migrations` checksum ledger, single-session `pg_advisory_lock`, version-zero `VerifiedEmptyTarget` atomic baseline installer, dirty data-backfill resume without generic `Force`, and `reapply_incremental_runtime_grants` after `pg_restore`; `_sqlx_migrations` absent — plus the durable stores for workspace, authorization, event, checkpoint, task, and execution.
+- Core Phase 1 durable domains: `central-workspace`, `central-task`, `central-execution`, `central-event`, `central-checkpoint`, `central-authorization`.
+- `central-kernel` composition root: manual dependency composition, supervised component lifecycle (`CancellationToken` + bounded settlement), profile-aware readiness, and the ready-proof lifecycle (publish, revoke, generation fencing).
+- `bins/central` skeleton: `--version` and fail-closed `exit 5` (`UNSUPPORTED_IN_THIS_SLICE`) `central.local-result/v1` JSON for R2–R6 verbs; it depends only on `central-kernel` and `central-foundation`.
+- Committed `.sqlx/` offline query metadata; the §7 fail-fast pipeline and the `CENTRAL_TEST_DSN` PostgreSQL integration suites are green (lease fencing, recovery epochs, retry, and the outbox covered).
 
 ## Completed: Phase R0 — Documentation & Contract Baseline
 
@@ -32,8 +39,8 @@ Two upstream decisions shape everything below: [ADR 0035](../adr/0035-freeze-b09
 
 | Slice | Scope | Status |
 | --- | --- | --- |
-| R1 | Workspace scaffold, `v0..b37` extraction, native migration runner, durable Task/Execution core | **Active** |
-| R2 | Verified artifact lifecycle, `central-adapter-s3` | Pending |
+| R1 | Workspace scaffold, `v0..b37` extraction, native migration runner, durable Task/Execution core | **Complete** |
+| R2 | Verified artifact lifecycle, `central-adapter-s3` | **Active** |
 | R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | Pending |
 | R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | Pending |
 | R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | Pending |

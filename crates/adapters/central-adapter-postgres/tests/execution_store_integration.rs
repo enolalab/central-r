@@ -1882,11 +1882,10 @@ async fn resume_replays_stored_payload_and_rejects_rebinding() -> Result<()> {
         epoch_generation: epoch.generation,
         coordinator_fence: lease.fence,
         expected_state: RecoveryEpochState::RecoveryEpochDegraded,
-        expected_cursor: degraded
-            .scheduler_cursor
-            .map_or_else(|| WorkspaceId::from_trusted_db_bytes([0; 16]), |c| {
-                WorkspaceId::from_trusted_db_bytes(*c.as_bytes())
-            }),
+        expected_cursor: degraded.scheduler_cursor.map_or_else(
+            || WorkspaceId::from_trusted_db_bytes([0; 16]),
+            |c| WorkspaceId::from_trusted_db_bytes(*c.as_bytes()),
+        ),
         expected_retry_attempt: degraded.retry_attempt,
         acknowledgement_reason: "operator acknowledged degraded pass".to_owned(),
         idempotency_key: "resume-1".to_owned(),
