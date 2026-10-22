@@ -803,6 +803,59 @@ async fn restore_body_create_only_refuses_before_any_request() {
     );
 }
 
+/// Restore counterpart of `TestUploadHoldsPermitUntilAbandonedTransferSettles`:
+/// a deadline-abandoned restore still holds its permit until the parked
+/// buffered read settles — the task joins the blocking read instead of
+/// detaching it while releasing the permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restore_body_holds_permit_until_abandoned_read_settles() {
+    let f = FakeS3::new();
+    let mut s = new_test_store(&f);
+    s.total_deadline = Duration::from_millis(75);
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let src = StalledReader {
+        once: AtomicBool::new(false),
+        done: done_rx,
+    };
+
+    let err = s
+        .restore_body_create_only(READY_KEY.to_owned(), Box::new(src), 8)
+        .await
+        .expect_err("want total-deadline failure");
+    assert_eq!(err.class, FailureClass::Ambiguous, "class");
+    assert_eq!(err.reason, Reason::TotalDeadline, "reason");
+
+    // Every other permit is free...
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONCURRENT_TRANSFERS - 1 {
+        let permit = tokio::time::timeout(Duration::from_secs(1), s.limiter().acquire_owned())
+            .await
+            .expect("permit should be free")
+            .expect("acquire");
+        held.push(permit);
+    }
+
+    // ...but the abandoned restore's own permit is not, because its
+    // blocking read is still parked inside the caller's reader.
+    let blocked =
+        tokio::time::timeout(Duration::from_millis(250), s.limiter().acquire_owned()).await;
+    assert!(
+        blocked.is_err(),
+        "permit was released while the abandoned restore read was still running"
+    );
+
+    // Letting the stalled reader yield settles the read, which is what
+    // returns the permit.
+    drop(done_tx);
+    let settled = tokio::time::timeout(Duration::from_secs(10), s.limiter().acquire_owned()).await;
+    assert!(
+        settled.is_ok(),
+        "permit was never released after the abandoned restore read settled"
+    );
+    drop(settled);
+    drop(held);
+}
+
 // ---------------------------------------------------------------------------
 // HTTP classification matrix (upstream `classify` table)
 // ---------------------------------------------------------------------------

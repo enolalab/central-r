@@ -583,8 +583,9 @@ impl S3ObjectStore {
 
         // The buffered read runs on the blocking pool inside a spawned
         // task that owns the permit: if the supervisor gives up on a
-        // stalled read, the permit stays held until the read settles —
-        // the same "abandoned transfer" contract as `upload`.
+        // stalled read, the task joins the blocking read before exiting,
+        // so the permit stays held until the read settles — the same
+        // "abandoned transfer" contract as `upload`.
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         let key2 = key.clone();
@@ -592,24 +593,36 @@ impl S3ObjectStore {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let read = tokio::task::spawn_blocking(move || {
+                let mut read = tokio::task::spawn_blocking(move || {
                     let mut buf: Vec<u8> = Vec::new();
                     let mut limited = io::Read::take(body, size.saturating_add(1) as u64);
                     let result = limited.read_to_end(&mut buf);
                     result.map(|_| buf)
                 });
-                let bytes: Vec<u8> = tokio::select! {
+                let bytes: Result<Vec<u8>, Failure> = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
                         Err(fail(OP, FailureClass::Ambiguous, Reason::Canceled))
                     }
-                    joined = read => match joined {
+                    joined = &mut read => match joined {
                         Ok(Ok(bytes)) => Ok(bytes),
                         Ok(Err(_)) | Err(_) => {
                             Err(fail(OP, FailureClass::Ambiguous, Reason::TransferIncomplete))
                         }
                     },
-                }?;
+                };
+                // Settle path — the same contract as `upload`'s
+                // `pump.join()`: a cancel-resolved select leaves the
+                // `spawn_blocking` read parked inside the caller's
+                // reader, still owning its `size + 1` buffer. Joining it
+                // before returning is what keeps `_permit` held until the
+                // abandoned transfer actually settles; dropping the
+                // handle would detach the read while freeing the permit
+                // for a new transfer, exceeding the concurrent bound.
+                if !read.is_finished() {
+                    let _ = read.await;
+                }
+                let bytes = bytes?;
                 if bytes.len() as i64 > size {
                     return Err(fail(OP, FailureClass::LimitExceeded, Reason::LimitExceeded));
                 }
