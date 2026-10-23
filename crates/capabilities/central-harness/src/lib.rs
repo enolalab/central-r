@@ -36,6 +36,20 @@
 //!   never injects, relocates, or redirects harness credentials.
 //! - [`recovery`] — [`recovery::attempt_id_for_step_attempt`] and
 //!   [`attempt::Attempt::fail_unlaunched`] for the startup reconciler.
+//! - [`port`] — the three contract seams (port of
+//!   `internal/harness/port`): [`port::Adapter`]/[`port::Session`] over
+//!   the harness boundary, [`port::ProcessLauncher`]/[`port::Process`]
+//!   over the process boundary, and
+//!   [`port::AttemptStore`]/[`port::ApprovalStore`]/
+//!   [`port::LeaseBinder`]/[`port::RecoveryStore`] over the durable
+//!   boundary — expected-version/fence CAS, monotonic event `seq`,
+//!   digest-checked replay, transactional approval effects and
+//!   lease-bound writes.
+//! - [`query`] — the read-side projections
+//!   ([`query::AttemptSummaryRead`], [`query::HarnessEventRead`] with a
+//!   `(attempt_id, seq)` seek cursor, [`query::PendingApprovalRead`],
+//!   [`query::BudgetUsageRead`]); keyset pagination only, never
+//!   `OFFSET`.
 
 pub mod approval;
 pub mod attempt;
@@ -44,6 +58,8 @@ pub mod capability;
 pub mod domain;
 pub mod env;
 pub mod event;
+pub mod port;
+pub mod query;
 pub mod record;
 pub mod recovery;
 

@@ -1,7 +1,12 @@
 //! Test helpers shared by the ported upstream `internal/harness` suites:
 //! the fixed clock bases, the shared execution-lease fence, the canonical
-//! `prepareInput`, the default effective budget, the digest/MAC keys, and
-//! nil-identity constructors standing in for Go zero values.
+//! `prepareInput`, the default effective budget, the digest/MAC keys, the
+//! unsafe-free immediate-ready `block_on` for `#[trait_variant]` futures,
+//! and nil-identity constructors standing in for Go zero values.
+
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use central_foundation::failure::Failure;
 use central_foundation::identity::{
@@ -59,6 +64,21 @@ pub(crate) fn test_mac_key() -> &'static [u8] {
 /// `ok(t)(a.Launch(...))`.
 pub(crate) fn ok<T>(r: Result<T, Failure>) -> T {
     r.unwrap()
+}
+
+/// Drives an immediate-ready `#[trait_variant]`-style future to
+/// completion on the calling thread. Contract fakes never park: a
+/// `Poll::Pending` just yields and polls again. Unsafe-free — the same
+/// shape `central-retry`'s testkit uses.
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+    let mut context = Context::from_waker(Waker::noop());
+    let mut future = pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
 
 /// A canonical `prepareInput` (`identity.New*` → `*Id::new()`).
