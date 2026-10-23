@@ -750,9 +750,9 @@ pub trait AttemptStore: Send + Sync + 'static {
     /// never moves the event cursor or usage: only `append_event`
     /// may, atomically with the event row it records.
     ///
-    /// Harness phase 3c decisions 11 and 16: each [`ApprovalOpen`] in
-    /// `open` opens a pending permission approval in the same
-    /// transaction; it is refused unless `next` enters
+    /// Harness phase 3c decisions 11 and 16: at most one
+    /// [`ApprovalOpen`] in `open` opens a pending permission approval
+    /// in the same transaction; it is refused unless `next` enters
     /// `awaiting_permission` with a new `pending_permission` equal to
     /// its `request_id` (see [`opens_approval`]). A write that moves
     /// the attempt to a terminal state or to ambiguous supersedes its
@@ -1119,7 +1119,6 @@ mod tests {
     fn port_sentinels_are_distinct() {
         assert_ne!(codes::SESSION_ENDED, codes::NO_PENDING_PERMISSION);
         assert_ne!(codes::NO_PENDING_PERMISSION, codes::PERMISSION_BINDING);
-        assert_ne!(codes::PERMISSION_BINDING, codes::NO_PENDING_PERMISSION);
         let err = Failure::conflict(codes::SESSION_ENDED, "adapter: session has ended");
         assert!(is_code(&err, codes::SESSION_ENDED));
         assert!(!is_code(&err, codes::NO_PENDING_PERMISSION));
@@ -1550,6 +1549,16 @@ mod tests {
             open: &'a [ApprovalOpen],
         ) -> PortFuture<'a, Result<Attempt, Failure>> {
             Box::pin(async move {
+                // NOTE for the T3 Postgres implementation — do not copy
+                // this validation order: upstream `AppendEvent`
+                // (adapter/postgres/harness/store.go) runs
+                // `prepareWrite` + `planApprovalWrite` on the attempt
+                // pair FIRST and validates the record (`rec.Validate`,
+                // owner, cursor) only afterwards. Both orders return
+                // the same error set, but when the attempt pair AND
+                // the record are both invalid upstream reports the
+                // attempt/approval failure while this fake reports
+                // INVALID_EVENT.
                 rec.validate()?;
                 if rec.attempt != next.id {
                     return Err(Failure::invalid(

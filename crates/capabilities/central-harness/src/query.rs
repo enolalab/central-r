@@ -233,9 +233,13 @@ pub trait BudgetUsageRead: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalState;
     use crate::domain::codes as domain_codes;
     use crate::record::EventRecord;
-    use crate::testkit::{block_on, is_code, nil_workspace_id, t0};
+    use crate::testkit::{
+        block_on, is_code, nil_workspace_id, pending_approval, prepare_input, t0,
+    };
+    use time::{Duration, OffsetDateTime};
 
     fn ws() -> WorkspaceId {
         WorkspaceId::new()
@@ -291,11 +295,22 @@ mod tests {
     // A minimal in-memory reader proving the query traits are
     // implementable without driver types, and exercising the
     // seek-cursor contract: strictly-after ordering, bounded pages,
-    // no offset arithmetic.
+    // no offset arithmetic. `runs` holds the `central.runs` rows
+    // upstream `queryCostForTask` joins through — a Run, its Task and
+    // their Workspace.
     struct MemRead {
         records: Vec<EventRecord>,
         attempts: Vec<Attempt>,
         approvals: Vec<PermissionApproval>,
+        runs: Vec<RunRow>,
+    }
+
+    // A `central.runs` row — links a Run to its Task within their
+    // workspace.
+    struct RunRow {
+        workspace_id: WorkspaceId,
+        run_id: RunId,
+        task_id: TaskId,
     }
 
     impl AttemptSummaryRead for MemRead {
@@ -406,7 +421,7 @@ mod tests {
             &self,
             workspace_id: WorkspaceId,
         ) -> Result<PendingApprovalSummary, Failure> {
-            let pending: Vec<&PermissionApproval> = self
+            let mut pending: Vec<&PermissionApproval> = self
                 .approvals
                 .iter()
                 .filter(|a| {
@@ -414,6 +429,14 @@ mod tests {
                         && a.state == crate::approval::ApprovalState::Pending
                 })
                 .collect();
+            // Upstream `queryPendingApprovalSummary` orders
+            // `requested_at, id` ASC — the oldest pending approval names
+            // the banner's Task.
+            pending.sort_by(|a, b| {
+                a.requested_at
+                    .cmp(&b.requested_at)
+                    .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+            });
             Ok(PendingApprovalSummary {
                 count: pending.len(),
                 oldest_task_id: pending.first().map(|a| a.task_id),
@@ -438,6 +461,13 @@ mod tests {
                 .filter(|a| a.workspace_id == workspace_id && a.run_id == run)
                 .cloned()
                 .collect();
+            // Upstream `queryApprovalHistory` is `requested_at DESC,
+            // id DESC` — newest first.
+            out.sort_by(|a, b| {
+                b.requested_at
+                    .cmp(&a.requested_at)
+                    .then_with(|| b.id.to_string().cmp(&a.id.to_string()))
+            });
             out.truncate(limit);
             Ok(out)
         }
@@ -447,14 +477,24 @@ mod tests {
         async fn cost_for_task(
             &self,
             workspace_id: WorkspaceId,
-            _task: TaskId,
+            task: TaskId,
         ) -> Result<i64, Failure> {
+            // Upstream `queryCostForTask` joins `central.runs` so only
+            // attempts of the Task's own Runs count, and LEAST clamps
+            // the sum — saturating here, not a panicking `i64` add.
             Ok(self
                 .attempts
                 .iter()
-                .filter(|a| a.workspace_id == workspace_id)
+                .filter(|a| {
+                    a.workspace_id == workspace_id
+                        && self.runs.iter().any(|r| {
+                            r.workspace_id == workspace_id
+                                && r.run_id == a.run_id
+                                && r.task_id == task
+                        })
+                })
                 .map(|a| a.usage.cost_micro_usd)
-                .sum())
+                .fold(0i64, i64::saturating_add))
         }
     }
 
@@ -477,6 +517,7 @@ mod tests {
             records: (1..=7u64).map(rec).collect(),
             attempts: Vec::new(),
             approvals: Vec::new(),
+            runs: Vec::new(),
         };
         let req = HarnessEventRequest {
             workspace_id: ws(),
@@ -515,5 +556,211 @@ mod tests {
             vec![7]
         );
         assert!(page.next_cursor.is_none());
+    }
+
+    // An attempt of `run` in `ws`, prepared `at`.
+    fn attempt_at(ws_id: WorkspaceId, run: RunId, at: OffsetDateTime) -> Attempt {
+        let mut a = Attempt::prepare(prepare_input()).unwrap();
+        a.workspace_id = ws_id;
+        a.run_id = run;
+        a.prepared_at = at;
+        a
+    }
+
+    // An attempt of `run` in `ws` that recorded `cost` micro-USD.
+    fn costed(ws_id: WorkspaceId, run: RunId, cost: i64) -> Attempt {
+        let mut a = attempt_at(ws_id, run, t0());
+        a.usage.cost_micro_usd = cost;
+        a
+    }
+
+    // A pending approval of `run`/`task` in `ws`, requested `at`.
+    fn approval_at(
+        ws_id: WorkspaceId,
+        run: RunId,
+        task: TaskId,
+        at: OffsetDateTime,
+    ) -> PermissionApproval {
+        let mut a = pending_approval();
+        a.workspace_id = ws_id;
+        a.run_id = run;
+        a.task_id = task;
+        a.requested_at = at;
+        a
+    }
+
+    // A `central.runs` row — `run` belongs to `task` in `ws`.
+    fn run_row(ws_id: WorkspaceId, run: RunId, task: TaskId) -> RunRow {
+        RunRow {
+            workspace_id: ws_id,
+            run_id: run,
+            task_id: task,
+        }
+    }
+
+    // Exercises `AttemptSummaryRead`: both projections scope to the Run
+    // within the workspace and order by (prepared_at, id).
+    #[test]
+    fn attempt_summary_read_orders_within_the_run() {
+        let ws_id = ws();
+        let run = RunId::new();
+        let mut first = attempt_at(ws_id, run, t0());
+        first.id = HarnessAttemptId::from_trusted_db_bytes([1; 16]);
+        // The same prepared_at — the id breaks the tie on both reads.
+        let mut second = attempt_at(ws_id, run, t0());
+        second.id = HarnessAttemptId::from_trusted_db_bytes([2; 16]);
+        let later = attempt_at(ws_id, run, t0() + Duration::minutes(1));
+        // Neither another run nor another workspace's attempt counts.
+        let other_run = attempt_at(ws_id, RunId::new(), t0());
+        let other_ws = attempt_at(ws(), run, t0());
+        let reader = MemRead {
+            records: Vec::new(),
+            attempts: vec![
+                later.clone(),
+                second.clone(),
+                first.clone(),
+                other_run,
+                other_ws,
+            ],
+            approvals: Vec::new(),
+            runs: Vec::new(),
+        };
+        // attempts_for_run is oldest prepared first, id ascending on ties.
+        let page = block_on(reader.attempts_for_run(ws_id, run)).unwrap();
+        assert_eq!(
+            page.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![first.id, second.id, later.id]
+        );
+        // latest_attempt_for_run is prepared_at DESC, id DESC.
+        assert_eq!(
+            block_on(reader.latest_attempt_for_run(ws_id, run))
+                .unwrap()
+                .map(|a| a.id),
+            Some(later.id)
+        );
+        // The run read under another workspace finds nothing.
+        assert_eq!(
+            block_on(reader.latest_attempt_for_run(ws(), run)).unwrap(),
+            None
+        );
+        // More than MAX_ATTEMPTS_FOR_RUN is INVALID_ATTEMPT.
+        let reader = MemRead {
+            records: Vec::new(),
+            attempts: (0..=MAX_ATTEMPTS_FOR_RUN)
+                .map(|i| attempt_at(ws_id, run, t0() + Duration::seconds(i as i64)))
+                .collect(),
+            approvals: Vec::new(),
+            runs: Vec::new(),
+        };
+        let err = block_on(reader.attempts_for_run(ws_id, run)).unwrap_err();
+        assert!(is_code(&err, domain_codes::INVALID_ATTEMPT), "{err}");
+    }
+
+    // Exercises `PendingApprovalRead`: the banner counts the pending
+    // approvals and names the oldest one's Task (`requested_at, id`
+    // ASC), and the history is `requested_at DESC, id DESC`, bounded.
+    #[test]
+    fn pending_approval_read_orders_the_banner_and_history() {
+        let ws_id = ws();
+        let run = RunId::new();
+        let oldest_task = TaskId::new();
+        // Insertion order is newest first: ordering, not position,
+        // must pick the oldest pending.
+        let newer = approval_at(ws_id, run, TaskId::new(), t0() + Duration::minutes(2));
+        let older = approval_at(ws_id, run, oldest_task, t0() + Duration::minutes(1));
+        let mut decided = approval_at(ws_id, run, TaskId::new(), t0());
+        decided.state = ApprovalState::Denied;
+        let other_ws = approval_at(
+            ws(),
+            RunId::new(),
+            TaskId::new(),
+            t0() - Duration::minutes(1),
+        );
+        let reader = MemRead {
+            records: Vec::new(),
+            attempts: Vec::new(),
+            approvals: vec![newer.clone(), decided.clone(), older.clone(), other_ws],
+            runs: Vec::new(),
+        };
+        let summary = block_on(reader.pending_approvals(ws_id)).unwrap();
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.oldest_task_id, Some(oldest_task));
+        // The history is every approval of the run, newest first, and
+        // honors its bound.
+        let history = block_on(reader.approval_history(ws_id, run, 10)).unwrap();
+        assert_eq!(
+            history.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![newer.id, older.id, decided.id]
+        );
+        let one = block_on(reader.approval_history(ws_id, run, 1)).unwrap();
+        assert_eq!(one.iter().map(|a| a.id).collect::<Vec<_>>(), vec![newer.id]);
+        let err = block_on(reader.approval_history(ws_id, run, 0)).unwrap_err();
+        assert!(is_code(&err, domain_codes::INVALID_APPROVAL), "{err}");
+        // load_approval reads one by id; an unknown id is
+        // NO_PENDING_APPROVAL.
+        assert_eq!(
+            block_on(reader.load_approval(ws_id, older.id)).unwrap(),
+            older
+        );
+        let err =
+            block_on(reader.load_approval(ws_id, HarnessPermissionApprovalId::new())).unwrap_err();
+        assert!(is_code(&err, domain_codes::NO_PENDING_APPROVAL), "{err}");
+    }
+
+    // Exercises `BudgetUsageRead`: the recorded cost of every attempt
+    // of every Run of the Task — nothing of another Task or workspace —
+    // saturating at i64::MAX.
+    #[test]
+    fn budget_usage_read_sums_every_run_of_the_task() {
+        let ws_id = ws();
+        let task = TaskId::new();
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        let sibling_task = TaskId::new();
+        let sibling_run = RunId::new();
+        let reader = MemRead {
+            records: Vec::new(),
+            // Two attempts in the first run (a resume chain), one in
+            // the second (a Retry); another Task's run and another
+            // workspace's attempt count for neither.
+            attempts: vec![
+                costed(ws_id, run_a, 1_200_000),
+                costed(ws_id, run_a, 300_000),
+                costed(ws_id, run_b, 450_000),
+                costed(ws_id, sibling_run, 7_000_000),
+                costed(ws(), run_a, 9_000_000),
+            ],
+            approvals: Vec::new(),
+            runs: vec![
+                run_row(ws_id, run_a, task),
+                run_row(ws_id, run_b, task),
+                run_row(ws_id, sibling_run, sibling_task),
+            ],
+        };
+        assert_eq!(
+            block_on(reader.cost_for_task(ws_id, task)).unwrap(),
+            1_950_000
+        );
+        assert_eq!(
+            block_on(reader.cost_for_task(ws_id, sibling_task)).unwrap(),
+            7_000_000
+        );
+        // An unknown task, and the task under another workspace, read 0.
+        assert_eq!(
+            block_on(reader.cost_for_task(ws_id, TaskId::new())).unwrap(),
+            0
+        );
+        assert_eq!(block_on(reader.cost_for_task(ws(), task)).unwrap(), 0);
+        // Runs whose recorded costs sum past i64 saturate at i64::MAX.
+        let big = MemRead {
+            records: Vec::new(),
+            attempts: vec![
+                costed(ws_id, run_a, i64::MAX - 1),
+                costed(ws_id, run_b, i64::MAX - 1),
+            ],
+            approvals: Vec::new(),
+            runs: vec![run_row(ws_id, run_a, task), run_row(ws_id, run_b, task)],
+        };
+        assert_eq!(block_on(big.cost_for_task(ws_id, task)).unwrap(), i64::MAX);
     }
 }
