@@ -6,21 +6,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use central_foundation::failure::Failure;
+use central_foundation::identity::{HarnessAttemptId, StepAttemptId, StepId, TaskId};
 use time::Duration;
 
+use crate::attempt::{Attempt, PrepareInput};
 use crate::budget::Budget;
 use crate::capability::Capabilities;
-use crate::domain::{self, PermissionPolicy, Terminal, TerminalStatus};
+use crate::domain::{
+    self, Fence, Kind, PermissionPolicy, Resolution, ResolutionKind, State, Terminal,
+    TerminalStatus, Workspace,
+};
 use crate::event::{self, EventKind, EventPayload, MessageRole, ToolStatus, Usage, UsageScope};
-use crate::port;
+use crate::port::{self, LinkedStepAttemptState};
 use crate::recovery::REASON_NOT_LAUNCHED;
 use sha2::Digest;
 
 use super::bridge::decided_by_code;
+use super::dispatcher::{DispatcherConfig, DispatcherState, PauseReason};
 use super::orchestrator::{Orchestrator, OrchestratorConfig, billed_tokens};
 use super::ports::{
-    ArtifactOutcome, ArtifactOutcomeKind, ArtifactRole, DispatchableRun, FailureCode,
+    ArtifactOutcome, ArtifactOutcomeKind, ArtifactRole, DispatchCase, DispatchableRun, FailureCode,
     MilestoneKind, Outcome, Settlement, codes,
+};
+use super::reconciler::{
+    AMBIGUITY_RESTART, DECIDED_BY_OPERATOR_RESUME, DECIDED_BY_RECOVERY,
+    REASON_RECOVERED_SETTLEMENT, Reconciler, Resolver,
 };
 use super::testkit::*;
 
@@ -4335,4 +4345,2159 @@ fn decided_by_codes_are_fixed() {
             "decidedByCode({decided_by:?})"
         );
     }
+}
+
+// ===========================================================================
+// resume_test.go — the resuming-claim path (harness phase 3g decisions
+// 4, 5, 7, 13): a claimed attempt that continues an earlier harness
+// session resumes it in the Run's existing clone, and never calls
+// Provision (which would delete the clone), including when it adopts
+// the attempt's own prepared row after a restart.
+// ===========================================================================
+
+const RESUME_PROMPT: &str =
+    "Continue the task from where the previous run stopped. When finished, give the final report.";
+const RESUMED_SESSION: &str = "session-resumed";
+const RESUME_COST_LIMIT: i64 = 3_000_000;
+
+/// `resumedScript` — a succeeded session that reveals the resumed
+/// session id.
+fn resumed_script() -> Script {
+    Script {
+        session_id: RESUMED_SESSION.to_string(),
+        payloads: vec![
+            EventPayload::SessionStarted(event::SessionStarted {
+                harness_session_id: RESUMED_SESSION.to_string(),
+                harness_version: "2.1.283".to_string(),
+                model: String::new(),
+                tools: Vec::new(),
+                reported_capabilities: Vec::new(),
+            }),
+            EventPayload::Message(event::Message {
+                role: MessageRole::Assistant,
+                text: FINAL_REPORT.to_string(),
+                partial: false,
+            }),
+        ],
+        terminal: Terminal {
+            status: TerminalStatus::Succeeded,
+            ..Terminal::default()
+        },
+        ..Script::default()
+    }
+}
+
+fn resume_caps() -> Capabilities {
+    Capabilities {
+        resume_by_id: true,
+        native_cost_limit: true,
+        ..Capabilities::default()
+    }
+}
+
+/// `resumeFixture` — a world whose next claim is the prepared resume
+/// attempt of a Run whose earlier attempt, `source`, is
+/// resolved(resume).
+struct ResumeFixture {
+    w: World,
+    src: Arc<ScriptedResume>,
+    run: DispatchableRun,
+    source: Attempt,
+    from: super::ports::ResumeFrom,
+    /// The harness attempt id of the claimed StepAttempt.
+    id: HarnessAttemptId,
+}
+
+fn resume_fixture(
+    cfg: OrchestratorConfig,
+    caps: Capabilities,
+    scripts: Vec<Script>,
+) -> ResumeFixture {
+    let src = Arc::new(ScriptedResume::new(None, None));
+    let mut cfg = cfg;
+    cfg.resume = src.clone();
+    let w = new_world(cfg, caps, scripts);
+    let run = DispatchableRun {
+        case: DispatchCase::PreparedSuccessor,
+        workspace_id: central_foundation::identity::WorkspaceId::new(),
+        task_id: TaskId::new(),
+        run_id: central_foundation::identity::RunId::new(),
+        step_id: StepId::new(),
+        step_attempt_id: StepAttemptId::new(),
+    };
+    let id = crate::recovery::attempt_id_for_step_attempt(run.step_attempt_id).expect("attempt id");
+    let f = Fence { generation: 1 };
+    let at = w.clock.now() - Duration::HOUR;
+    let mut source = Attempt::prepare(PrepareInput {
+        id: HarnessAttemptId::new(),
+        workspace_id: run.workspace_id,
+        run_id: run.run_id,
+        kind: Kind::new("claude-code"),
+        adapter_version: "claudecode/3a".to_string(),
+        workspace: Workspace {
+            path: format!(
+                "/var/lib/central-harness/worktrees/runs/{}/repo",
+                run.run_id
+            ),
+            base_sha: BASE_SHA.to_string(),
+        },
+        permission: PermissionPolicy::Deny,
+        fence: f,
+        at,
+        budget: Budget {
+            cost_micro_usd: 5_000_000,
+            wall_clock: Duration::minutes(30),
+            cost_defaulted: false,
+            wall_clock_defaulted: false,
+        },
+    })
+    .expect("prepare");
+    source = source
+        .launch(f, &source.id.to_string(), "2.1.283", at + Duration::SECOND)
+        .expect("launch");
+    source = source
+        .reveal_session(f, RESUMED_SESSION, at + Duration::seconds(2))
+        .expect("reveal");
+    source = source
+        .mark_ambiguous(f, AMBIGUITY_RESTART, at + Duration::seconds(3))
+        .expect("ambiguous");
+    source = source
+        .resolve(
+            f,
+            Resolution {
+                kind: ResolutionKind::Resume,
+                decided_by: DECIDED_BY_OPERATOR_RESUME.to_string(),
+            },
+            at + Duration::seconds(4),
+        )
+        .expect("resolve");
+    w.st.store_attempt(source.clone());
+    w.life.set_generation(1); // the claim takes generation 2
+    let from = resume_from(
+        source.clone(),
+        RESUME_PROMPT,
+        Budget {
+            cost_micro_usd: RESUME_COST_LIMIT,
+            wall_clock: Duration::minutes(30),
+            cost_defaulted: false,
+            wall_clock_defaulted: false,
+        },
+    );
+    src.set_from(Some(from.clone()));
+    ResumeFixture {
+        w,
+        src,
+        run,
+        source,
+        from,
+        id,
+    }
+}
+
+impl ResumeFixture {
+    fn run_once(&self) -> super::ports::HarnessResult {
+        block_on(
+            self.w
+                .orch
+                .run_dispatchable(self.run.clone(), "2.1.283", &*self.w.stop),
+        )
+    }
+
+    /// `stored` — the harness row of the claimed attempt.
+    fn stored(&self) -> Attempt {
+        self.w.st.stored(self.id).unwrap_or_else(|| {
+            unreachable!(
+                "no harness row for the claimed attempt: {:?}",
+                self.w.tr.all()
+            )
+        })
+    }
+
+    /// `preparedResumeRow` — the resume row an earlier claim (fence 1)
+    /// created.
+    fn prepared_resume_row(&self) -> Attempt {
+        Attempt::prepare_resume(
+            &self.source,
+            PrepareInput {
+                id: self.id,
+                workspace_id: self.run.workspace_id,
+                run_id: self.run.run_id,
+                kind: Kind::new("claude-code"),
+                adapter_version: "claudecode/3a".to_string(),
+                workspace: self.source.workspace.clone(),
+                permission: PermissionPolicy::Deny,
+                fence: Fence { generation: 1 },
+                at: self.w.clock.now() - Duration::minutes(1),
+                budget: self.from.budget,
+            },
+        )
+        .expect("PrepareResume")
+    }
+}
+
+#[test]
+fn orchestrator_resumes_the_source_session_without_provisioning() {
+    let f = resume_fixture(default_cfg(), resume_caps(), vec![resumed_script()]);
+    let res = f.run_once();
+    assert!(
+        res.outcome == Outcome::Succeeded && res.err.is_none(),
+        "result = {res:?} ({:?})",
+        f.w.tr.all()
+    );
+    assert_eq!(
+        f.w.tr.count("provisioner.Provision"),
+        0,
+        "Provision calls on the resume path"
+    );
+    let reopens = f.w.prov.reopen_calls();
+    assert!(
+        reopens.len() == 1
+            && reopens[0].want == f.source.workspace
+            && reopens[0].run == f.run.run_id
+            && reopens[0].ws == f.run.workspace_id,
+        "reopens = {reopens:?}, want one of {:?}",
+        f.source.workspace
+    );
+    let calls = f.src.calls();
+    assert!(
+        calls.len() == 1 && calls[0].step_attempt_id == f.run.step_attempt_id,
+        "resume source calls = {calls:?}"
+    );
+    let a = f.stored();
+    assert!(
+        a.resume_of == Some(f.source.id)
+            && a.resume_session_id == f.source.harness_session_id
+            && a.budget == f.from.budget
+            && a.workspace == f.source.workspace
+            && a.state == State::Succeeded
+            && a.harness_session_id == RESUMED_SESSION,
+        "resume row = {a:?}"
+    );
+    let adapter_calls = f.w.ad.calls();
+    assert_eq!(adapter_calls.len(), 1, "adapter calls = {adapter_calls:?}");
+    let c = &adapter_calls[0];
+    assert!(
+        c.0 == "Resume" && c.2.harness_session_id == f.source.harness_session_id,
+        "adapter call = {} {:?}",
+        c.0,
+        c.2
+    );
+    assert!(
+        c.1.prompt == f.from.prompt && c.1.prompt != f.w.life.prompt(),
+        "the resume was not launched with the continuation prompt"
+    );
+    assert!(
+        c.1.limits.max_cost_micro_usd == RESUME_COST_LIMIT
+            && c.1.workspace == f.source.workspace
+            && c.1.attempt == f.id
+            && c.1.env.sandbox_scope_id == f.id.to_string()
+            && c.1.permission == PermissionPolicy::Deny,
+        "resume spec = {:?}",
+        c.1
+    );
+    let order = [
+        "provisioner.CheckFreeSpace",
+        "provisioner.Reopen",
+        "store.Create",
+        "lifecycle.MarkInvoked",
+        "adapter.Resume",
+        "lifecycle.CompleteWithReport",
+    ];
+    let mut last = -1;
+    for call in order {
+        let i = f.w.tr.index(call);
+        assert!(
+            i > last,
+            "{call} at {i}, not after {last}: {:?}",
+            f.w.tr.all()
+        );
+        last = i;
+    }
+    assert_eq!(
+        f.w.tr.count("adapter.Start"),
+        0,
+        "a resume started a fresh session"
+    );
+}
+
+#[test]
+fn orchestrator_adopts_a_prepared_resume_row_after_a_restart() {
+    let f = resume_fixture(default_cfg(), resume_caps(), vec![resumed_script()]);
+    let prior = f.prepared_resume_row();
+    f.w.st.store_attempt(prior.clone());
+    let res = f.run_once();
+    assert!(
+        res.outcome == Outcome::Succeeded && res.err.is_none(),
+        "result = {res:?} ({:?})",
+        f.w.tr.all()
+    );
+    assert_eq!(
+        f.w.tr.count("provisioner.Provision"),
+        0,
+        "Provision calls while adopting a resume row"
+    );
+    let a = f.stored();
+    assert!(
+        a.fence.generation == 2
+            && a.prepared_at == prior.prepared_at
+            && a.resume_of == Some(f.source.id)
+            && a.state == State::Succeeded,
+        "adopted row = {} fence {} prepared {} resume of {:?}",
+        a.state.as_str(),
+        a.fence.generation,
+        a.prepared_at,
+        a.resume_of
+    );
+    let order = [
+        "provisioner.Reopen",
+        "store.Create",
+        "store.Save:prepared",
+        "lifecycle.MarkInvoked",
+        "adapter.Resume",
+    ];
+    let mut last = -1;
+    for call in order {
+        let i = f.w.tr.index(call);
+        assert!(
+            i > last,
+            "{call} at {i}, not after {last}: {:?}",
+            f.w.tr.all()
+        );
+        last = i;
+    }
+    let c = f.w.ad.calls();
+    assert!(
+        c.len() == 1 && c[0].0 == "Resume" && c[0].2.harness_session_id == RESUMED_SESSION,
+        "adapter calls = {c:?}"
+    );
+}
+
+#[test]
+fn orchestrator_refuses_to_adopt_a_row_of_the_other_kind() {
+    let f = resume_fixture(default_cfg(), resume_caps(), vec![resumed_script()]);
+    let ordinary = Attempt::prepare(PrepareInput {
+        id: f.id,
+        workspace_id: f.run.workspace_id,
+        run_id: f.run.run_id,
+        kind: Kind::new("claude-code"),
+        adapter_version: "claudecode/3a".to_string(),
+        workspace: f.source.workspace.clone(),
+        permission: PermissionPolicy::Deny,
+        fence: Fence { generation: 1 },
+        at: f.w.clock.now() - Duration::minutes(1),
+        budget: f.from.budget,
+    })
+    .expect("prepare");
+    f.w.st.store_attempt(ordinary.clone());
+    let res = f.run_once();
+    assert!(
+        res.outcome == Outcome::Abandoned && res.reason == FailureCode::EXECUTION_FAILED,
+        "result = {res:?}"
+    );
+    assert!(
+        is_code(res.err.as_ref(), domain::codes::VERSION_CONFLICT),
+        "cause = {:?}",
+        res.err
+    );
+    assert!(
+        f.w.ad.calls().is_empty()
+            && f.w.tr.count("lifecycle.MarkInvoked") == 0
+            && f.w.tr.count("provisioner.Provision") == 0,
+        "launched or provisioned: {:?}",
+        f.w.tr.all()
+    );
+    let a = f.stored();
+    assert!(
+        a.state == State::Prepared && a.fence.generation == 1,
+        "the ordinary row was changed: {} fence {}",
+        a.state.as_str(),
+        a.fence.generation
+    );
+}
+
+#[test]
+fn orchestrator_abandons_a_resume_it_cannot_start() {
+    struct Case {
+        name: &'static str,
+        caps: Capabilities,
+        setup: Box<dyn Fn(&ResumeFixture)>,
+        reason: FailureCode,
+    }
+    let cases = vec![
+        Case {
+            name: "clone unavailable",
+            caps: resume_caps(),
+            setup: Box::new(|f: &ResumeFixture| {
+                f.w.prov.set_reopen_err(Some(Failure::unavailable(
+                    codes::WORKSPACE_UNAVAILABLE,
+                    "the run directory was replaced",
+                )));
+            }),
+            reason: FailureCode::WORKSPACE_UNAVAILABLE,
+        },
+        Case {
+            name: "no usable source",
+            caps: resume_caps(),
+            setup: Box::new(|f: &ResumeFixture| {
+                f.src.set_err(Some(Failure::unavailable(
+                    codes::RESUME_UNAVAILABLE,
+                    "no usable source",
+                )));
+            }),
+            reason: FailureCode::EXECUTION_FAILED,
+        },
+        Case {
+            name: "chain budget exhausted",
+            caps: resume_caps(),
+            setup: Box::new(|f: &ResumeFixture| {
+                f.src.set_err(Some(Failure::conflict(
+                    domain::codes::CHAIN_BUDGET_EXHAUSTED,
+                    "9999 micro-USD remaining",
+                )));
+            }),
+            reason: FailureCode::BUDGET_COST,
+        },
+        Case {
+            name: "adapter cannot resume",
+            caps: Capabilities {
+                native_cost_limit: true,
+                ..Capabilities::default()
+            },
+            setup: Box::new(|_: &ResumeFixture| {}),
+            reason: FailureCode::EXECUTION_FAILED,
+        },
+        Case {
+            name: "empty prompt",
+            caps: resume_caps(),
+            setup: Box::new(|f: &ResumeFixture| {
+                let mut from = f.from.clone();
+                from.prompt = String::new();
+                f.src.set_from(Some(from));
+            }),
+            reason: FailureCode::EXECUTION_FAILED,
+        },
+    ];
+    for tc in cases {
+        let f = resume_fixture(default_cfg(), tc.caps, vec![resumed_script()]);
+        (tc.setup)(&f);
+        let res = f.run_once();
+        assert!(
+            res.outcome == Outcome::Abandoned && res.reason == tc.reason,
+            "{}: result = {res:?}",
+            tc.name
+        );
+        let (_, settled, abandoned) = f.w.life.snapshot();
+        assert!(
+            abandoned == vec![tc.reason.clone()] && settled.is_empty(),
+            "{}: abandoned={abandoned:?} settled={settled:?}",
+            tc.name
+        );
+        assert_eq!(
+            f.w.tr.count("provisioner.Provision"),
+            0,
+            "{}: Provision calls",
+            tc.name
+        );
+        assert!(
+            f.w.ad.calls().is_empty(),
+            "{}: adapter calls = {:?}",
+            tc.name,
+            f.w.ad.calls()
+        );
+        assert!(
+            f.w.tr.count("store.Create") == 0 && f.w.tr.count("lifecycle.MarkInvoked") == 0,
+            "{}: a resume that cannot start went on: {:?}",
+            tc.name,
+            f.w.tr.all()
+        );
+        let m = f.w.sink.of(MilestoneKind::Terminal);
+        assert!(
+            m.len() == 1 && m[0].reason == tc.reason.as_str(),
+            "{}: terminal milestone = {m:?}",
+            tc.name
+        );
+    }
+}
+
+#[test]
+fn orchestrator_cancel_before_a_resume_launch_settles_the_cancellation() {
+    let mut cfg = default_cfg();
+    cfg.heartbeat_interval = Duration::milliseconds(10);
+    let f = resume_fixture(cfg, resume_caps(), vec![resumed_script()]);
+    let life = f.w.life.clone();
+    f.src.set_block(move || {
+        life.cancelling.store(true, Ordering::SeqCst);
+    });
+    // The heartbeat sees the cancel and ends the pre-launch work; the
+    // pending resume call is dropped by the work race.
+    let res = f.run_once();
+    require_cancelled(&f.w, &res);
+    for call in [
+        "provisioner.Provision",
+        "provisioner.Reopen",
+        "store.Create",
+        "lifecycle.MarkInvoked",
+        "adapter.",
+    ] {
+        assert_eq!(
+            f.w.tr.count(call),
+            0,
+            "{call} after the cancellation: {:?}",
+            f.w.tr.all()
+        );
+    }
+    assert!(f.w.ad.calls().is_empty(), "a cancelled resume was launched");
+}
+
+#[test]
+fn orchestrator_provisions_when_there_is_no_resume_source() {
+    // no source
+    {
+        let f = resume_fixture(
+            default_cfg(),
+            resume_caps(),
+            vec![succeeded_script(Vec::new())],
+        );
+        f.src.set_from(None);
+        let res = f.run_once();
+        assert!(
+            res.outcome == Outcome::Succeeded && res.err.is_none(),
+            "result = {res:?} ({:?})",
+            f.w.tr.all()
+        );
+        assert_eq!(f.w.tr.count("provisioner.Provision"), 1, "Provision calls");
+        assert_eq!(
+            f.w.prov.reopen_calls().len(),
+            0,
+            "Reopen calls on the ordinary path"
+        );
+        let c = f.w.ad.calls();
+        assert!(
+            c.len() == 1 && c[0].0 == "Start" && c[0].1.prompt == f.w.life.prompt(),
+            "adapter calls = {c:?}"
+        );
+        let a = f.stored();
+        assert!(
+            a.resume_of.is_none() && a.resume_session_id.is_empty(),
+            "ordinary row = {a:?}"
+        );
+        assert!(
+            f.w.tr.index("provisioner.CheckFreeSpace") < f.w.tr.index("provisioner.Provision"),
+            "order: {:?}",
+            f.w.tr.all()
+        );
+    }
+    // source unavailable
+    {
+        let f = resume_fixture(
+            default_cfg(),
+            resume_caps(),
+            vec![succeeded_script(Vec::new())],
+        );
+        f.src.set_err(Some(Failure::unavailable(
+            codes::RESUME_UNAVAILABLE,
+            "step sequence 2 has no source",
+        )));
+        let res = f.run_once();
+        assert!(
+            res.outcome == Outcome::Abandoned
+                && res.reason == FailureCode::EXECUTION_FAILED
+                && is_code(res.err.as_ref(), codes::RESUME_UNAVAILABLE),
+            "result = {res:?}"
+        );
+        assert_eq!(f.w.tr.count("provisioner.Provision"), 0, "Provision calls");
+        assert!(f.w.ad.calls().is_empty(), "launched without a source");
+    }
+}
+
+#[test]
+fn new_orchestrator_requires_a_resume_source() {
+    // `OrchestratorConfig::new` fills the `noResume` default; a config
+    // whose resume source is absent is unrepresentable in Rust — the
+    // field is non-optional. The meaningful half is that the default
+    // source answers `None` (the `noResume` port).
+    let src = Arc::new(NoResume);
+    let res = block_on(super::ports::ResumeSource::resume_from(
+        src.as_ref(),
+        super::ports::ClaimedRun {
+            workspace_id: central_foundation::identity::WorkspaceId::new(),
+            task_id: TaskId::new(),
+            run_id: central_foundation::identity::RunId::new(),
+            step_id: StepId::new(),
+            step_attempt_id: StepAttemptId::new(),
+            prompt: "p".to_string(),
+            permission: PermissionPolicy::Deny,
+            budget: Budget::default(),
+            lease: crate::port::ExecutionLease {
+                generation: 1,
+                credential: [7; 32],
+            },
+        },
+    ));
+    assert!(matches!(res, Ok(None)), "noResume = {res:?}");
+}
+
+// ===========================================================================
+// reconciler_test.go — the startup reconciler and the Resolver (harness
+// phase 3e/3g/3k): every non-terminal harness row takes the state its
+// linked StepAttempt implies, under the recovery authority.
+// ===========================================================================
+
+/// `resolvedAs` — the stored row a concurrent writer would leave.
+fn resolved_as(a: &Attempt, res: Resolution) -> Attempt {
+    let mut next = a
+        .resolve(a.fence, res, a.updated_at + Duration::SECOND)
+        .expect("resolve");
+    next.version = a.version + 1;
+    next
+}
+
+#[test]
+fn reconciler_gives_each_attempt_the_state_its_step_attempt_implies() {
+    struct Case {
+        name: &'static str,
+        state: State,
+        step: LinkedStepAttemptState,
+        lease_live: bool,
+        want: Option<State>,
+        reason: &'static str,
+    }
+    let cases = vec![
+        Case {
+            name: "launched then restart",
+            state: State::Running,
+            step: LinkedStepAttemptState::Reconciliation,
+            lease_live: false,
+            want: Some(State::Ambiguous),
+            reason: "",
+        },
+        Case {
+            name: "launching then restart",
+            state: State::Launching,
+            step: LinkedStepAttemptState::Reconciliation,
+            lease_live: false,
+            want: Some(State::Ambiguous),
+            reason: "",
+        },
+        Case {
+            name: "awaiting permission then restart",
+            state: State::AwaitingPermission,
+            step: LinkedStepAttemptState::Reconciliation,
+            lease_live: false,
+            want: Some(State::Ambiguous),
+            reason: "",
+        },
+        Case {
+            name: "invoked but never launched",
+            state: State::Prepared,
+            step: LinkedStepAttemptState::Reconciliation,
+            lease_live: false,
+            want: Some(State::Ambiguous),
+            reason: "",
+        },
+        Case {
+            name: "stop before MarkInvoked",
+            state: State::Prepared,
+            step: LinkedStepAttemptState::Cancelled,
+            lease_live: false,
+            want: Some(State::Failed),
+            reason: REASON_NOT_LAUNCHED,
+        },
+        Case {
+            name: "cancelled after launch",
+            state: State::Running,
+            step: LinkedStepAttemptState::Cancelled,
+            lease_live: false,
+            want: Some(State::Ambiguous),
+            reason: "",
+        },
+        Case {
+            name: "settled succeeded from receipt",
+            state: State::Running,
+            step: LinkedStepAttemptState::Succeeded,
+            lease_live: false,
+            want: Some(State::Succeeded),
+            reason: REASON_RECOVERED_SETTLEMENT,
+        },
+        Case {
+            name: "settled failed from receipt",
+            state: State::Running,
+            step: LinkedStepAttemptState::Failed,
+            lease_live: false,
+            want: Some(State::Failed),
+            reason: REASON_RECOVERED_SETTLEMENT,
+        },
+        Case {
+            name: "settled failed never launched",
+            state: State::Prepared,
+            step: LinkedStepAttemptState::Failed,
+            lease_live: false,
+            want: Some(State::Failed),
+            reason: REASON_NOT_LAUNCHED,
+        },
+        Case {
+            name: "settled succeeded but unrepresentable",
+            state: State::Launching,
+            step: LinkedStepAttemptState::Succeeded,
+            lease_live: false,
+            want: Some(State::Ambiguous),
+            reason: "",
+        },
+        Case {
+            name: "operator resolution lost its harness write",
+            state: State::Ambiguous,
+            step: LinkedStepAttemptState::Failed,
+            lease_live: false,
+            want: Some(State::Resolved),
+            reason: "",
+        },
+        Case {
+            name: "ambiguous awaiting the operator",
+            state: State::Ambiguous,
+            step: LinkedStepAttemptState::Reconciliation,
+            lease_live: false,
+            want: None,
+            reason: "",
+        },
+        Case {
+            name: "lease still live",
+            state: State::Running,
+            step: LinkedStepAttemptState::Invoked,
+            lease_live: true,
+            want: None,
+            reason: "",
+        },
+        Case {
+            name: "invoked, not recovered",
+            state: State::Running,
+            step: LinkedStepAttemptState::Invoked,
+            lease_live: false,
+            want: None,
+            reason: "",
+        },
+        Case {
+            name: "no linked step attempt",
+            state: State::Prepared,
+            step: LinkedStepAttemptState::Unset,
+            lease_live: false,
+            want: None,
+            reason: "",
+        },
+    ];
+    for tc in cases {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(tc.state);
+        st.put(a.clone(), tc.step, tc.lease_live);
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+        let sum = block_on(r.run()).unwrap_or_else(|e| unreachable!("{}: {e}", tc.name));
+        let got = st
+            .stored(a.id)
+            .unwrap_or_else(|| unreachable!("{}: no stored row", tc.name));
+        match tc.want {
+            None => {
+                assert!(
+                    got.version == a.version && st.recovered().is_empty() && sum.skipped == 1,
+                    "{}: attempt touched: {} v{}, summary {sum:?}",
+                    tc.name,
+                    got.state.as_str(),
+                    got.version
+                );
+                continue;
+            }
+            Some(want) => {
+                assert!(
+                    got.state == want
+                        && got.version == a.version + 1
+                        && got.fence == a.fence
+                        && got.last_event_seq == a.last_event_seq,
+                    "{}: attempt = {} v{} fence {}, want {} v{}",
+                    tc.name,
+                    got.state.as_str(),
+                    got.version,
+                    got.fence.generation,
+                    want.as_str(),
+                    a.version + 1
+                );
+            }
+        }
+        if !tc.reason.is_empty() {
+            assert_eq!(
+                got.terminal.reason, tc.reason,
+                "{}: terminal reason",
+                tc.name
+            );
+        }
+        if got.state == State::Ambiguous {
+            assert_eq!(
+                got.ambiguity_reason, AMBIGUITY_RESTART,
+                "{}: ambiguity reason",
+                tc.name
+            );
+        }
+        if got.state == State::Resolved {
+            assert!(
+                got.resolution.kind == ResolutionKind::Abandon
+                    && got.resolution.decided_by == DECIDED_BY_RECOVERY,
+                "{}: resolution = {:?}",
+                tc.name,
+                got.resolution
+            );
+        }
+        assert!(
+            sum.scanned == 1 && sum.skipped == 0,
+            "{}: summary = {sum:?}",
+            tc.name
+        );
+    }
+}
+
+#[test]
+fn reconciler_skips_what_the_recovery_authority_refuses() {
+    let st = FakeStore::new(&Trace::default());
+    let a = attempt_in(State::Running);
+    st.put(a.clone(), LinkedStepAttemptState::Reconciliation, false);
+    st.set_refuse(
+        a.id,
+        Failure::denied(domain::codes::RECOVERY_NOT_AUTHORIZED, "still lease-live"),
+    );
+    let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+    let sum = block_on(r.run()).expect("run");
+    assert!(sum.skipped == 1 && sum.ambiguous == 0, "summary = {sum:?}");
+    let got = st.stored(a.id).expect("stored");
+    assert!(
+        got.version == a.version && st.recovered().is_empty(),
+        "attempt touched"
+    );
+}
+
+#[test]
+fn reconciler_pages_through_every_candidate() {
+    let st = FakeStore::new(&Trace::default());
+    let n = crate::port::MAX_RECOVERY_CANDIDATES + 7;
+    for i in 0..n {
+        let mut a = attempt_in(State::Running);
+        a.prepared_at = EPOCH + Duration::milliseconds(i as i64);
+        st.put(a, LinkedStepAttemptState::Reconciliation, false);
+    }
+    let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+    let sum = block_on(r.run()).expect("run");
+    assert!(sum.scanned == n && sum.ambiguous == n, "summary = {sum:?}");
+}
+
+#[test]
+fn reconciler_is_idempotent() {
+    let st = FakeStore::new(&Trace::default());
+    st.put(
+        attempt_in(State::Running),
+        LinkedStepAttemptState::Reconciliation,
+        false,
+    );
+    st.put(
+        attempt_in(State::Prepared),
+        LinkedStepAttemptState::Cancelled,
+        false,
+    );
+    let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+    block_on(r.run()).expect("first run");
+    let writes = st.recovered().len();
+    let sum = block_on(r.run()).expect("second run");
+    assert!(
+        st.recovered().len() == writes
+            && sum.ambiguous + sum.unlaunched + sum.settled + sum.resolved == 0,
+        "second pass wrote: {sum:?}"
+    );
+}
+
+#[test]
+fn resolver_resolves_the_ambiguous_attempt_as_abandon() {
+    let st = FakeStore::new(&Trace::default());
+    let a = attempt_in(State::Ambiguous);
+    st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+    let r = Resolver::new(st.clone(), Arc::new(RealClock));
+    block_on(r.resolve_abandon(a.workspace_id, step_of(&a), "operator-session:alice"))
+        .expect("resolve");
+    let got = st.stored(a.id).expect("stored");
+    assert!(
+        got.state == State::Resolved
+            && got.resolution
+                == Resolution {
+                    kind: ResolutionKind::Abandon,
+                    decided_by: "operator-session:alice".to_string(),
+                },
+        "attempt = {} {:?}",
+        got.state.as_str(),
+        got.resolution
+    );
+    // Idempotent: a second resolve writes nothing.
+    let writes = st.recovered().len();
+    block_on(r.resolve_abandon(a.workspace_id, step_of(&a), "operator-session:alice"))
+        .expect("second");
+    assert_eq!(st.recovered().len(), writes, "second call wrote");
+}
+
+#[test]
+fn resolver_marks_a_live_attempt_ambiguous_first() {
+    let st = FakeStore::new(&Trace::default());
+    let a = attempt_in(State::Running);
+    st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+    let r = Resolver::new(st.clone(), Arc::new(RealClock));
+    block_on(r.resolve_abandon(a.workspace_id, step_of(&a), "operator-session:alice"))
+        .expect("resolve");
+    let rec = st.recovered();
+    assert!(
+        rec.len() == 2
+            && rec[0].state == State::Ambiguous
+            && rec[1].state == State::Resolved
+            && rec[1].resolution.kind == ResolutionKind::Abandon,
+        "recovered = {rec:?}"
+    );
+}
+
+#[test]
+fn resolver_without_a_harness_row_is_a_no_op() {
+    let st = FakeStore::new(&Trace::default());
+    let r = Resolver::new(st.clone(), Arc::new(RealClock));
+    block_on(r.resolve_abandon(
+        central_foundation::identity::WorkspaceId::new(),
+        StepAttemptId::new(),
+        "operator-session:alice",
+    ))
+    .expect("resolve");
+    assert!(st.recovered().is_empty());
+}
+
+#[test]
+fn reconciler_supersedes_the_pending_approval_of_what_it_settles() {
+    for step in [
+        LinkedStepAttemptState::Reconciliation,
+        LinkedStepAttemptState::Failed,
+        LinkedStepAttemptState::Cancelled,
+    ] {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::AwaitingPermission);
+        st.put(a.clone(), step, false);
+        let approval = st.put_approval(&a);
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+        block_on(r.run()).expect("run");
+        let got = &st.approval_list()[0];
+        assert!(
+            got.id == approval.id
+                && got.state == crate::approval::ApprovalState::Superseded
+                && got.decided_by == crate::approval::DECIDED_BY_SUPERSEDED,
+            "{step:?}: approval = {got:?}"
+        );
+        let next = st.only();
+        assert!(
+            next.state == State::Ambiguous || next.state.is_terminal(),
+            "{step:?}: attempt = {}",
+            next.state.as_str()
+        );
+    }
+}
+
+#[test]
+fn resolver_fail_unlaunched_fails_a_prepared_row_once() {
+    let st = FakeStore::new(&Trace::default());
+    let a = attempt_in(State::Prepared);
+    st.put(a.clone(), LinkedStepAttemptState::Cancelled, false);
+    let r = Resolver::new(st.clone(), Arc::new(RealClock));
+    block_on(r.fail_unlaunched(a.workspace_id, step_of(&a))).expect("fail");
+    let got = st.stored(a.id).expect("stored");
+    assert!(
+        got.state == State::Failed
+            && got.terminal.reason == REASON_NOT_LAUNCHED
+            && got.fence == a.fence
+            && got.version == a.version + 1,
+        "attempt = {} {:?} fence {} v{}",
+        got.state.as_str(),
+        got.terminal.reason,
+        got.fence.generation,
+        got.version
+    );
+    // Idempotent.
+    let writes = st.recovered().len();
+    block_on(r.fail_unlaunched(a.workspace_id, step_of(&a))).expect("second");
+    assert_eq!(st.recovered().len(), writes, "second call wrote");
+}
+
+#[test]
+fn resolver_fail_unlaunched_without_a_row_is_a_no_op() {
+    let st = FakeStore::new(&Trace::default());
+    let r = Resolver::new(st.clone(), Arc::new(RealClock));
+    block_on(r.fail_unlaunched(
+        central_foundation::identity::WorkspaceId::new(),
+        StepAttemptId::new(),
+    ))
+    .expect("fail");
+    assert!(st.recovered().is_empty());
+}
+
+#[test]
+fn resolver_fail_unlaunched_leaves_a_launched_row_to_the_reconciler() {
+    let st = FakeStore::new(&Trace::default());
+    let a = attempt_in(State::Running);
+    st.put(a.clone(), LinkedStepAttemptState::Cancelled, false);
+    let r = Resolver::new(st.clone(), Arc::new(RealClock));
+    block_on(r.fail_unlaunched(a.workspace_id, step_of(&a))).expect("fail");
+    let got = st.stored(a.id).expect("stored");
+    assert!(
+        got.state == State::Running && st.recovered().is_empty(),
+        "a launched row was failed: {}",
+        got.state.as_str()
+    );
+}
+
+#[test]
+fn resolver_fail_unlaunched_returns_the_recovery_refusal() {
+    let st = FakeStore::new(&Trace::default());
+    let a = attempt_in(State::Prepared);
+    st.put(a.clone(), LinkedStepAttemptState::Cancelled, false);
+    st.set_refuse(
+        a.id,
+        Failure::denied(domain::codes::RECOVERY_NOT_AUTHORIZED, "still lease-live"),
+    );
+    let r = Resolver::new(st.clone(), Arc::new(RealClock));
+    let err = block_on(r.fail_unlaunched(a.workspace_id, step_of(&a)))
+        .expect_err("the refusal is returned");
+    assert_eq!(err.code(), domain::codes::RECOVERY_NOT_AUTHORIZED);
+    let got = st.stored(a.id).expect("stored");
+    assert!(got.state == State::Prepared, "attempt touched");
+}
+
+// Harness phase 3g decision 6: an operator's resume created the
+// successor StepAttempt but its resolved(resume) harness write was
+// lost.
+#[test]
+fn reconciler_heals_a_lost_resume_write() {
+    // ambiguous with a successor becomes resolved(resume)
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+        let sum = block_on(r.run()).expect("run");
+        assert!(sum.resolved == 1 && sum.skipped == 0, "summary = {sum:?}");
+        let got = st.stored(a.id).expect("stored");
+        assert!(
+            got.state == State::Resolved
+                && got.version == a.version + 1
+                && got.resolution
+                    == Resolution {
+                        kind: ResolutionKind::Resume,
+                        decided_by: DECIDED_BY_OPERATOR_RESUME.to_string(),
+                    },
+            "attempt = {} v{} {:?}",
+            got.state.as_str(),
+            got.version,
+            got.resolution
+        );
+    }
+    // no session id falls back to resolved(abandon)
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = ambiguous_without_session();
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+        let sum = block_on(r.run()).expect("run");
+        assert!(sum.resolved == 1 && sum.skipped == 0, "summary = {sum:?}");
+        let got = st.stored(a.id).expect("stored");
+        assert!(
+            got.state == State::Resolved
+                && got.resolution
+                    == Resolution {
+                        kind: ResolutionKind::Abandon,
+                        decided_by: DECIDED_BY_RECOVERY.to_string(),
+                    },
+            "attempt = {} {:?}",
+            got.state.as_str(),
+            got.resolution
+        );
+    }
+    // ambiguous failed without a successor still abandons
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+        let sum = block_on(r.run()).expect("run");
+        assert_eq!(sum.resolved, 1, "summary = {sum:?}");
+        let got = st.stored(a.id).expect("stored");
+        assert!(
+            got.state == State::Resolved
+                && got.resolution
+                    == Resolution {
+                        kind: ResolutionKind::Abandon,
+                        decided_by: DECIDED_BY_RECOVERY.to_string(),
+                    },
+            "attempt = {} {:?}",
+            got.state.as_str(),
+            got.resolution
+        );
+    }
+    // a non-ambiguous row with a successor takes the failed path
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Running);
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
+        let sum = block_on(r.run()).expect("run");
+        assert_eq!(sum.settled, 1, "summary = {sum:?}");
+        let got = st.stored(a.id).expect("stored");
+        assert!(
+            got.state == State::Failed && got.terminal.reason == REASON_RECOVERED_SETTLEMENT,
+            "attempt = {} {:?}",
+            got.state.as_str(),
+            got.terminal.reason
+        );
+    }
+}
+
+#[test]
+fn resolver_complete_resume() {
+    const DECIDER: &str = "operator-session:alice";
+    let resumed = Resolution {
+        kind: ResolutionKind::Resume,
+        decided_by: DECIDER.to_string(),
+    };
+
+    // ambiguous is resolved once as resume by the given decider
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER)).expect("complete");
+        let rec = st.recovered();
+        assert!(
+            rec.len() == 1 && rec[0].state == State::Resolved && rec[0].resolution == resumed,
+            "recovered = {rec:?}"
+        );
+        block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER)).expect("second");
+        assert_eq!(st.recovered().len(), 1, "second call wrote");
+    }
+    // already resolved(resume) writes nothing
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = resolved_as(&attempt_in(State::Ambiguous), resumed.clone());
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        block_on(r.complete_resume(a.workspace_id, step_of(&a), "another-decider"))
+            .expect("complete");
+        assert!(st.recovered().is_empty(), "wrote");
+    }
+    // a version conflict reloads once and accepts resolved(resume)
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let won = resolved_as(&a, resumed.clone());
+        let st2 = st.clone();
+        let cs = Arc::new(ConflictOnce::new(st.clone(), move || {
+            st2.store_attempt(won.clone());
+        }));
+        let r = Resolver::new(cs, Arc::new(RealClock));
+        block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER)).expect("complete");
+        assert!(st.recovered().is_empty(), "wrote over the winner");
+    }
+    // a version conflict reloads once and writes a row still ambiguous
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let st2 = st.clone();
+        let cs = Arc::new(ConflictOnce::new(st.clone(), move || {
+            let mut bumped = st2.stored(a.id).expect("stored");
+            bumped.version += 1;
+            st2.store_attempt(bumped);
+        }));
+        let r = Resolver::new(cs.clone(), Arc::new(RealClock));
+        block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER)).expect("complete");
+        let rec = st.recovered();
+        assert!(
+            cs.done.load(Ordering::SeqCst)
+                && rec.len() == 1
+                && rec[0].version == a.version + 2
+                && rec[0].resolution == resumed,
+            "conflict seen {}, recovered = {rec:?}",
+            cs.done.load(Ordering::SeqCst)
+        );
+    }
+    // a version conflict reloads once and refuses resolved(abandon)
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let abandoned = resolved_as(
+            &a,
+            Resolution {
+                kind: ResolutionKind::Abandon,
+                decided_by: "operator-session:bob".to_string(),
+            },
+        );
+        let st2 = st.clone();
+        let cs = Arc::new(ConflictOnce::new(st.clone(), move || {
+            st2.store_attempt(abandoned.clone());
+        }));
+        let r = Resolver::new(cs.clone(), Arc::new(RealClock));
+        let err = block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER))
+            .expect_err("resolved(abandon) refuses");
+        assert!(
+            err.code() == domain::codes::RESUME_NOT_ALLOWED
+                && cs.done.load(Ordering::SeqCst)
+                && st.recovered().is_empty(),
+            "err {err}, conflict seen {}, writes",
+            cs.done.load(Ordering::SeqCst)
+        );
+    }
+    // a persistent version conflict is returned after one reload
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        st.set_refuse(
+            a.id,
+            Failure::conflict(domain::codes::VERSION_CONFLICT, "the attempt moved on"),
+        );
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        let err = block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER))
+            .expect_err("conflict returned");
+        assert_eq!(err.code(), domain::codes::VERSION_CONFLICT);
+    }
+    // resolved(abandon) is not resumable
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = resolved_as(
+            &attempt_in(State::Ambiguous),
+            Resolution {
+                kind: ResolutionKind::Abandon,
+                decided_by: "operator-session:bob".to_string(),
+            },
+        );
+        st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        let err = block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER))
+            .expect_err("not resumable");
+        assert!(
+            err.code() == domain::codes::RESUME_NOT_ALLOWED && st.recovered().is_empty(),
+            "err {err}, writes"
+        );
+    }
+    // a live attempt is not resumable
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Running);
+        st.put(a.clone(), LinkedStepAttemptState::Invoked, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        let err = block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER))
+            .expect_err("not resumable");
+        assert!(
+            err.code() == domain::codes::RESUME_NOT_ALLOWED && st.recovered().is_empty(),
+            "err {err}, writes"
+        );
+    }
+    // an ambiguous attempt without a session id is not resumable
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = ambiguous_without_session();
+        st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        let err = block_on(r.complete_resume(a.workspace_id, step_of(&a), DECIDER))
+            .expect_err("not resumable");
+        assert!(
+            err.code() == domain::codes::RESUME_NOT_ALLOWED && st.recovered().is_empty(),
+            "err {err}, writes"
+        );
+    }
+    // no row wraps ErrAttemptNotFound
+    {
+        let st = FakeStore::new(&Trace::default());
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        let err = block_on(r.complete_resume(
+            central_foundation::identity::WorkspaceId::new(),
+            StepAttemptId::new(),
+            DECIDER,
+        ))
+        .expect_err("missing row");
+        assert_eq!(err.code(), domain::codes::ATTEMPT_NOT_FOUND);
+    }
+}
+
+// ===========================================================================
+// rerun_resolver_test.go — harness phase 3k decision 4 (acceptance 1):
+// ResolveRerun has ResolveAbandon's shape with the kind rerun.
+// ===========================================================================
+
+#[test]
+fn resolver_resolve_rerun() {
+    const DECIDER: &str = "operator-session:alice";
+
+    // ambiguous: resolved(rerun), once
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        block_on(r.resolve_rerun(a.workspace_id, step_of(&a), DECIDER)).expect("rerun");
+        let got = st.stored(a.id).expect("stored");
+        assert!(
+            got.state == State::Resolved
+                && got.resolution
+                    == Resolution {
+                        kind: ResolutionKind::Rerun,
+                        decided_by: DECIDER.to_string(),
+                    }
+                && got.fence == a.fence
+                && got.version == a.version + 1,
+            "attempt = {} {:?} fence {} v{}",
+            got.state.as_str(),
+            got.resolution,
+            got.fence.generation,
+            got.version
+        );
+        let writes = st.recovered().len();
+        block_on(r.resolve_rerun(a.workspace_id, step_of(&a), DECIDER)).expect("second");
+        assert_eq!(st.recovered().len(), writes, "second call wrote");
+    }
+    // a live row is marked ambiguous first
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Running);
+        st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        block_on(r.resolve_rerun(a.workspace_id, step_of(&a), DECIDER)).expect("rerun");
+        let rec = st.recovered();
+        assert!(
+            rec.len() == 2
+                && rec[0].state == State::Ambiguous
+                && rec[1].state == State::Resolved
+                && rec[1].resolution.kind == ResolutionKind::Rerun,
+            "recovered = {rec:?}"
+        );
+    }
+    // already resolved(abandon) is left alone
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = resolved_as(
+            &attempt_in(State::Ambiguous),
+            Resolution {
+                kind: ResolutionKind::Abandon,
+                decided_by: DECIDED_BY_RECOVERY.to_string(),
+            },
+        );
+        st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        block_on(r.resolve_rerun(a.workspace_id, step_of(&a), DECIDER)).expect("rerun");
+        assert!(st.recovered().is_empty(), "a resolved row was touched");
+    }
+    // no row is a no-op
+    {
+        let st = FakeStore::new(&Trace::default());
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        block_on(r.resolve_rerun(
+            central_foundation::identity::WorkspaceId::new(),
+            StepAttemptId::new(),
+            DECIDER,
+        ))
+        .expect("rerun");
+        assert!(st.recovered().is_empty());
+    }
+    // the recovery authority's refusal is returned
+    {
+        let st = FakeStore::new(&Trace::default());
+        let a = attempt_in(State::Ambiguous);
+        st.put(a.clone(), LinkedStepAttemptState::Failed, false);
+        st.set_refuse(
+            a.id,
+            Failure::denied(domain::codes::RECOVERY_NOT_AUTHORIZED, "retry pending"),
+        );
+        let r = Resolver::new(st.clone(), Arc::new(RealClock));
+        let err = block_on(r.resolve_rerun(a.workspace_id, step_of(&a), DECIDER))
+            .expect_err("refusal returned");
+        assert_eq!(err.code(), domain::codes::RECOVERY_NOT_AUTHORIZED);
+    }
+}
+
+// ===========================================================================
+// dispatcher_test.go — the bounded fan-out driver (harness phase 3h):
+// probe before claim, paused states, bounded concurrency, the startup
+// sweep, cooldowns, lost/settle-failed holds, bounded shutdown.
+// ===========================================================================
+
+/// `lastIndex` — the last trace position of `call`, or -1.
+fn last_index(calls: &[String], call: &str) -> i64 {
+    calls
+        .iter()
+        .rposition(|c| c == call)
+        .map(|i| i as i64)
+        .unwrap_or(-1)
+}
+
+/// `dispatcherConfig{}` — the world default the port of
+/// `newDispatchWorld` applies.
+fn dispatch_cfg() -> DispatcherConfig {
+    DispatcherConfig {
+        concurrency: 1,
+        launch_env: test_env(),
+        poll_interval: Duration::milliseconds(5),
+        pause_retry: Duration::milliseconds(30),
+        shutdown_budget: Duration::ZERO,
+        probe_budget: Duration::ZERO,
+        not_startable_cooldown: Duration::ZERO,
+        max_not_startable_cooldown: Duration::ZERO,
+    }
+}
+
+fn probe_ok() -> port::ProbeResult {
+    port::ProbeResult {
+        harness_version: "2.1.283".to_string(),
+        authenticated: true,
+        detail: String::new(),
+    }
+}
+
+#[test]
+fn dispatcher_probes_before_claiming_and_pauses_when_not_logged_in() {
+    let tr = Trace::default();
+    let run = queued_run();
+    let life = Arc::new(Lifecycle::new(&tr, vec![run.clone()]));
+    let w = new_dispatch_world(None, life, dispatch_cfg());
+    w.ad.set_probe(port::ProbeResult {
+        harness_version: "2.1.283".to_string(),
+        authenticated: false,
+        detail: String::new(),
+    });
+    w.start();
+    wait_for("a not-logged-in pause", || {
+        let s = w.disp.status();
+        s.state == DispatcherState::Paused && s.pause == PauseReason::NotLoggedIn
+    });
+    std::thread::sleep(std::time::Duration::from_millis(80)); // several re-probes
+    assert_eq!(
+        w.tr.count("lifecycle.Start"),
+        0,
+        "claimed while not logged in"
+    );
+    let paused = w.sink.of(MilestoneKind::DispatchPaused);
+    assert!(
+        paused.len() == 1
+            && paused[0].task_id == run.task_id
+            && paused[0].reason == PauseReason::NotLoggedIn.as_str(),
+        "paused milestones = {paused:?}"
+    );
+    w.ad.set_probe(probe_ok());
+    wait_for("the claim after login", || {
+        w.tr.count("lifecycle.Start") == 1
+    });
+    assert_eq!(
+        w.disp.status().state,
+        DispatcherState::Running,
+        "status = {:?}",
+        w.disp.status()
+    );
+    let calls = w.tr.all();
+    let last = last_index(&calls, "adapter.Probe");
+    assert!(
+        !(last > w.tr.index("lifecycle.Start") || last < 0),
+        "no probe before the claim: {calls:?}"
+    );
+    let resumed = w.sink.of(MilestoneKind::DispatchResumed);
+    assert!(
+        resumed.len() == 1 && resumed[0].task_id == run.task_id,
+        "resumed milestones = {resumed:?}"
+    );
+    w.stop_wait().expect("stop");
+    assert_eq!(
+        w.disp.status().state,
+        DispatcherState::Stopped,
+        "status after stop = {:?}",
+        w.disp.status()
+    );
+}
+
+#[test]
+fn dispatcher_pauses_while_the_launcher_is_unreachable() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![queued_run()]));
+    let w = new_dispatch_world(None, life, dispatch_cfg());
+    w.ad.set_probe_err(Some(Failure::internal(
+        "probe",
+        "dial unix: connection refused",
+    )));
+    w.start();
+    wait_for("a launcher-unreachable pause", || {
+        let s = w.disp.status();
+        s.paused() && s.pause == PauseReason::LauncherUnreachable
+    });
+    assert_eq!(
+        w.tr.count("lifecycle.Start"),
+        0,
+        "claimed with the launcher unreachable"
+    );
+    w.ad.set_probe_err(None);
+    wait_for("the claim after the launcher returned", || {
+        w.tr.count("lifecycle.Start") == 1
+    });
+}
+
+#[test]
+fn dispatcher_pauses_on_low_disk_without_probing() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![queued_run()]));
+    let w = new_dispatch_world(None, life, dispatch_cfg());
+    w.prov.set_space_err(Some(Failure::unavailable(
+        codes::LOW_DISK,
+        "free space below the minimum",
+    )));
+    w.start();
+    wait_for("a low-disk pause", || {
+        let s = w.disp.status();
+        s.paused() && s.pause == PauseReason::LowDisk
+    });
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert!(
+        w.tr.count("adapter.Probe") == 0 && w.tr.count("lifecycle.Start") == 0,
+        "probed or claimed on low disk: {:?}",
+        w.tr.all()
+    );
+    w.prov.set_space_err(None);
+    wait_for("the claim after space was freed", || {
+        w.tr.count("lifecycle.Start") == 1
+    });
+}
+
+#[test]
+fn dispatcher_idles_without_probing_when_nothing_is_dispatchable() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![]));
+    let w = new_dispatch_world(None, life, dispatch_cfg());
+    w.start();
+    wait_for("running", || {
+        w.disp.status().state == DispatcherState::Running
+    });
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    // One startup probe, then none while the queue is empty.
+    assert_eq!(
+        w.tr.count("adapter.Probe"),
+        1,
+        "probes, want only the startup probe"
+    );
+}
+
+// §7 acceptance: serve starting with the launcher stopped is ready with
+// the dispatcher paused, and resumes once the probe succeeds.
+#[test]
+fn dispatcher_starts_paused_when_the_harness_is_unavailable() {
+    struct Case {
+        name: &'static str,
+        down: Box<dyn Fn(&DispatchWorld)>,
+        up: Box<dyn Fn(&DispatchWorld)>,
+        reason: PauseReason,
+    }
+    let cases = vec![
+        Case {
+            name: "launcher down",
+            down: Box::new(|w: &DispatchWorld| {
+                w.ad.set_probe_err(Some(Failure::internal(
+                    "probe",
+                    "dial unix: connection refused",
+                )));
+            }),
+            up: Box::new(|w: &DispatchWorld| w.ad.set_probe_err(None)),
+            reason: PauseReason::LauncherUnreachable,
+        },
+        Case {
+            name: "not logged in",
+            down: Box::new(|w: &DispatchWorld| {
+                w.ad.set_probe(port::ProbeResult {
+                    harness_version: "2.1.283".to_string(),
+                    authenticated: false,
+                    detail: String::new(),
+                });
+            }),
+            up: Box::new(|w: &DispatchWorld| w.ad.set_probe(probe_ok())),
+            reason: PauseReason::NotLoggedIn,
+        },
+    ];
+    for tc in cases {
+        let tr = Trace::default();
+        let life = Arc::new(Lifecycle::new(&tr, vec![]));
+        let mut cfg = dispatch_cfg();
+        cfg.pause_retry = Duration::milliseconds(20);
+        let w = new_dispatch_world(None, life, cfg);
+        (tc.down)(&w);
+        w.start();
+        wait_for("a paused start", || {
+            let s = w.disp.status();
+            s.paused() && s.pause == tc.reason
+        });
+        assert!(
+            w.tr.index("adapter.Probe") >= 0,
+            "{}: paused without a probe: {:?}",
+            tc.name,
+            w.tr.all()
+        );
+        wait_for("a re-probe while paused", || {
+            w.tr.count("adapter.Probe") >= 3
+        });
+        assert_eq!(
+            w.disp.status().state,
+            DispatcherState::Paused,
+            "{}: status = {:?}",
+            tc.name,
+            w.disp.status()
+        );
+        (tc.up)(&w);
+        wait_for("running after the probe succeeded", || {
+            w.disp.status().state == DispatcherState::Running
+        });
+        let probes = w.tr.count("adapter.Probe");
+        std::thread::sleep(std::time::Duration::from_millis(60)); // three pause retries
+        assert_eq!(
+            w.tr.count("adapter.Probe"),
+            probes,
+            "{}: probed an empty queue after resuming",
+            tc.name
+        );
+        assert!(
+            w.sink.of(MilestoneKind::DispatchPaused).is_empty(),
+            "{}: paused milestone with no waiting task",
+            tc.name
+        );
+        w.stop_wait().expect("stop");
+    }
+}
+
+#[test]
+fn dispatcher_runs_at_most_concurrency_attempts() {
+    let tr = Trace::default();
+    let runs: Vec<DispatchableRun> = (0..5).map(|_| queued_run()).collect();
+    let life = Arc::new(Lifecycle::new(&tr, runs));
+    let release = Arc::new(ManualCancel::default());
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.release = Some(release.clone());
+    runner.result = HarnessResult::bare(Outcome::Succeeded, None);
+    let runner = Arc::new(runner);
+    let mut cfg = dispatch_cfg();
+    cfg.concurrency = 2;
+    let w = new_dispatch_world(Some(runner.clone()), life, cfg);
+    w.start();
+    wait_for("two attempts", || runner.active.load(Ordering::SeqCst) == 2);
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    assert!(
+        runner.calls.load(Ordering::SeqCst) == 2 && w.disp.status().active == 2,
+        "calls={} active={}",
+        runner.calls.load(Ordering::SeqCst),
+        w.disp.status().active
+    );
+    release.cancel();
+    wait_for("every run", || {
+        runner.calls.load(Ordering::SeqCst) == 5 && runner.active.load(Ordering::SeqCst) == 0
+    });
+    assert_eq!(runner.max_active.load(Ordering::SeqCst), 2, "max active");
+}
+
+#[test]
+fn new_dispatcher_rejects_concurrency_outside_one_to_four() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![]));
+    for c in [0usize, 5] {
+        let mut cfg = dispatch_cfg();
+        cfg.concurrency = c;
+        let res = super::dispatcher::Dispatcher::new(super::dispatcher::DispatcherDeps {
+            lifecycle: life.clone(),
+            runner: starting_runner(life.clone()),
+            adapter: Arc::new(FakeAdapter::new(
+                &tr,
+                "claude-code",
+                Capabilities::default(),
+                vec![],
+            )),
+            launcher: Arc::new(FakeLauncher::new()),
+            recovery: FakeStore::new(&tr),
+            workspaces: Arc::new(Provisioner::new(&tr, Arc::new(super::ports::RealTicker))),
+            events: Arc::new(Sink::new(&tr, false)),
+            clock: Arc::new(RealClock),
+            ticker: Arc::new(super::ports::RealTicker),
+            logger: Arc::new(RecordingLog::default()),
+            cfg,
+        });
+        assert!(res.is_err(), "concurrency {c} accepted");
+    }
+}
+
+#[test]
+fn dispatcher_sweeps_ambiguous_scopes_on_first_start() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![]));
+    let w = new_dispatch_world(None, life, dispatch_cfg());
+    let alive = attempt_in(State::Ambiguous);
+    let dead = attempt_in(State::Ambiguous);
+    let running = attempt_in(State::Running);
+    w.st.put(alive.clone(), LinkedStepAttemptState::Reconciliation, false);
+    w.st.put(dead.clone(), LinkedStepAttemptState::Reconciliation, false);
+    w.st.put(running.clone(), LinkedStepAttemptState::Invoked, true);
+    w.launcher.set_alive(&alive.sandbox_scope_id, true);
+    w.launcher.set_alive(&running.sandbox_scope_id, true);
+    w.launcher
+        .fail_alive(Some(Failure::internal("alive", "launcher unreachable")));
+    w.start();
+    wait_for("a launcher-unreachable pause", || {
+        let s = w.disp.status();
+        s.paused() && s.pause == PauseReason::LauncherUnreachable
+    });
+    assert!(
+        w.launcher.kills().is_empty(),
+        "killed without asking the launcher"
+    );
+    w.launcher.fail_alive(None);
+    wait_for("running after the sweep", || {
+        w.disp.status().state == DispatcherState::Running
+    });
+    let kills = w.launcher.kills();
+    assert!(
+        kills.len() == 1 && kills[0] == alive.sandbox_scope_id,
+        "kills = {kills:?}, want only {}",
+        alive.sandbox_scope_id
+    );
+}
+
+#[test]
+fn dispatcher_never_redispatches_a_lost_run() {
+    let tr = Trace::default();
+    let run = queued_run();
+    let life = Arc::new(Lifecycle::new(&tr, vec![run.clone()]));
+    life.set_relist_all(true); // relistingLifecycle
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.result = HarnessResult {
+        outcome: Outcome::Lost,
+        reason: FailureCode::LEASE_LOST,
+        low_disk: false,
+        settle_failed: false,
+        err: Some(Failure::conflict(codes::LEASE_LOST, "the lease was lost")),
+    };
+    let runner = Arc::new(runner);
+    let w = new_dispatch_world(Some(runner.clone()), life, dispatch_cfg());
+    w.start();
+    wait_for("the lost run to be recorded", || {
+        w.disp.status().lost.len() == 1
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        1,
+        "lost run dispatched more than once"
+    );
+    let lost = w.disp.status().lost;
+    assert_eq!(lost[0], run.run_id, "lost = {lost:?}");
+}
+
+#[test]
+fn dispatcher_shutdown_closes_lifelines_within_the_budget() {
+    let w = new_world(
+        default_cfg(),
+        Capabilities::default(),
+        vec![blocking_script(), blocking_script()],
+    );
+    w.life.push_run(queued_run());
+    let runner: Arc<dyn super::dispatcher::AttemptRunner> = Arc::new(
+        Orchestrator::new(super::orchestrator::OrchestratorDeps {
+            lifecycle: w.life.clone(),
+            attempts: w.st.clone(),
+            adapter: w.ad.clone(),
+            workspaces: w.prov.clone(),
+            capture: w.cap.clone(),
+            artifacts: w.arts.clone(),
+            clock: w.clock.clone(),
+            ticker: w.ticker.clone(),
+            cfg: {
+                let mut c = default_cfg();
+                c.adapter_version = "claudecode/3a".to_string();
+                c.launch_env = test_env();
+                c.events = Some(w.sink.clone());
+                c
+            },
+        })
+        .expect("NewOrchestrator"),
+    );
+    let mut cfg = dispatch_cfg();
+    cfg.concurrency = 2;
+    cfg.shutdown_budget = Duration::SECOND;
+    let d = super::dispatcher::Dispatcher::new(super::dispatcher::DispatcherDeps {
+        lifecycle: w.life.clone(),
+        runner,
+        adapter: w.ad.clone(),
+        launcher: Arc::new(FakeLauncher::new()),
+        recovery: w.st.clone(),
+        workspaces: w.prov.clone(),
+        events: w.sink.clone(),
+        clock: w.clock.clone(),
+        ticker: w.ticker.clone(),
+        logger: Arc::new(RecordingLog::default()),
+        cfg,
+    })
+    .expect("NewDispatcher");
+    let d = Arc::new(d);
+    let stop: Arc<dyn super::ports::CancelSignal> = w.stop.clone();
+    let d2 = d.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(block_on(d2.run(stop)));
+    });
+    wait_for("two waiting sessions", || {
+        w.tr.count("store.AppendEvent:permission_requested") == 2
+    });
+    let started = std::time::Instant::now();
+    w.stop.cancel();
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("Run did not return")
+        .expect("Run");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    for i in 0..2 {
+        let (_, kills) =
+            w.ad.session_counts(i)
+                .unwrap_or_else(|| unreachable!("session {i}"));
+        assert_eq!(kills, 1, "session {i} lifeline not closed");
+    }
+    assert_eq!(w.tr.count("lifecycle.Settle"), 0, "settled during shutdown");
+    assert_eq!(
+        d.status().state,
+        DispatcherState::Stopped,
+        "status = {:?}",
+        d.status()
+    );
+}
+
+#[test]
+fn dispatcher_shutdown_reports_an_attempt_that_outlives_the_budget() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![queued_run()]));
+    let release = Arc::new(ManualCancel::default());
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.release = Some(release.clone());
+    runner.ignore_stop = true;
+    let runner = Arc::new(runner);
+    let mut cfg = dispatch_cfg();
+    cfg.shutdown_budget = Duration::milliseconds(30);
+    let w = new_dispatch_world(Some(runner.clone()), life, cfg);
+    w.start();
+    wait_for("the attempt", || runner.active.load(Ordering::SeqCst) == 1);
+    assert!(
+        w.stop_wait().is_err(),
+        "shutdown past the budget reported no error"
+    );
+    release.cancel();
+}
+
+#[test]
+fn dispatcher_pauses_on_low_disk_reported_by_an_attempt() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![queued_run()]));
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.result = HarnessResult {
+        outcome: Outcome::Abandoned,
+        reason: FailureCode::WORKSPACE_UNAVAILABLE,
+        low_disk: true,
+        settle_failed: false,
+        err: None,
+    };
+    let runner = Arc::new(runner);
+    let mut cfg = dispatch_cfg();
+    cfg.pause_retry = Duration::HOUR;
+    let w = new_dispatch_world(Some(runner), life, cfg);
+    w.start();
+    wait_for("a low-disk pause", || {
+        let s = w.disp.status();
+        s.paused() && s.pause == PauseReason::LowDisk
+    });
+}
+
+// Review T-I2: the oldest Run is listed but refused at start. It must
+// not block the Run after it, and the dispatcher must not re-probe
+// for it round after round.
+#[test]
+fn dispatcher_cools_down_a_run_it_cannot_start() {
+    let tr = Trace::default();
+    let next = queued_run();
+    let life = Arc::new(Lifecycle::new(&tr, vec![next]));
+    let refused = queued_run();
+    life.set_refused(Some(refused));
+    let mut cfg = dispatch_cfg();
+    cfg.not_startable_cooldown = Duration::HOUR;
+    let w = new_dispatch_world(Some(starting_runner(life.clone())), life.clone(), cfg);
+    w.start();
+    wait_for("the run behind the refused one", || {
+        w.tr.count("lifecycle.Start") == 2
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100)); // twenty poll intervals
+    assert_eq!(
+        life.refuse_attempts.load(Ordering::SeqCst),
+        1,
+        "refused run started more than once (cool-down)"
+    );
+    // The startup probe, then one per claim round.
+    assert!(
+        w.tr.count("adapter.Probe") <= 3,
+        "probed {} times for one refused and one started run",
+        w.tr.count("adapter.Probe")
+    );
+    assert_eq!(
+        w.disp.status().state,
+        DispatcherState::Running,
+        "status = {:?}",
+        w.disp.status()
+    );
+}
+
+#[test]
+fn dispatcher_retries_a_refused_run_after_its_cooldown() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![]));
+    life.set_refused(Some(queued_run()));
+    let mut cfg = dispatch_cfg();
+    cfg.not_startable_cooldown = Duration::milliseconds(20);
+    cfg.max_not_startable_cooldown = Duration::milliseconds(40);
+    let w = new_dispatch_world(Some(starting_runner(life.clone())), life.clone(), cfg);
+    w.start();
+    wait_for("a retry after the cool-down", || {
+        life.refuse_attempts.load(Ordering::SeqCst) >= 3
+    });
+    let started = std::time::Instant::now();
+    let before = life.refuse_attempts.load(Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // At most one retry per capped back-off (40 ms), plus one in
+    // flight.
+    let n = life.refuse_attempts.load(Ordering::SeqCst) - before;
+    let budget = (started.elapsed().as_millis() / 40) as i64 + 1;
+    assert!(
+        n <= budget,
+        "{n} retries in {:?}: the back-off is not applied",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn dispatcher_sweep_bounds_a_hanging_launcher() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![]));
+    let mut cfg = dispatch_cfg();
+    cfg.pause_retry = Duration::milliseconds(20);
+    cfg.probe_budget = Duration::milliseconds(20);
+    let w = new_dispatch_world(None, life, cfg);
+    let survivor = attempt_in(State::Ambiguous);
+    w.st.put(
+        survivor.clone(),
+        LinkedStepAttemptState::Reconciliation,
+        false,
+    );
+    w.launcher.set_alive(&survivor.sandbox_scope_id, true);
+    w.launcher.hang.store(true, Ordering::SeqCst);
+    w.start();
+    wait_for("a launcher-unreachable pause", || {
+        let s = w.disp.status();
+        s.paused() && s.pause == PauseReason::LauncherUnreachable
+    });
+    wait_for("a second bounded sweep", || {
+        w.launcher.alive_calls.load(Ordering::SeqCst) >= 2
+    });
+    w.launcher.hang.store(false, Ordering::SeqCst);
+    wait_for("running after the sweep", || {
+        w.disp.status().state == DispatcherState::Running
+    });
+    let kills = w.launcher.kills();
+    assert!(
+        kills.len() == 1 && kills[0] == survivor.sandbox_scope_id,
+        "kills = {kills:?}"
+    );
+}
+
+#[test]
+fn dispatcher_surfaces_a_failed_settlement_and_never_redispatches_it() {
+    let tr = Trace::default();
+    let run = queued_run();
+    let life = Arc::new(Lifecycle::new(&tr, vec![run.clone()]));
+    life.set_relist_all(true); // relistingLifecycle
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.result = HarnessResult {
+        outcome: Outcome::Failed,
+        reason: FailureCode::BUDGET_COST,
+        low_disk: false,
+        settle_failed: true,
+        err: Some(Failure::internal(
+            "settle",
+            "settle refused: IMMUTABLE_ATTEMPT",
+        )),
+    };
+    let runner = Arc::new(runner);
+    let w = new_dispatch_world(Some(runner.clone()), life, dispatch_cfg());
+    w.start();
+    wait_for("the settle-failed run to be recorded", || {
+        w.disp.status().settle_failed.len() == 1
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        1,
+        "settle-failed run dispatched more than once"
+    );
+    let s = w.disp.status();
+    assert!(
+        s.settle_failed[0] == run.run_id && s.lost.is_empty() && s.needs_restart(),
+        "status = {s:?}"
+    );
+    let out = w.log.all();
+    assert!(
+        out.contains("level=WARN")
+            && out.contains("settlement not written")
+            && out.contains("IMMUTABLE_ATTEMPT")
+            && out.contains(&run.run_id.to_string())
+            && out.contains("outcome=failed"),
+        "log = {out}"
+    );
+}
+
+#[test]
+fn dispatcher_logs_the_error_of_any_outcome() {
+    let tr = Trace::default();
+    let run = queued_run();
+    let life = Arc::new(Lifecycle::new(&tr, vec![run.clone()]));
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.result = HarnessResult {
+        outcome: Outcome::Abandoned,
+        reason: FailureCode::WORKSPACE_UNAVAILABLE,
+        low_disk: false,
+        settle_failed: false,
+        err: Some(Failure::internal("resume", "source missing")),
+    };
+    let runner = Arc::new(runner);
+    let w = new_dispatch_world(Some(runner.clone()), life, dispatch_cfg());
+    w.start();
+    wait_for("the run", || runner.calls.load(Ordering::SeqCst) == 1);
+    wait_for("the warning", || {
+        let out = w.log.all();
+        out.contains("level=WARN")
+            && out.contains("source missing")
+            && out.contains("outcome=abandoned")
+            && out.contains(&run.run_id.to_string())
+    });
+    assert!(
+        !w.disp.status().needs_restart(),
+        "status = {:?}",
+        w.disp.status()
+    );
+}
+
+// The lost set keeps at most 256 Runs, evicting the oldest.
+#[test]
+fn dispatcher_bounds_the_lost_set() {
+    const RUNS: usize = 300;
+    let tr = Trace::default();
+    let all: Vec<DispatchableRun> = (0..RUNS).map(|_| queued_run()).collect();
+    let life = Arc::new(Lifecycle::new(&tr, all));
+    life.set_relist_all(true); // relistingLifecycle
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.result = HarnessResult {
+        outcome: Outcome::Lost,
+        reason: FailureCode::LEASE_LOST,
+        low_disk: false,
+        settle_failed: false,
+        err: Some(Failure::conflict(codes::LEASE_LOST, "the lease was lost")),
+    };
+    let runner = Arc::new(runner);
+    let mut cfg = dispatch_cfg();
+    cfg.concurrency = super::dispatcher::MAX_CONCURRENCY;
+    cfg.poll_interval = Duration::milliseconds(1);
+    let w = new_dispatch_world(Some(runner.clone()), life, cfg);
+    w.start();
+    wait_for("every run to be lost once", || {
+        assert!(
+            w.disp.status().lost.len() <= 256,
+            "lost set holds {} runs",
+            w.disp.status().lost.len()
+        );
+        runner.calls.load(Ordering::SeqCst) >= RUNS as i64
+    });
+    assert_eq!(w.disp.status().lost.len(), 256, "lost set holds, want 256");
+}
+
+// Review minor 1: a start whose commit outcome is unknown may have
+// left the Task running with nobody driving it. It is held lost, so
+// NeedsRestart and the banner show it, and it is never re-dispatched.
+#[test]
+fn dispatcher_holds_a_start_with_an_unknown_outcome_as_lost() {
+    let tr = Trace::default();
+    let run = queued_run();
+    let life = Arc::new(Lifecycle::new(&tr, vec![run.clone()]));
+    life.set_relist_all(true); // relistingLifecycle
+    life.set_start_err(Some(Failure::internal(
+        codes::START_OUTCOME_UNKNOWN,
+        "connection reset at commit",
+    )));
+    let w = new_dispatch_world(None, life.clone(), dispatch_cfg());
+    let runner: Arc<dyn super::dispatcher::AttemptRunner> = Arc::new(
+        Orchestrator::new(super::orchestrator::OrchestratorDeps {
+            lifecycle: life.clone(),
+            attempts: w.st.clone(),
+            adapter: w.ad.clone(),
+            workspaces: w.prov.clone(),
+            capture: w.cap.clone(),
+            artifacts: w.arts.clone(),
+            clock: w.clock.clone(),
+            ticker: w.ticker.clone(),
+            cfg: {
+                let mut c = default_cfg();
+                c.adapter_version = "v".to_string();
+                c.launch_env = test_env();
+                c.events = Some(w.sink.clone());
+                c
+            },
+        })
+        .expect("NewOrchestrator"),
+    );
+    let d = super::dispatcher::Dispatcher::new(super::dispatcher::DispatcherDeps {
+        lifecycle: life.clone(),
+        runner,
+        adapter: w.ad.clone(),
+        launcher: w.launcher.clone(),
+        recovery: w.st.clone(),
+        workspaces: w.prov.clone(),
+        events: w.sink.clone(),
+        clock: w.clock.clone(),
+        ticker: w.ticker.clone(),
+        logger: w.log.clone(),
+        cfg: dispatch_cfg(),
+    })
+    .expect("NewDispatcher");
+    let d = Arc::new(d);
+    let stop: Arc<dyn super::ports::CancelSignal> = w.stop.clone();
+    let d2 = d.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(block_on(d2.run(stop)));
+    });
+    wait_for("the unknown start to be held lost", || {
+        d.status().lost.len() == 1
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let s = d.status();
+    assert!(
+        s.lost[0] == run.run_id && s.needs_restart(),
+        "status = {s:?}"
+    );
+    assert_eq!(
+        w.tr.count("lifecycle.Start"),
+        1,
+        "started more than once (never re-dispatched)"
+    );
+    assert_eq!(
+        w.tr.count("provisioner.Provision") + w.tr.count("store.Create"),
+        0,
+        "worked on an unknown start: {:?}",
+        w.tr.all()
+    );
+    w.stop.cancel();
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
 }

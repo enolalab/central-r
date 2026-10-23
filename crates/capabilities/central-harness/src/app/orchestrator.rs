@@ -16,8 +16,8 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use central_foundation::failure::Failure;
@@ -376,12 +376,17 @@ struct Standing<'o> {
     /// disables the drop).
     attempt_id: HarnessAttemptId,
     /// `r.stop` — the serve-stop channel; `None` once it fired (a
-    /// completed future is never polled again).
-    stop: Option<PortFuture<'o, ()>>,
+    /// completed future is never polled again). The `Mutex` makes
+    /// `Standing` `Sync` — a `PortFuture` is `Send` but not `Sync`, and
+    /// the dispatcher's `AttemptRunner` contract needs the
+    /// orchestration future `Send` (the kernel spawns it); only
+    /// `poll`/`new` touch these, always under `&mut self`, so
+    /// `get_mut` stands in for locking.
+    stop: Option<Mutex<PortFuture<'o, ()>>>,
     /// `r.hbTick` — next heartbeat tick.
-    hb_tick: PortFuture<'o, ()>,
+    hb_tick: Mutex<PortFuture<'o, ()>>,
     /// `r.hb` — a heartbeat in flight.
-    hb: Option<PortFuture<'o, Result<bool, Failure>>>,
+    hb: Mutex<Option<PortFuture<'o, Result<bool, Failure>>>>,
     /// `r.cancelReq`-closed — `requestCancel` ran (the upstream
     /// channel; `cancelHit` is `AttemptRun::cancel_consumed`).
     cancel_hit: bool,
@@ -399,9 +404,9 @@ impl<'o> Standing<'o> {
             o,
             run,
             attempt_id: HarnessAttemptId::from_trusted_db_bytes([0; 16]),
-            hb_tick: o.deps.ticker.after(o.deps.cfg.heartbeat_interval),
-            stop: Some(stop.cancelled()),
-            hb: None,
+            hb_tick: Mutex::new(o.deps.ticker.after(o.deps.cfg.heartbeat_interval)),
+            stop: Some(Mutex::new(stop.cancelled())),
+            hb: Mutex::new(None),
             cancel_hit: false,
             end: End::Live,
             last_beat_at: o.deps.clock.now(),
@@ -458,30 +463,63 @@ impl<'o> Standing<'o> {
     }
 
     /// `pollStanding` — one non-blocking pass over the standing arms.
+    /// `get_mut` reaches through the `Mutex`es: `poll` has `&mut self`,
+    /// so no locking is needed.
     fn poll(&mut self, cx: &mut std::task::Context<'_>) {
-        if let Some(stop) = self.stop.as_mut()
-            && let Poll::Ready(()) = stop.as_mut().poll(cx)
-        {
-            self.stop = None;
-            self.end_with(End::Stopped);
+        if let Some(stop) = self.stop.as_mut() {
+            let done = matches!(
+                stop.get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+                    .poll(cx),
+                Poll::Ready(())
+            );
+            if done {
+                self.stop = None;
+                self.end_with(End::Stopped);
+            }
         }
         if !self.hb_stopped {
-            if let Poll::Ready(()) = self.hb_tick.as_mut().poll(cx) {
+            let tick = {
+                let hb_tick = self.hb_tick.get_mut().unwrap_or_else(|e| e.into_inner());
+                matches!(hb_tick.as_mut().poll(cx), Poll::Ready(()))
+            };
+            if tick {
                 // A tick while a heartbeat is in flight is dropped
                 // (upstream's ticker drops it when unreceived).
-                if self.hb.is_none() {
-                    self.hb = Some(self.o.deps.lifecycle.heartbeat(self.run.clone()));
+                {
+                    let hb = self.hb.get_mut().unwrap_or_else(|e| e.into_inner());
+                    if hb.is_none() {
+                        *hb = Some(self.o.deps.lifecycle.heartbeat(self.run.clone()));
+                    }
                 }
-                self.hb_tick = self.o.deps.ticker.after(self.o.deps.cfg.heartbeat_interval);
+                *self.hb_tick.get_mut().unwrap_or_else(|e| e.into_inner()) =
+                    self.o.deps.ticker.after(self.o.deps.cfg.heartbeat_interval);
                 // Poll the fresh timer now so it registers this pass's
                 // waker: a timer that fires before its first poll can
                 // never wake the executor.
-                let _ = self.hb_tick.as_mut().poll(cx);
+                let _ = self
+                    .hb_tick
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_mut()
+                    .poll(cx);
             }
-            if let Some(hb) = self.hb.as_mut()
-                && let Poll::Ready(res) = hb.as_mut().poll(cx)
-            {
-                self.hb = None;
+            let res = {
+                let hb_slot = self.hb.get_mut().unwrap_or_else(|e| e.into_inner());
+                let res = match hb_slot.as_mut() {
+                    Some(f) => match f.as_mut().poll(cx) {
+                        Poll::Ready(res) => Some(res),
+                        Poll::Pending => None,
+                    },
+                    None => None,
+                };
+                if res.is_some() {
+                    *hb_slot = None;
+                }
+                res
+            };
+            if let Some(res) = res {
                 self.on_heartbeat(res);
             }
         }

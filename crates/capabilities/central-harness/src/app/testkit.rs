@@ -30,16 +30,18 @@ use crate::domain::{self, Kind, PermissionPolicy, Terminal, TerminalStatus, Work
 use crate::event::{Event, EventKind, EventPayload, PermissionResolved};
 use crate::port::{
     Adapter, ApprovalOpen, AttemptStore, ExecutionLease, LeaseBinder, OperatorInput,
-    PermissionDecision, PortFuture, ProbeResult, ReconcileInput, ReconcileResult, Session,
+    PermissionDecision, PortFuture, ProbeResult, Process, ProcessLauncher, ProcessSpec,
+    ReconcileInput, ReconcileResult, RecoveryCandidate, RecoveryCursor, RecoveryStore, Session,
     SessionRef, StartSpec,
 };
 use crate::record::EventRecord;
 
+use super::dispatcher::{AttemptRunner, DispatchLog, Dispatcher, DispatcherConfig, DispatcherDeps};
 use super::orchestrator::{Orchestrator, OrchestratorConfig, OrchestratorDeps};
 use super::ports::{
     self, ArtifactOutcome, ArtifactOutcomeKind, ArtifactRole, CancelSignal, Capture, ClaimedRun,
     Clock, DispatchCase, DispatchableRun, FailureCode, HarnessResult, Milestone, MilestoneKind,
-    ResumeFrom, Settlement, codes,
+    Outcome, ResolveStore, ResumeFrom, Settlement, codes,
 };
 
 pub(crate) const BASE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -203,6 +205,16 @@ pub(crate) struct Lifecycle {
     pub(crate) heartbeats: AtomicI64,
     pub(crate) cancellations: AtomicI64,
     pub(crate) reconciled: AtomicI64,
+    /// `relist_all` — `relistingLifecycle`: `list_dispatchable` returns
+    /// every run, started included, as a Run whose lease was lost
+    /// in-process would be if the query ever returned it.
+    pub(crate) relist_all: AtomicBool,
+    /// `refusingLifecycle` — a Run `start` refuses and every list leads
+    /// with, as a Run the query lists but the start command refuses
+    /// would be (review T-I2).
+    refused: Mutex<Option<DispatchableRun>>,
+    /// `l.attempts` — refused starts so far.
+    pub(crate) refuse_attempts: AtomicI64,
     /// `heartbeat_block` makes Heartbeat pend until the executor drops
     /// it — `blockedHeartbeatLifecycle` (the join test).
     pub(crate) heartbeat_block: AtomicBool,
@@ -278,6 +290,9 @@ impl Lifecycle {
             heartbeats: AtomicI64::new(0),
             cancellations: AtomicI64::new(0),
             reconciled: AtomicI64::new(0),
+            relist_all: AtomicBool::new(false),
+            refused: Mutex::new(None),
+            refuse_attempts: AtomicI64::new(0),
             heartbeat_block: AtomicBool::new(false),
             hb_entered: Arc::new(AtomicBool::new(false)),
             hb_wake: Mutex::new(None),
@@ -305,6 +320,14 @@ impl Lifecycle {
         if let Ok(mut i) = self.inner.lock() {
             i.generation = g;
         }
+    }
+
+    /// `life.prompt` — the instruction the claim carries.
+    pub(crate) fn prompt(&self) -> String {
+        self.inner
+            .lock()
+            .map(|g| g.prompt.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn set_prompt(&self, prompt: &str) {
@@ -371,6 +394,28 @@ impl Lifecycle {
         }
     }
 
+    /// `push` — appends a dispatchable run (the dispatch tests append
+    /// Runs after the world was built).
+    pub(crate) fn push_run(&self, run: DispatchableRun) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.runs.push(run);
+        }
+    }
+
+    /// `set_relist` — `relistingLifecycle`: every list returns every
+    /// run, started included.
+    pub(crate) fn set_relist_all(&self, v: bool) {
+        self.relist_all.store(v, Ordering::SeqCst);
+    }
+
+    /// `set_refused` — `refusingLifecycle`: `run` leads every list and
+    /// is refused at `start`.
+    pub(crate) fn set_refused(&self, run: Option<DispatchableRun>) {
+        if let Ok(mut g) = self.refused.lock() {
+            *g = run;
+        }
+    }
+
     /// `lost` — the lease refusal.
     fn lost(&self) -> Result<(), Failure> {
         if self.lease_lost.load(Ordering::SeqCst) {
@@ -428,17 +473,43 @@ impl ports::RunLifecycle for Lifecycle {
             };
             let started: std::collections::HashSet<RunId> =
                 g.started.iter().map(|d| d.run_id).collect();
-            let mut out = Vec::new();
+            let refused = self.refused.lock().ok().and_then(|r| r.clone());
+            let relist = self.relist_all.load(Ordering::SeqCst);
+            let mut out: Vec<DispatchableRun> = refused.into_iter().collect();
             for r in g.runs.iter() {
-                if !started.contains(&r.run_id) && out.len() < limit {
+                if relist || !started.contains(&r.run_id) {
                     out.push(r.clone());
                 }
+            }
+            // `relistingLifecycle` ignores `limit`, as a query that
+            // keeps returning every Run would.
+            if !relist {
+                out.truncate(limit);
             }
             Ok(out)
         })
     }
 
     fn start<'a>(&'a self, run: DispatchableRun) -> PortFuture<'a, Result<ClaimedRun, Failure>> {
+        // `refusingLifecycle`: a refused Run fails before the
+        // lifecycle's own bookkeeping and only records the variant
+        // call.
+        let refused = self
+            .refused
+            .lock()
+            .ok()
+            .and_then(|r| r.as_ref().map(|r| r.run_id == run.run_id))
+            .unwrap_or(false);
+        if refused {
+            self.tr.add("lifecycle.Start:refused");
+            self.refuse_attempts.fetch_add(1, Ordering::SeqCst);
+            return Box::pin(async move {
+                Err(Failure::internal(
+                    codes::NOT_STARTABLE,
+                    "the run is not startable",
+                ))
+            });
+        }
         self.tr.add("lifecycle.Start");
         Box::pin(async move {
             let mut g = match self.inner.lock() {
@@ -2068,6 +2139,13 @@ impl FakeAdapter {
         }
     }
 
+    /// `SetProbe` — scripts the probe result (auth state included).
+    pub(crate) fn set_probe(&self, p: ProbeResult) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.probe = p;
+        }
+    }
+
     /// `Calls`.
     pub(crate) fn calls(&self) -> Vec<(String, StartSpec, SessionRef)> {
         self.inner
@@ -2301,41 +2379,85 @@ pub(crate) struct ScriptedResume {
 #[derive(Default)]
 struct ScriptedResumeInner {
     from: Option<ResumeFrom>,
+    /// `ok` — distinguishes `from: None` "no source" from "unset".
+    ok: bool,
     err: Option<Failure>,
-    calls: u64,
+    /// `block` — invoked once inside `resume_from` before the answer;
+    /// the call then pends until the work race drops it (upstream's
+    /// `<-ctx.Done(); return ctx.Err()`).
+    block: Option<Box<dyn FnOnce() + Send>>,
+    runs: Vec<ClaimedRun>,
 }
 
 impl ScriptedResume {
     pub(crate) fn new(from: Option<ResumeFrom>, err: Option<Failure>) -> Self {
         Self {
             inner: Mutex::new(ScriptedResumeInner {
+                ok: from.is_some(),
                 from,
                 err,
-                calls: 0,
+                block: None,
+                runs: Vec::new(),
             }),
         }
     }
 
-    pub(crate) fn calls(&self) -> u64 {
-        self.inner.lock().map(|g| g.calls).unwrap_or(0)
+    /// `src.calls` — the runs the source was asked about.
+    pub(crate) fn calls(&self) -> Vec<ClaimedRun> {
+        self.inner
+            .lock()
+            .map(|g| g.runs.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_from(&self, from: Option<ResumeFrom>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.ok = from.is_some();
+            g.from = from;
+        }
+    }
+
+    pub(crate) fn set_err(&self, err: Option<Failure>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.err = err;
+        }
+    }
+
+    /// `src.block` — the resume call runs `f` and then pends forever
+    /// (the orchestrator's cancel race drops it).
+    pub(crate) fn set_block(&self, f: impl FnOnce() + Send + 'static) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.block = Some(Box::new(f));
+        }
     }
 }
 
 impl ports::ResumeSource for ScriptedResume {
     fn resume_from<'a>(
         &'a self,
-        _run: ClaimedRun,
+        run: ClaimedRun,
     ) -> PortFuture<'a, Result<Option<ResumeFrom>, Failure>> {
         Box::pin(async move {
-            let mut g = match self.inner.lock() {
-                Ok(g) => g,
-                Err(_) => return Err(Failure::internal("poisoned", "resume lock poisoned")),
+            let (out, block) = {
+                let mut g = match self.inner.lock() {
+                    Ok(g) => g,
+                    Err(_) => return Err(Failure::internal("poisoned", "resume lock poisoned")),
+                };
+                g.runs.push(run);
+                let out: Result<Option<ResumeFrom>, Failure> = if let Some(e) = &g.err {
+                    Err(Failure::internal(e.code(), e.message()))
+                } else if g.ok {
+                    Ok(g.from.clone())
+                } else {
+                    Ok(None)
+                };
+                (out, g.block.take())
             };
-            g.calls += 1;
-            if let Some(e) = &g.err {
-                return Err(Failure::internal(e.code(), e.message()));
+            if let Some(block) = block {
+                block();
+                std::future::pending::<()>().await;
             }
-            Ok(g.from.clone())
+            out
         })
     }
 }
@@ -2477,4 +2599,706 @@ pub(crate) fn resume_from(source: Attempt, prompt: &str, budget: Budget) -> Resu
         budget,
         prompt: prompt.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// recovery/resolve sides of the store — fakes_test.go's ListRecoveryCandidates,
+// RecoverAttempt, Load, putApproval
+// ---------------------------------------------------------------------------
+
+impl FakeStore {
+    /// `st.recovered` — every recovery write's stored row.
+    pub(crate) fn recovered(&self) -> Vec<Attempt> {
+        self.recovered.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// `st.refuse[id] = e` — RecoverAttempt's per-attempt refusal.
+    pub(crate) fn set_refuse(&self, id: HarnessAttemptId, e: Failure) {
+        if let Ok(mut g) = self.refuse.lock() {
+            g.insert(id, e);
+        }
+    }
+
+    /// `st.attempts[id] = a` — rewrites a stored row, as a concurrent
+    /// writer would (the conflict tests).
+    pub(crate) fn store_attempt(&self, a: Attempt) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.attempts.insert(a.id, a);
+        }
+    }
+
+    /// `stored` — the stored row of `id`, if any.
+    pub(crate) fn stored(&self, id: HarnessAttemptId) -> Option<Attempt> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|g| g.attempts.get(&id).cloned())
+    }
+
+    /// `putApproval` — seeds a pending approval of `a`.
+    pub(crate) fn put_approval(&self, a: &Attempt) -> PermissionApproval {
+        let mac = crate::approval::compute_input_mac(b"reconciler-test-key-0123456789abc", b"{}")
+            .expect("input mac");
+        let approval = PermissionApproval::open(crate::approval::OpenApprovalInput {
+            id: HarnessPermissionApprovalId::new(),
+            workspace_id: a.workspace_id,
+            attempt_id: a.id,
+            task_id: TaskId::new(),
+            run_id: a.run_id,
+            request_id: a.pending_permission.clone(),
+            tool_call_id: String::new(),
+            tool_name: "Bash".to_string(),
+            input_mac: mac,
+            input_size: 2,
+            requested_at: a.updated_at,
+            expires_at: a.updated_at + Duration::HOUR,
+        })
+        .expect("open approval");
+        if let Ok(mut g) = self.inner.lock() {
+            g.approvals.insert(approval.id, approval.clone());
+            g.approval_order.push(approval.id);
+        }
+        approval
+    }
+
+    /// `RecoverAttempt` — the recovery-authority write both
+    /// `port.RecoveryStore` and `app.ResolveStore` share.
+    fn recover(&self, expected: &Attempt, next: &Attempt) -> Result<Attempt, Failure> {
+        if let Some(e) = self
+            .refuse
+            .lock()
+            .ok()
+            .and_then(|r| r.get(&expected.id).cloned())
+        {
+            return Err(e);
+        }
+        next.validate()?;
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| Failure::internal("poisoned", "store lock poisoned"))?;
+        let stored = g.attempts.get(&expected.id).cloned().ok_or_else(|| {
+            Failure::not_found(domain::codes::ATTEMPT_NOT_FOUND, "no such attempt")
+        })?;
+        if stored.version != expected.version
+            || next.version != expected.version
+            || next.fence != stored.fence
+        {
+            return Err(Failure::conflict(
+                domain::codes::VERSION_CONFLICT,
+                "the attempt moved on",
+            ));
+        }
+        let mut out = next.clone();
+        // As the PostgreSQL store: every recovery target supersedes the
+        // attempt's pending approval in the same write.
+        FakeStore::approval_side(&mut g, expected, &out, &[])?;
+        out.version += 1;
+        g.attempts.insert(out.id, out.clone());
+        drop(g);
+        if let Ok(mut r) = self.recovered.lock() {
+            r.push(out.clone());
+        }
+        Ok(out)
+    }
+}
+
+impl RecoveryStore for FakeStore {
+    fn list_recovery_candidates<'a>(
+        &'a self,
+        after: RecoveryCursor,
+        limit: usize,
+    ) -> PortFuture<'a, Result<Vec<RecoveryCandidate>, Failure>> {
+        Box::pin(async move {
+            let mut all = self
+                .candidates
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_default();
+            all.sort_by(|x, y| {
+                x.attempt
+                    .prepared_at
+                    .cmp(&y.attempt.prepared_at)
+                    .then_with(|| x.attempt.id.to_string().cmp(&y.attempt.id.to_string()))
+            });
+            let g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return Ok(Vec::new()),
+            };
+            let mut out = Vec::new();
+            for mut c in all {
+                let a = &c.attempt;
+                if after.prepared_at != OffsetDateTime::UNIX_EPOCH
+                    && (a.prepared_at < after.prepared_at
+                        || (a.prepared_at == after.prepared_at
+                            && a.id.to_string() <= after.id.to_string()))
+                {
+                    continue;
+                }
+                if let Some(cur) = g.attempts.get(&a.id) {
+                    if cur.state.is_terminal() {
+                        continue;
+                    }
+                    c.attempt = cur.clone();
+                }
+                out.push(c);
+                if out.len() == limit {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn recover_attempt<'a>(
+        &'a self,
+        expected: &'a Attempt,
+        next: &'a Attempt,
+    ) -> PortFuture<'a, Result<Attempt, Failure>> {
+        Box::pin(async move { self.recover(expected, next) })
+    }
+}
+
+impl ResolveStore for FakeStore {
+    fn load<'a>(
+        &'a self,
+        _ws: WorkspaceId,
+        id: HarnessAttemptId,
+    ) -> PortFuture<'a, Result<Attempt, Failure>> {
+        Box::pin(async move {
+            self.inner
+                .lock()
+                .map_err(|_| Failure::internal("poisoned", "store lock poisoned"))?
+                .attempts
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| {
+                    Failure::not_found(domain::codes::ATTEMPT_NOT_FOUND, "no such attempt")
+                })
+        })
+    }
+
+    fn recover_attempt<'a>(
+        &'a self,
+        expected: &'a Attempt,
+        next: &'a Attempt,
+    ) -> PortFuture<'a, Result<Attempt, Failure>> {
+        Box::pin(async move { self.recover(expected, next) })
+    }
+}
+
+/// `conflictOnce` — fails the first `recover_attempt` with
+/// `VERSION_CONFLICT` after running `conflict` (which moves the stored
+/// row, as a concurrent writer would).
+pub(crate) struct ConflictOnce {
+    inner: Arc<FakeStore>,
+    conflict: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub(crate) done: AtomicBool,
+}
+
+impl ConflictOnce {
+    pub(crate) fn new(inner: Arc<FakeStore>, conflict: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner,
+            conflict: Mutex::new(Some(Box::new(conflict))),
+            done: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ResolveStore for ConflictOnce {
+    fn load<'a>(
+        &'a self,
+        ws: WorkspaceId,
+        id: HarnessAttemptId,
+    ) -> PortFuture<'a, Result<Attempt, Failure>> {
+        self.inner.load(ws, id)
+    }
+
+    fn recover_attempt<'a>(
+        &'a self,
+        expected: &'a Attempt,
+        next: &'a Attempt,
+    ) -> PortFuture<'a, Result<Attempt, Failure>> {
+        Box::pin(async move {
+            if !self.done.swap(true, Ordering::SeqCst) {
+                if let Ok(mut f) = self.conflict.lock()
+                    && let Some(f) = f.take()
+                {
+                    f();
+                }
+                return Err(Failure::conflict(
+                    domain::codes::VERSION_CONFLICT,
+                    "the attempt moved on",
+                ));
+            }
+            ResolveStore::recover_attempt(self.inner.as_ref(), expected, next).await
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// launcher — fake.Launcher plus the hanging-Alive knob
+// ---------------------------------------------------------------------------
+
+/// `fake.Launcher` — a scripted [`ProcessLauncher`] for tests of code
+/// that only probes and kills scopes. `alive` reports the scripted
+/// liveness; `kill_scope` records the scope and marks it dead; a scope
+/// never scripted is empty. `hang` makes `is_alive` pend — the
+/// dispatcher's probe budget bounds it (the `hangingLauncher` test).
+pub(crate) struct FakeLauncher {
+    inner: Mutex<LaunchInner>,
+    pub(crate) hang: AtomicBool,
+    pub(crate) alive_calls: AtomicI64,
+}
+
+#[derive(Default)]
+struct LaunchInner {
+    alive: HashMap<String, bool>,
+    kills: Vec<String>,
+    kill_err: Option<Failure>,
+    alive_err: Option<Failure>,
+}
+
+impl FakeLauncher {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(LaunchInner::default()),
+            hang: AtomicBool::new(false),
+            alive_calls: AtomicI64::new(0),
+        }
+    }
+
+    /// `SetAlive` — scripts a scope's liveness.
+    pub(crate) fn set_alive(&self, scope: &str, alive: bool) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.alive.insert(scope.to_string(), alive);
+        }
+    }
+
+    /// `FailAlive` — every later `is_alive` returns `e` (a launcher
+    /// unreachable), `None` clears it.
+    pub(crate) fn fail_alive(&self, e: Option<Failure>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.alive_err = e;
+        }
+    }
+
+    /// `FailKill`.
+    pub(crate) fn fail_kill(&self, e: Option<Failure>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.kill_err = e;
+        }
+    }
+
+    /// `Kills` — the scopes `kill_scope` saw, in order.
+    pub(crate) fn kills(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|g| g.kills.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl ProcessLauncher for FakeLauncher {
+    fn launch<'a>(
+        &'a self,
+        _spec: ProcessSpec,
+    ) -> PortFuture<'a, Result<Box<dyn Process>, Failure>> {
+        Box::pin(async move {
+            Err(Failure::internal(
+                "launch",
+                "fake launcher: launch is not supported",
+            ))
+        })
+    }
+
+    fn is_alive<'a>(&'a self, scope_id: &'a str) -> PortFuture<'a, Result<bool, Failure>> {
+        Box::pin(async move {
+            self.alive_calls.fetch_add(1, Ordering::SeqCst);
+            if self.hang.load(Ordering::SeqCst) {
+                // `<-ctx.Done()` upstream — the bounded call drops
+                // this future at the probe budget.
+                std::future::pending::<()>().await;
+            }
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| Failure::internal("poisoned", "launcher lock poisoned"))?;
+            if let Some(e) = &g.alive_err {
+                return Err(e.clone());
+            }
+            Ok(g.alive.get(scope_id).copied().unwrap_or(false))
+        })
+    }
+
+    fn kill_scope<'a>(&'a self, scope_id: &'a str) -> PortFuture<'a, Result<(), Failure>> {
+        Box::pin(async move {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| Failure::internal("poisoned", "launcher lock poisoned"))?;
+            g.kills.push(scope_id.to_string());
+            if let Some(e) = &g.kill_err {
+                return Err(e.clone());
+            }
+            g.alive.insert(scope_id.to_string(), false);
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// runner — the scripted AttemptRunner of dispatcher_test.go
+// ---------------------------------------------------------------------------
+
+/// `runner` — starts through `life`, waits on `release` (or the stop),
+/// and returns the scripted result. `ignore_stop` waits only on
+/// `release`, as an attempt that does not answer cancellation does.
+pub(crate) struct ScriptedRunner {
+    pub(crate) life: Arc<dyn ports::RunLifecycle>,
+    pub(crate) release: Option<Arc<ManualCancel>>,
+    pub(crate) ignore_stop: bool,
+    pub(crate) result: HarnessResult,
+    pub(crate) calls: AtomicI64,
+    pub(crate) active: AtomicI64,
+    pub(crate) max_active: AtomicI64,
+}
+
+impl ScriptedRunner {
+    pub(crate) fn new(life: Arc<dyn ports::RunLifecycle>) -> Self {
+        Self {
+            life,
+            release: None,
+            ignore_stop: false,
+            result: HarnessResult::bare(Outcome::Unset, None),
+            calls: AtomicI64::new(0),
+            active: AtomicI64::new(0),
+            max_active: AtomicI64::new(0),
+        }
+    }
+
+    fn clone_result(&self) -> HarnessResult {
+        let r = &self.result;
+        HarnessResult {
+            outcome: r.outcome,
+            reason: r.reason.clone(),
+            low_disk: r.low_disk,
+            settle_failed: r.settle_failed,
+            err: r.err.clone(),
+        }
+    }
+}
+
+impl AttemptRunner for ScriptedRunner {
+    fn run(
+        self: Arc<Self>,
+        d: DispatchableRun,
+        _harness_version: String,
+        stop: Arc<dyn CancelSignal>,
+    ) -> PortFuture<'static, HarnessResult> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Err(e) = self.life.start(d).await {
+                return HarnessResult::bare(Outcome::NotStarted, Some(e));
+            }
+            let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            loop {
+                let m = self.max_active.load(Ordering::SeqCst);
+                if n <= m
+                    || self
+                        .max_active
+                        .compare_exchange(m, n, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    break;
+                }
+            }
+            let mut early: Option<HarnessResult> = None;
+            if let Some(rel) = &self.release {
+                if self.ignore_stop {
+                    rel.cancelled().await;
+                } else {
+                    let mut rel_f = std::pin::pin!(rel.cancelled());
+                    let mut stop_f = std::pin::pin!(stop.cancelled());
+                    let stopped = std::future::poll_fn(|cx| {
+                        if let Poll::Ready(()) = stop_f.as_mut().poll(cx) {
+                            return Poll::Ready(true);
+                        }
+                        if let Poll::Ready(()) = rel_f.as_mut().poll(cx) {
+                            return Poll::Ready(false);
+                        }
+                        Poll::Pending
+                    })
+                    .await;
+                    if stopped {
+                        early = Some(HarnessResult::bare(Outcome::Stopped, None));
+                    }
+                }
+            }
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            early.unwrap_or_else(|| self.clone_result())
+        })
+    }
+}
+
+/// `startingRunner` — `runner` that ends at once with a scripted
+/// result (the cooldown tests).
+pub(crate) fn starting_runner(life: Arc<Lifecycle>) -> Arc<dyn AttemptRunner> {
+    let mut r = ScriptedRunner::new(life);
+    r.result = HarnessResult::bare(Outcome::Succeeded, None);
+    Arc::new(r)
+}
+
+// ---------------------------------------------------------------------------
+// log — the DispatchLog the log-assertion tests inspect
+// ---------------------------------------------------------------------------
+
+/// `syncBuffer` — the recording `DispatchLog`: each record is
+/// `level=X msg k=v ...` so tests can `contains`-assert like the
+/// upstream `slog.NewTextHandler` output.
+#[derive(Default)]
+pub(crate) struct RecordingLog {
+    lines: Mutex<Vec<String>>,
+}
+
+impl RecordingLog {
+    pub(crate) fn all(&self) -> String {
+        self.inner_join()
+    }
+
+    fn inner_join(&self) -> String {
+        self.inner_lines().join("\n")
+    }
+
+    fn inner_lines(&self) -> Vec<String> {
+        self.lines.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn push(&self, level: &str, msg: &str, fields: &[(&str, String)]) {
+        let mut line = format!("level={level} {msg}");
+        for (k, v) in fields {
+            line.push_str(&format!(" {k}={v}"));
+        }
+        if let Ok(mut g) = self.lines.lock() {
+            g.push(line);
+        }
+    }
+}
+
+impl DispatchLog for RecordingLog {
+    fn warn(&self, msg: &str, fields: &[(&str, String)]) {
+        self.push("WARN", msg, fields);
+    }
+
+    fn info(&self, msg: &str, fields: &[(&str, String)]) {
+        self.push("INFO", msg, fields);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dispatchWorld — fakes_test.go's dispatcher test harness
+// ---------------------------------------------------------------------------
+
+/// `dispatchWorld` — a dispatcher wired to the test fakes. `start`
+/// runs `disp.run` on a spawned thread (the port owns no runtime);
+/// `stop_wait` cancels and waits up to 10 s, as upstream's `t.Cleanup`
+/// does.
+pub(crate) struct DispatchWorld {
+    pub(crate) tr: Trace,
+    pub(crate) life: Arc<Lifecycle>,
+    pub(crate) st: Arc<FakeStore>,
+    pub(crate) prov: Arc<Provisioner>,
+    pub(crate) cap: Arc<Capturer>,
+    pub(crate) arts: Arc<Artifacts>,
+    pub(crate) sink: Arc<Sink>,
+    pub(crate) ad: Arc<FakeAdapter>,
+    pub(crate) launcher: Arc<FakeLauncher>,
+    pub(crate) log: Arc<RecordingLog>,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) ticker: Arc<dyn ports::Ticker>,
+    pub(crate) disp: Arc<Dispatcher>,
+    pub(crate) stop: Arc<ManualCancel>,
+    done: Mutex<Option<std::sync::mpsc::Receiver<Result<(), Failure>>>>,
+}
+
+/// `newDispatchWorld` — `r` `None` takes the default runner (start +
+/// the zero result, as upstream's `&runner{life: life}`).
+pub(crate) fn new_dispatch_world(
+    r: Option<Arc<dyn AttemptRunner>>,
+    life: Arc<Lifecycle>,
+    mut cfg: DispatcherConfig,
+) -> DispatchWorld {
+    let tr = life.tr.clone();
+    let st = FakeStore::new(&tr);
+    let ticker: Arc<dyn ports::Ticker> = Arc::new(ports::RealTicker);
+    let prov = Arc::new(Provisioner::new(&tr, ticker.clone()));
+    let cap = Arc::new(Capturer::new(&tr));
+    let arts = Arc::new(Artifacts::new(&tr));
+    let sink = Arc::new(Sink::new(&tr, false));
+    let ad = Arc::new(FakeAdapter::new(
+        &tr,
+        "claude-code",
+        Capabilities::default(),
+        vec![],
+    ));
+    let launcher = Arc::new(FakeLauncher::new());
+    let log = Arc::new(RecordingLog::default());
+    if cfg.concurrency == 0 {
+        cfg.concurrency = 1;
+    }
+    if cfg.launch_env.is_empty() {
+        cfg.launch_env = test_env();
+    }
+    if cfg.poll_interval <= Duration::ZERO {
+        cfg.poll_interval = Duration::milliseconds(5);
+    }
+    if cfg.pause_retry <= Duration::ZERO {
+        cfg.pause_retry = Duration::milliseconds(30);
+    }
+    let runner =
+        r.unwrap_or_else(|| Arc::new(ScriptedRunner::new(life.clone())) as Arc<dyn AttemptRunner>);
+    let disp = Dispatcher::new(DispatcherDeps {
+        lifecycle: life.clone(),
+        runner,
+        adapter: ad.clone(),
+        launcher: launcher.clone(),
+        recovery: st.clone(),
+        workspaces: prov.clone(),
+        events: sink.clone(),
+        clock: Arc::new(RealClock),
+        ticker: ticker.clone(),
+        logger: log.clone(),
+        cfg,
+    })
+    .expect("NewDispatcher");
+    DispatchWorld {
+        tr,
+        life,
+        st,
+        prov,
+        cap,
+        arts,
+        sink,
+        ad,
+        launcher,
+        log,
+        clock: Arc::new(RealClock),
+        ticker,
+        disp: Arc::new(disp),
+        stop: Arc::new(ManualCancel::default()),
+        done: Mutex::new(None),
+    }
+}
+
+impl DispatchWorld {
+    /// `w.start(t)` — `go w.disp.Run(ctx)` on a spawned thread with the
+    /// result channel upstream's `done` carries.
+    pub(crate) fn start(&self) {
+        let disp = self.disp.clone();
+        let stop: Arc<dyn CancelSignal> = self.stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(block_on(disp.run(stop)));
+        });
+        if let Ok(mut g) = self.done.lock() {
+            *g = Some(rx);
+        }
+    }
+
+    /// `w.stop(t)` — cancels and waits 10 s (upstream's 5 s cleanup
+    /// bound, doubled for loaded CI); re-arms `done` like upstream so a
+    /// second stop sees the same result.
+    pub(crate) fn stop_wait(&self) -> Result<(), Failure> {
+        self.stop.cancel();
+        let rx = self.done.lock().ok().and_then(|mut g| g.take());
+        let rx = rx.expect("dispatcher not started");
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(r) => {
+                // Re-arm `done` so a second `stop_wait` observes the
+                // same result, as upstream's channel does.
+                let (tx, rx2) = std::sync::mpsc::channel();
+                let _ = tx.send(r.clone());
+                if let Ok(mut g) = self.done.lock() {
+                    *g = Some(rx2);
+                }
+                r
+            }
+            Err(_) => unreachable!("dispatcher did not stop"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// attemptIn + stepOf — reconciler/resolver fixtures
+// ---------------------------------------------------------------------------
+
+/// `epoch` — reconciler_test.go's fixture clock base.
+pub(crate) const EPOCH: OffsetDateTime = time::macros::datetime!(2026-09-28 08:00:00 UTC);
+
+/// `attemptIn` — a valid attempt in `state` (prepared, launching,
+/// running, awaiting_permission or ambiguous) at fence generation 1.
+pub(crate) fn attempt_in(state: domain::State) -> Attempt {
+    let id = HarnessAttemptId::new();
+    let f = domain::Fence { generation: 1 };
+    let mut a = Attempt::prepare(crate::attempt::PrepareInput {
+        id,
+        workspace_id: WorkspaceId::new(),
+        run_id: RunId::new(),
+        kind: Kind::new("claude-code"),
+        adapter_version: "claudecode/3a".to_string(),
+        workspace: Workspace {
+            path: format!("/w/{id}"),
+            base_sha: BASE_SHA.to_string(),
+        },
+        permission: PermissionPolicy::Deny,
+        fence: f,
+        at: EPOCH,
+        budget: Budget {
+            cost_micro_usd: 5_000_000,
+            wall_clock: Duration::minutes(30),
+            cost_defaulted: false,
+            wall_clock_defaulted: false,
+        },
+    })
+    .expect("prepare");
+    let at = EPOCH + Duration::SECOND;
+    match state {
+        domain::State::Prepared => a,
+        domain::State::Launching => a.launch(f, &id.to_string(), "2.1.283", at).expect("launch"),
+        domain::State::Running => {
+            a = a.launch(f, &id.to_string(), "2.1.283", at).expect("launch");
+            a.reveal_session(f, &id.to_string(), at).expect("reveal")
+        }
+        domain::State::AwaitingPermission => {
+            a = a.launch(f, &id.to_string(), "2.1.283", at).expect("launch");
+            a = a.reveal_session(f, &id.to_string(), at).expect("reveal");
+            a.await_permission(f, "req", at).expect("await")
+        }
+        domain::State::Ambiguous => {
+            a = a.launch(f, &id.to_string(), "2.1.283", at).expect("launch");
+            a = a.reveal_session(f, &id.to_string(), at).expect("reveal");
+            a.mark_ambiguous(f, super::reconciler::AMBIGUITY_RESTART, at)
+                .expect("ambiguous")
+        }
+        s => unreachable!("unsupported state {s:?}"),
+    }
+}
+
+/// `ambiguousWithoutSession` — an ambiguous attempt that never
+/// revealed a harness session id (marked ambiguous while launching),
+/// so it cannot resume.
+pub(crate) fn ambiguous_without_session() -> Attempt {
+    let a = attempt_in(domain::State::Launching);
+    a.mark_ambiguous(
+        a.fence,
+        super::reconciler::AMBIGUITY_RESTART,
+        EPOCH + Duration::seconds(2),
+    )
+    .expect("ambiguous")
+}
+
+/// `stepOf` — the StepAttempt an attempt id links to (same UUID).
+pub(crate) fn step_of(a: &Attempt) -> StepAttemptId {
+    StepAttemptId::parse(&a.id.to_string()).expect("step attempt id")
 }
