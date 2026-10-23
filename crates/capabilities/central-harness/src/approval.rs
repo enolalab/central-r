@@ -12,7 +12,6 @@ use central_foundation::failure::Failure;
 use central_foundation::identity::{
     HarnessAttemptId, HarnessPermissionApprovalId, RunId, TaskId, WorkspaceId,
 };
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -105,8 +104,10 @@ pub const MIN_INPUT_MAC_KEY_BYTES: usize = 32;
 /// by a random key serve generates once per process and never stores
 /// (decision 5). A plain hash would let whoever reads the database or
 /// the page confirm a guessed low-entropy secret; the MAC does not. It
-/// is not secret itself.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// is not secret itself. No serde: nothing serializes it, and a derived
+/// JSON encoding (a number array) would contradict the hex
+/// `Display`/[`parse_input_mac`] convention.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct InputMac(pub [u8; 32]);
 
 impl InputMac {
@@ -247,7 +248,7 @@ impl ApprovalState {
 /// One durable harness permission approval — upstream
 /// `PermissionApproval` (decision 6). `decided_at`/`decided_by` are set
 /// exactly for a decided approval; `None`/empty pending.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PermissionApproval {
     /// The approval's id.
     pub id: HarnessPermissionApprovalId,

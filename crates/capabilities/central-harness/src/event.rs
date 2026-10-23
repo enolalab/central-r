@@ -166,8 +166,9 @@ impl Usage {
 
     /// Upstream `Usage.fold`: combines the stored cumulative usage `self`
     /// with a validated, non-empty report in the same scope (`self` may
-    /// still be the zero value).
-    pub fn fold(&self, report: &Usage) -> Result<Usage, Failure> {
+    /// still be the zero value). Unexported upstream; the sole caller is
+    /// `crate::attempt::Attempt::apply_usage`.
+    pub(crate) fn fold(&self, report: &Usage) -> Result<Usage, Failure> {
         let pairs = [
             (self.tokens_in, report.tokens_in),
             (self.tokens_out, report.tokens_out),
@@ -488,7 +489,11 @@ pub struct TerminalReported {
 ///
 /// Serialized with `kind`/`payload` adjacent tags: the `kind` strings are
 /// the upstream `EventKind` spellings and each `payload` keeps the
-/// payload's own snake_case field names.
+/// payload's own snake_case field names. Upstream Go never emits
+/// `EventPayload` JSON to any durable or wire surface —
+/// `central.harness_events` stores bounded metadata columns only — so
+/// this encoding is an internal Rust-only contract, pinned byte-for-byte
+/// by `tests::event_payload_json_golden`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum EventPayload {
@@ -1167,5 +1172,95 @@ mod tests {
             assert!(scope.known(), "{scope}: not known");
             assert!(seen.insert(*scope), "{scope}: duplicate");
         }
+    }
+
+    // Pins the `Event`/`EventPayload` serde_json contract byte-for-byte.
+    // Upstream Go emits no payload JSON — `central.harness_events` stores
+    // bounded metadata columns only — so this shape is an internal
+    // Rust-only contract with no cross-implementation spelling to match.
+    // The test locks the `{"kind","payload"}` envelope, the upstream
+    // `EventKind` spellings, snake_case field names, `Vec<u8>` as a JSON
+    // number array, and vocab enums as their declared strings; any
+    // serde-attribute or field drift fails here loudly.
+    #[test]
+    fn event_payload_json_golden() {
+        let cases: [(EventPayload, &str); 4] = [
+            (
+                EventPayload::SessionStarted(SessionStarted {
+                    harness_session_id: "sess-1".to_string(),
+                    harness_version: "2.1.0".to_string(),
+                    model: "claude".to_string(),
+                    tools: vec!["Bash".to_string()],
+                    reported_capabilities: vec!["usage_report".to_string()],
+                }),
+                r#"{"kind":"session_started","payload":{"harness_session_id":"sess-1","harness_version":"2.1.0","model":"claude","tools":["Bash"],"reported_capabilities":["usage_report"]}}"#,
+            ),
+            (
+                EventPayload::ToolCall(ToolCall {
+                    id: "toolu_1".to_string(),
+                    parent_id: "toolu_0".to_string(),
+                    name: "Bash".to_string(),
+                    input: vec![123, 34, 99],
+                }),
+                r#"{"kind":"tool_call","payload":{"id":"toolu_1","parent_id":"toolu_0","name":"Bash","input":[123,34,99]}}"#,
+            ),
+            (
+                EventPayload::UsageReport(UsageReport {
+                    usage: Usage {
+                        tokens_in: 5,
+                        tokens_out: 7,
+                        cost_micro_usd: 100,
+                        scope: UsageScope::Step,
+                        estimated: true,
+                        ..Usage::default()
+                    },
+                }),
+                r#"{"kind":"usage_report","payload":{"usage":{"tokens_in":5,"tokens_out":7,"cache_read":0,"cache_write":0,"cost_micro_usd":100,"scope":"step","estimated":true}}}"#,
+            ),
+            (
+                EventPayload::TerminalReported(TerminalReported {
+                    terminal: Terminal {
+                        status: TerminalStatus::MaxTurns,
+                        reason: "turn cap".to_string(),
+                        exit_code: Some(2),
+                    },
+                }),
+                r#"{"kind":"terminal_reported","payload":{"terminal":{"status":"max_turns","reason":"turn cap","exit_code":2}}}"#,
+            ),
+        ];
+        for (payload, want) in &cases {
+            assert_eq!(serde_json::to_string(payload).unwrap(), *want);
+            let back: EventPayload = serde_json::from_str(want).unwrap();
+            assert_eq!(&back, payload);
+        }
+
+        // The envelope: the attempt id as a UUID string, `at` in the
+        // `time` crate's `(year, ordinal, h, m, s, ns, offset h/m/s)`
+        // array form, `raw` as a number array, `Some(payload)` inlined
+        // and `None` as `null`.
+        let event = Event {
+            attempt: HarnessAttemptId::from_trusted_db_bytes([
+                0x01, 0x9a, 0x3c, 0x5e, 0x9b, 0x0e, 0x7f, 0x3a, 0x9b, 0x0e, 0x9b, 0x0e, 0x9b, 0x0e,
+                0x9b, 0x0e,
+            ]),
+            seq: 1,
+            at: datetime!(2026-09-27 10:00:00 UTC),
+            harness_session_id: "sess-1".to_string(),
+            raw: br#"{"frame":1}"#.to_vec(),
+            payload: Some(EventPayload::Warning(Warning {
+                message: "w".to_string(),
+            })),
+        };
+        let want = r#"{"attempt":"019a3c5e-9b0e-7f3a-9b0e-9b0e9b0e9b0e","seq":1,"at":[2026,270,10,0,0,0,0,0,0],"harness_session_id":"sess-1","raw":[123,34,102,114,97,109,101,34,58,49,125],"payload":{"kind":"warning","payload":{"message":"w"}}}"#;
+        assert_eq!(serde_json::to_string(&event).unwrap(), want);
+        assert_eq!(serde_json::from_str::<Event>(want).unwrap(), event);
+
+        let mut no_payload = event.clone();
+        no_payload.payload = None;
+        assert!(
+            serde_json::to_string(&no_payload)
+                .unwrap()
+                .ends_with(r#""payload":null}"#)
+        );
     }
 }

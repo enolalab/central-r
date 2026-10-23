@@ -28,8 +28,9 @@
 //! - [`budget`] — [`budget::Budget`], the effective per-attempt bounds,
 //!   and [`budget::sum_chain`]/[`budget::ChainCost::next`] chain-cost
 //!   arithmetic.
-//! - [`capability`] — [`capability::Capabilities`] adapter self-description
-//!   and the [`capability::UsageScope`] vocabulary.
+//! - [`capability`] — [`capability::Capabilities`] adapter self-description;
+//!   the [`event::UsageScope`] vocabulary it carries lives with
+//!   [`event::Usage`].
 //! - [`env`] — the launch-environment allowlist/denylist filter
 //!   ([`env::validate_launch_env`]) enforcing ADR 0035's rule that Central
 //!   never injects, relocates, or redirects harness credentials.

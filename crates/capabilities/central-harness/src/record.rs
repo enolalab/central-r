@@ -10,7 +10,6 @@ use std::fmt;
 
 use central_foundation::failure::Failure;
 use central_foundation::identity::HarnessAttemptId;
-use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::approval::compute_input_mac;
@@ -18,8 +17,10 @@ use crate::domain::{Terminal, TerminalStatus, codes, is_zero_time};
 use crate::event::{Event, EventKind, EventPayload, PermissionOutcome, ToolStatus};
 
 /// The bounded metadata persisted for one normalized event — upstream
-/// `EventRecord`.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// `EventRecord`. No serde: it is persisted as bounded metadata columns
+/// upstream, and a derived JSON encoding (`raw_sha256` as a number
+/// array) would contradict the digest's hex `Display` convention.
+#[derive(Clone, PartialEq)]
 pub struct EventRecord {
     /// The attempt the event belongs to.
     pub attempt: HarnessAttemptId,
