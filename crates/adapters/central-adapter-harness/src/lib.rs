@@ -21,4 +21,11 @@ pub mod claudecode;
 pub mod fake;
 pub mod launcher;
 pub mod localexec;
+pub mod opencode;
 pub mod process;
+
+/// `json` — the byte-level JSON machinery shared by the adapters:
+/// raw member spans, `json.Compact`, and the duplicate-member-name
+/// walk. Lifted out of `claudecode` (its upstream home) so the
+/// OpenCode, Codex and Antigravity ports share it unchanged.
+mod json;

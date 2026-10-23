@@ -1,0 +1,4 @@
+{"type":"step_start","timestamp":1791641000000,"sessionID":"ses_handbuilt00000000000001","part":{"id":"prt_1","messageID":"msg_1","sessionID":"ses_handbuilt00000000000001","type":"step-start"}}
+{"type":"reasoning","timestamp":1791641000001,"sessionID":"ses_handbuilt00000000000001","part":{"id":"prt_9","messageID":"msg_1","sessionID":"ses_handbuilt00000000000001","type":"reasoning","text":"thinking out loud","time":{"start":1,"end":2}}}
+{"type":"text","timestamp":1791641000002,"sessionID":"ses_handbuilt00000000000001","part":{"id":"prt_2","messageID":"msg_1","sessionID":"ses_handbuilt00000000000001","type":"text","text":"done","time":{"start":1,"end":2}}}
+{"type":"step_finish","timestamp":1791641000003,"sessionID":"ses_handbuilt00000000000001","part":{"id":"prt_3","reason":"stop","messageID":"msg_1","sessionID":"ses_handbuilt00000000000001","type":"step-finish","tokens":{"total":10,"input":6,"output":3,"reasoning":1,"cache":{"write":0,"read":0}},"cost":0}}

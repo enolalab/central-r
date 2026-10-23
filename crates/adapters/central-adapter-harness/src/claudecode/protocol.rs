@@ -2,7 +2,7 @@
 //! reader task uses, and the outgoing line encoders the writer queues.
 //!
 //! Frames decode through the crate's byte-level scanner
-//! ([`crate::claudecode::json`]): member extraction keeps raw value
+//! ([`crate::json`]): member extraction keeps raw value
 //! spans so `input`/`content`/`message` are never re-encoded, and typed
 //! member decodes use `Option<…>` targets so JSON `null` is the no-op it
 //! is for a Go zero field. The whole-frame grammar is upstream's
@@ -13,7 +13,7 @@
 use central_harness::domain::{Terminal, TerminalStatus};
 use central_harness::event::{Usage, UsageScope};
 
-use super::json::{self, JsonError, Span};
+use crate::json::{self, JsonError, Span};
 
 /// One decoded `control_request.request` object (`protocol.go`'s
 /// `controlRequest`).
@@ -362,41 +362,14 @@ pub(crate) fn add_turn(total: Usage, turn: Usage) -> Usage {
     }
 }
 
-/// `json.Marshal(s)` via Go's `appendString` with EscapeHTML off — the
-/// mode `encodeLine` sets: `"` `\` shorthand escapes, `\n`/`\r`/`\t`,
-/// other controls as `\u00xx`, U+2028/U+2029 escaped, everything else
-/// raw UTF-8 (`<`/`>`/`&` unescaped).
-pub(crate) fn push_json_string(out: &mut Vec<u8>, s: &str) {
-    out.push(b'"');
-    for c in s.chars() {
-        match c {
-            '"' => out.extend_from_slice(b"\\\""),
-            '\\' => out.extend_from_slice(b"\\\\"),
-            '\n' => out.extend_from_slice(b"\\n"),
-            '\r' => out.extend_from_slice(b"\\r"),
-            '\t' => out.extend_from_slice(b"\\t"),
-            '\u{2028}' => out.extend_from_slice(b"\\u2028"),
-            '\u{2029}' => out.extend_from_slice(b"\\u2029"),
-            c if (c as u32) < 0x20 => {
-                out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes());
-            }
-            c => {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-        }
-    }
-    out.push(b'"');
-}
-
 /// `control_request` line without the newline —
 /// `{"type":"control_request","request_id":"…","request":{"subtype":"…"}}`.
 fn control_request_frame(request_id: &str, subtype: &str) -> Vec<u8> {
     let mut b = Vec::with_capacity(96);
     b.extend_from_slice(b"{\"type\":\"control_request\",\"request_id\":");
-    push_json_string(&mut b, request_id);
+    json::push_json_string(&mut b, request_id);
     b.extend_from_slice(b",\"request\":{\"subtype\":");
-    push_json_string(&mut b, subtype);
+    json::push_json_string(&mut b, subtype);
     b.extend_from_slice(b"}}");
     b
 }
@@ -414,7 +387,7 @@ pub(crate) fn permission_response_frame(
     b.extend_from_slice(
         b"{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":",
     );
-    push_json_string(&mut b, request_id);
+    json::push_json_string(&mut b, request_id);
     b.extend_from_slice(b",\"response\":");
     if allow {
         b.extend_from_slice(b"{\"behavior\":\"allow\",\"updatedInput\":");
@@ -426,7 +399,7 @@ pub(crate) fn permission_response_frame(
         b.push(b'}');
     } else {
         b.extend_from_slice(b"{\"behavior\":\"deny\",\"message\":");
-        push_json_string(&mut b, deny_message);
+        json::push_json_string(&mut b, deny_message);
         b.extend_from_slice(b",\"interrupt\":false}");
     }
     b.extend_from_slice(b"}}");
@@ -440,7 +413,7 @@ pub(crate) fn unsupported_response_frame(request_id: &str) -> Vec<u8> {
     b.extend_from_slice(
         b"{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":",
     );
-    push_json_string(&mut b, request_id);
+    json::push_json_string(&mut b, request_id);
     b.extend_from_slice(b",\"error\":\"unsupported control request\"}}");
     b
 }
@@ -449,7 +422,7 @@ pub(crate) fn unsupported_response_frame(request_id: &str) -> Vec<u8> {
 pub(crate) fn user_message_frame(text: &str) -> Vec<u8> {
     let mut b = Vec::with_capacity(text.len() + 64);
     b.extend_from_slice(b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":");
-    push_json_string(&mut b, text);
+    json::push_json_string(&mut b, text);
     b.extend_from_slice(b"}}");
     b
 }

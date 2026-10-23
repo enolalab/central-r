@@ -656,7 +656,7 @@ impl Inner {
             self.stop_locked(st, reasons::PERMISSION_BRIDGE_UNAVAILABLE);
             return;
         }
-        let input = match super::json::echoed_input(&req.input) {
+        let input = match crate::json::echoed_input(&req.input) {
             Ok(input) => input,
             Err(_) => {
                 self.stop_locked(st, reasons::PERMISSION_BRIDGE_UNAVAILABLE);
@@ -920,10 +920,10 @@ impl Inner {
 fn stream_ended_frame(t: &Terminal) -> Vec<u8> {
     let mut b = Vec::with_capacity(96);
     b.extend_from_slice(b"{\"type\":\"central_stream_ended\",\"status\":");
-    protocol::push_json_string(&mut b, t.status.as_str());
+    crate::json::push_json_string(&mut b, t.status.as_str());
     if !t.reason.is_empty() {
         b.extend_from_slice(b",\"reason\":");
-        protocol::push_json_string(&mut b, &t.reason);
+        crate::json::push_json_string(&mut b, &t.reason);
     }
     b.push(b'}');
     b
@@ -1333,7 +1333,7 @@ mod tests {
     /// duplicate-key refusal at every depth.
     #[test]
     fn echoed_input_rules() {
-        use super::super::json::{JsonError, echoed_input};
+        use crate::json::{JsonError, echoed_input};
         assert_eq!(echoed_input(b"").unwrap(), b"{}");
         assert_eq!(
             echoed_input(b"{ \"cmd\" : \"ls\" }").unwrap(),

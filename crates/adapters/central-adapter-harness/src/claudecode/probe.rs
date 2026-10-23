@@ -72,17 +72,17 @@ fn parse_auth_status(out: &[u8]) -> Result<AuthStatus, ()> {
     let start = out.iter().position(|b| !ws(*b)).unwrap_or(out.len());
     let end = out.iter().rposition(|b| !ws(*b)).map_or(start, |i| i + 1);
     let trimmed = &out[start..end];
-    let members = super::json::object_members(trimmed).map_err(|_| ())?;
+    let members = crate::json::object_members(trimmed).map_err(|_| ())?;
     let mut status = AuthStatus::default();
     for (name, span) in &members {
         match name.as_str() {
             "loggedIn" => {
                 status.logged_in =
-                    super::json::field::<Option<bool>>(trimmed, span).map_err(|_| ())?;
+                    crate::json::field::<Option<bool>>(trimmed, span).map_err(|_| ())?;
             }
             "authMethod" => {
                 status.auth_method =
-                    super::json::field::<Option<String>>(trimmed, span).map_err(|_| ())?;
+                    crate::json::field::<Option<String>>(trimmed, span).map_err(|_| ())?;
             }
             _ => {}
         }

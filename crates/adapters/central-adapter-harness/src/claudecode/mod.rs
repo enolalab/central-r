@@ -16,7 +16,6 @@
 //!   the duplicate-member-name walk).
 
 mod argv;
-mod json;
 mod probe;
 mod protocol;
 mod session;

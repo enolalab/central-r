@@ -546,3 +546,30 @@ fn hex4(s: &[u8]) -> Option<u32> {
     }
     Some(v)
 }
+
+/// `json.Marshal(s)` via Go's `appendString` with EscapeHTML off — the
+/// mode `encodeLine` sets: `"` `\` shorthand escapes, `\n`/`\r`/`\t`,
+/// other controls as `\u00xx`, U+2028/U+2029 escaped, everything else
+/// raw UTF-8 (`<`/`>`/`&` unescaped).
+pub(crate) fn push_json_string(out: &mut Vec<u8>, s: &str) {
+    out.push(b'"');
+    for c in s.chars() {
+        match c {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            '\u{2028}' => out.extend_from_slice(b"\\u2028"),
+            '\u{2029}' => out.extend_from_slice(b"\\u2029"),
+            c if (c as u32) < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes());
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    out.push(b'"');
+}
