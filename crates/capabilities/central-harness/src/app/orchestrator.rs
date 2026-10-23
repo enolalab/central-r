@@ -55,7 +55,7 @@ const WRITE_ATTEMPTS: usize = 3;
 /// `writeBackoff` — the write retry's base backoff (`<<i` doubling).
 const WRITE_BACKOFF: Duration = Duration::milliseconds(100);
 /// `eventWriteBackoffMax` — the event-write retry's backoff cap.
-const EVENT_WRITE_BACKOFF_MAX: Duration = Duration::milliseconds(500);
+const EVENT_WRITE_BACKOFF_MAX: Duration = Duration::seconds(5);
 /// `permissionAnswerBudget` — bounds one `respond_permission` call.
 const PERMISSION_ANSWER_BUDGET: Duration = Duration::seconds(5);
 /// `sessionWaitBudget` — bounds `session.wait()`/`scopeReleased`'s
@@ -78,8 +78,6 @@ pub struct OrchestratorConfig {
     pub lifeline_budget: Duration,
     /// `InterruptGrace` — between interrupt and kill.
     pub interrupt_grace: Duration,
-    /// `ResumePollInterval` — a resume re-poll (3g).
-    pub resume_poll_interval: Duration,
     /// `DefaultCostMicroUSD` — the effective budget when the claim's
     /// `cost` is unset (decision 5).
     pub default_cost_micro_usd: i64,
@@ -119,7 +117,6 @@ impl fmt::Debug for OrchestratorConfig {
             .field("event_write_budget", &self.event_write_budget)
             .field("lifeline_budget", &self.lifeline_budget)
             .field("interrupt_grace", &self.interrupt_grace)
-            .field("resume_poll_interval", &self.resume_poll_interval)
             .field("default_cost_micro_usd", &self.default_cost_micro_usd)
             .field("default_wall_clock", &self.default_wall_clock)
             .field("max_tokens", &self.max_tokens)
@@ -142,7 +139,6 @@ impl OrchestratorConfig {
             event_write_budget: Duration::seconds(10),
             lifeline_budget: Duration::seconds(5),
             interrupt_grace: Duration::milliseconds(200),
-            resume_poll_interval: Duration::seconds(30),
             default_cost_micro_usd: 5_000_000,
             default_wall_clock: Duration::minutes(30),
             max_tokens: 0,
@@ -379,14 +375,13 @@ struct Standing<'o> {
     /// (upstream's `bridgedAttempt` is always `r.attempt.ID`; a nil id
     /// disables the drop).
     attempt_id: HarnessAttemptId,
-    /// `r.stop` — the serve-stop channel.
-    stop: PortFuture<'o, ()>,
+    /// `r.stop` — the serve-stop channel; `None` once it fired (a
+    /// completed future is never polled again).
+    stop: Option<PortFuture<'o, ()>>,
     /// `r.hbTick` — next heartbeat tick.
     hb_tick: PortFuture<'o, ()>,
     /// `r.hb` — a heartbeat in flight.
     hb: Option<PortFuture<'o, Result<bool, Failure>>>,
-    /// `r.hbMissed` — a tick while a heartbeat was in flight.
-    hb_missed: bool,
     /// `r.cancelReq`-closed — `requestCancel` ran (the upstream
     /// channel; `cancelHit` is `AttemptRun::cancel_consumed`).
     cancel_hit: bool,
@@ -405,9 +400,8 @@ impl<'o> Standing<'o> {
             run,
             attempt_id: HarnessAttemptId::from_trusted_db_bytes([0; 16]),
             hb_tick: o.deps.ticker.after(o.deps.cfg.heartbeat_interval),
-            stop: stop.cancelled(),
+            stop: Some(stop.cancelled()),
             hb: None,
-            hb_missed: false,
             cancel_hit: false,
             end: End::Live,
             last_beat_at: o.deps.clock.now(),
@@ -432,6 +426,14 @@ impl<'o> Standing<'o> {
         }
     }
 
+    /// `r.cancel(cause)` — `WithCancelCause`: the first cause wins;
+    /// a later one changes nothing (`interrupted`'s reported cause).
+    fn end_with(&mut self, end: End) {
+        if self.end == End::Live {
+            self.end = end;
+        }
+    }
+
     /// `onHeartbeat` — applies one heartbeat result (upstream's
     /// heartbeat goroutine body).
     fn on_heartbeat(&mut self, res: Result<bool, Failure>) {
@@ -448,7 +450,7 @@ impl<'o> Standing<'o> {
                     self.last_beat_at = self.o.deps.clock.now();
                     self.request_cancel();
                 } else if code == codes::LEASE_LOST {
-                    self.end = End::Lost;
+                    self.end_with(End::Lost);
                 }
                 // Otherwise logged upstream; the next tick retries.
             }
@@ -457,14 +459,17 @@ impl<'o> Standing<'o> {
 
     /// `pollStanding` — one non-blocking pass over the standing arms.
     fn poll(&mut self, cx: &mut std::task::Context<'_>) {
-        if let Poll::Ready(()) = self.stop.as_mut().poll(cx) {
-            self.end = End::Stopped;
+        if let Some(stop) = self.stop.as_mut()
+            && let Poll::Ready(()) = stop.as_mut().poll(cx)
+        {
+            self.stop = None;
+            self.end_with(End::Stopped);
         }
         if !self.hb_stopped {
             if let Poll::Ready(()) = self.hb_tick.as_mut().poll(cx) {
-                if self.hb.is_some() {
-                    self.hb_missed = true;
-                } else {
+                // A tick while a heartbeat is in flight is dropped
+                // (upstream's ticker drops it when unreceived).
+                if self.hb.is_none() {
                     self.hb = Some(self.o.deps.lifecycle.heartbeat(self.run.clone()));
                 }
                 self.hb_tick = self.o.deps.ticker.after(self.o.deps.cfg.heartbeat_interval);
@@ -557,9 +562,12 @@ impl<'o> Standing<'o> {
 }
 
 /// The drive loop's own arms — upstream's non-standing `select` cases.
-/// Session futures borrow the `session` local.
+/// Session futures borrow `session`.
 struct DriveArms<'a> {
-    /// `case ev, ok := <-events`.
+    /// The session every session-bound arm borrows.
+    session: &'a dyn Session,
+    /// `case ev, ok := <-events` — re-armed on each delivered event;
+    /// `None` once the stream closed.
     next_event: Option<PortFuture<'a, Option<Event>>>,
     /// `case <-wall.C`.
     wall: Option<PortFuture<'a, ()>>,
@@ -600,19 +608,14 @@ enum Fired {
 
 impl<'a> DriveArms<'a> {
     /// One non-blocking pass over the drive arms — the upstream
-    /// `select`'s cases in textual order. The approval arms are
-    /// maintained by `opened`/`closeOpen`/`answer` (the upstream
-    /// `approvalSignal()`/`approvalExpiry()` returning `nil` for a
-    /// nil or answered open is their clearing).
+    /// `select`'s cases. The timer and approval arms are polled before
+    /// the event arm: upstream's `select` picks among ready cases at
+    /// random, so a session that yields an event every pass must not
+    /// starve the wall clock, the kill ladder or a decision. The
+    /// approval arms are maintained by `opened`/`closeOpen`/`answer`
+    /// (the upstream `approvalSignal()`/`approvalExpiry()` returning
+    /// `nil` for a nil or answered open is their clearing).
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Option<Fired> {
-        if let Some(f) = self.next_event.as_mut()
-            && let Poll::Ready(ev) = f.as_mut().poll(cx)
-        {
-            if ev.is_none() {
-                self.next_event = None;
-            }
-            return Some(Fired::Event(ev.map(Box::new)));
-        }
         if let Some(f) = self.wall.as_mut()
             && let Poll::Ready(()) = f.as_mut().poll(cx)
         {
@@ -645,6 +648,24 @@ impl<'a> DriveArms<'a> {
         }
         if let Poll::Ready(()) = self.recheck.as_mut().poll(cx) {
             return Some(Fired::Recheck);
+        }
+        if let Some(f) = self.next_event.as_mut()
+            && let Poll::Ready(ev) = f.as_mut().poll(cx)
+        {
+            return Some(match ev {
+                Some(ev) => {
+                    // One `next_event()` call per event (the `Session`
+                    // contract): the next pull is armed now so the
+                    // completed future is never polled again.
+                    self.next_event = Some(self.session.next_event());
+                    Fired::Event(Some(Box::new(ev)))
+                }
+                // `events = nil` — the closed stream is left `None`.
+                None => {
+                    self.next_event = None;
+                    Fired::Event(None)
+                }
+            });
         }
         None
     }
@@ -982,7 +1003,7 @@ impl<'o> AttemptRun<'o> {
     /// or fence conflict ends the attempt as lost.
     fn lost_or_stopped(&mut self, err: &Failure) -> Option<HarnessResult> {
         if err.code() == codes::LEASE_LOST || err.code() == domain::codes::FENCE_MISMATCH {
-            self.standing.end = End::Lost;
+            self.standing.end_with(End::Lost);
             return self.interrupted();
         }
         self.interrupted()
@@ -1031,10 +1052,11 @@ impl<'o> AttemptRun<'o> {
     // ------------------------------------------------------------------
 
     async fn execute_inner(&mut self) -> HarnessResult {
-        // CheckFreeSpace.
+        // CheckFreeSpace — under the work ctx (orchestrator.go:501):
+        // a Task cancel aborts a hanging check.
         match self
             .standing
-            .race(self.o.deps.workspaces.check_free_space())
+            .work_race(self.o.deps.workspaces.check_free_space())
             .await
         {
             Race::Done(Ok(())) => {}
@@ -1481,7 +1503,8 @@ impl<'o> AttemptRun<'o> {
                     "terminal",
                     &status,
                     ports::MILESTONE_REASON_CANCELLED,
-                );
+                )
+                .await;
                 HarnessResult {
                     outcome: Outcome::Cancelled,
                     reason: FailureCode::default(),
@@ -1505,6 +1528,7 @@ impl<'o> AttemptRun<'o> {
                     &status,
                     ports::MILESTONE_REASON_CANCELLED,
                 )
+                .await
             }
         }
     }
@@ -1541,7 +1565,8 @@ impl<'o> AttemptRun<'o> {
                     "terminal",
                     "failed",
                     reason.as_str(),
-                );
+                )
+                .await;
                 HarnessResult {
                     outcome: Outcome::Abandoned,
                     reason,
@@ -1568,6 +1593,7 @@ impl<'o> AttemptRun<'o> {
                     "failed",
                     reason.as_str(),
                 )
+                .await
             }
         }
     }
@@ -1662,10 +1688,12 @@ impl<'o> AttemptRun<'o> {
         };
         let res = {
             let adapter = &*self.o.deps.adapter;
-            if self.attempt.resume_of.is_some()
-                && !self.attempt.resume_session_id.is_empty()
-                && adapter.capabilities().resume_by_id
-            {
+            if self.attempt.resume_of.is_some() {
+                // Upstream calls `Adapter.Resume` unconditionally once
+                // `ResumeOf` is set (orchestrator.go:811-819): the
+                // adapter's own error becomes `launch_failed` — a
+                // capability gate here would start a fresh session on
+                // a resume-prepared attempt instead.
                 let spec2 = spec.clone();
                 self.standing
                     .race(adapter.resume(
@@ -1715,7 +1743,8 @@ impl<'o> AttemptRun<'o> {
             }
         };
         self.session_started = true;
-        self.milestone(MilestoneKind::AttemptLaunched, "launched", "launching", "");
+        self.milestone(MilestoneKind::AttemptLaunched, "launched", "launching", "")
+            .await;
         self.drive(session).await
     }
 
@@ -1723,6 +1752,7 @@ impl<'o> AttemptRun<'o> {
     async fn drive(&mut self, session: Box<dyn Session>) -> HarnessResult {
         let session: &dyn Session = &*session;
         let mut arms = DriveArms {
+            session,
             next_event: Some(session.next_event()),
             wall: Some(
                 self.o
@@ -1965,7 +1995,7 @@ impl<'o> AttemptRun<'o> {
             return Err(e);
         }
         if let (Some(o), Some(p)) = (open, request) {
-            self.opened(o, p, arms)?;
+            self.opened(o, p, arms).await?;
         }
         let seq = ev.seq.to_string();
         match ev.payload {
@@ -1980,7 +2010,8 @@ impl<'o> AttemptRun<'o> {
                     "session_started",
                     "running",
                     "",
-                );
+                )
+                .await;
             }
             Some(EventPayload::PermissionRequested(p)) => {
                 if !self.bridging() {
@@ -2008,7 +2039,8 @@ impl<'o> AttemptRun<'o> {
                     (MilestoneKind::PermissionDenied, "deny")
                 };
                 let reason = decided_by_code(&p.decided_by);
-                self.milestone(kind, &format!("seq:{seq}"), status, reason);
+                self.milestone(kind, &format!("seq:{seq}"), status, reason)
+                    .await;
                 if self.bridging()
                     && let Err(e) = self.resolved(&p, arms).await
                 {
@@ -2022,11 +2054,13 @@ impl<'o> AttemptRun<'o> {
                         &format!("seq:{seq}"),
                         "deny",
                         "",
-                    );
+                    )
+                    .await;
                 }
             }
             Some(EventPayload::Retry(_)) => {
-                self.milestone(MilestoneKind::Retry, &format!("seq:{seq}"), "", "");
+                self.milestone(MilestoneKind::Retry, &format!("seq:{seq}"), "", "")
+                    .await;
             }
             _ => {}
         }
@@ -2062,7 +2096,7 @@ impl<'o> AttemptRun<'o> {
                 Race::Ended => return Err(ended_err(self.standing.end)),
             };
             if self.lease_stale() {
-                self.standing.end = End::Lost;
+                self.standing.end_with(End::Lost);
                 return Err(Failure::conflict(
                     codes::LEASE_LOST,
                     "no heartbeat succeeded for a lease duration",
@@ -2215,10 +2249,21 @@ impl<'o> AttemptRun<'o> {
         arms.kill_pending = Some(session.kill());
     }
 
-    /// `closeLifeline` — end the session without the kill ladder.
+    /// `closeLifeline` — end the session without the kill ladder: a
+    /// bounded `kill`, then the remaining events drained (upstream
+    /// drains them in a background goroutine so the adapter's delivery
+    /// ends; here the drain shares the lifeline budget and `Session`'s
+    /// `Drop` covers whatever is left — the `Session` contract
+    /// requires pulling until `None`).
     async fn close_lifeline(&mut self, session: &dyn Session) {
         let _ = bounded(
             session.kill(),
+            self.o.deps.ticker.after(self.o.deps.cfg.lifeline_budget),
+        )
+        .await;
+        let drain = async { while let Some(_ev) = session.next_event().await {} };
+        let _ = bounded(
+            drain,
             self.o.deps.ticker.after(self.o.deps.cfg.lifeline_budget),
         )
         .await;
@@ -2312,17 +2357,19 @@ impl<'o> AttemptRun<'o> {
                     self.request_cancel();
                     return self.settle_cancellation(cause).await;
                 }
-                return self.settle_failed(
-                    HarnessResult {
-                        outcome: outcome_of(s),
-                        reason: s.reason.clone(),
-                        low_disk: self.low_disk,
-                        settle_failed: false,
-                        err: Some(e),
-                    },
-                    &status,
-                    s.reason.as_str(),
-                );
+                return self
+                    .settle_failed(
+                        HarnessResult {
+                            outcome: outcome_of(s),
+                            reason: s.reason.clone(),
+                            low_disk: self.low_disk,
+                            settle_failed: false,
+                            err: Some(e),
+                        },
+                        &status,
+                        s.reason.as_str(),
+                    )
+                    .await;
             }
         }
         self.stop_heartbeat();
@@ -2339,7 +2386,8 @@ impl<'o> AttemptRun<'o> {
                     "terminal",
                     &status,
                     s.reason.as_str(),
-                );
+                )
+                .await;
                 HarnessResult {
                     outcome: outcome_of(s),
                     reason: s.reason.clone(),
@@ -2367,6 +2415,7 @@ impl<'o> AttemptRun<'o> {
                     &status,
                     s.reason.as_str(),
                 )
+                .await
             }
         }
     }
@@ -2394,9 +2443,8 @@ impl<'o> AttemptRun<'o> {
             if let Some(r) = self.aborted(cause.clone(), session).await {
                 return r;
             }
-            if path.is_empty() {
-                continue;
-            }
+            // Upstream calls `Store` unconditionally (orchestrator.go:
+            // 1406): the sink rejects an empty path itself.
             let (outcome, err) = self.store_artifact(role, path).await;
             if let Some(r) = self
                 .on_artifact_outcome(&role, outcome, err, cause.clone(), session)
@@ -2445,8 +2493,10 @@ impl<'o> AttemptRun<'o> {
             "artifacts",
             "succeeded",
             "",
-        );
-        self.milestone(MilestoneKind::Terminal, "terminal", "succeeded", "");
+        )
+        .await;
+        self.milestone(MilestoneKind::Terminal, "terminal", "succeeded", "")
+            .await;
         HarnessResult {
             outcome: Outcome::Succeeded,
             reason: FailureCode::default(),
@@ -2471,7 +2521,7 @@ impl<'o> AttemptRun<'o> {
         if let Some(e) = err.as_ref()
             && e.code() == codes::LEASE_LOST
         {
-            self.standing.end = End::Lost;
+            self.standing.end_with(End::Lost);
             return Some(HarnessResult {
                 outcome: Outcome::Lost,
                 reason: FailureCode::LEASE_LOST,
@@ -2566,7 +2616,8 @@ impl<'o> AttemptRun<'o> {
                     "terminal",
                     &status,
                     ports::MILESTONE_REASON_RECONCILIATION,
-                );
+                )
+                .await;
                 HarnessResult {
                     outcome: Outcome::Reconciliation,
                     reason: FailureCode::default(),
@@ -2594,6 +2645,7 @@ impl<'o> AttemptRun<'o> {
                     &status,
                     ports::MILESTONE_REASON_RECONCILIATION,
                 )
+                .await
             }
         }
     }
@@ -2640,7 +2692,10 @@ impl<'o> AttemptRun<'o> {
                     (ArtifactRole::Patch, c.patch),
                     (ArtifactRole::Commits, c.commits),
                 ] {
-                    if path.is_empty() || self.standing.ended() || self.standing.cancel_hit {
+                    // Upstream breaks only on the work ctx's end
+                    // (orchestrator.go:1540); `Store` is called with an
+                    // empty path too — the sink rejects it.
+                    if self.standing.ended() || self.standing.cancel_hit {
                         break;
                     }
                     let (outcome, err) = self.store_artifact(role, path).await;
@@ -2678,14 +2733,16 @@ impl<'o> AttemptRun<'o> {
                 "artifacts",
                 &status,
                 failure.as_str(),
-            );
+            )
+            .await;
         } else {
             self.milestone(
                 MilestoneKind::ArtifactsCaptured,
                 "artifacts",
                 &status,
                 reason.as_str(),
-            );
+            )
+            .await;
         }
         None
     }
@@ -2766,13 +2823,14 @@ impl<'o> AttemptRun<'o> {
     }
 
     /// `settleFailed` — a settlement write failed permanently.
-    fn settle_failed(
+    async fn settle_failed(
         &mut self,
         mut res: HarnessResult,
         status: &str,
         reason: &str,
     ) -> HarnessResult {
-        self.milestone(MilestoneKind::SettleFailed, "settle_failed", status, reason);
+        self.milestone(MilestoneKind::SettleFailed, "settle_failed", status, reason)
+            .await;
         res.settle_failed = true;
         res
     }
@@ -2853,7 +2911,7 @@ impl<'o> AttemptRun<'o> {
 
     /// `opened` — register the just-written approval: registry entry,
     /// signal + expiry arms, milestone.
-    fn opened<'a>(
+    async fn opened<'a>(
         &mut self,
         open: ApprovalOpen,
         request: PermissionRequested,
@@ -2888,7 +2946,8 @@ impl<'o> AttemptRun<'o> {
             &format!("permission:{aid}"),
             ApprovalState::Pending.as_str(),
             &tool,
-        );
+        )
+        .await;
         Ok(())
     }
 
@@ -2967,7 +3026,7 @@ impl<'o> AttemptRun<'o> {
                     }
                     return Err(bridge::bridge_failure(e));
                 }
-                self.opened(open, head, arms)
+                self.opened(open, head, arms).await
             }
             Err(e) => Err(bridge::bridge_failure(e)),
         }
@@ -3138,8 +3197,10 @@ impl<'o> AttemptRun<'o> {
     // ------------------------------------------------------------------
 
     /// `r.milestone` — best-effort; never written once the ctx ended
-    /// (unless `completed`, whose settlement committed).
-    fn milestone(&self, kind: MilestoneKind, key: &str, status: &str, reason: &str) {
+    /// (unless `completed`, whose settlement committed). Upstream
+    /// `events.Record` is a blocking call whose error is only logged,
+    /// so the record is awaited and its failure ignored.
+    async fn milestone(&self, kind: MilestoneKind, key: &str, status: &str, reason: &str) {
         if !self.completed && self.standing.ended() {
             return;
         }
@@ -3157,12 +3218,6 @@ impl<'o> AttemptRun<'o> {
             reason: reason.to_string(),
             at: self.o.deps.clock.now(),
         };
-        // The port crate owns no runtime: a parked `record` future is
-        // dropped at the first `Pending` — the upstream `go`+log is the
-        // equivalent (best-effort, never fails the attempt).
-        let mut f = Box::pin(sink.record(m));
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        let _ = f.as_mut().poll(&mut cx);
+        let _ = sink.record(m).await;
     }
 }
