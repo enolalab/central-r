@@ -454,7 +454,10 @@ impl ResumeCheckpointStore for Store {
         let attempt_id = uuid_of(checkpoint.attempt_id.as_bytes());
 
         let mut tx = begin_tx(&self.pool).await?;
-        let stored: Option<Vec<u8>> = sqlx::query_scalar!(
+        // Row existence stays distinct from the column value: a NULL
+        // `payload_fingerprint` (pre-backfill row) is a stored
+        // fingerprint that matches nothing, not an absent row.
+        let stored: Option<Option<Vec<u8>>> = sqlx::query_scalar!(
             "SELECT payload_fingerprint FROM central.resume_checkpoints \
              WHERE attempt_id = $1 AND checkpoint_seq = $2",
             attempt_id,
@@ -462,17 +465,18 @@ impl ResumeCheckpointStore for Store {
         )
         .fetch_optional(&mut *tx)
         .await
-        .ctx("checkpoint: probe idempotency coordinate")?
-        .flatten();
+        .ctx("checkpoint: probe idempotency coordinate")?;
 
         match stored {
-            Some(stored) if stored == fingerprint => {
+            Some(Some(stored)) if stored == fingerprint => {
                 // Identical retry — return the recorded row.
                 let row =
                     load_by_coordinate(&mut tx, attempt_id, checkpoint.checkpoint_seq).await?;
                 tx.commit().await.ctx("checkpoint: commit dedupe reload")?;
                 Ok(row)
             }
+            // `Some(None)` (NULL fingerprint) lands here too: the row
+            // exists, its fingerprint mismatches, the write conflicts.
             Some(_) => Err(Failure::conflict(
                 codes::DUPLICATE_IDEMPOTENCY,
                 "the checkpoint_seq already carries a different payload fingerprint",
@@ -1224,7 +1228,16 @@ impl Store {
         let by_id: std::collections::HashMap<ResumeCheckpointId, &ResumeCheckpoint> =
             candidates.iter().map(|c| (c.id, c)).collect();
         for id in &picks {
-            let candidate = by_id[id];
+            // gc_pick only picks from `candidates`, so both lookups
+            // always hit — an absent entry is a store defect, not a
+            // panic site.
+            let candidate = by_id
+                .get(id)
+                .copied()
+                .ok_or_else(|| corrupt("a gc pick lost its candidate row"))?;
+            let node_key = node_keys
+                .get(id)
+                .ok_or_else(|| corrupt("a gc pick lost its node key"))?;
             sqlx::query!(
                 "DELETE FROM central.resume_checkpoints WHERE checkpoint_id = $1",
                 uuid_of(id.as_bytes()),
@@ -1239,7 +1252,7 @@ impl Store {
                 None,
                 serde_json::json!({
                     "checkpoint_id": id.to_string(),
-                    "node_key": node_keys[id],
+                    "node_key": node_key,
                     "gc_class": candidate.gc_class.as_str(),
                 }),
             );
@@ -1487,7 +1500,11 @@ impl ResumeStore for Store {
         // INSERT below still relies on the constraint for writers
         // outside the lock discipline.
         let fingerprint = record.fingerprint();
-        let stored: Option<Vec<u8>> = sqlx::query_scalar!(
+        // Row existence stays distinct from the column value: a NULL
+        // `payload_fingerprint` (pre-backfill row) is a stored
+        // fingerprint that matches nothing — upstream's probe scans it
+        // into the `default:` refusal branch, not the no-rows path.
+        let stored: Option<Option<Vec<u8>>> = sqlx::query_scalar!(
             "SELECT payload_fingerprint FROM central.resume_checkpoints \
              WHERE attempt_id = $1 AND checkpoint_seq = $2",
             locked.id,
@@ -1495,11 +1512,10 @@ impl ResumeStore for Store {
         )
         .fetch_optional(&mut *tx)
         .await
-        .ctx("checkpoint write: probe dedup key")?
-        .flatten();
+        .ctx("checkpoint write: probe dedup key")?;
 
         match stored {
-            Some(stored) if stored == fingerprint => {
+            Some(Some(stored)) if stored == fingerprint => {
                 // Replay: return the recorded row and journal
                 // command_deduped so the re-issue is observable
                 // (spec-5 replay semantics).
@@ -1523,9 +1539,10 @@ impl ResumeStore for Store {
                 return Ok(existing);
             }
             Some(_) => {
-                // Same key, different payload fingerprint: the
-                // recorded row stands and the write is refused
-                // (spec-5).
+                // Same key, different payload fingerprint — including
+                // a NULL column, which mismatches any live fingerprint:
+                // the recorded row stands and the write is refused
+                // (spec-5), and the refusal journals + commits.
                 let refusal = Failure::denied(
                     codes::DUPLICATE_IDEMPOTENCY,
                     format!(

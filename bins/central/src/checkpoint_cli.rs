@@ -263,11 +263,16 @@ async fn run_verb<B: ResumeStore>(
             {
                 return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
             }
-            let Some(run_raw) = parse_uuid_operand(&flags["run"]) else {
+            // Presence of `run`/`seq` is pre-checked above; `.get` keeps
+            // the impossible miss a usage failure, never a panic.
+            let Some(run_raw) = flags.get("run").and_then(|text| parse_uuid_operand(text)) else {
                 return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
             };
             let run_id = RunId::from_trusted_db_bytes(run_raw);
-            let Ok(checkpoint_seq) = flags["seq"].parse::<i64>() else {
+            let Some(seq_text) = flags.get("seq") else {
+                return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
+            };
+            let Ok(checkpoint_seq) = seq_text.parse::<i64>() else {
                 return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
             };
             if checkpoint_seq < 1 {
@@ -317,7 +322,10 @@ async fn run_verb<B: ResumeStore>(
             if !positional.is_empty() || flags.get("token").is_none_or(String::is_empty) {
                 return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
             }
-            match backend.resume_subtree(&flags["token"], "").await {
+            let Some(token) = flags.get("token") else {
+                return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
+            };
+            match backend.resume_subtree(token, "").await {
                 Ok(()) => emit(
                     stdout,
                     start,
@@ -405,7 +413,7 @@ async fn run_verb<B: ResumeStore>(
             if !positional.is_empty() || flags.get("run").is_none_or(String::is_empty) {
                 return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
             }
-            let Some(run_raw) = parse_uuid_operand(&flags["run"]) else {
+            let Some(run_raw) = flags.get("run").and_then(|text| parse_uuid_operand(text)) else {
                 return fail(stdout, start, command_id, EXIT_CONFIG_INVALID, REASON_USAGE);
             };
             let run_id = RunId::from_trusted_db_bytes(run_raw);

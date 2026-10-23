@@ -470,6 +470,9 @@ struct CkptSeed {
     completed: Vec<String>,
     artifacts: Vec<uuid::Uuid>,
     in_flight: Vec<String>,
+    /// Write `payload_fingerprint = NULL` — the pre-backfill row shape
+    /// `write_checkpoint`'s dedup probe must refuse as a mismatch.
+    null_fingerprint: bool,
 }
 
 impl CkptSeed {
@@ -486,6 +489,7 @@ impl CkptSeed {
             completed: Vec::new(),
             artifacts: Vec::new(),
             in_flight: Vec::new(),
+            null_fingerprint: false,
         }
     }
 }
@@ -527,6 +531,11 @@ async fn write_checkpoint_row(f: &mut Fixture, seed: CkptSeed) -> Result<ResumeC
     };
     record.content_digest = record.digest();
     let fingerprint = record.fingerprint();
+    let stored_fingerprint: Option<&[u8]> = if seed.null_fingerprint {
+        None
+    } else {
+        Some(&fingerprint[..])
+    };
     let artifact_ids = seed.artifacts;
 
     sqlx::query(
@@ -557,7 +566,7 @@ async fn write_checkpoint_row(f: &mut Fixture, seed: CkptSeed) -> Result<ResumeC
     .bind(record.gc_class.as_str())
     .bind(record.expires_at)
     .bind(&record.content_digest)
-    .bind(&fingerprint[..])
+    .bind(stored_fingerprint)
     .execute(&mut f.mig)
     .await
     .map_err(|e| classify_sqlx(&e))?;
@@ -961,6 +970,66 @@ async fn write_checkpoint_seq_dedupe() -> Result<()> {
     drop_db(
         &mut admin,
         &format!("ckpt_test_wdedup_{}", std::process::id()),
+    )
+    .await;
+    result
+}
+
+/// Spec-5 dedupe against a pre-backfill row: a `payload_fingerprint =
+/// NULL` row occupies the `(attempt_id, checkpoint_seq)` coordinate
+/// and mismatches every live fingerprint — upstream's probe scans NULL
+/// into the `default:` refusal branch. The write must refuse
+/// DUPLICATE_IDEMPOTENCY_KEY and the `checkpoint_refused` journal must
+/// still commit alone (spec D2's event-only refusal commit): collapsing
+/// NULL into the no-row path instead dies on the 23505 constraint with
+/// the refusal event rolled back.
+#[tokio::test]
+async fn write_checkpoint_null_fingerprint_refuses_and_journals() -> Result<()> {
+    skip!();
+    let Some((mut admin, mut f)) = fixture("wnullfp").await? else {
+        return Ok(());
+    };
+    let result = async {
+        let anchor = seed_node(&mut f, "anchor", None, "succeeded", 0).await?;
+        let attempt = seed_attempt(&mut f, anchor, 1, "succeeded", None, None).await?;
+
+        // Migration-authority seed: seq 1 on the anchor attempt with a
+        // NULL fingerprint — the row shape no write path produces.
+        let mut seed = CkptSeed::new(anchor, attempt);
+        seed.null_fingerprint = true;
+        write_checkpoint_row(&mut f, seed).await?;
+
+        let err = f
+            .store
+            .write_checkpoint(
+                f.run_id,
+                f.node(anchor),
+                "operator-test",
+                GcClass::RunTerminal,
+                1,
+            )
+            .await
+            .expect_err("a NULL stored fingerprint must refuse as a mismatch");
+        require_failure(
+            &err,
+            FailureKind::Denied,
+            checkpoint_codes::DUPLICATE_IDEMPOTENCY,
+        );
+        // The refusal commits its journal event by itself: no
+        // checkpoint_written, no second row, the NULL row stands.
+        assert_eq!(count_events(&mut f, "checkpoint_refused").await?, 1);
+        assert_eq!(
+            last_event_reason(&mut f, "checkpoint_refused").await?,
+            Some(checkpoint_codes::DUPLICATE_IDEMPOTENCY.to_owned())
+        );
+        assert_eq!(count_events(&mut f, "checkpoint_written").await?, 0);
+        assert_eq!(count_checkpoints(&mut f).await?, 1);
+        Ok(())
+    }
+    .await;
+    drop_db(
+        &mut admin,
+        &format!("ckpt_test_wnullfp_{}", std::process::id()),
     )
     .await;
     result
