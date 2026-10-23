@@ -22,7 +22,8 @@
 //! `domain.rs` follows.
 
 use central_foundation::identity::{
-    ArtifactId, ProduceEdgeId, ReadEdgeId, RunId, SessionAttemptId, WorkflowNodeId, WorkspaceId,
+    ArtifactId, ContentGeneration, ProduceEdgeId, ReadEdgeId, RunId, SessionAttemptId,
+    WorkflowNodeId, WorkspaceId,
 };
 use time::OffsetDateTime;
 
@@ -416,6 +417,130 @@ pub struct RunLineage {
     pub produced: Vec<ProduceEdge>,
     /// Every read edge journaled inside the run.
     pub read: Vec<ReadEdge>,
+}
+
+// ---------------------------------------------------------------------------
+// Attempt-scoped finalization (spec-5 section 5)
+// ---------------------------------------------------------------------------
+
+/// A nil identity or empty name in a finalize command (upstream
+/// `INVALID_FINALIZE_INPUT`, `FailureInvalid`).
+pub const REASON_INVALID_FINALIZE_INPUT: &str = "INVALID_FINALIZE_INPUT";
+/// The `(attempt_id, artifact_name)` key row already names a different
+/// checksum, or the artifact's produce edge was journaled under a
+/// different attempt (upstream `ARTIFACT_ALREADY_FINALIZED`,
+/// `FailureConflict`).
+pub const REASON_ARTIFACT_ALREADY_FINALIZED: &str = "ARTIFACT_ALREADY_FINALIZED";
+/// The artifact row's stored `checksum_value` does not equal the
+/// caller's verified body digest (upstream
+/// `ARTIFACT_CHECKSUM_MISMATCH`, `FailureConflict`).
+pub const REASON_ARTIFACT_CHECKSUM_MISMATCH: &str = "ARTIFACT_CHECKSUM_MISMATCH";
+/// The artifact's producer chain — `workspace_id`, `run_id`, or
+/// `required_role` — does not match the producing attempt's durable
+/// coordinates (upstream `PRODUCER_CHAIN_MISMATCH`, `FailureDenied`).
+pub const REASON_PRODUCER_CHAIN_MISMATCH: &str = "PRODUCER_CHAIN_MISMATCH";
+/// The producing attempt id does not name a `central.session_attempts`
+/// row (upstream `ATTEMPT_NOT_FOUND`, `FailureConflict`).
+pub const REASON_ATTEMPT_NOT_FOUND: &str = "ATTEMPT_NOT_FOUND";
+/// The artifact id does not name a `central.artifacts` row (upstream
+/// `ARTIFACT_NOT_FOUND`, `FailureConflict`).
+pub const REASON_FINALIZE_ARTIFACT_NOT_FOUND: &str = "ARTIFACT_NOT_FOUND";
+
+/// The raw attempt-scoped finalize command (upstream
+/// `FinalizeAttemptArtifact`'s parameter list plus the coordinates the
+/// change set must carry): the caller — the attempt-outcome path the
+/// scheduler owns — binds the artifact it verified and promoted,
+/// including the producing attempt's run/node coordinates and the
+/// artifact's `content_generation`, so the commit can re-validate them
+/// against durable state instead of trusting a mid-flight snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinalizeAttemptInput {
+    /// The producing attempt (the key row's `attempt_id` half).
+    pub attempt_id: SessionAttemptId,
+    /// `artifacts.required_role` — the name the artifact resolves under
+    /// for `central artifact read --from <node_key> --name <name>` (the
+    /// key row's `artifact_name` half).
+    pub artifact_name: String,
+    /// The artifact row to transition `verifying` → `ready`.
+    pub artifact_id: ArtifactId,
+    /// The run the producing attempt belongs to; re-validated against
+    /// `session_attempts.run_id` inside the commit.
+    pub run_id: RunId,
+    /// The workflow node the producing attempt belongs to; re-validated
+    /// against `session_attempts.node_id` inside the commit.
+    pub node_id: WorkflowNodeId,
+    /// The verified body SHA-256 the artifacts row already carries
+    /// (`checksum_value`); a mismatch aborts the commit as
+    /// [`REASON_ARTIFACT_CHECKSUM_MISMATCH`].
+    pub checksum: [u8; 32],
+    /// The canonical-command fingerprint stored on the key row for
+    /// audit (32-byte SHA-256 width enforced by the type).
+    pub payload_fingerprint: [u8; 32],
+    /// The content generation the B10 promote stage recorded;
+    /// re-validated against `artifacts.content_generation` inside the
+    /// commit so a stale promotion binding cannot finalize.
+    pub content_generation: ContentGeneration,
+}
+
+/// The artifact-owned change set [`attempt_finalization`] produces —
+/// what `port::AttemptFinalizationStore` maps in one transaction to the
+/// `artifact_finalizations` key row, the `verifying` → `ready`
+/// transition, the journaled produce edge, and the `artifact_finalized`
+/// run event.
+///
+/// `central-artifact` deliberately holds no journal types: the run-event
+/// envelope is the adapter's mapping, keeping the capability free of
+/// the `central-eventjournal` edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttemptFinalization {
+    /// See [`FinalizeAttemptInput`].
+    pub attempt_id: SessionAttemptId,
+    /// See [`FinalizeAttemptInput`].
+    pub artifact_name: String,
+    /// See [`FinalizeAttemptInput`].
+    pub artifact_id: ArtifactId,
+    /// See [`FinalizeAttemptInput`].
+    pub run_id: RunId,
+    /// See [`FinalizeAttemptInput`].
+    pub node_id: WorkflowNodeId,
+    /// See [`FinalizeAttemptInput`].
+    pub checksum: [u8; 32],
+    /// See [`FinalizeAttemptInput`].
+    pub payload_fingerprint: [u8; 32],
+    /// See [`FinalizeAttemptInput`].
+    pub content_generation: ContentGeneration,
+}
+
+/// Evaluates the caller's finalize command into the validated
+/// [`AttemptFinalization`] change set — the capability's half of
+/// upstream `FinalizeAttemptArtifact`'s input guard. `checksum` and
+/// `payload_fingerprint` are 32 bytes by construction (`[u8; 32]` —
+/// upstream's `INVALID_CHECKSUM`/`INVALID_FINGERPRINT` length guards are
+/// unreachable in Rust); nil identities, a nil content generation, or an
+/// empty artifact name is [`REASON_INVALID_FINALIZE_INPUT`].
+pub fn attempt_finalization(input: &FinalizeAttemptInput) -> Result<AttemptFinalization, Failure> {
+    if input.attempt_id.is_nil()
+        || input.artifact_id.is_nil()
+        || input.run_id.is_nil()
+        || input.node_id.is_nil()
+        || input.artifact_name.is_empty()
+        || input.content_generation.is_nil()
+    {
+        return Err(lineage_failure(
+            FailureClass::Invalid,
+            REASON_INVALID_FINALIZE_INPUT,
+        ));
+    }
+    Ok(AttemptFinalization {
+        attempt_id: input.attempt_id,
+        artifact_name: input.artifact_name.clone(),
+        artifact_id: input.artifact_id,
+        run_id: input.run_id,
+        node_id: input.node_id,
+        checksum: input.checksum,
+        payload_fingerprint: input.payload_fingerprint,
+        content_generation: input.content_generation,
+    })
 }
 
 #[cfg(test)]

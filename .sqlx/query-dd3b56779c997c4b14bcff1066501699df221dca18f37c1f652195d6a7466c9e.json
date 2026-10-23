@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.artifact_finalizations (attempt_id, artifact_name, artifact_id, checksum, payload_fingerprint) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (attempt_id, artifact_name) DO NOTHING RETURNING artifact_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "dd3b56779c997c4b14bcff1066501699df221dca18f37c1f652195d6a7466c9e"
+}

@@ -22,15 +22,16 @@ use crate::domain::{
     Artifact, ArtifactTombstone, BeginUploadResult, FAILURE_CODE_STAGING_EXPIRED, Outcome,
     OutcomeKind, PromotionResult, RejectResult, ReserveResult, VerifiedResult,
 };
-use crate::lineage::{LineageArtifact, ProduceEdge, ReadEdge};
+use crate::lineage::{AttemptFinalization, LineageArtifact, ProduceEdge, ReadEdge};
 use crate::port::{
-    ArtifactChangeSet, ByteStream, ByteStreamFuture, ClaimIncompleteRequest, ClaimIncompleteResult,
-    ClaimLargeRequest, ClaimRejectedStagingRequest, ClaimRejectedStagingResult, Classifier,
-    ClassifyRequest, ClassifyResult, ClearStagingKeyRequest, CommitResult, CompletionContributor,
-    ExpireStagingRequest, ExpireStagingResult, LargeClaim, LineageReader, ObjectInfo, ObjectRef,
-    ObjectStore, ProduceEdgeStore, ReadEdgeStore, ReadStore, ReconciliationProgress,
-    ReconciliationStore, RecordLargeClaimRequest, RejectedStagingClaim, ReleaseLargeClaimRequest,
-    Store, TwoPhaseDeleteResult, TwoPhaseDeleteStore, UploadRequest, UploadResult,
+    ArtifactChangeSet, AttemptFinalizationStore, ByteStream, ByteStreamFuture,
+    ClaimIncompleteRequest, ClaimIncompleteResult, ClaimLargeRequest, ClaimRejectedStagingRequest,
+    ClaimRejectedStagingResult, Classifier, ClassifyRequest, ClassifyResult,
+    ClearStagingKeyRequest, CommitResult, CompletionContributor, ExpireStagingRequest,
+    ExpireStagingResult, LargeClaim, LineageReader, ObjectInfo, ObjectRef, ObjectStore,
+    ProduceEdgeStore, ReadEdgeStore, ReadStore, ReconciliationProgress, ReconciliationStore,
+    RecordLargeClaimRequest, RejectedStagingClaim, ReleaseLargeClaimRequest, Store,
+    TwoPhaseDeleteResult, TwoPhaseDeleteStore, UploadRequest, UploadResult,
 };
 
 /// A state cell shared between a fake and the fixture that cloned it —
@@ -409,6 +410,17 @@ pub(crate) struct FakeStore {
     pub(crate) load_err: Shared<Option<Failure>>,
     pub(crate) delete_pending_err: Shared<Option<Failure>>,
     pub(crate) complete_err: Shared<Option<Failure>>,
+
+    /// Every [`AttemptFinalization`] change set the commit saw, in
+    /// order — proves the service hands the store the evaluated result,
+    /// not the raw input.
+    pub(crate) finalizations: Shared<Vec<AttemptFinalization>>,
+    /// Injected commit failure.
+    pub(crate) finalize_attempt_err: Shared<Option<Failure>>,
+    /// When set, `finalize_attempt_artifact` returns this id instead of
+    /// `change.artifact_id` — models a same-checksum replay answering
+    /// with the RECORDED artifact id.
+    pub(crate) finalize_attempt_result: Shared<Option<ArtifactId>>,
 }
 
 impl FakeStore {
@@ -427,7 +439,36 @@ impl FakeStore {
             load_err: shared(None),
             delete_pending_err: shared(None),
             complete_err: shared(None),
+            finalizations: shared(Vec::new()),
+            finalize_attempt_err: shared(None),
+            finalize_attempt_result: shared(None),
         }
+    }
+}
+
+impl AttemptFinalizationStore for FakeStore {
+    async fn finalize_attempt_artifact(
+        &self,
+        change: AttemptFinalization,
+    ) -> Result<ArtifactId, Failure> {
+        self.journal.record("store.FinalizeAttempt");
+        self.finalizations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(change.clone());
+        if let Some(failure) = self
+            .finalize_attempt_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Err(failure);
+        }
+        Ok(self
+            .finalize_attempt_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(change.artifact_id))
     }
 }
 

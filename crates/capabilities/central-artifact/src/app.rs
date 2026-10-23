@@ -50,15 +50,16 @@ use crate::domain::{
     reserve, verified,
 };
 use crate::lineage::{
-    LineageArtifact, ProduceEdge, REASON_ARTIFACT_NOT_FINALIZED, REASON_ARTIFACT_READ_UNRESOLVED,
-    REASON_ARTIFACT_SCOPE_DENIED, REASON_LINEAGE_ARTIFACT_REQUIRED, REASON_LINEAGE_NODE_REQUIRED,
-    REASON_LINEAGE_RUN_REQUIRED, REASON_LINEAGE_STORE_UNAVAILABLE, ReadAuthorization, ReadEdge,
-    ReadRequest, ReadScope, ReadSelector, RunLineage,
+    FinalizeAttemptInput, LineageArtifact, ProduceEdge, REASON_ARTIFACT_NOT_FINALIZED,
+    REASON_ARTIFACT_READ_UNRESOLVED, REASON_ARTIFACT_SCOPE_DENIED,
+    REASON_LINEAGE_ARTIFACT_REQUIRED, REASON_LINEAGE_NODE_REQUIRED, REASON_LINEAGE_RUN_REQUIRED,
+    REASON_LINEAGE_STORE_UNAVAILABLE, ReadAuthorization, ReadEdge, ReadRequest, ReadScope,
+    ReadSelector, RunLineage,
 };
 use crate::port::{
-    ArtifactChangeSet, ArtifactCommandReceipt, ByteStream, Classifier, ClassifyRequest,
-    ClassifyResult, CompletionContributor, LineageReader, ObjectInfo, ObjectRef, ObjectStore,
-    ProduceEdgeStore, ReadEdgeStore, ReadStore, Store, TRANSFER_COPY_BUFFER_BYTES,
+    ArtifactChangeSet, ArtifactCommandReceipt, AttemptFinalizationStore, ByteStream, Classifier,
+    ClassifyRequest, ClassifyResult, CompletionContributor, LineageReader, ObjectInfo, ObjectRef,
+    ObjectStore, ProduceEdgeStore, ReadEdgeStore, ReadStore, Store, TRANSFER_COPY_BUFFER_BYTES,
     TwoPhaseDeleteStore, UploadRequest,
 };
 
@@ -1718,6 +1719,44 @@ fn reconstructed_tombstone(
 }
 
 // ---------------------------------------------------------------------------
+// spec-5 §5 attempt-scoped finalization — the single visibility boundary
+// (upstream internal/adapter/postgres/artifact/finalize.go)
+// ---------------------------------------------------------------------------
+
+impl<S, O, C, P, F> Service<S, O, C, P, F>
+where
+    S: AttemptFinalizationStore,
+{
+    /// Commits the spec-5 §5 single visibility boundary for one
+    /// attempt-produced artifact (upstream `FinalizeAttemptArtifact`).
+    ///
+    /// The service's half is evaluation only: the caller's
+    /// [`FinalizeAttemptInput`] becomes the artifact-owned
+    /// [`AttemptFinalization`][crate::lineage::AttemptFinalization]
+    /// change set (nil identities, an empty
+    /// artifact name, or a nil content generation is
+    /// [`REASON_INVALID_FINALIZE_INPUT`][crate::lineage::REASON_INVALID_FINALIZE_INPUT]),
+    /// which the store maps inside
+    /// one transaction to the `artifact_finalizations` key row, the
+    /// `verifying` → `ready` transition, the journaled produce edge, and
+    /// the `artifact_finalized` run event.
+    ///
+    /// `central-artifact` deliberately holds no journal types: the
+    /// run-event envelope is the adapter's mapping, keeping the
+    /// capability free of the `central-eventjournal` edge.
+    ///
+    /// Returns the finalized artifact id — on a same-checksum replay the
+    /// RECORDED id, which may differ from `input.artifact_id`.
+    pub async fn finalize_attempt_artifact(
+        &self,
+        input: FinalizeAttemptInput,
+    ) -> Result<ArtifactId, Failure> {
+        let change = crate::lineage::attempt_finalization(&input).map_err(Failure::from)?;
+        self.store.finalize_attempt_artifact(change).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // b34 lineage — the async, store-consuming operations
 // (upstream internal/artifact/lineage.go)
 // ---------------------------------------------------------------------------
@@ -1991,7 +2030,9 @@ mod tests {
         CommandStage, FAILURE_CODE_SECRET_DISCLOSURE, FAILURE_CODE_UNSUPPORTED_MEDIA_TYPE,
         Sensitivity,
     };
-    use crate::lineage::{REASON_LINEAGE_PRODUCE_EDGE_INCOMPLETE, ReadEdge};
+    use crate::lineage::{
+        REASON_INVALID_FINALIZE_INPUT, REASON_LINEAGE_PRODUCE_EDGE_INCOMPLETE, ReadEdge,
+    };
     use crate::testkit::{
         FakeClassifier, FakeCompletion, FakeLineageStore, FakeObjects, FakeStore, Journal, block_on,
     };
@@ -3559,5 +3600,100 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(REASON_LINEAGE_STORE_UNAVAILABLE, err.code());
+    }
+
+    // -----------------------------------------------------------------
+    // spec-5 §5 attempt-scoped finalization — the capability half
+    // -----------------------------------------------------------------
+
+    fn finalize_attempt_input() -> FinalizeAttemptInput {
+        FinalizeAttemptInput {
+            attempt_id: SessionAttemptId::new(),
+            artifact_name: "report".to_owned(),
+            artifact_id: ArtifactId::new(),
+            run_id: RunId::new(),
+            node_id: WorkflowNodeId::new(),
+            checksum: [0xAA; 32],
+            payload_fingerprint: [0xBB; 32],
+            content_generation: ContentGeneration::new(),
+        }
+    }
+
+    /// The service hands the store the evaluated `AttemptFinalization`
+    /// change set — the capability's side of the boundary never sees a
+    /// journal type (upstream `FinalizeAttemptArtifact`'s commit half
+    /// lives in the adapter).
+    #[test]
+    fn finalize_attempt_artifact_passes_evaluated_change_set_to_store() {
+        let f = fixture();
+        let input = finalize_attempt_input();
+        let returned = block_on(f.service.finalize_attempt_artifact(input.clone())).unwrap();
+        assert_eq!(input.artifact_id, returned);
+        assert!(f.journal.has("store.FinalizeAttempt"));
+        let changes = f
+            .store
+            .finalizations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(1, changes.len());
+        let change = &changes[0];
+        assert_eq!(input.attempt_id, change.attempt_id);
+        assert_eq!(input.artifact_name, change.artifact_name);
+        assert_eq!(input.artifact_id, change.artifact_id);
+        assert_eq!(input.run_id, change.run_id);
+        assert_eq!(input.node_id, change.node_id);
+        assert_eq!(input.checksum, change.checksum);
+        assert_eq!(input.payload_fingerprint, change.payload_fingerprint);
+        assert_eq!(input.content_generation, change.content_generation);
+    }
+
+    /// An empty artifact name is `INVALID_FINALIZE_INPUT` before any
+    /// store call — upstream's `attemptID == uuid.Nil || artifactID ==
+    /// uuid.Nil || name == ""` guard evaluated in the capability.
+    #[test]
+    fn finalize_attempt_artifact_rejects_empty_name_without_store_call() {
+        let f = fixture();
+        let mut input = finalize_attempt_input();
+        input.artifact_name = String::new();
+        let err = block_on(f.service.finalize_attempt_artifact(input)).unwrap_err();
+        assert_eq!(REASON_INVALID_FINALIZE_INPUT, err.code());
+        assert_eq!(FailureKind::Invalid, err.kind());
+        assert!(!f.journal.has("store.FinalizeAttempt"));
+    }
+
+    /// A same-checksum replay returns the RECORDED artifact id the
+    /// store answers with, which may differ from the passed id.
+    #[test]
+    fn finalize_attempt_artifact_returns_recorded_id_on_replay() {
+        let f = fixture();
+        let input = finalize_attempt_input();
+        let recorded = ArtifactId::new();
+        *f.store
+            .finalize_attempt_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(recorded);
+        let returned = block_on(f.service.finalize_attempt_artifact(input)).unwrap();
+        assert_eq!(recorded, returned);
+    }
+
+    /// A store verdict (e.g. `ARTIFACT_ALREADY_FINALIZED`) propagates
+    /// unchanged — the service adds no mapping of its own.
+    #[test]
+    fn finalize_attempt_artifact_propagates_store_failure() {
+        let f = fixture();
+        *f.store
+            .finalize_attempt_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Failure::conflict(
+            "ARTIFACT_ALREADY_FINALIZED",
+            "already finalized",
+        ));
+        let err = block_on(
+            f.service
+                .finalize_attempt_artifact(finalize_attempt_input()),
+        )
+        .unwrap_err();
+        assert_eq!("ARTIFACT_ALREADY_FINALIZED", err.code());
     }
 }

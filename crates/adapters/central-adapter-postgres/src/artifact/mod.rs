@@ -27,6 +27,11 @@
 //!   journal over `central.artifact_produce_edges` and
 //!   `central.artifact_read_edges`, plus the `central artifact read`
 //!   authorization inputs.
+//! - [`port::AttemptFinalizationStore`] — the spec-5 §5 attempt-scoped
+//!   single visibility boundary: one transaction lands the
+//!   `artifact_finalizations` key row, the `verifying` → `ready`
+//!   transition, the journaled produce edge, and the
+//!   `artifact_finalized` run event with its `event_outbox` row.
 //!
 //! Completion lock ordering (postgresql-adapter-mapping §6, upstream
 //! `CommitArtifact`): `workspace_event_counters` → `workspaces` quota
@@ -49,6 +54,7 @@
 use central_foundation::failure::{Failure, FailureKind};
 
 mod commit;
+mod finalization;
 mod lineage_store;
 mod queries;
 mod reconcile;

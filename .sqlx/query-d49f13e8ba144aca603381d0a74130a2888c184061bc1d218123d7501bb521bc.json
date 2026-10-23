@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT workspace_id, run_id, state, version, checksum_value, COALESCE(ready_key, '') AS \"ready_key!\", content_generation, COALESCE(required_role, '') AS \"required_role!\", size FROM central.artifacts WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "checksum_value",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "ready_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "content_generation",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "required_role!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "size",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      true,
+      null,
+      false
+    ]
+  },
+  "hash": "d49f13e8ba144aca603381d0a74130a2888c184061bc1d218123d7501bb521bc"
+}

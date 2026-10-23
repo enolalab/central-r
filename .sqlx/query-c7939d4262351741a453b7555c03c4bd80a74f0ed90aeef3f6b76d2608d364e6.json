@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT artifact_id, checksum FROM central.artifact_finalizations WHERE attempt_id = $1 AND artifact_name = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "checksum",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c7939d4262351741a453b7555c03c4bd80a74f0ed90aeef3f6b76d2608d364e6"
+}

@@ -32,7 +32,7 @@ use crate::domain::{
     Artifact, ArtifactTombstone, BeginUploadResult, CommandIdentity, FinalizeResult, Outcome,
     PromotionResult, RejectResult, ReserveResult, State, VerifiedResult,
 };
-use crate::lineage::{LineageArtifact, ProduceEdge, ReadEdge};
+use crate::lineage::{AttemptFinalization, LineageArtifact, ProduceEdge, ReadEdge};
 
 // ---------------------------------------------------------------------------
 // Transfer bounds: a generic body ceiling distinct from the B09 report class
@@ -704,6 +704,43 @@ pub trait ReconciliationStore: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 // Lineage stores (b34)
 // ---------------------------------------------------------------------------
+
+/// Commits the spec-5 §5 single visibility boundary (upstream
+/// `internal/adapter/postgres/artifact/finalize.go`
+/// `FinalizeAttemptArtifact`): keyed `(attempt_id, artifact_name)` on
+/// `central.artifact_finalizations`, one transaction lands the key row,
+/// the artifact's `verifying` → `ready` transition, the journaled
+/// produce edge, and the `artifact_finalized` run event with its
+/// `event_outbox` row.
+///
+/// It is deliberately NOT the B10 [`CompletionContributor`] path:
+/// `CommitArtifact` is the Phase-1 receipt-dedup finalize keyed
+/// `(workspace, finalize, receipt key)` that also settles
+/// `ExecutionChangeSet`s; this port touches no Phase-1 execution rows.
+///
+/// The capability hands over an already pure-evaluated
+/// [`AttemptFinalization`] change set; the implementation re-validates
+/// every bound coordinate against durable state inside the transaction:
+/// the attempt's durable run/node must equal `change.run_id` /
+/// `change.node_id`, and the artifact row's `workspace_id` / `run_id` /
+/// `required_role` / `content_generation` / `checksum_value` must match
+/// the attempt's coordinates and the caller's binding. The run-event
+/// envelope is the adapter's own mapping — the capability carries no
+/// journal types.
+#[trait_variant::make(Send)]
+pub trait AttemptFinalizationStore: Send + Sync + 'static {
+    /// Commits `change` atomically and returns the finalized artifact
+    /// id. A same-checksum replay of the `(attempt_id, artifact_name)`
+    /// key is idempotent: it returns the RECORDED artifact id — which
+    /// may differ from `change.artifact_id` — after journaling
+    /// `command_deduped`. A different checksum under the same key, or a
+    /// produce edge journaled under a different attempt, is
+    /// `ARTIFACT_ALREADY_FINALIZED`.
+    async fn finalize_attempt_artifact(
+        &self,
+        change: AttemptFinalization,
+    ) -> Result<ArtifactId, Failure>;
+}
 
 /// Persists produce edges (upstream `ProduceEdgeStore`).
 /// `insert_produce_edge` must dedupe on `artifact_id`: when the edge

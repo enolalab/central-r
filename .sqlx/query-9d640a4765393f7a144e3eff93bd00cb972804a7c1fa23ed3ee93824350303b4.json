@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts SET version = version + 1, state = 'ready', ready_at = clock_timestamp(), updated_at = clock_timestamp() WHERE id = $1 AND version = $2 AND state = 'verifying' AND checksum_value = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9d640a4765393f7a144e3eff93bd00cb972804a7c1fa23ed3ee93824350303b4"
+}

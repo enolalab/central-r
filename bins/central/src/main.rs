@@ -1,16 +1,16 @@
 //! `central` — the main CLI and serving binary (rust-application-
 //! boundaries.md §2.1/§3.2).
 //!
-//! R1 ships the closed fail-closed skeleton only: `--version`/`version`
-//! and the `central.local-result/v1` envelope. Every command owned by a
-//! not-yet-landed R-slice — `serve`, `local *`, `migrate *`, `backup *`,
-//! `restore *`, `run *`, `node *`, `checkpoint *`, `artifact *`,
-//! `maintenance *`, `bootstrap *`, `grant`, `attest`, `broker *`, and the
-//! protected execution modes — resolves to a schema-valid
-//! `UNSUPPORTED_IN_THIS_SLICE` result at exit `5` with no mutation
-//! (local-development-environment.md §11). A command that ends without a
-//! written result fails closed at exit `6`, matching upstream
-//! `cli.ResultExitCode`.
+//! `central artifact read` (Phase R4 task 7) is the one landed verb so
+//! far — `artifact_cli` owns its envelope and the `--stdout` byte plane
+//! end to end. Every command owned by a not-yet-landed R-slice —
+//! `serve`, `local *`, `migrate *`, `backup *`, `restore *`, `run *`,
+//! `node *`, `checkpoint *`, `maintenance *`, `bootstrap *`, `grant`,
+//! `attest`, `broker *`, and the protected execution modes — resolves
+//! to a schema-valid `UNSUPPORTED_IN_THIS_SLICE` result at exit `5`
+//! with no mutation (local-development-environment.md §11). A command
+//! that ends without a written result fails closed at exit `6`,
+//! matching upstream `cli.ResultExitCode`.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -18,6 +18,8 @@ use std::process::ExitCode;
 use central_foundation::failure::{ExitClass, Failure};
 use central_foundation::local_result::LocalResult;
 use central_kernel::lifecycle;
+
+mod artifact_cli;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,6 +41,12 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
             }
         }
         Resolution::Command(command_id) => {
+            // `central artifact read` is the one landed slice: it owns
+            // its envelope (and stdout byte ownership under `--stdout`)
+            // end to end.
+            if command_id == "artifact.read" {
+                return artifact_cli::artifact_read(&artifact_read_tokens(args), stdout, stderr);
+            }
             let result = LocalResult::unsupported(command_id);
             match result.write_json_line(stdout) {
                 Ok(()) => result.exit_code,
@@ -46,6 +54,31 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
             }
         }
     }
+}
+
+/// Returns the raw argv tokens following the `artifact read` verb pair —
+/// flags included, in original order (upstream `args[3:]`). Global
+/// `--config <value>` pairs are consumed without becoming tokens.
+fn artifact_read_tokens(args: &[String]) -> Vec<String> {
+    let mut skip_value = false;
+    let mut positional_seen = 0usize;
+    for (index, arg) in args.iter().enumerate() {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        match arg.as_str() {
+            "--config" => skip_value = true,
+            _ if arg.starts_with('-') => {}
+            _ => {
+                positional_seen += 1;
+                if positional_seen == 2 {
+                    return args[index + 1..].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Fails closed on a result that could not be written: upstream's rule
@@ -351,7 +384,6 @@ mod tests {
             (&["checkpoint", "create"], "checkpoint.create"),
             (&["checkpoint", "resume"], "checkpoint.resume"),
             (&["checkpoint", "list"], "checkpoint.list"),
-            (&["artifact", "read", "id"], "artifact.read"),
             (&["maintenance", "plan"], "maintenance.plan"),
             (&["maintenance", "apply"], "maintenance.apply"),
             (&["bootstrap", "show"], "bootstrap.show"),
@@ -394,6 +426,41 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(parsed["command_id"], "unknown");
         assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
+    }
+
+    #[test]
+    fn artifact_read_without_env_config_is_unavailable_at_exit_5() {
+        // `artifact.read` is landed: without the composition env it
+        // reports ARTIFACT_READ_UNAVAILABLE (still exit 5), never the
+        // deferred-verb placeholder.
+        let (code, stdout, _) = invoke(&["artifact", "read", "id"]);
+        assert_eq!(code, 5);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["schema_version"], "central.local-result/v1");
+        assert_eq!(parsed["command_id"], "artifact.read");
+        assert_eq!(parsed["exit_code"], 5);
+        assert_eq!(parsed["reason"], "ARTIFACT_READ_UNAVAILABLE");
+    }
+
+    #[test]
+    fn artifact_read_tokens_skip_global_config_pairs() {
+        let argv = [
+            "--config",
+            "/abs/central.json",
+            "artifact",
+            "read",
+            "id",
+            "--stdout",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect::<Vec<_>>();
+        assert_eq!(artifact_read_tokens(&argv), vec!["id", "--stdout"]);
+        let argv = ["artifact", "read"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
+        assert!(artifact_read_tokens(&argv).is_empty());
     }
 
     #[test]

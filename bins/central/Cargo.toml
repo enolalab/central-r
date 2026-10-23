@@ -9,9 +9,18 @@ publish.workspace = true
 [dependencies]
 central-foundation = { path = "../../crates/central-foundation", version = "0.1.0" }
 central-kernel = { path = "../../crates/central-kernel", version = "0.1.0" }
-
-[dev-dependencies]
+# `central artifact read` (Phase R4, spec-5 §5/§7): the capability owns
+# the read-authorization and edge-journaling domain; the binary composes
+# the two adapters behind it exactly as upstream's
+# `cmd/central/artifact_read_composition.go` does.
+central-artifact = { path = "../../crates/capabilities/central-artifact", version = "0.1.0" }
+central-adapter-postgres = { path = "../../crates/adapters/central-adapter-postgres", version = "0.1.0" }
+central-adapter-s3 = { path = "../../crates/adapters/central-adapter-s3", version = "0.1.0" }
 serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
