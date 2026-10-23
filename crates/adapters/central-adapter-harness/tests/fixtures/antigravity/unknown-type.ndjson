@@ -1,0 +1,3 @@
+{"event":"init","conversation_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","init":{"model":"gemini-3.8-flash-low","cwd":"/work","tools":[],"permission_mode":"request-review"}}
+{"event":"future_x","conversation_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","note":"hand-built"}
+{"event":"result","result":{"conversation_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","status":"SUCCESS","response":"hand-built-ok\n","duration_seconds":0.1,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":2,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":12}}}
