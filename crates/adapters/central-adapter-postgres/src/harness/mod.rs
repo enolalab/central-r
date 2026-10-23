@@ -39,6 +39,14 @@
 //! - The `tasks.permission_policy` column (b31) is not consulted by the
 //!   approval gate: upstream's decision/expire SQL checks the live
 //!   lease, matching the port contract.
+//! - Upstream `NewStore` accepts an open `pgx.Tx` so a caller can run
+//!   harness writes inside its own atomic unit (savepoints); this store
+//!   is pool-bound like the rest of the adapter family — no upstream
+//!   production caller uses the capability, and a tx-taking
+//!   constructor can be added if a composed-write flow ever needs it.
+//! - Port futures carry no `Context`; the upstream
+//!   `TestStoreHonoursCancellation` guarantee now rests on sqlx
+//!   `Transaction` drop-rollback.
 //!
 //! Lock ordering inside every write transaction: the attempt row is
 //! locked `FOR UPDATE` first, then `central.execution_ownership` and

@@ -1626,35 +1626,42 @@ async fn attempts_for_run_and_latest_are_bounded_and_ordered() -> Result<()> {
     // No attempts yet: empty page, no latest.
     assert!(store.attempts_for_run(ws, run).await?.is_empty());
     assert!(store.latest_attempt_for_run(ws, run).await?.is_none());
-    // A terminal first attempt then a resumed live one; the read is
-    // oldest-first.
-    let first = attempt_in(ws, run, State::Failed)?;
-    let mut resumed = Attempt::prepare_resume(
-        &first,
-        PrepareInput {
-            id: HarnessAttemptId::new(),
-            workspace_id: ws,
-            run_id: run,
-            kind: first.kind.clone(),
-            adapter_version: "0.1.0".to_string(),
-            workspace: first.workspace.clone(),
-            permission: PermissionPolicy::Deny,
-            fence: FENCE,
-            budget: first.budget,
-            at: t0() + Duration::hours(1),
+    // The later-prepared attempt is written first: the read orders by
+    // prepared_at, not by insertion (upstream budget_test.go).
+    let later = Attempt::prepare(PrepareInput {
+        id: HarnessAttemptId::new(),
+        workspace_id: ws,
+        run_id: run,
+        kind: Kind::new("claude-code"),
+        adapter_version: "0.1.0".to_string(),
+        workspace: Workspace {
+            path: "/srv/central/worktrees/r1".to_string(),
+            base_sha: "abc123".to_string(),
         },
-    )?;
-    resumed.permission = PermissionPolicy::Deny;
-    store.create(&first).await?;
-    store.create(&resumed).await?;
+        permission: PermissionPolicy::Deny,
+        fence: FENCE,
+        budget: Budget {
+            cost_micro_usd: 400_000,
+            wall_clock: Duration::minutes(1),
+            cost_defaulted: false,
+            wall_clock_defaulted: false,
+        },
+        at: t0() + Duration::hours(1),
+    })?;
+    store.create(&later).await?;
+    let later_failed = later.fail_unlaunched(FENCE, t0() + Duration::hours(2))?;
+    let later_stored = store.save(&later, &later_failed, &[]).await?;
+    let earlier = prepared(ws, run, PermissionPolicy::Deny)?;
+    store.create(&earlier).await?;
     let attempts = store.attempts_for_run(ws, run).await?;
     assert_eq!(attempts.len(), 2);
-    assert!(attempts[0].equal(&first) && attempts[1].equal(&resumed));
+    assert!(attempts[0].equal(&earlier) && attempts[1].equal(&later_stored));
     let latest = store
         .latest_attempt_for_run(ws, run)
         .await?
         .expect("latest");
-    assert!(latest.equal(&resumed));
+    // Newest prepared wins, live or terminal.
+    assert!(latest.equal(&later_stored));
     // Workspace scoping.
     assert!(
         store
@@ -3067,7 +3074,14 @@ async fn operator_and_timeout_race_has_exactly_one_winner() -> Result<()> {
         // the bound store.
         let operator = store.clone();
         let req = decide_req(&w, true, w.mac);
-        let decide = async move { operator.decide_permission(req).await };
+        // Upstream holds the operator's decision back until ~2ms before
+        // expiry so the timeout branch is a real coin flip.
+        let decide = async move {
+            while OffsetDateTime::now_utc() < due - Duration::milliseconds(2) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            operator.decide_permission(req).await
+        };
         let expire = async {
             loop {
                 match w.bound.expire_permission(&w.attempt, w.approval).await {
