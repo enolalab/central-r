@@ -695,7 +695,11 @@ impl WorkflowStore for Store {
             .map(|(key, node)| (key.clone(), node.id))
             .collect();
         for child in &novel.children {
-            let depth = i32::try_from(parent_depth + i64::from(depths[&child.node_key]))
+            let child_depth = depths
+                .get(child.node_key.as_str())
+                .copied()
+                .ok_or_else(|| corrupt("a validated child lost its depth"))?;
+            let depth = i32::try_from(parent_depth + i64::from(child_depth))
                 .map_err(|_| corrupt("a batch depth overflowed the depth column"))?;
             let (node, was_present) = Self::insert_node_tx(
                 &mut tx,

@@ -263,10 +263,7 @@ async fn drive(fixture: &Fixture, id: WorkflowNodeId, to: NodeStatus) -> Result<
             NodeStatus::Succeeded,
         ],
         _ => {
-            return Err(Failure::internal(
-                "test",
-                format!("drive: no path to {to}"),
-            ));
+            return Err(Failure::internal("test", format!("drive: no path to {to}")));
         }
     };
     for step in path {
