@@ -920,10 +920,10 @@ impl Inner {
 fn stream_ended_frame(t: &Terminal) -> Vec<u8> {
     let mut b = Vec::with_capacity(96);
     b.extend_from_slice(b"{\"type\":\"central_stream_ended\",\"status\":");
-    crate::json::push_json_string(&mut b, t.status.as_str());
+    crate::json::push_json_string_html(&mut b, t.status.as_str());
     if !t.reason.is_empty() {
         b.extend_from_slice(b",\"reason\":");
-        crate::json::push_json_string(&mut b, &t.reason);
+        crate::json::push_json_string_html(&mut b, &t.reason);
     }
     b.push(b'}');
     b

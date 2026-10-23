@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::json::push_json_string;
+use crate::json::push_json_string_html;
 use crate::process::{EXIT_GRACE, FrameReader, Outcome, Stream, drain_discard, wait_exit};
 
 use super::protocol::{self, FrameKind, ItemSkip, decode_frame};
@@ -534,10 +534,10 @@ fn prompt_raw() -> Vec<u8> {
 fn central_raw(status: &str, reason: &str) -> Vec<u8> {
     let mut b = Vec::with_capacity(80);
     b.extend_from_slice(b"{\"type\":\"central_stream_ended\",\"status\":");
-    push_json_string(&mut b, status);
+    push_json_string_html(&mut b, status);
     if !reason.is_empty() {
         b.extend_from_slice(b",\"reason\":");
-        push_json_string(&mut b, reason);
+        push_json_string_html(&mut b, reason);
     }
     b.push(b'}');
     b
