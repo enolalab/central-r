@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE subtree AS (SELECT id FROM central.workflow_nodes WHERE id = $1::uuid UNION ALL SELECT n.id FROM central.workflow_nodes n JOIN subtree s ON n.parent_node_id = s.id ) SELECT n.node_key FROM central.workflow_nodes n WHERE n.id IN (SELECT id FROM subtree) AND n.state = 'succeeded' ORDER BY n.node_key",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "node_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "37e993c276dfd5c2f13739ca161e19ee7c8ca88661227d1b230d8125c3d785a4"
+}

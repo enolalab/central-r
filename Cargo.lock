@@ -544,6 +544,7 @@ dependencies = [
  "central-adapter-postgres",
  "central-adapter-s3",
  "central-artifact",
+ "central-checkpoint",
  "central-foundation",
  "central-kernel",
  "serde_json",
@@ -661,6 +662,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "time",
+ "tracing",
  "trait-variant",
 ]
 

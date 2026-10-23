@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, state, workspace_path, workspace_kind, harness_session_id FROM central.session_attempts WHERE node_id = $1 ORDER BY attempt_seq DESC LIMIT 1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "workspace_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "harness_session_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "47c2c7a82e79bd52341bb6d5bb425d2f2f9dfd063fbb1ce3a5f71049376c614a"
+}

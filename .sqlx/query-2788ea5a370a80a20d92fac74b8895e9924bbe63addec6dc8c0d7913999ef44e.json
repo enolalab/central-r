@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT u.id FROM unnest($1::uuid[]) AS u(id) WHERE NOT EXISTS (SELECT 1 FROM central.artifacts a WHERE a.id = u.id AND a.state = 'ready') ORDER BY 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2788ea5a370a80a20d92fac74b8895e9924bbe63addec6dc8c0d7913999ef44e"
+}

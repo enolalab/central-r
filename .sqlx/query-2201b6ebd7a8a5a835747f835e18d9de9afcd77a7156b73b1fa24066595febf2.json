@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.resume_checkpoints (checkpoint_id, workspace_id, run_id, node_id, attempt_id, checkpoint_seq, format_version, graph_schema_version, event_watermark, harness_session_id, workspace_digest, workspace_path, completed_nodes, finalized_artifacts, in_flight_nodes, gc_class, expires_at, content_digest, payload_fingerprint) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text[], $14::uuid[], $15::text[], $16, NULL, $17, $18) RETURNING created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "TextArray",
+        "UuidArray",
+        "TextArray",
+        "Text",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2201b6ebd7a8a5a835747f835e18d9de9afcd77a7156b73b1fa24066595febf2"
+}

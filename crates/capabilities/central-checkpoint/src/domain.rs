@@ -42,6 +42,12 @@ pub mod codes {
     pub const RESUME_TOKEN_STALE: &str = "RESUME_TOKEN_STALE";
     pub const FORMAT_INCOMPATIBLE: &str = "CHECKPOINT_INCOMPATIBLE";
     pub const WORKSPACE_DIGEST_MISMATCH: &str = "WORKSPACE_DIGEST_MISMATCH";
+    /// Spec-3's preflight check-4 verdict: a `finalized_artifacts`
+    /// entry that no longer resolves `ready` (upstream
+    /// `ReasonCheckpointArtifactMissing`). Distinct from the Phase-1
+    /// compatibility check-7 code [`ARTIFACT_MISSING`] above — the two
+    /// layers carry different vocabularies by design.
+    pub const RESUME_ARTIFACT_MISSING: &str = "CHECKPOINT_ARTIFACT_MISSING";
     pub const RESUME_REQUIRES_OPERATOR: &str = "RESUME_REQUIRES_OPERATOR_DECISION";
     pub const DUPLICATE_IDEMPOTENCY: &str = "DUPLICATE_IDEMPOTENCY_KEY";
     pub const MIGRATION_UNSUPPORTED: &str = "checkpoint_migration_unsupported";
@@ -908,14 +914,19 @@ pub fn boundary_legal(
 }
 
 /// Whether this build can read a checkpoint recorded under the given
-/// format and graph-schema versions (spec D3 check 2).
+/// format and graph-schema versions (spec D3 check 2). The detail
+/// carries the observed-vs-expected pair verbatim — upstream
+/// `Compatible` — so the `resume_failed` journal is actionable.
 pub fn resume_format_compatible(format: &str, graph_schema: &str) -> Result<(), Failure> {
     if format == RESUME_FORMAT_VERSION && graph_schema == GRAPH_SCHEMA_VERSION {
         Ok(())
     } else {
         Err(Failure::denied(
             codes::FORMAT_INCOMPATIBLE,
-            "the format or graph-schema version is unreadable by this build",
+            format!(
+                "format_version={format:?} graph_schema_version={graph_schema:?} \
+                 (want {RESUME_FORMAT_VERSION:?} / {GRAPH_SCHEMA_VERSION:?})"
+            ),
         ))
     }
 }
@@ -944,6 +955,11 @@ impl GcClass {
             Self::Pinned => "pinned",
         }
     }
+
+    /// Every declared class in declaration order — upstream
+    /// `GCClasses()`. The ordered list is itself spec vocabulary
+    /// (`supersedeable` first, least retentive).
+    pub const ALL: [Self; 3] = [Self::Supersedeable, Self::RunTerminal, Self::Pinned];
 
     /// Parses the canonical text.
     pub fn parse(text: &str) -> Result<Self, Failure> {
@@ -1638,5 +1654,58 @@ mod tests {
         assert!(picks.contains(&candidates[7].id)); // aged run_terminal
         assert!(picks.contains(&expired_id));
         assert!(!picks.contains(&pinned.id));
+    }
+
+    // -- upstream domain_test.go: TestGCClassVocabularyIsClosedAndOrdered ----------
+
+    #[test]
+    fn gc_class_vocabulary_is_closed_and_ordered() {
+        assert_eq!(
+            GcClass::ALL,
+            [
+                GcClass::Supersedeable,
+                GcClass::RunTerminal,
+                GcClass::Pinned
+            ],
+            "ALL is the spec's declaration order — supersedeable first"
+        );
+        for class in GcClass::ALL {
+            assert_eq!(GcClass::parse(class.as_str()).unwrap(), class);
+        }
+        assert!(GcClass::parse("other").is_err());
+    }
+
+    // -- upstream domain_test.go: TestReasonCodesAreClosedSpecVocabulary -----------
+
+    #[test]
+    fn resume_reason_codes_are_closed_spec_vocabulary() {
+        let spec3: [&str; 7] = [
+            codes::BOUNDARY_ILLEGAL,
+            codes::RESUME_TOKEN_STALE,
+            codes::FORMAT_INCOMPATIBLE,
+            codes::WORKSPACE_DIGEST_MISMATCH,
+            codes::RESUME_ARTIFACT_MISSING,
+            codes::RESUME_REQUIRES_OPERATOR,
+            codes::DUPLICATE_IDEMPOTENCY,
+        ];
+        for (index, code) in spec3.iter().enumerate() {
+            // Spec-3 codes are SCREAMING_CASE and pairwise distinct.
+            assert_eq!(*code, code.to_uppercase(), "{code}");
+            assert!(!spec3[..index].contains(code), "duplicate code {code}");
+        }
+    }
+
+    // -- upstream domain_test.go: TestDigestIsCanonicalOverInventoryOrder ----------
+
+    #[test]
+    fn digest_is_canonical_over_inventory_order() {
+        let mut a = resume(1);
+        let mut b = a.clone();
+        b.completed_nodes.reverse();
+        b.finalized_artifacts.reverse();
+        b.in_flight_nodes.reverse();
+        assert_eq!(a.digest(), b.digest(), "set order must not matter");
+        a.completed_nodes.push("extra".into());
+        assert_ne!(a.digest(), b.digest());
     }
 }

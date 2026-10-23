@@ -1,16 +1,18 @@
 //! `central` — the main CLI and serving binary (rust-application-
 //! boundaries.md §2.1/§3.2).
 //!
-//! `central artifact read` (Phase R4 task 7) is the one landed verb so
-//! far — `artifact_cli` owns its envelope and the `--stdout` byte plane
-//! end to end. Every command owned by a not-yet-landed R-slice —
-//! `serve`, `local *`, `migrate *`, `backup *`, `restore *`, `run *`,
-//! `node *`, `checkpoint *`, `maintenance *`, `bootstrap *`, `grant`,
-//! `attest`, `broker *`, and the protected execution modes — resolves
-//! to a schema-valid `UNSUPPORTED_IN_THIS_SLICE` result at exit `5`
-//! with no mutation (local-development-environment.md §11). A command
-//! that ends without a written result fails closed at exit `6`,
-//! matching upstream `cli.ResultExitCode`.
+//! `central artifact read` (Phase R4 task 7) and `central checkpoint *`
+//! (Phase R4 task 8) are the landed verbs — `artifact_cli` owns its
+//! envelope and the `--stdout` byte plane end to end, `checkpoint_cli`
+//! owns the checkpoint verb surface end to end. Every command owned by
+//! a not-yet-landed R-slice — `serve`, `local *`, `migrate *`,
+//! `backup *`, `restore *`, `run *`, `node *`, `maintenance *`,
+//! `bootstrap *`, `grant`, `attest`, `broker *`, and the protected
+//! execution modes — resolves to a schema-valid
+//! `UNSUPPORTED_IN_THIS_SLICE` result at exit `5` with no mutation
+//! (local-development-environment.md §11). A command that ends without
+//! a written result fails closed at exit `6`, matching upstream
+//! `cli.ResultExitCode`.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -20,6 +22,7 @@ use central_foundation::local_result::LocalResult;
 use central_kernel::lifecycle;
 
 mod artifact_cli;
+mod checkpoint_cli;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -41,11 +44,14 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
             }
         }
         Resolution::Command(command_id) => {
-            // `central artifact read` is the one landed slice: it owns
-            // its envelope (and stdout byte ownership under `--stdout`)
-            // end to end.
+            // The landed slices own their envelopes end to end:
+            // `artifact read` (plus its `--stdout` byte ownership) and
+            // every `checkpoint *` verb.
             if command_id == "artifact.read" {
-                return artifact_cli::artifact_read(&artifact_read_tokens(args), stdout, stderr);
+                return artifact_cli::artifact_read(&verb_tokens(args), stdout, stderr);
+            }
+            if command_id.starts_with("checkpoint.") {
+                return checkpoint_cli::checkpoint(&command_id, &verb_tokens(args), stdout, stderr);
             }
             let result = LocalResult::unsupported(command_id);
             match result.write_json_line(stdout) {
@@ -56,10 +62,10 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
     }
 }
 
-/// Returns the raw argv tokens following the `artifact read` verb pair —
+/// Returns the raw argv tokens following the `<noun> <verb>` pair —
 /// flags included, in original order (upstream `args[3:]`). Global
 /// `--config <value>` pairs are consumed without becoming tokens.
-fn artifact_read_tokens(args: &[String]) -> Vec<String> {
+fn verb_tokens(args: &[String]) -> Vec<String> {
     let mut skip_value = false;
     let mut positional_seen = 0usize;
     for (index, arg) in args.iter().enumerate() {
@@ -381,9 +387,12 @@ mod tests {
             (&["restore", "abandon"], "restore.abandon"),
             (&["run", "submit"], "run.submit"),
             (&["node", "decide"], "node.decide"),
-            (&["checkpoint", "create"], "checkpoint.create"),
-            (&["checkpoint", "resume"], "checkpoint.resume"),
-            (&["checkpoint", "list"], "checkpoint.list"),
+            // `checkpoint *` is landed (task 8): the verbs route to
+            // checkpoint_cli, which without the composition env
+            // reports CHECKPOINT_UNAVAILABLE — still exit 5, never the
+            // deferred-verb placeholder. Covered by
+            // `checkpoint_verbs_without_env_are_unavailable` below.
+            (&["checkpoint"], "checkpoint"),
             (&["maintenance", "plan"], "maintenance.plan"),
             (&["maintenance", "apply"], "maintenance.apply"),
             (&["bootstrap", "show"], "bootstrap.show"),
@@ -443,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_read_tokens_skip_global_config_pairs() {
+    fn verb_tokens_skip_global_config_pairs() {
         let argv = [
             "--config",
             "/abs/central.json",
@@ -455,12 +464,41 @@ mod tests {
         .iter()
         .map(|s| (*s).to_owned())
         .collect::<Vec<_>>();
-        assert_eq!(artifact_read_tokens(&argv), vec!["id", "--stdout"]);
+        assert_eq!(verb_tokens(&argv), vec!["id", "--stdout"]);
         let argv = ["artifact", "read"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect::<Vec<_>>();
-        assert!(artifact_read_tokens(&argv).is_empty());
+        assert!(verb_tokens(&argv).is_empty());
+        // Same walk for the checkpoint verb pair.
+        let argv = ["checkpoint", "list", "--run", "r"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(verb_tokens(&argv), vec!["--run", "r"]);
+    }
+
+    #[test]
+    fn checkpoint_verbs_without_env_are_unavailable_at_exit_5() {
+        // `checkpoint *` is landed: without CENTRAL_CHECKPOINT_DSN the
+        // verbs report CHECKPOINT_UNAVAILABLE (still exit 5), never
+        // the deferred-verb placeholder.
+        for argv in [
+            &["checkpoint", "create"][..],
+            &["checkpoint", "resume", "--token", "t"][..],
+            &["checkpoint", "list", "--run", "r"][..],
+            &["checkpoint", "show", "id"][..],
+            &["checkpoint", "gc"][..],
+            &["checkpoint", "pin", "id"][..],
+            &["checkpoint", "unpin", "id"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, 5, "argv {argv:?}");
+            let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+            assert_eq!(parsed["schema_version"], "central.local-result/v1");
+            assert_eq!(parsed["reason"], "CHECKPOINT_UNAVAILABLE", "argv {argv:?}");
+            assert_eq!(parsed["exit_code"], 5);
+        }
     }
 
     #[test]

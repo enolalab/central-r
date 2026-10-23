@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(SELECT 1 FROM central.workflow_edges e JOIN central.workflow_nodes p ON p.id = e.prerequisite_node_id WHERE e.dependent_node_id = $1 AND e.kind = 'ordering' AND p.state <> 'succeeded')OR EXISTS(SELECT 1 FROM central.workflow_edges e LEFT JOIN central.artifacts a ON a.id = e.artifact_id WHERE e.dependent_node_id = $1 AND e.kind = 'artifact' AND a.state IS DISTINCT FROM 'ready')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "?column?",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "52d487e3a8fcd0093b6c69115beb39b0abd2459a88e4cd40c7732612ea0d3550"
+}

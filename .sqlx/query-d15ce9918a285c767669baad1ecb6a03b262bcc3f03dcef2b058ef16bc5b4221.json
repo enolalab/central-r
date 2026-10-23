@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE subtree AS (SELECT id FROM central.workflow_nodes WHERE id = $1::uuid UNION ALL SELECT n.id FROM central.workflow_nodes n JOIN subtree s ON n.parent_node_id = s.id ) SELECT n.id, n.node_key, n.state, n.not_before FROM central.workflow_nodes n WHERE n.id IN (SELECT id FROM subtree) ORDER BY n.node_key FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "node_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "not_before",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "d15ce9918a285c767669baad1ecb6a03b262bcc3f03dcef2b058ef16bc5b4221"
+}

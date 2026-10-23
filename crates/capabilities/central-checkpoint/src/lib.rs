@@ -23,5 +23,6 @@
 
 pub mod app;
 pub mod domain;
+pub mod janitor;
 pub mod port;
 pub mod query;

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.resume_checkpoints SET gc_class = $2 WHERE checkpoint_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8352f891291153c612de22fc8e0450d01357a12e5c51ac110b8eeb702aab1489"
+}

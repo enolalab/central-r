@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM central.resume_checkpoints WHERE checkpoint_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a441a7089ec1478465413d3f8cd0b40521573c476adab6197e8acdde5e235f47"
+}

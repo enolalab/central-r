@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.session_attempts SET state = 'ambiguous', dispatch_reason_code = $2 WHERE id = $1 AND state = ANY($3::text[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bab4ffd0d4fb2580a468e49f97701b6050d4a083a9222b55372a2b9459202340"
+}

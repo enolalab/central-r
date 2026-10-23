@@ -14,6 +14,11 @@ central-kernel = { path = "../../crates/central-kernel", version = "0.1.0" }
 # the two adapters behind it exactly as upstream's
 # `cmd/central/artifact_read_composition.go` does.
 central-artifact = { path = "../../crates/capabilities/central-artifact", version = "0.1.0" }
+# `central checkpoint *` (Phase R4 task 8, issue #94 slice 2C): the
+# capability owns the resume-checkpoint domain and orchestration ports;
+# the binary composes the PostgreSQL store + filesystem digester exactly
+# as upstream's `cmd/central/checkpoint_composition.go` does.
+central-checkpoint = { path = "../../crates/capabilities/central-checkpoint", version = "0.1.0" }
 central-adapter-postgres = { path = "../../crates/adapters/central-adapter-postgres", version = "0.1.0" }
 central-adapter-s3 = { path = "../../crates/adapters/central-adapter-s3", version = "0.1.0" }
 serde_json.workspace = true

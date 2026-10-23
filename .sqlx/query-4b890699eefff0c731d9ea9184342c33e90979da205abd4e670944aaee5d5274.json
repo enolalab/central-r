@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE subtree AS (SELECT id FROM central.workflow_nodes WHERE id = $1::uuid UNION ALL SELECT n.id FROM central.workflow_nodes n JOIN subtree s ON n.parent_node_id = s.id ) SELECT ref FROM (SELECT e.artifact_id AS ref FROM central.workflow_edges e JOIN central.workflow_nodes d ON d.id = e.dependent_node_id WHERE e.kind = 'artifact' AND d.id IN (SELECT id FROM subtree) AND d.state NOT IN ('succeeded', 'cancelled')UNION SELECT (r->>'artifact_id')::uuid FROM central.workflow_nodes n CROSS JOIN LATERAL jsonb_array_elements(n.input_artifact_refs) r WHERE n.id IN (SELECT id FROM subtree) AND n.state NOT IN ('succeeded', 'cancelled')) refs WHERE ref IN (SELECT id FROM central.artifacts WHERE state = 'ready') ORDER BY 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ref",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4b890699eefff0c731d9ea9184342c33e90979da205abd4e670944aaee5d5274"
+}
