@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT decision, payload_fingerprint FROM central.attempt_decisions WHERE attempt_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "decision",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "payload_fingerprint",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "3bef0fbc62b4d2caae4040379281ae82775b3cf0b135bbff1291973c022a576c"
+}

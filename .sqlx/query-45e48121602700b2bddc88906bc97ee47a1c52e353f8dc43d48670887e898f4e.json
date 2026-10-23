@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.event_outbox SET published_at = clock_timestamp(), publish_attempts = publish_attempts + 1 WHERE run_id = $1 AND seq = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "45e48121602700b2bddc88906bc97ee47a1c52e353f8dc43d48670887e898f4e"
+}

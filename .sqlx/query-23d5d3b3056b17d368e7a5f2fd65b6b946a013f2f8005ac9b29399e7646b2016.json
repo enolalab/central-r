@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.run_events (id, workspace_id, run_id, seq, node_id, attempt_id, kind, actor, reason_code, payload, recorded_at) SELECT $1, $2, $3, COALESCE(MAX(e.seq), 0) + 1, $4, $5, $6, $7, $8, $9, COALESCE($10, now()) FROM central.run_events e WHERE e.run_id = $3 ON CONFLICT (id) DO NOTHING RETURNING seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "23d5d3b3056b17d368e7a5f2fd65b6b946a013f2f8005ac9b29399e7646b2016"
+}

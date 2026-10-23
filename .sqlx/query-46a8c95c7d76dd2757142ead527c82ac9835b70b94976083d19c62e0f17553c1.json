@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.workflow_edges (id, run_id, dependent_node_id, prerequisite_node_id, kind, artifact_id) VALUES ($1, $2, $3, $4, 'ordering', NULL) ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "46a8c95c7d76dd2757142ead527c82ac9835b70b94976083d19c62e0f17553c1"
+}

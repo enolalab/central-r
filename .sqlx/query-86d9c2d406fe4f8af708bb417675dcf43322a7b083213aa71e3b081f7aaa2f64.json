@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.workflow_nodes SET state = $2, ready_at = now() WHERE id = $1 AND state = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "86d9c2d406fe4f8af708bb417675dcf43322a7b083213aa71e3b081f7aaa2f64"
+}

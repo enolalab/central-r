@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT run_id, depth, budget_wall_clock_seconds, budget_cost_micro_usd FROM central.workflow_nodes WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "depth",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "budget_wall_clock_seconds",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "budget_cost_micro_usd",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "9fa30da1b35b66415e68d438fd5efecee9bc57e7e28501735dd4c2f3126afa35"
+}

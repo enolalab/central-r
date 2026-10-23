@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, run_id, seq, node_id, attempt_id, kind, actor, reason_code, payload, recorded_at FROM central.run_events WHERE run_id = $1 ORDER BY seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "seq",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "actor",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "reason_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "payload",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 10,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f8cbee40d7647c45ed494feda91e370fd22249b32af73ef0481266df46703e2d"
+}

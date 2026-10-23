@@ -1,0 +1,137 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, run_id, workspace_id, node_key, parent_node_id, harness, workspace_kind, depth, state, budget_wall_clock_seconds, budget_cost_micro_usd, max_attempts, attempt_count, not_before, input_artifact_refs, spec, spec_fingerprint, node_timeout_seconds, ready_at, created_at FROM central.workflow_nodes WHERE run_id = $1 AND node_key = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "node_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "parent_node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "harness",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "workspace_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "depth",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "budget_wall_clock_seconds",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "budget_cost_micro_usd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "max_attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 12,
+        "name": "attempt_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "not_before",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "input_artifact_refs",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 15,
+        "name": "spec",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 16,
+        "name": "spec_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 17,
+        "name": "node_timeout_seconds",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "ready_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "a997aa16196c0865c9969d93688785418aa15a65c872b5145dc5289eae7ce27c"
+}

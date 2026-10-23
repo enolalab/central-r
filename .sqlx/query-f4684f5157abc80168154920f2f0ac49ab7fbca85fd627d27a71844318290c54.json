@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.workflow_nodes (id, run_id, workspace_id, node_key, parent_node_id, harness, workspace_kind, depth, state, budget_wall_clock_seconds, budget_cost_micro_usd, input_artifact_refs, spec, spec_fingerprint, node_timeout_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'declared', $9, $10, $11, $12, $13, $14) ON CONFLICT (run_id, node_key) DO NOTHING RETURNING id, created_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int4",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "Jsonb",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "f4684f5157abc80168154920f2f0ac49ab7fbca85fd627d27a71844318290c54"
+}
