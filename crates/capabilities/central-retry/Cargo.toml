@@ -1,10 +1,15 @@
 [package]
 name = "central-retry"
-description = "Retry capability — b37 error taxonomy, budgets, timeout hierarchy, compensation, outbox (domain.rs/port.rs/query.rs/app.rs)"
+description = "Retry capability — b37 error taxonomy, budgets, timeout hierarchy, compensation (domain.rs/port.rs/query.rs)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+central-foundation = { path = "../../central-foundation", version = "0.1.0" }
+time.workspace = true
+trait-variant.workspace = true
 
 [lints]
 workspace = true
