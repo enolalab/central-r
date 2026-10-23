@@ -667,6 +667,13 @@ dependencies = [
 [[package]]
 name = "central-eventjournal"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "serde",
+ "serde_json",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-execution"
