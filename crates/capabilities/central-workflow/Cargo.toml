@@ -6,5 +6,16 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+central-foundation = { path = "../../central-foundation", version = "0.1.0" }
+# Approved edge for the retry-policy domain types node-spec validation
+# consumes (rust-application-boundaries.md §2, R4 plan DAG):
+# `central-retry` never imports `central-workflow`.
+central-retry = { path = "../central-retry", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+trait-variant.workspace = true
+
 [lints]
 workspace = true

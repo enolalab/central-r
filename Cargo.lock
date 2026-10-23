@@ -776,6 +776,14 @@ version = "0.1.0"
 [[package]]
 name = "central-workflow"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "central-retry",
+ "serde",
+ "serde_json",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-workspace"
