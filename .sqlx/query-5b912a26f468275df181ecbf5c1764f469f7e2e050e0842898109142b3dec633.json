@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.harness_permission_approvals (\n                workspace_id, id, attempt_id, task_id, run_id, request_id, tool_call_id, tool_name,\n                input_mac, input_size, state, requested_at, expires_at, version\n            )\n            SELECT\n                $1, $2, $3, run.task_id, run.id, $6, $7, $8,\n                $9, $10, 'pending', $11, $12, 0\n            FROM central.runs run\n            WHERE run.workspace_id = $1 AND run.id = $5 AND run.task_id = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Bytea",
+        "Int8",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5b912a26f468275df181ecbf5c1764f469f7e2e050e0842898109142b3dec633"
+}

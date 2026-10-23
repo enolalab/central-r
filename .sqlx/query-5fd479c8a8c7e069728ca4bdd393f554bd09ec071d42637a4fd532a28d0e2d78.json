@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT fencing_generation FROM central.execution_ownership\n             WHERE workspace_id = $1 AND run_id = $2\n               AND claimed_step_attempt_id = $3\n               AND fencing_generation = $4 AND lease_token_hash = $5\n               AND lease_expires_at > clock_timestamp()\n             FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fencing_generation",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5fd479c8a8c7e069728ca4bdd393f554bd09ec071d42637a4fd532a28d0e2d78"
+}

@@ -1,0 +1,49 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.harness_attempts SET\n            kind = $4, adapter_version = $5, harness_version = $6, harness_session_id = $7,\n            resume_of = $8, resume_session_id = $9, workspace_path = $10, base_sha = $11,\n            permission = $12, sandbox_scope_id = $13, fence_generation = $14, version = $15,\n            state = $16, pending_permission = $17, terminal_status = $18, terminal_reason = $19,\n            terminal_exit_code = $20, resolution_kind = $21, resolution_decided_by = $22,\n            ambiguity_reason = $23, last_event_seq = $24, usage_tokens_in = $25,\n            usage_tokens_out = $26, usage_cache_read = $27, usage_cache_write = $28,\n            usage_cost_micro_usd = $29, usage_scope = $30, usage_estimated = $31,\n            prepared_at = $32, updated_at = $33, ended_at = $34\n        WHERE workspace_id = $1 AND id = $2 AND run_id = $3\n          AND version = $35 AND fence_generation = $36",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Text",
+        "Bool",
+        "Timestamptz",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8e639457838e933e159720aae7dbc2a59048db7f4d3ca8e7a8efcb4a0f397637"
+}

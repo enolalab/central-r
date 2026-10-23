@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS count,\n                (SELECT oldest.task_id\n                 FROM central.harness_permission_approvals oldest\n                 WHERE oldest.workspace_id = $1 AND oldest.state = 'pending'\n                 ORDER BY oldest.requested_at, oldest.id\n                 LIMIT 1) AS oldest_task_id\n             FROM central.harness_permission_approvals approval\n             WHERE approval.workspace_id = $1 AND approval.state = 'pending'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "oldest_task_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "16cfb99f8007ed93238b11f5326dc8a37860a0fd725c78db9168287ed9ec13e3"
+}

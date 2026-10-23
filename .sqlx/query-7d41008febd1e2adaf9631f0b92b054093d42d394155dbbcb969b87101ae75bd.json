@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT approval.workspace_id, approval.id, approval.attempt_id, approval.task_id,\n                    approval.run_id, approval.request_id, approval.tool_call_id, approval.tool_name,\n                    approval.input_mac, approval.input_size, approval.state, approval.requested_at,\n                    approval.expires_at, approval.decided_at, approval.decided_by, approval.version\n             FROM central.harness_permission_approvals approval\n             WHERE approval.workspace_id = $1 AND approval.run_id = $2 AND approval.state = 'pending'\n             ORDER BY approval.requested_at DESC, approval.id DESC\n             LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "request_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "tool_call_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "tool_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "input_mac",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 9,
+        "name": "input_size",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "requested_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "decided_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "decided_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "7d41008febd1e2adaf9631f0b92b054093d42d394155dbbcb969b87101ae75bd"
+}

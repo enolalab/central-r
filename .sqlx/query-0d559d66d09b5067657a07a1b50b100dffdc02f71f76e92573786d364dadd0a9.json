@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT version, fence_generation, last_event_seq\n         FROM central.harness_attempts\n         WHERE workspace_id = $1 AND id = $2\n         FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "fence_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "last_event_seq",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0d559d66d09b5067657a07a1b50b100dffdc02f71f76e92573786d364dadd0a9"
+}

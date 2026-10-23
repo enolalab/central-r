@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT LEAST(COALESCE(SUM(a.usage_cost_micro_usd), 0), 9223372036854775807)::bigint\n             FROM central.runs r\n             JOIN central.harness_attempts a ON a.workspace_id = r.workspace_id AND a.run_id = r.id\n             WHERE r.workspace_id = $1 AND r.task_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "least",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "71d953cb183260f3fc6cd252471d8c29c0573a09a4031f82a214fb95ae744329"
+}

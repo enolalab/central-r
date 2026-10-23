@@ -1,0 +1,116 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH live AS (\n                SELECT approval.id\n                FROM central.harness_permission_approvals approval\n                JOIN central.harness_attempts attempt\n                  ON attempt.workspace_id = approval.workspace_id AND attempt.id = approval.attempt_id\n                JOIN central.execution_ownership ownership\n                  ON ownership.workspace_id = attempt.workspace_id AND ownership.run_id = attempt.run_id\n                 AND ownership.claimed_step_attempt_id = attempt.id\n                 AND ownership.fencing_generation = attempt.fence_generation\n                WHERE approval.workspace_id = $1 AND approval.id = $2\n                  AND approval.state = 'pending' AND approval.expires_at > clock_timestamp()\n                  AND approval.input_mac = $3\n                  AND attempt.state = 'awaiting_permission' AND attempt.pending_permission = approval.request_id\n                  AND ownership.lease_expires_at > clock_timestamp()\n                FOR SHARE OF attempt, ownership\n            )\n            UPDATE central.harness_permission_approvals approval\n            SET state = $4, decided_by = $5,\n                decided_at = GREATEST(approval.requested_at, clock_timestamp()),\n                version = approval.version + 1\n            FROM live\n            WHERE approval.id = live.id AND approval.workspace_id = $1 AND approval.state = 'pending'\n            RETURNING approval.workspace_id, approval.id, approval.attempt_id, approval.task_id,\n                      approval.run_id, approval.request_id, approval.tool_call_id, approval.tool_name,\n                      approval.input_mac, approval.input_size, approval.state, approval.requested_at,\n                      approval.expires_at, approval.decided_at, approval.decided_by, approval.version",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "request_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "tool_call_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "tool_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "input_mac",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 9,
+        "name": "input_size",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "requested_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "decided_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "decided_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "version",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "abc396671ca9c851284586017539018219e763b9e074df29e216168cafd89231"
+}

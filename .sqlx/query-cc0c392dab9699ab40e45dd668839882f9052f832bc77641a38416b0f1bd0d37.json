@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.harness_permission_approvals\n                 SET state = 'superseded', decided_by = 'system:superseded',\n                     decided_at = GREATEST(requested_at, $3), version = version + 1\n                 WHERE workspace_id = $1 AND attempt_id = $2 AND state = 'pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cc0c392dab9699ab40e45dd668839882f9052f832bc77641a38416b0f1bd0d37"
+}
