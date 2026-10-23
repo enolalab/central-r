@@ -135,7 +135,14 @@ pub(crate) fn decode_frame(line: &[u8]) -> Result<Frame, JsonError> {
             "result" => f.result = string_field(line, span)?,
             "terminal_reason" => f.terminal_reason = string_field(line, span)?,
             "total_cost_usd" => {
-                f.total_cost_usd = json::field::<Option<f64>>(line, span)?.unwrap_or(0.0);
+                let cost = json::field::<Option<f64>>(line, span)?.unwrap_or(0.0);
+                // Fail closed on non-finite costs: a `1e999`-style literal
+                // decodes to an infinite f64 whose micro-USD conversion
+                // would otherwise silently saturate.
+                if !cost.is_finite() {
+                    return Err(JsonError::Malformed);
+                }
+                f.total_cost_usd = cost;
             }
             "usage" => f.usage = json::field::<Option<ResultUsage>>(line, span)?,
             "queued_turn_count" => {
@@ -615,6 +622,60 @@ mod tests {
         assert_eq!(t.status, TerminalStatus::MaxTurns);
         let t = map_result(&f("error_max_budget_usd", "", true, ""), false, false);
         assert_eq!(t.status, TerminalStatus::Budget);
+        // Success ignores the auth-failed and interrupt flags.
+        let t = map_result(&f("success", "", false, "done"), true, true);
+        assert_eq!(t.status, TerminalStatus::Succeeded);
+        // An unknown error subtype with free-text reason → api_error.
+        let t = map_result(
+            &f("error_new_kind", "free text from the harness", true, ""),
+            false,
+            false,
+        );
+        assert_eq!(t.status, TerminalStatus::Failed);
+        assert_eq!(t.reason, super::super::reasons::HARNESS_API_ERROR);
+        // Every non-empty reason is inside the declared vocabulary.
+        for (subtype, reason, is_error, auth, interrupt) in [
+            ("success", "", false, false, false),
+            ("success", "api_error", true, true, false),
+            ("success", "api_error", true, false, false),
+            (
+                "error_during_execution",
+                "aborted_tools",
+                true,
+                false,
+                false,
+            ),
+            (
+                "error_during_execution",
+                "aborted_streaming",
+                true,
+                false,
+                true,
+            ),
+            (
+                "error_during_execution",
+                "aborted_streaming",
+                true,
+                false,
+                false,
+            ),
+            ("error_max_turns", "max_turns", true, false, false),
+            ("error_max_budget_usd", "", true, false, false),
+            (
+                "error_new_kind",
+                "free text from the harness",
+                true,
+                false,
+                false,
+            ),
+        ] {
+            let t = map_result(&f(subtype, reason, is_error, ""), auth, interrupt);
+            assert!(
+                t.reason.is_empty() || super::super::reasons().contains(&t.reason.as_str()),
+                "{subtype}/{reason}: reason {:?} outside the vocabulary",
+                t.reason
+            );
+        }
     }
 
     /// Duplicate member names on the same object — last wins upstream.
@@ -696,5 +757,434 @@ mod tests {
         let u = f.usage();
         assert_eq!(u.tokens_in, 0);
         assert_eq!(u.cost_micro_usd, 500_000);
+    }
+
+    /// A `total_cost_usd` that decodes to a non-finite f64 (a `1e999`
+    /// literal, or negative overflow) is malformed — it must never
+    /// reach the micro-USD conversion and silently saturate.
+    #[test]
+    fn non_finite_total_cost_is_rejected() {
+        for cost in ["1e999", "-1e999"] {
+            let line = format!("{{\"type\":\"result\",\"total_cost_usd\":{cost}}}");
+            assert!(
+                decode_frame(line.as_bytes()).is_err(),
+                "cost {cost} decoded"
+            );
+        }
+        // Large but finite still decodes; the conversion saturates.
+        let f = decode_frame(br#"{"type":"result","total_cost_usd":1e300}"#).unwrap();
+        assert_eq!(f.usage().cost_micro_usd, i64::MAX);
+    }
+
+    /// `TestFramesDecodeEverySanitizedFixture` — every line of every
+    /// captured stream decodes, except the one deliberately malformed
+    /// line of misc-frames.
+    #[test]
+    fn frames_decode_every_sanitized_fixture() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claudecode");
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                (p.extension().is_some_and(|x| x == "ndjson")).then_some(p)
+            })
+            .collect();
+        names.sort();
+        assert!(!names.is_empty(), "no ndjson fixtures in {dir:?}");
+        for path in names {
+            let base = path.file_name().unwrap().to_string_lossy().into_owned();
+            let data = std::fs::read(&path).unwrap();
+            for (i, line) in data.split(|b| *b == b'\n').enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                // The fixture-editing marker is not a wire frame.
+                if line.starts_with(b"{\"central_fixture\"") {
+                    continue;
+                }
+                let ok = decode_frame(line)
+                    .and_then(|f| f.blocks().map(|_| ()))
+                    .is_ok();
+                let malformed = base == "misc-frames.ndjson" && i == 7;
+                assert_eq!(ok, !malformed, "{base}:{} decode", i + 1);
+            }
+        }
+    }
+
+    /// `TestInitAndPermissionFramesDecode` — the captured init and
+    /// can_use_tool request decode to the expected fields.
+    #[test]
+    fn init_and_permission_frames_decode() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claudecode/bridge-allow.ndjson");
+        let data = std::fs::read(path).unwrap();
+        let mut init = Frame::default();
+        let mut request = Frame::default();
+        for line in data.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let f = decode_frame(line).unwrap();
+            if f.typ == "system" && f.subtype == "init" {
+                init = f;
+            } else if f.typ == "control_request" {
+                request = f;
+            }
+        }
+        assert_eq!(init.session_id, "0192f000-0000-7000-8000-000000000001");
+        assert_eq!(init.permission_mode, "default");
+        assert_eq!(init.claude_code_version, "2.1.283");
+        assert_eq!(init.model, "claude-haiku-4-5-20251001");
+        assert_eq!(
+            init.tools,
+            ["Task", "Bash", "Edit", "Read", "Write"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(init.capabilities.len(), 5);
+        let req = request.can_use_tool().unwrap();
+        assert!(!request.request_id.is_empty());
+        assert_eq!(req.subtype, "can_use_tool");
+        assert_eq!(req.tool_name, "Bash");
+        assert_eq!(req.blocked_path, "/workspace/probe.txt");
+        assert_eq!(req.tool_use_id, "toolu_011r1UrbLM4eu7EYBqc2WYwD");
+        assert!(String::from_utf8_lossy(&req.input).contains("echo probe > probe.txt"));
+    }
+
+    /// `TestResultUsageMapping` — decision 14: one result's token
+    /// counters verbatim, cost to micro-USD rounded half away.
+    #[test]
+    fn result_usage_mapping_of_the_fixtures() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claudecode");
+        for (name, want) in [
+            ("success.ndjson", (10, 31, 13689, 34951, 71436)),
+            ("bridge-allow.ndjson", (18, 205, 63842, 35532, 78491)),
+            ("not-authenticated.ndjson", (0, 0, 0, 0, 0)),
+        ] {
+            let data = std::fs::read(dir.join(name)).unwrap();
+            let mut result = None;
+            for line in data.split(|b| *b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let f = decode_frame(line).unwrap();
+                if f.typ == "result" {
+                    result = Some(f);
+                }
+            }
+            let result = result.unwrap_or_else(|| unreachable!("{name}: no result"));
+            let u = result.usage();
+            assert_eq!(
+                (
+                    u.tokens_in,
+                    u.tokens_out,
+                    u.cache_read,
+                    u.cache_write,
+                    u.cost_micro_usd
+                ),
+                want,
+                "{name}"
+            );
+            assert_eq!(u.scope, UsageScope::SessionCumulative);
+            assert!(u.estimated);
+            u.validate().unwrap_or_else(|e| unreachable!("{name}: {e}"));
+        }
+        assert_eq!(cost_micro_usd(0.0000005), 1, "half micro rounds away");
+        assert_eq!(cost_micro_usd(-1.0), 0);
+    }
+
+    /// `TestResultQueueField` — every captured 2.1.283 result carries
+    /// queued_turn_count 0 and so ends its session; a positive count
+    /// does not, and an absent field counts as zero.
+    #[test]
+    fn result_queue_field_of_the_fixtures() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claudecode");
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                (p.extension().is_some_and(|x| x == "ndjson")).then_some(p)
+            })
+            .collect();
+        names.sort();
+        let mut results = 0;
+        for path in names {
+            let base = path.file_name().unwrap().to_string_lossy().into_owned();
+            let data = std::fs::read(&path).unwrap();
+            for line in data.split(|b| *b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(f) = decode_frame(line) else {
+                    continue;
+                };
+                if f.typ != "result" {
+                    continue;
+                }
+                results += 1;
+                if base == "misc-frames.ndjson" {
+                    assert!(f.queued_turn_count.is_none() && f.last_result(), "{base}");
+                    continue;
+                }
+                assert_eq!(f.queued_turn_count, Some(0), "{base}");
+                assert!(f.last_result(), "{base}");
+            }
+        }
+        assert!(results > 0, "no result frames");
+        let mut f = Frame {
+            queued_turn_count: Some(1),
+            ..Frame::default()
+        };
+        assert!(!f.last_result());
+        f.queued_turn_count = Some(0);
+        assert!(f.last_result());
+        f.queued_turn_count = None;
+        assert!(f.last_result());
+    }
+
+    /// `TestOutgoingMessageShapes` — the exact host-to-harness frames
+    /// of the 2.1.283 protocol (spec §2.2).
+    #[test]
+    fn outgoing_message_shapes() {
+        let input = br#"{"command":"echo probe > probe.txt","description":"d"}"#;
+        for (name, got, want) in [
+            (
+                "initialize",
+                initialize_line("r1"),
+                r#"{"type":"control_request","request_id":"r1","request":{"subtype":"initialize"}}"#
+                    .to_string(),
+            ),
+            (
+                "interrupt",
+                interrupt_line("r2"),
+                r#"{"type":"control_request","request_id":"r2","request":{"subtype":"interrupt"}}"#
+                    .to_string(),
+            ),
+            (
+                "user",
+                user_message_line("do it"),
+                r#"{"type":"user","message":{"role":"user","content":"do it"}}"#.to_string(),
+            ),
+            (
+                "allow",
+                encode_line(permission_response_frame("r3", true, input, "")),
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"r3","response":{"behavior":"allow","updatedInput":{"command":"echo probe > probe.txt","description":"d"}}}}"#
+                    .to_string(),
+            ),
+            (
+                "deny",
+                encode_line(permission_response_frame("r4", false, input, "denied")),
+                r#"{"type":"control_response","response":{"subtype":"success","request_id":"r4","response":{"behavior":"deny","message":"denied","interrupt":false}}}"#
+                    .to_string(),
+            ),
+            (
+                "unsupported",
+                encode_line(unsupported_response_frame("r5")),
+                r#"{"type":"control_response","response":{"subtype":"error","request_id":"r5","error":"unsupported control request"}}"#
+                    .to_string(),
+            ),
+        ] {
+            assert_eq!(String::from_utf8(got).unwrap(), format!("{want}\n"), "{name}");
+        }
+    }
+
+    /// `TestMainThreadUsageOfTheFixtures` — phase 3l decision 3 on the
+    /// captured 2.1.283 streams: every assistant frame is the main
+    /// thread's, a message is repeated once per content block with the
+    /// same usage, and the billed tokens summed over distinct message
+    /// ids never exceed the result's.
+    #[test]
+    fn main_thread_usage_of_the_fixtures() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claudecode");
+        for (name, want_ids, want_in, want_out, want_write) in [
+            ("bridge-allow.ndjson", 2usize, 18i64, 5i64, 35532i64),
+            ("success.ndjson", 1, 10, 6, 34951),
+            ("resume.ndjson", 1, 10, 5, 80),
+            ("not-authenticated.ndjson", 1, 0, 0, 0),
+        ] {
+            let data = std::fs::read(dir.join(name)).unwrap();
+            let mut seen = std::collections::BTreeMap::<String, LiveTokens>::new();
+            let mut result = Frame::default();
+            for line in data.split(|b| *b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let f = decode_frame(line).unwrap();
+                match f.typ.as_str() {
+                    "result" => result = f,
+                    "assistant" => {
+                        let (id, tokens) = f.main_thread_usage().unwrap_or_else(|| {
+                            unreachable!(
+                                "{name}: an assistant frame was not counted: {}",
+                                String::from_utf8_lossy(line)
+                            )
+                        });
+                        if let Some(prev) = seen.get(&id) {
+                            assert_eq!(
+                                *prev, tokens,
+                                "{name}: message {id} repeated with other usage"
+                            );
+                        }
+                        seen.insert(id, tokens);
+                    }
+                    _ => {}
+                }
+            }
+            let mut sum = LiveTokens::default();
+            for t in seen.values() {
+                sum.tokens_in += t.tokens_in;
+                sum.tokens_out += t.tokens_out;
+                sum.cache_write += t.cache_write;
+            }
+            assert_eq!(seen.len(), want_ids, "{name}");
+            assert_eq!(sum.tokens_in, want_in, "{name}");
+            assert_eq!(sum.tokens_out, want_out, "{name}");
+            assert_eq!(sum.cache_write, want_write, "{name}");
+            let u = result.usage();
+            assert!(
+                sum.tokens_in <= u.tokens_in
+                    && sum.tokens_out <= u.tokens_out
+                    && sum.cache_write <= u.cache_write,
+                "{name}: live {sum:?} exceeds the result's {u:?}"
+            );
+        }
+    }
+
+    /// `TestMainThreadUsageCountsOnlyUsableMainThreadFrames` — the full
+    /// upstream table.
+    #[test]
+    fn main_thread_usage_counts_only_usable_main_thread_frames() {
+        let usage = r#""usage":{"input_tokens":3,"output_tokens":2,"cache_creation_input_tokens":7,"cache_read_input_tokens":900}"#;
+        let lt = |i: i64, o: i64, w: i64| LiveTokens {
+            tokens_in: i,
+            tokens_out: o,
+            cache_write: w,
+        };
+        for (name, line, ok, want) in [
+            (
+                "main thread",
+                format!("{{\"type\":\"assistant\",\"parent_tool_use_id\":null,\"message\":{{\"id\":\"m1\",{usage}}}}}"),
+                true,
+                lt(3, 2, 7),
+            ),
+            (
+                "no parent field",
+                format!("{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",{usage}}}}}"),
+                true,
+                lt(3, 2, 7),
+            ),
+            (
+                "no cache creation",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}".to_string(),
+                true,
+                lt(1, 1, 0),
+            ),
+            (
+                "subagent",
+                format!("{{\"type\":\"assistant\",\"parent_tool_use_id\":\"toolu_1\",\"message\":{{\"id\":\"m1\",{usage}}}}}"),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "empty parent is set",
+                format!("{{\"type\":\"assistant\",\"parent_tool_use_id\":\"\",\"message\":{{\"id\":\"m1\",{usage}}}}}"),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "no id",
+                format!("{{\"type\":\"assistant\",\"message\":{{{usage}}}}}"),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "empty id",
+                format!("{{\"type\":\"assistant\",\"message\":{{\"id\":\"\",{usage}}}}}"),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "no usage",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\"}}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "null usage",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":null}}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "negative input",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":-1,\"output_tokens\":2}}}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "negative output",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":-2}}}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "negative cache write",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"cache_creation_input_tokens\":-7}}}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "fractional counter",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":1.5}}}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "string message",
+                "{\"type\":\"assistant\",\"message\":\"hello\"}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "no message",
+                "{\"type\":\"assistant\"}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "message is an array",
+                "{\"type\":\"assistant\",\"message\":[1,2]}".to_string(),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "id of another type",
+                format!("{{\"type\":\"assistant\",\"message\":{{\"id\":7,{usage}}}}}"),
+                false,
+                lt(0, 0, 0),
+            ),
+            (
+                "cache reads are not billed",
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"cache_read_input_tokens\":900}}}".to_string(),
+                true,
+                lt(0, 0, 0),
+            ),
+        ] {
+            let f = decode_frame(line.as_bytes())
+                .unwrap_or_else(|e| unreachable!("{name}: {e:?}"));
+            match f.main_thread_usage() {
+                Some((id, got)) => {
+                    assert!(ok, "{name}: counted {got:?}");
+                    assert_eq!(id, "m1", "{name}");
+                    assert_eq!(got, want, "{name}");
+                }
+                None => assert!(!ok, "{name}: not counted"),
+            }
+        }
     }
 }

@@ -1299,6 +1299,36 @@ mod tests {
         ));
     }
 
+    /// `TestBoundedRequestAcceptsEveryFieldExactlyAtItsLimit` — the
+    /// resources-array companion of the black-box at-limit bridging
+    /// tests: the real wire protocol only ever sends one blocked_path,
+    /// so the multi-resource bounds are exercised here directly, at
+    /// every phase 3c bound at once.
+    #[test]
+    fn bounded_request_accepts_every_field_exactly_at_its_limit() {
+        let req = ControlRequest {
+            tool_name: "n".repeat(MAX_TOOL_NAME_BYTES),
+            tool_use_id: "t".repeat(MAX_TOOL_CALL_ID_BYTES),
+            ..ControlRequest::default()
+        };
+        let resources = vec!["p".repeat(MAX_PERMISSION_RESOURCE_BYTES); MAX_PERMISSION_RESOURCES];
+        let request_id = "r".repeat(MAX_PERMISSION_REQUEST_ID_BYTES);
+        assert!(
+            protocol::bounded_request(&request_id, &req, &resources),
+            "a request exactly at every phase 3c bound was rejected"
+        );
+        assert!(
+            !protocol::bounded_request(&format!("{request_id}r"), &req, &resources),
+            "a request id one byte over the limit was accepted"
+        );
+        let mut one_too_many = resources.clone();
+        one_too_many.push("one too many".to_string());
+        assert!(
+            !protocol::bounded_request(&request_id, &req, &one_too_many),
+            "one resource over the limit count was accepted"
+        );
+    }
+
     /// `echoedInput` — compact form, `{}` for absent, and the decoded
     /// duplicate-key refusal at every depth.
     #[test]

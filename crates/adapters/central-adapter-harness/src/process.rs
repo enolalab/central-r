@@ -113,6 +113,15 @@ impl FrameReader {
                 return Ok(Some(line));
             }
             if self.eof {
+                // An unterminated tail is a token too: upstream's scanner
+                // reports ErrTooLong when the buffer reaches the cap even
+                // though no newline ever arrives.
+                if self.buf.len() - self.pos >= MAX_FRAME_BYTES {
+                    return Err(Failure::invalid(
+                        codes::FRAME_TOO_LONG,
+                        "harness frame exceeds the 16 MiB cap",
+                    ));
+                }
                 if self.pos < self.buf.len() {
                     let line = self.buf[self.pos..].to_vec();
                     self.pos = self.buf.len();
@@ -582,6 +591,30 @@ mod tests {
 
         let mut data = vec![b'y'; MAX_FRAME_BYTES - 1];
         data.push(b'\n');
+        let p = ScriptProc::output(&data);
+        let mut r = FrameReader::new();
+        let line = r.next(&p).await.unwrap_or(None).unwrap_or_default();
+        assert_eq!(line.len(), MAX_FRAME_BYTES - 1);
+    }
+
+    /// An unterminated tail of exactly `maxFrameBytes` at EOF is
+    /// refused like a capped newline-terminated frame — upstream's
+    /// `bufio.Scanner` reports ErrTooLong the moment the buffer reaches
+    /// the cap, whether or not a newline ever arrives.
+    #[tokio::test]
+    async fn frame_reader_refuses_an_unterminated_cap_sized_eof_tail() {
+        let data = vec![b'z'; MAX_FRAME_BYTES];
+        let p = ScriptProc::output(&data);
+        let mut r = FrameReader::new();
+        let err = r
+            .next(&p)
+            .await
+            .err()
+            .unwrap_or_else(|| unreachable!("cap-sized EOF tail must fail"));
+        assert_eq!(err.code(), codes::FRAME_TOO_LONG);
+
+        // One byte under still returns as the final unterminated frame.
+        let data = vec![b'z'; MAX_FRAME_BYTES - 1];
         let p = ScriptProc::output(&data);
         let mut r = FrameReader::new();
         let line = r.next(&p).await.unwrap_or(None).unwrap_or_default();
