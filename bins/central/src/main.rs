@@ -1,10 +1,12 @@
 //! `central` — the main CLI and serving binary (rust-application-
 //! boundaries.md §2.1/§3.2).
 //!
-//! `central artifact read` (Phase R4 task 7) and `central checkpoint *`
-//! (Phase R4 task 8) are the landed verbs — `artifact_cli` owns its
-//! envelope and the `--stdout` byte plane end to end, `checkpoint_cli`
-//! owns the checkpoint verb surface end to end. Every command owned by
+//! `central artifact read` (Phase R4 task 7), `central checkpoint *`
+//! (Phase R4 task 8), and `central node decide` (Phase R4 task 9) are
+//! the landed verbs — `artifact_cli` owns its envelope and the
+//! `--stdout` byte plane end to end, `checkpoint_cli` owns the
+//! checkpoint verb surface end to end, `node_cli` owns the
+//! operator-decision verb end to end. Every command owned by
 //! a not-yet-landed R-slice — `serve`, `local *`, `migrate *`,
 //! `backup *`, `restore *`, `run *`, `node *`, `maintenance *`,
 //! `bootstrap *`, `grant`, `attest`, `broker *`, and the protected
@@ -23,6 +25,7 @@ use central_kernel::lifecycle;
 
 mod artifact_cli;
 mod checkpoint_cli;
+mod node_cli;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,13 +48,16 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
         }
         Resolution::Command(command_id) => {
             // The landed slices own their envelopes end to end:
-            // `artifact read` (plus its `--stdout` byte ownership) and
-            // every `checkpoint *` verb.
+            // `artifact read` (plus its `--stdout` byte ownership),
+            // every `checkpoint *` verb, and `node decide`.
             if command_id == "artifact.read" {
                 return artifact_cli::artifact_read(&verb_tokens(args), stdout, stderr);
             }
             if command_id.starts_with("checkpoint.") {
                 return checkpoint_cli::checkpoint(&command_id, &verb_tokens(args), stdout, stderr);
+            }
+            if command_id.starts_with("node.") {
+                return node_cli::node(&command_id, &verb_tokens(args), stdout, stderr);
             }
             let result = LocalResult::unsupported(command_id);
             match result.write_json_line(stdout) {
@@ -386,7 +392,12 @@ mod tests {
             (&["restore", "resume"], "restore.resume"),
             (&["restore", "abandon"], "restore.abandon"),
             (&["run", "submit"], "run.submit"),
-            (&["node", "decide"], "node.decide"),
+            // `node decide` is landed (task 9): it routes to
+            // node_cli, which without the composition env reports
+            // NODE_UNAVAILABLE — still exit 5, never the deferred-verb
+            // placeholder. Covered by
+            // `node_decide_without_env_is_unavailable` below.
+            (&["node"], "node"),
             // `checkpoint *` is landed (task 8): the verbs route to
             // checkpoint_cli, which without the composition env
             // reports CHECKPOINT_UNAVAILABLE — still exit 5, never the
@@ -499,6 +510,29 @@ mod tests {
             assert_eq!(parsed["reason"], "CHECKPOINT_UNAVAILABLE", "argv {argv:?}");
             assert_eq!(parsed["exit_code"], 5);
         }
+    }
+
+    #[test]
+    fn node_decide_without_env_is_unavailable_at_exit_5() {
+        // `node decide` is landed: without CENTRAL_NODE_DSN it
+        // reports NODE_UNAVAILABLE (still exit 5), never the
+        // deferred-verb placeholder.
+        let (code, stdout, _) = invoke(&[
+            "node",
+            "decide",
+            "--run",
+            "r",
+            "--node",
+            "n",
+            "--decision",
+            "rerun",
+        ]);
+        assert_eq!(code, 5);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["schema_version"], "central.local-result/v1");
+        assert_eq!(parsed["command_id"], "node.decide");
+        assert_eq!(parsed["exit_code"], 5);
+        assert_eq!(parsed["reason"], "NODE_UNAVAILABLE");
     }
 
     #[test]

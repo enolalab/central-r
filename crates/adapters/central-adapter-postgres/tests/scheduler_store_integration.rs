@@ -67,6 +67,7 @@ use central_foundation::failure::{Failure, FailureKind};
 use central_foundation::identity::{
     NodeLeaseId, RunId, SessionAttemptId, TaskId, WorkerId, WorkflowNodeId, WorkspaceId,
 };
+use central_retry::app::sweeper::RetrySweeper;
 use central_retry::domain::{FailureClass, OutcomeKind, ReasonCode, RetryPolicy};
 use central_retry::port::{
     Clock, CompensationExecutor, Killer, Outcome, Rand, SkippedScope, Store as RetryStore,
@@ -2224,5 +2225,39 @@ async fn run_compensation_failure_never_reopens() -> Result<()> {
     .await
     .map_err(|e| classify_sqlx(&e))?;
     assert_eq!(payload["result"], serde_json::json!("failed"));
+    Ok(())
+}
+
+/// Task-9 composition check — `RetrySweeper::sweep_once` (the
+/// capability app pass, upstream `TimeoutSweeper.sweepOnce`) drives
+/// `PgSchedulerStore::sweep_timeouts` at the injected clock: an
+/// armed node bound lands `failed_terminal` exactly as the direct
+/// store call does in `sweep_node_timeout_claimed`, and a repeat
+/// pass is a safe no-op against the terminal row.
+#[tokio::test]
+async fn retry_sweeper_pass_lands_armed_deadline() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "sw_compose").await?;
+    let mut fx = setup_fixture(&db).await?;
+    let node = seed_ready_node(&mut fx, "n1", "claude-code", "worktree", 0).await?;
+    set_node_timeout(&mut fx, node, 60).await?;
+    let wid = fx.store.register_worker(worker(&fx, 4)).await?;
+    let attempt = claim_attempt(&fx, wid).await?.attempt.id;
+    age_claimed_at(&mut fx, attempt, 3600.0).await?;
+
+    let instant = OffsetDateTime::now_utc();
+    let mut sweeper = RetrySweeper::new(fx.store.clone());
+    sweeper.clock = Some(Arc::new(move || instant));
+    sweeper.sweep_once().await;
+    assert_eq!(
+        node_state(&mut fx, node).await?,
+        "failed_terminal",
+        "the sweeper pass must land the armed node bound"
+    );
+    // Repeat pass: the terminal node is out of every candidate set —
+    // a ticked pass is idempotent.
+    sweeper.sweep_once().await;
+    assert_eq!(node_state(&mut fx, node).await?, "failed_terminal");
     Ok(())
 }

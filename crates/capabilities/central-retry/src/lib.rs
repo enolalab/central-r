@@ -18,7 +18,15 @@
 //!   the clock/jitter determinism seams.
 //! - [`query`] — the attempt outcome/decision history projection over
 //!   `attempt_outcomes` and `attempt_decisions`.
+//! - [`app`] — the component pass the kernel supervisor ticks:
+//!   [`app::sweeper::RetrySweeper`], the deadline monitor. Upstream's
+//!   ticker/`Run`/`Shutdown` plumbing is the kernel's; cancellation is
+//!   future-drop.
 
+pub mod app;
 pub mod domain;
 pub mod port;
 pub mod query;
+
+#[cfg(test)]
+pub(crate) mod testkit;

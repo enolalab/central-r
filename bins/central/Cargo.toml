@@ -19,6 +19,11 @@ central-artifact = { path = "../../crates/capabilities/central-artifact", versio
 # the binary composes the PostgreSQL store + filesystem digester exactly
 # as upstream's `cmd/central/checkpoint_composition.go` does.
 central-checkpoint = { path = "../../crates/capabilities/central-checkpoint", version = "0.1.0" }
+# `central node decide` (Phase R4 task 9, issue #95 slice 2D): the
+# capability owns the ambiguous-decision vocabulary and the workflow
+# store seam; the binary composes the PostgreSQL workflow store
+# exactly as upstream's `cmd/central/node_composition.go` does.
+central-workflow = { path = "../../crates/capabilities/central-workflow", version = "0.1.0" }
 central-adapter-postgres = { path = "../../crates/adapters/central-adapter-postgres", version = "0.1.0" }
 central-adapter-s3 = { path = "../../crates/adapters/central-adapter-s3", version = "0.1.0" }
 serde_json.workspace = true

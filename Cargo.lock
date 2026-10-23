@@ -547,6 +547,7 @@ dependencies = [
  "central-checkpoint",
  "central-foundation",
  "central-kernel",
+ "central-workflow",
  "serde_json",
  "sha2 0.11.1",
  "sqlx",

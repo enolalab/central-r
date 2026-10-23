@@ -236,6 +236,18 @@ impl Clock for SystemClock {
     }
 }
 
+/// Any `Fn() -> OffsetDateTime` is a [`Clock`] — the closure form of
+/// upstream's `Now func() time.Time` field (the
+/// `central-scheduler` `Clock` precedent).
+impl<F> Clock for F
+where
+    F: Fn() -> OffsetDateTime + Send + Sync + 'static,
+{
+    fn now(&self) -> OffsetDateTime {
+        self()
+    }
+}
+
 /// Supplies the full-jitter draw [`compute_delay`] applies — a uniform
 /// `[0,1)` float (upstream `Rand`). Injectable so tests pin the jitter
 /// and the journaled `retry_at` stays reproducible.
