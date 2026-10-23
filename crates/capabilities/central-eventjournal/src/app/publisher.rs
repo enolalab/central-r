@@ -11,7 +11,10 @@
 //! done-channel wait) is a kernel `Component` concern — the capability
 //! crate carries the pass itself plus the [`Publisher::stalled`]
 //! flag the health/readiness surfaces read, and [`Publisher::interval`]
-//! the supervisor ticks on. Passes never overlap by construction (one
+//! the supervisor ticks on. TICK CONTRACT: upstream `Run` calls
+//! `publishOnce` once at start BEFORE the ticker begins — the
+//! supervisor must run one pass at component start, then tick every
+//! `interval`. Passes never overlap by construction (one
 //! `&self` call); a failed pass logs and retries on the next tick — an
 //! outbox error must never kill the serve process, and transitions
 //! never depend on publication (spec-5 failure semantics).

@@ -93,12 +93,12 @@ fn checkpoint_exit_reason(failure: &Failure) -> (ExitClass, String) {
     }
 }
 
-/// `uuid.FromString` parity for operator-supplied ids: canonical
-/// lowercase hyphenated text, version-agnostic, non-nil — the command
-/// surface accepts every UUID form, so the strict-v7 identity parses
-/// cannot serve this boundary (the `parse_artifact_selector`
-/// precedent). `from_trusted_db_bytes` is safe here because every rule
-/// beyond version (canonical form, non-nil) is checked first.
+/// Operator-supplied ids: canonical lowercase hyphenated 36-char
+/// text, version-agnostic, non-nil — deliberately narrower than
+/// upstream `uuid.FromString` (which also admits dashless, braced,
+/// and urn: forms); canonical is the only realistic operator input.
+/// `from_trusted_db_bytes` is safe here because every rule beyond
+/// version (canonical form, non-nil) is checked first.
 fn parse_uuid_operand(text: &str) -> Option<[u8; 16]> {
     const HYPHENS: [usize; 4] = [8, 13, 18, 23];
     let bytes = text.as_bytes();
