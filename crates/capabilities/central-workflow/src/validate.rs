@@ -164,8 +164,14 @@ fn reject(detail: String, keys: &[&str]) -> Rejection {
 /// run state (upstream `ValidateBatch`): `None` on acceptance, the
 /// atomic [`Rejection`] of the first violated rule otherwise.
 ///
-/// `existing_keys` is the run's committed `node_key` set. `edges` is
-/// the committed edge set: `validate_batch` does not need it to decide
+/// `existing_keys` is the run's committed `node_key` set. `batch` is
+/// the post-partition emission: the committing store removes children
+/// whose `(run_id, node_key)` already recorded an equal spec
+/// fingerprint (they dedupe as replays) before calling — passing the
+/// raw emission would falsely reject an exact replay on the unique-key
+/// rule.
+///
+/// `edges` is the committed edge set: `validate_batch` does not need it to decide
 /// acyclicity — an append-only graph can never cycle across the batch
 /// boundary, because a proposed node is only ever a dependent of
 /// committed nodes, never their prerequisite — but the argument is part

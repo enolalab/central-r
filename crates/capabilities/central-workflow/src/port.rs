@@ -37,15 +37,68 @@ use crate::domain::{ChildSpec, Edge, EmitResult, Node, NodeStatus};
 #[trait_variant::make(Send)]
 pub trait WorkflowStore: Send + Sync + 'static {
     /// Validates one `central.child-spec/v1` emission and appends its
-    /// nodes and edges atomically (upstream `EmitBatch`). On violation
-    /// it journals `child_spec_rejected` (reason_code
-    /// `SPEC_VALIDATION_FAILED`) in the same commit and returns
+    /// nodes and edges atomically (upstream `EmitBatch`) in one
+    /// transaction anchored on the run-row lock. The commit sequence is
+    /// contract, in order:
+    ///
+    /// 1. **Lock + parent resolution.** `SELECT workspace_id FROM
+    ///    central.runs WHERE id = $1 FOR UPDATE`; a missing run row is
+    ///    `INVALID`/`WORKFLOW_RUN_NOT_FOUND`. `parent_id: None` emits
+    ///    the run's roots: the depth base is `-1` (batch roots land at
+    ///    absolute depth 0) and `parent_remaining` is unbounded. A
+    ///    `Some` parent reads its `run_id`, absolute `depth`, and
+    ///    remaining budget ceilings from `central.workflow_nodes`
+    ///    inside the same transaction; a missing parent row is
+    ///    `INVALID`/`WORKFLOW_PARENT_NOT_FOUND`, and a parent whose
+    ///    `run_id` differs is `DENIED`/`WORKFLOW_PARENT_RUN_MISMATCH`.
+    /// 2. **Dedup partition precedes validation.** Each child whose
+    ///    `(run_id, node_key)` is already recorded compares the
+    ///    recorded `spec_fingerprint`: an equal fingerprint dedupes to
+    ///    the committed node, a different one rejects the whole batch
+    ///    as `CONFLICT`/`DUPLICATE_IDEMPOTENCY_KEY` with the recorded
+    ///    row standing. [`crate::validate::validate_batch`] is called
+    ///    with ONLY the novel children (as a `ChildSpec` carrying the
+    ///    batch's `version`) while `existing_keys` still contains every
+    ///    committed key — feeding it the full batch would falsely
+    ///    reject an exact replay on the unique-key rule. Validation is
+    ///    skipped only when the novel set is empty AND
+    ///    `batch.version == CHILD_SPEC_VERSION`: the fully-deduped
+    ///    replay of an on-version batch is the one path that skips it;
+    ///    an off-version envelope validates even with zero novel
+    ///    children.
+    /// 3. **Effective caps.** The store's configured
+    ///    [`crate::domain::Caps`] applies; a zero `Caps` falls back to
+    ///    [`crate::domain::Caps::locked`]. The validator
+    ///    sees `max_depth` shifted by the parent's absolute depth
+    ///    (`caps.max_depth - parent_depth`), because it evaluates
+    ///    batch-internal depth where batch roots are 1.
+    /// 4. **Commit.** Novel children insert at absolute depth
+    ///    `parent_depth + batch_depth` ([`crate::validate::batch_depths`],
+    ///    batch roots = 1); a child omitting `budget` inherits
+    ///    `parent_remaining`, recorded explicitly on the row.
+    ///    `ON CONFLICT (run_id, node_key) DO NOTHING` plus re-select is
+    ///    the second idempotency line and resolves to the committed
+    ///    row. Each `depends_on` inserts an `ordering` edge
+    ///    dependent→prerequisite; each `input_artifact_refs` entry
+    ///    resolves its producer via `central.artifact_produce_edges`
+    ///    `(run_id, artifact_id)` and, when an in-run producer exists,
+    ///    inserts an `artifact` edge dependent→producer carrying the
+    ///    artifact id — a ref with no in-run producer inserts no edge
+    ///    and stays declared on the node's `input_artifact_refs` (the
+    ///    read-scope union reads both sources; this is the RTM-14
+    ///    declared-read edge). Edge lookups resolve through the
+    ///    batch-wide node_key→id map covering committed, deduped, and
+    ///    just-inserted nodes; edge inserts dedupe on their key.
+    ///    `node_declared` journals (actor `leader`) for newly inserted
+    ///    nodes only; each replayed child journals `command_deduped`.
+    ///
+    /// On violation it journals `child_spec_rejected` (reason_code
+    /// `SPEC_VALIDATION_FAILED`, `node_id` bound to the emitting
+    /// parent) in the same commit and returns
     /// `EmitResult{rejected: Some(..)}` without error — rejection is
-    /// data, not a crash. Re-emission dedupes on `(run_id, node_key)`:
-    /// an identical child returns the existing node and journals
-    /// `command_deduped`; the same key under a different spec
-    /// fingerprint is `DUPLICATE_IDEMPOTENCY_KEY` and the recorded row
-    /// stands.
+    /// data, not a crash. `EmitResult.nodes` lists every batch child in
+    /// emission order — the inserted node, or the committed node a
+    /// replay deduped to.
     async fn emit_batch(
         &self,
         run_id: RunId,
