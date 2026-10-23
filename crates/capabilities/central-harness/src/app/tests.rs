@@ -5088,8 +5088,9 @@ fn reconciler_gives_each_attempt_the_state_its_step_attempt_implies() {
         let st = FakeStore::new(&Trace::default());
         let a = attempt_in(tc.state);
         st.put(a.clone(), tc.step, tc.lease_live);
-        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-        let sum = block_on(r.run()).unwrap_or_else(|e| unreachable!("{}: {e}", tc.name));
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+        let (sum, res) = block_on(r.run());
+        res.unwrap_or_else(|e| unreachable!("{}: {e}", tc.name));
         let got = st
             .stored(a.id)
             .unwrap_or_else(|| unreachable!("{}: no stored row", tc.name));
@@ -5160,8 +5161,9 @@ fn reconciler_skips_what_the_recovery_authority_refuses() {
         a.id,
         Failure::denied(domain::codes::RECOVERY_NOT_AUTHORIZED, "still lease-live"),
     );
-    let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-    let sum = block_on(r.run()).expect("run");
+    let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+    let (sum, res) = block_on(r.run());
+    res.expect("run");
     assert!(sum.skipped == 1 && sum.ambiguous == 0, "summary = {sum:?}");
     let got = st.stored(a.id).expect("stored");
     assert!(
@@ -5179,8 +5181,9 @@ fn reconciler_pages_through_every_candidate() {
         a.prepared_at = EPOCH + Duration::milliseconds(i as i64);
         st.put(a, LinkedStepAttemptState::Reconciliation, false);
     }
-    let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-    let sum = block_on(r.run()).expect("run");
+    let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+    let (sum, res) = block_on(r.run());
+    res.expect("run");
     assert!(sum.scanned == n && sum.ambiguous == n, "summary = {sum:?}");
 }
 
@@ -5197,10 +5200,11 @@ fn reconciler_is_idempotent() {
         LinkedStepAttemptState::Cancelled,
         false,
     );
-    let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-    block_on(r.run()).expect("first run");
+    let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+    block_on(r.run()).1.expect("first run");
     let writes = st.recovered().len();
-    let sum = block_on(r.run()).expect("second run");
+    let (sum, res) = block_on(r.run());
+    res.expect("second run");
     assert!(
         st.recovered().len() == writes
             && sum.ambiguous + sum.unlaunched + sum.settled + sum.resolved == 0,
@@ -5277,8 +5281,8 @@ fn reconciler_supersedes_the_pending_approval_of_what_it_settles() {
         let a = attempt_in(State::AwaitingPermission);
         st.put(a.clone(), step, false);
         let approval = st.put_approval(&a);
-        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-        block_on(r.run()).expect("run");
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+        block_on(r.run()).1.expect("run");
         let got = &st.approval_list()[0];
         assert!(
             got.id == approval.id
@@ -5338,12 +5342,16 @@ fn resolver_fail_unlaunched_leaves_a_launched_row_to_the_reconciler() {
     let a = attempt_in(State::Running);
     st.put(a.clone(), LinkedStepAttemptState::Cancelled, false);
     let r = Resolver::new(st.clone(), Arc::new(RealClock));
-    block_on(r.fail_unlaunched(a.workspace_id, step_of(&a))).expect("fail");
+    let err = block_on(r.fail_unlaunched(a.workspace_id, step_of(&a)))
+        .expect_err("a launched row refuses fail_unlaunched");
     let got = st.stored(a.id).expect("stored");
     assert!(
-        got.state == State::Running && st.recovered().is_empty(),
-        "a launched row was failed: {}",
-        got.state.as_str()
+        err.code() == domain::codes::INVALID_TRANSITION
+            && got.state == State::Running
+            && st.recovered().is_empty(),
+        "err = {err:?}, attempt = {}, recovered = {:?}",
+        got.state.as_str(),
+        st.recovered()
     );
 }
 
@@ -5374,8 +5382,9 @@ fn reconciler_heals_a_lost_resume_write() {
         let st = FakeStore::new(&Trace::default());
         let a = attempt_in(State::Ambiguous);
         st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
-        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-        let sum = block_on(r.run()).expect("run");
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+        let (sum, res) = block_on(r.run());
+        res.expect("run");
         assert!(sum.resolved == 1 && sum.skipped == 0, "summary = {sum:?}");
         let got = st.stored(a.id).expect("stored");
         assert!(
@@ -5397,8 +5406,9 @@ fn reconciler_heals_a_lost_resume_write() {
         let st = FakeStore::new(&Trace::default());
         let a = ambiguous_without_session();
         st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
-        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-        let sum = block_on(r.run()).expect("run");
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+        let (sum, res) = block_on(r.run());
+        res.expect("run");
         assert!(sum.resolved == 1 && sum.skipped == 0, "summary = {sum:?}");
         let got = st.stored(a.id).expect("stored");
         assert!(
@@ -5418,8 +5428,9 @@ fn reconciler_heals_a_lost_resume_write() {
         let st = FakeStore::new(&Trace::default());
         let a = attempt_in(State::Ambiguous);
         st.put(a.clone(), LinkedStepAttemptState::Failed, false);
-        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-        let sum = block_on(r.run()).expect("run");
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+        let (sum, res) = block_on(r.run());
+        res.expect("run");
         assert_eq!(sum.resolved, 1, "summary = {sum:?}");
         let got = st.stored(a.id).expect("stored");
         assert!(
@@ -5439,8 +5450,9 @@ fn reconciler_heals_a_lost_resume_write() {
         let st = FakeStore::new(&Trace::default());
         let a = attempt_in(State::Running);
         st.put(a.clone(), LinkedStepAttemptState::Resumed, false);
-        let r = Reconciler::new(st.clone(), Arc::new(RealClock));
-        let sum = block_on(r.run()).expect("run");
+        let r = Reconciler::new(st.clone(), Arc::new(RealClock), None);
+        let (sum, res) = block_on(r.run());
+        res.expect("run");
         assert_eq!(sum.settled, 1, "summary = {sum:?}");
         let got = st.stored(a.id).expect("stored");
         assert!(
@@ -5701,19 +5713,25 @@ fn resolver_resolve_rerun() {
         .expect("rerun");
         assert!(st.recovered().is_empty());
     }
-    // the recovery authority's refusal is returned
+    // the recovery authority's refusal is returned; the row is left
+    // ambiguous for the next Retry to resolve
     {
         let st = FakeStore::new(&Trace::default());
         let a = attempt_in(State::Ambiguous);
         st.put(a.clone(), LinkedStepAttemptState::Failed, false);
         st.set_refuse(
             a.id,
-            Failure::denied(domain::codes::RECOVERY_NOT_AUTHORIZED, "retry pending"),
+            Failure::conflict(domain::codes::INVALID_TRANSITION, "retry pending"),
         );
         let r = Resolver::new(st.clone(), Arc::new(RealClock));
         let err = block_on(r.resolve_rerun(a.workspace_id, step_of(&a), DECIDER))
             .expect_err("refusal returned");
-        assert_eq!(err.code(), domain::codes::RECOVERY_NOT_AUTHORIZED);
+        let got = st.stored(a.id).expect("stored");
+        assert!(
+            err.code() == domain::codes::INVALID_TRANSITION && got.state == State::Ambiguous,
+            "err = {err:?}, attempt = {}",
+            got.state.as_str()
+        );
     }
 }
 
@@ -6500,4 +6518,53 @@ fn dispatcher_holds_a_start_with_an_unknown_outcome_as_lost() {
     );
     w.stop.cancel();
     let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+}
+
+// The kernel-driven mode a runtime embedder uses (the port's
+// task-per-attempt seam): `sweep` once, then loop `round` + one task
+// per `Spawned` running `attempt` + `sleep`, and end with `shutdown` —
+// `run` never enters the picture. A finish that lands around the round
+// must wake `sleep` at once: with a one-hour `wait` only the waker,
+// never the timer, can end it.
+#[test]
+fn dispatcher_kernel_driven_mode_wakes_sleep_on_a_finish() {
+    let tr = Trace::default();
+    let life = Arc::new(Lifecycle::new(&tr, vec![queued_run()]));
+    let mut runner = ScriptedRunner::new(life.clone());
+    runner.result = HarnessResult::bare(Outcome::Succeeded, None);
+    let runner = Arc::new(runner);
+    let mut cfg = dispatch_cfg();
+    cfg.poll_interval = Duration::HOUR;
+    let w = new_dispatch_world(Some(runner.clone()), life, cfg);
+    let stop: Arc<dyn super::ports::CancelSignal> = w.stop.clone();
+    let disp = w.disp.clone();
+
+    block_on(disp.sweep(&*stop)).expect("sweep");
+    let mut round = block_on(disp.round(&*stop));
+    assert_eq!(round.spawned.len(), 1, "round = {round:?}");
+    // The kernel's fan-out: one task per Spawned running `attempt`.
+    let s = round.spawned.drain(..).next().expect("one spawned");
+    let d2 = disp.clone();
+    let stop2 = stop.clone();
+    let attempt = std::thread::spawn(move || block_on(d2.attempt(s, stop2)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let d3 = disp.clone();
+    let stop3 = stop.clone();
+    let sleeper = std::thread::spawn(move || {
+        block_on(d3.sleep(&round, &*stop3));
+        let _ = tx.send(());
+    });
+    let res = attempt.join().expect("attempt task");
+    assert_eq!(res.outcome, Outcome::Succeeded, "attempt = {res:?}");
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("sleep did not wake on the finish");
+    sleeper.join().expect("sleeper task");
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "attempt ran");
+    block_on(disp.shutdown()).expect("shutdown");
+    assert_eq!(
+        disp.status().state,
+        DispatcherState::Stopped,
+        "status = {:?}",
+        disp.status()
+    );
 }

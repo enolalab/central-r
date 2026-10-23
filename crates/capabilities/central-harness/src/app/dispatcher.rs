@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
 use central_foundation::failure::Failure;
-use central_foundation::identity::{HarnessAttemptId, RunId, TaskId};
+use central_foundation::identity::{HarnessAttemptId, RunId, StepAttemptId, TaskId};
 use time::{Duration, OffsetDateTime};
 
 use crate::domain::{self, vocab};
@@ -151,10 +151,9 @@ impl Status {
     }
 }
 
-/// `DispatcherConfig` — upstream `DispatcherConfig`. Zero durations
-/// take the defaults. The `Logger` field has no Rust form: the crate
-/// has no logging port (see the task report); `finish` records the
-/// same facts in `status` instead.
+/// `DispatcherConfig` — upstream `DispatcherConfig` minus its `Logger`
+/// field, which the Rust port carries on [`DispatcherDeps::logger`]
+/// as the [`DispatchLog`] port. Zero durations take the defaults.
 #[derive(Debug)]
 pub struct DispatcherConfig {
     /// The number of attempts run at once, `1..=MAX_CONCURRENCY`.
@@ -269,14 +268,18 @@ impl Spawned {
 /// What one [`Dispatcher::round`] produced — the kernel fan-out seam.
 #[derive(Debug)]
 pub struct Round {
-    /// How long to wait before the next round — feed to
-    /// [`Dispatcher::sleep`], which also returns early on a completed
-    /// attempt (upstream's `freed` wake) or a stop.
+    /// How long to wait before the next round — the [`Dispatcher::sleep`]
+    /// bound, which also returns early on a completed attempt
+    /// (upstream's `freed` wake) or a stop.
     pub wait: Duration,
     /// Runs claimed this round. Each MUST be driven through
     /// [`Dispatcher::attempt`] — the claim is already booked, and only
     /// `attempt`'s `finish` frees it.
     pub spawned: Vec<Spawned>,
+    /// The `freed` epoch at this round's start — [`Dispatcher::sleep`]
+    /// wakes on a finish that landed *during* the round too, as a token
+    /// already queued in upstream's buffered `freed` channel does.
+    freed_epoch: u64,
 }
 
 /// The mutable dispatcher state — upstream's `d.mu` block plus the
@@ -465,24 +468,25 @@ impl Dispatcher {
                         self.mark_probed();
                         self.pause(PauseReason::LauncherUnreachable, &[], None)
                             .await;
-                        self.sleep(self.shared.deps.cfg.pause_retry, stop_dyn).await;
+                        self.sleep_for(self.shared.deps.cfg.pause_retry, stop_dyn)
+                            .await;
                     } else {
                         self.shared.deps.logger.warn(
                             "harness startup sweep could not list ambiguous attempts",
                             &[("error", e.to_string())],
                         );
-                        self.sleep(self.shared.deps.cfg.poll_interval, stop_dyn)
+                        self.sleep_for(self.shared.deps.cfg.poll_interval, stop_dyn)
                             .await;
                     }
                 }
             }
         }
         while !stop_dyn.is_cancelled() {
-            let round = self.round(stop_dyn).await;
-            for s in round.spawned {
+            let mut round = self.round(stop_dyn).await;
+            for s in round.spawned.drain(..) {
                 self.spawn_local(s, stop.clone());
             }
-            self.sleep(round.wait, stop_dyn).await;
+            self.sleep(&round, stop_dyn).await;
         }
         self.shutdown().await
     }
@@ -603,9 +607,15 @@ impl Dispatcher {
     /// [`attempt`](Self::attempt); [`Dispatcher::run`] drives them
     /// locally.
     pub async fn round(&self, stop: &dyn CancelSignal) -> Round {
+        // Baseline the wake epoch at the round's START: a `finish`
+        // landing while the round runs must wake the following `sleep`
+        // at once — upstream queues a token in the buffered `freed`
+        // channel for exactly that.
+        let freed_epoch = self.freed_epoch();
         let empty = |wait: Duration| Round {
             wait,
             spawned: Vec::new(),
+            freed_epoch,
         };
         let (free, paused, since_probe, skip) = {
             let g = match self.shared.inner.lock() {
@@ -678,6 +688,7 @@ impl Dispatcher {
         Round {
             wait: self.shared.deps.cfg.poll_interval,
             spawned,
+            freed_epoch,
         }
     }
 
@@ -714,12 +725,25 @@ impl Dispatcher {
         }
     }
 
-    /// `sleep` — waits `wait`, ending early on `stop` or on a completed
-    /// attempt that was not a refused start (upstream's `freed` arm).
-    /// Polls the local driver's in-flight futures — the only way they
-    /// progress.
-    pub async fn sleep(&self, wait: Duration, stop: &dyn CancelSignal) {
-        let e0 = self.freed_epoch();
+    /// `sleep` — waits `round.wait`, ending early on `stop` or on a
+    /// completed attempt that was not a refused start (upstream's
+    /// `freed` arm). The wake epoch is the round's own: a `finish`
+    /// that landed while `round` ran still ends this sleep at once,
+    /// as a token already queued in upstream's buffered `freed`
+    /// channel does. Polls the local driver's in-flight futures — the
+    /// only way they progress.
+    pub async fn sleep(&self, round: &Round, stop: &dyn CancelSignal) {
+        self.sleep_inner(round.freed_epoch, round.wait, stop).await
+    }
+
+    /// The sweep retries' wait — upstream passes a nil `freed` there:
+    /// nothing can be in flight before the first `round`, so the wake
+    /// epoch baselined at entry never moves.
+    async fn sleep_for(&self, wait: Duration, stop: &dyn CancelSignal) {
+        self.sleep_inner(self.freed_epoch(), wait, stop).await
+    }
+
+    async fn sleep_inner(&self, e0: u64, wait: Duration, stop: &dyn CancelSignal) {
         let mut timer = self.shared.deps.ticker.after(wait);
         let mut cancel = stop.cancelled();
         std::future::poll_fn(|cx| {
@@ -960,7 +984,12 @@ impl Dispatcher {
     ) -> Duration {
         let mut backoff = cfg.not_startable_cooldown;
         if let Some(prev) = g.cooling.get(&run) {
-            backoff = prev.backoff * 2;
+            // Go doubles into a negative on overflow and clamps it to
+            // the cap; `checked_mul` reaches the cap the same way.
+            backoff = prev
+                .backoff
+                .checked_mul(2)
+                .unwrap_or(cfg.max_not_startable_cooldown);
             if backoff > cfg.max_not_startable_cooldown || backoff <= Duration::ZERO {
                 backoff = cfg.max_not_startable_cooldown;
             }
@@ -1006,13 +1035,14 @@ impl Dispatcher {
         waiting: &[DispatchableRun],
         stop: Option<&dyn CancelSignal>,
     ) {
-        let (episode, tell) = {
+        let (episode, tell, changed) = {
             let mut g = match self.shared.inner.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
             let now = self.shared.deps.clock.now();
-            if g.status.state != DispatcherState::Paused || g.status.pause != reason {
+            let changed = g.status.state != DispatcherState::Paused || g.status.pause != reason;
+            if changed {
                 if g.status.state != DispatcherState::Paused {
                     g.episode = now;
                 }
@@ -1031,12 +1061,16 @@ impl Dispatcher {
                     tell.push(c.clone());
                 }
             }
-            (g.episode, tell)
+            (g.episode, tell, changed)
         };
-        self.shared.deps.logger.warn(
-            "harness dispatcher paused",
-            &[("reason", reason.as_str().to_string())],
-        );
+        // Upstream logs only on a real transition — a re-pause with
+        // the same reason records milestones, no second warn line.
+        if changed {
+            self.shared.deps.logger.warn(
+                "harness dispatcher paused",
+                &[("reason", reason.as_str().to_string())],
+            );
+        }
         for c in tell {
             self.record(
                 stop,
@@ -1053,12 +1087,13 @@ impl Dispatcher {
     /// `resume` — moves to running and records a resumed milestone on
     /// each Task told about the pause.
     async fn resume(&self, stop: Option<&dyn CancelSignal>) {
-        let (episode, tell) = {
+        let (episode, tell, changed) = {
             let mut g = match self.shared.inner.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            if g.status.state != DispatcherState::Running {
+            let changed = g.status.state != DispatcherState::Running;
+            if changed {
                 g.status = Status {
                     state: DispatcherState::Running,
                     since: self.shared.deps.clock.now(),
@@ -1067,12 +1102,14 @@ impl Dispatcher {
             }
             let tell: Vec<DispatchableRun> = g.notified.values().cloned().collect();
             g.notified.clear();
-            (g.episode, tell)
+            (g.episode, tell, changed)
         };
-        self.shared
-            .deps
-            .logger
-            .info("harness dispatcher running", &[]);
+        if changed {
+            self.shared
+                .deps
+                .logger
+                .info("harness dispatcher running", &[]);
+        }
         for c in tell {
             self.record(
                 stop,
@@ -1108,7 +1145,10 @@ impl Dispatcher {
             workspace_id: c.workspace_id,
             task_id: c.task_id,
             run_id: c.run_id,
-            step_attempt_id: c.step_attempt_id,
+            // Upstream's `record` leaves `StepAttemptID` zero — a
+            // dispatch milestone names the Task and Run, never the
+            // step attempt.
+            step_attempt_id: StepAttemptId::from_trusted_db_bytes([0; 16]),
             status: status.to_string(),
             reason: reason.to_string(),
             at: self.shared.deps.clock.now(),
@@ -1213,22 +1253,12 @@ impl Shared {
                 _ if res.settle_failed => hold(&mut g.settle_failed, c.run_id, now),
                 _ => {}
             }
-            let backoff = if res.outcome == Outcome::NotStarted {
+            if res.outcome == Outcome::NotStarted {
                 Dispatcher::cool_down(&mut g, &self.deps.cfg, c.run_id, now)
             } else {
                 g.cooling.remove(&c.run_id);
                 Duration::ZERO
-            };
-            // Upstream's `freed <- struct{}{}` — only a non-refused
-            // finish wakes `sleep`; every finish wakes `shutdown`'s
-            // drain check (its `wg.Done`).
-            if res.outcome != Outcome::NotStarted {
-                g.freed_epoch += 1;
             }
-            for w in g.wakers.drain(..) {
-                w.wake();
-            }
-            backoff
         };
         let run = c.run_id.to_string();
         let outcome = res.outcome.as_str().to_string();
@@ -1275,6 +1305,19 @@ impl Shared {
             }
             self.pause_dispatch(PauseReason::LowDisk).await;
         }
+        // Upstream's `freed <- struct{}{}` — sent only once `finish`
+        // returned, so the low-disk pause above is already applied
+        // before a woken `sleep` can run the next `round`. Only a
+        // non-refused finish wakes `sleep`; every finish wakes
+        // `shutdown`'s drain check (its `wg.Done`).
+        if let Ok(mut g) = self.inner.lock() {
+            if res.outcome != Outcome::NotStarted {
+                g.freed_epoch += 1;
+            }
+            for w in g.wakers.drain(..) {
+                w.wake();
+            }
+        }
         res
     }
 
@@ -1295,10 +1338,11 @@ impl Shared {
                 since: now,
                 ..Status::default()
             };
+            // Upstream logs under the lock, only on a real transition.
+            self.deps.logger.warn(
+                "harness dispatcher paused",
+                &[("reason", reason.as_str().to_string())],
+            );
         }
-        self.deps.logger.warn(
-            "harness dispatcher paused",
-            &[("reason", reason.as_str().to_string())],
-        );
     }
 }

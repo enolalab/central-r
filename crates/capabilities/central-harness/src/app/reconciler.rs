@@ -8,9 +8,9 @@
 //! harness execution disabled), and touches the database only: each
 //! non-terminal harness attempt takes the state its linked
 //! StepAttempt implies, written under the recovery authority
-//! ([`RecoveryStore`]), never under a fence. The `slog.Warn` line
-//! upstream logs for each ambiguous row has no Rust form — this crate
-//! has no logging port.
+//! ([`RecoveryStore`]), never under a fence. Each row it marks
+//! ambiguous gets one operator-facing `slog.Warn` line, over the
+//! [`DispatchLog`] port the dispatcher introduced.
 //!
 //! [`Resolver`] is the harness side of the operator's single-attempt
 //! actions, written under the same recovery authority once the
@@ -27,6 +27,7 @@ use crate::domain::{self, Resolution, ResolutionKind, State, Terminal, TerminalS
 use crate::port::{LinkedStepAttemptState, MAX_RECOVERY_CANDIDATES, RecoveryCursor, RecoveryStore};
 use crate::recovery::attempt_id_for_step_attempt;
 
+use super::dispatcher::{DiscardLog, DispatchLog};
 use super::ports::{Clock, ResolveStore};
 
 /// `AmbiguityRestart` — the `ambiguity_reason` of an attempt whose
@@ -66,6 +67,7 @@ pub struct ReconcileSummary {
 pub struct Reconciler {
     store: Arc<dyn RecoveryStore>,
     clock: Arc<dyn Clock>,
+    logger: Arc<dyn DispatchLog>,
 }
 
 /// Where one candidate's count goes.
@@ -77,32 +79,46 @@ enum Counter {
 }
 
 impl Reconciler {
-    /// `NewReconciler`. The Rust form takes no `logger`: upstream logs
-    /// one warning per ambiguous row; the rows themselves carry the
-    /// fact.
-    pub fn new(store: Arc<dyn RecoveryStore>, clock: Arc<dyn Clock>) -> Self {
-        Self { store, clock }
+    /// `NewReconciler` — `logger` may be `None` (upstream's nil
+    /// `*slog.Logger` becomes the discarding sink).
+    pub fn new(
+        store: Arc<dyn RecoveryStore>,
+        clock: Arc<dyn Clock>,
+        logger: Option<Arc<dyn DispatchLog>>,
+    ) -> Self {
+        Self {
+            store,
+            clock,
+            logger: logger.unwrap_or_else(|| Arc::new(DiscardLog)),
+        }
     }
 
     /// `Run` — reconciles every non-terminal harness attempt once. A
     /// candidate the recovery authority refuses (its StepAttempt is
     /// still lease-live, or not yet recovered) is skipped and counted;
     /// any other store failure ends the pass with an error, which
-    /// fails the recovery gate.
-    pub async fn run(&self) -> Result<ReconcileSummary, Failure> {
+    /// fails the recovery gate. As upstream's `(ReconcileSummary,
+    /// error)`, the counts gathered before the failure return with it.
+    pub async fn run(&self) -> (ReconcileSummary, Result<(), Failure>) {
         let mut sum = ReconcileSummary::default();
         let mut cursor = RecoveryCursor::default();
         loop {
-            let page = self
+            let page = match self
                 .store
                 .list_recovery_candidates(cursor, MAX_RECOVERY_CANDIDATES)
-                .await?;
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => return (sum, Err(e)),
+            };
             for c in &page {
                 sum.scanned += 1;
-                self.reconcile(c, &mut sum).await?;
+                if let Err(e) = self.reconcile(c, &mut sum).await {
+                    return (sum, Err(e));
+                }
             }
             if page.len() < MAX_RECOVERY_CANDIDATES {
-                return Ok(sum);
+                return (sum, Ok(()));
             }
             let last = page[page.len() - 1].attempt.clone();
             cursor = RecoveryCursor {
@@ -229,6 +245,12 @@ impl Reconciler {
             Counter::Unlaunched => sum.unlaunched += 1,
             Counter::Ambiguous => sum.ambiguous += 1,
             Counter::Resolved => sum.resolved += 1,
+        }
+        if next.state == State::Ambiguous {
+            self.logger.warn(
+                "harness attempt is ambiguous after restart; the operator resolves it",
+                &[("attempt", a.id.to_string()), ("run", a.run_id.to_string())],
+            );
         }
         Ok(())
     }
@@ -359,10 +381,7 @@ impl Resolver {
             Err(e) if e.code() == codes::ATTEMPT_NOT_FOUND => return Ok(()),
             r => r?,
         };
-        if a.state.is_terminal() || a.state != State::Prepared {
-            // A row that launched is the reconciler's, not this
-            // resolver's (upstream: "leaves a launched row to the
-            // reconciler").
+        if a.state.is_terminal() {
             return Ok(());
         }
         let at = std::cmp::max(self.clock.now(), a.updated_at);

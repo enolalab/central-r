@@ -2728,7 +2728,7 @@ impl RecoveryStore for FakeStore {
             let mut out = Vec::new();
             for mut c in all {
                 let a = &c.attempt;
-                if after.prepared_at != OffsetDateTime::UNIX_EPOCH
+                if !crate::domain::is_zero_time(after.prepared_at)
                     && (a.prepared_at < after.prepared_at
                         || (a.prepared_at == after.prepared_at
                             && a.id.to_string() <= after.id.to_string()))
