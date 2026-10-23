@@ -11,7 +11,7 @@
 
 use central_harness::event::{ToolStatus, Usage, UsageScope};
 
-use crate::json::{self, JsonError, push_json_string};
+use crate::json::{self, JsonError, push_json_string_html};
 
 /// `warnDenied` — the fixed-literal Warning of a turn whose result
 /// carries a non-empty `denied_actions` array: headless mode
@@ -374,8 +374,14 @@ pub(crate) fn decode_usage(raw: &[u8]) -> Option<Usage> {
     let output = output?;
     let thinking = thinking?;
     let cache = cache?;
-    let tokens_out = if thinking > 0 {
-        output.saturating_add(thinking)
+    // `output >= 0` gates the subtraction: Go's `math.MaxInt64-out`
+    // wraps negative for a negative out, making the `thinking <= …`
+    // check false so the sum saturates — the gate reproduces the
+    // wraparound outcome without overflowing.
+    let tokens_out = if thinking > 0 && output >= 0 && thinking <= i64::MAX - output {
+        output + thinking
+    } else if thinking > 0 {
+        i64::MAX
     } else {
         output
     };
@@ -392,11 +398,12 @@ pub(crate) fn decode_usage(raw: &[u8]) -> Option<Usage> {
 
 /// `tokenInt64` — one token counter strictly: only a present integral
 /// int64 JSON number is usable (a missing or null field decodes as
-/// `""` upstream). `json.Number.Int64` rejects fractions and
+/// `""` upstream). The member decodes as Go's `json.Number`, so a
+/// string member is accepted when its content is a valid JSON number
+/// (`"5"` is 5). `json.Number.Int64` rejects fractions and
 /// out-of-range values alike.
 fn token_int64(raw: &[u8], span: &json::Span) -> Option<i64> {
-    let n = json::field::<serde_json::Number>(raw, span).ok()?;
-    n.as_i64()
+    json::number_int64(&raw[span.clone()])
 }
 
 /// `addCounter` — folds one step counter into a running total: values
@@ -404,10 +411,16 @@ fn token_int64(raw: &[u8], span: &json::Span) -> Option<i64> {
 /// opencode; retained for upstream parity.
 #[allow(dead_code)]
 fn add_counter(total: i64, step: i64) -> i64 {
-    if step <= 0 {
-        return total;
+    // `total >= 0` gates the subtraction: Go's `math.MaxInt64-total`
+    // wraps negative for a negative total, so `step > …` is true and
+    // the sum saturates — the gate reproduces that without wrapping.
+    if step > 0 && total >= 0 && step <= i64::MAX - total {
+        total + step
+    } else if step > 0 {
+        i64::MAX
+    } else {
+        total
     }
-    total.saturating_add(step)
 }
 
 /// `resultData` — a decoded result body. `ok` is true for SUCCESS.
@@ -463,12 +476,13 @@ pub(crate) fn decode_result(raw: &[u8]) -> Option<ResultData> {
 
 /// `encodeUserEvent` — operator text as one NDJSON stdin line:
 /// `{"event":"user","message":{"role":"user","content":text}}`.
-/// `push_json_string` escapes the content exactly as Go's
-/// `encoding/json` does; the line ends with exactly one `"\n"`.
+/// Upstream encodes with plain `json.Marshal`, so the content escapes
+/// as `encoding/json`'s default: `<`, `>` and `&` also become
+/// `\u003c`, `\u003e`, `\u0026`. The line ends with exactly one `"\n"`.
 pub(crate) fn encode_user_event(text: &str) -> Vec<u8> {
     let mut b = Vec::with_capacity(text.len() + 64);
     b.extend_from_slice(b"{\"event\":\"user\",\"message\":{\"role\":\"user\",\"content\":");
-    push_json_string(&mut b, text);
+    push_json_string_html(&mut b, text);
     b.extend_from_slice(b"}}\n");
     b
 }
@@ -552,6 +566,24 @@ mod tests {
         assert_eq!(u.cache_read, 3);
         assert_eq!(u.scope, UsageScope::Step);
         assert_eq!(u.cost_micro_usd, 0);
+        // Quoted counters: `json.Number` accepts a string holding a
+        // valid JSON number.
+        let (d, ok) = decode_step(
+            br#"{"step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":"5","output_tokens":"3","thinking_tokens":"2","cache_read_tokens":"1"}}"#,
+        );
+        assert!(ok);
+        let u = d.usage.unwrap();
+        assert_eq!(u.tokens_in, 5);
+        assert_eq!(u.tokens_out, 5);
+        assert_eq!(u.cache_read, 1);
+        // output<0 ∧ thinking>0: upstream's `math.MaxInt64-out` wraps
+        // negative, so the fold saturates to MaxInt64 rather than
+        // producing -2.
+        let (d, ok) = decode_step(
+            br#"{"step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":0,"output_tokens":-5,"thinking_tokens":3,"cache_read_tokens":0}}"#,
+        );
+        assert!(ok);
+        assert_eq!(d.usage.unwrap().tokens_out, i64::MAX);
         // Present-but-bad usage keeps the text.
         let (d, ok) = decode_step(
             br#"{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"hi","usage":{"input_tokens":"x"}}"#,
@@ -660,9 +692,12 @@ mod tests {
         assert_eq!(v["event"], "user");
         assert_eq!(v["message"]["role"], "user");
         assert_eq!(v["message"]["content"], "hello \"world\"\nnext");
-        // Go's encoding/json escapes <, >, &.
+        // Plain `json.Marshal` HTML-escapes <, >, & — byte-exact.
         let line = encode_user_event("a<b>&c");
-        let text = String::from_utf8(line).unwrap();
-        assert!(text.contains("\\u003c") || text.contains("<"), "{text}");
+        assert_eq!(
+            line,
+            b"{\"event\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a\\u003cb\\u003e\\u0026c\"}}\n"
+                .as_slice()
+        );
     }
 }

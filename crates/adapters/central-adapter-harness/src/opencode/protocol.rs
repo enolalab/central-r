@@ -207,12 +207,12 @@ pub(crate) fn decode_tool(part: Option<&[u8]>) -> Option<(ToolCallData, ToolResu
 }
 
 /// `tokenInt64` — one token counter strictly: only an integral int64
-/// JSON number is usable. The raw literal text is parsed like
-/// `json.Number.Int64()` (Go `ParseInt`), so fractions, exponents and
-/// out-of-range values are all unusable.
+/// JSON number is usable. The member decodes as Go's `json.Number`,
+/// so a string member is accepted when its content is a valid JSON
+/// number (`"5"` is 5). `json.Number.Int64()` (Go `ParseInt`) then
+/// rejects fractions, exponents and out-of-range values alike.
 fn token_int64(raw: &[u8]) -> Option<i64> {
-    let s = std::str::from_utf8(raw).ok()?;
-    s.parse::<i64>().ok()
+    json::number_int64(raw)
 }
 
 fn non_negative(v: i64) -> i64 {
@@ -225,13 +225,16 @@ fn non_negative(v: i64) -> i64 {
 /// though the session applies its rule inline.
 #[allow(dead_code)]
 pub(crate) fn add_counter(total: i64, step: i64) -> i64 {
-    if step <= 0 {
-        return total;
+    // `total >= 0` gates the subtraction: Go's `math.MaxInt64-total`
+    // wraps negative for a negative total, so `step > …` is true and
+    // the sum saturates — the gate reproduces that without wrapping.
+    if step > 0 && total >= 0 && step <= i64::MAX - total {
+        total + step
+    } else if step > 0 {
+        i64::MAX
+    } else {
+        total
     }
-    if step > i64::MAX - total {
-        return i64::MAX;
-    }
-    total + step
 }
 
 /// `costMicroUSD` — USD to micro-USD, rounding half away from zero.
@@ -290,7 +293,11 @@ pub(crate) fn decode_step(part: Option<&[u8]>) -> Option<Usage> {
         }
         None => 0.0,
     };
-    let tokens_out = if reasoning > 0 && reasoning <= i64::MAX - out {
+    // `out >= 0` gates the subtraction: Go's `math.MaxInt64-out`
+    // wraps negative for a negative out, making the `reasoning <= …`
+    // check false so the sum saturates — the gate reproduces the
+    // wraparound outcome without overflowing.
+    let tokens_out = if reasoning > 0 && out >= 0 && reasoning <= i64::MAX - out {
         out + reasoning
     } else if reasoning > 0 {
         i64::MAX
@@ -465,6 +472,23 @@ mod tests {
         .expect("negative-counter step rejected");
         assert_eq!(u.tokens_in, 0);
         assert_eq!(u.tokens_out, 3);
+        // output<0 ∧ reasoning>0: upstream's `math.MaxInt64-out` wraps
+        // negative, so the fold saturates to MaxInt64 rather than
+        // producing -2.
+        let u = decode_step(Some(
+            br#"{"type":"step-finish","tokens":{"input":0,"output":-5,"reasoning":3,"cache":{"read":0,"write":0}},"cost":0}"#,
+        ))
+        .expect("wraparound-corner step rejected");
+        assert_eq!(u.tokens_out, i64::MAX);
+        // Quoted counters: `json.Number` accepts a string holding a
+        // valid JSON number.
+        let u = decode_step(Some(
+            br#"{"type":"step-finish","tokens":{"input":"5","output":"3","reasoning":"2","cache":{"read":"1","write":"0"}},"cost":0}"#,
+        ))
+        .expect("quoted-counter step rejected");
+        assert_eq!(u.tokens_in, 5);
+        assert_eq!(u.tokens_out, 5);
+        assert_eq!(u.cache_read, 1);
         // Missing cost is 0.
         let u = decode_step(Some(
             br#"{"type":"step-finish","tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
@@ -488,6 +512,24 @@ mod tests {
             (
                 "string cost",
                 r#"{"type":"step-finish","tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}},"cost":"0"}"#,
+            ),
+            // Quoted but not a valid JSON number: `isValidNumber`
+            // rejects "+5", "05" and " 5" upstream.
+            (
+                "quoted +5",
+                r#"{"type":"step-finish","tokens":{"input":"+5","output":1,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}"#,
+            ),
+            (
+                "quoted leading zero",
+                r#"{"type":"step-finish","tokens":{"input":"05","output":1,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}"#,
+            ),
+            (
+                "quoted space",
+                r#"{"type":"step-finish","tokens":{"input":" 5","output":1,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}"#,
+            ),
+            (
+                "quoted fraction",
+                r#"{"type":"step-finish","tokens":{"input":"3.5","output":1,"reasoning":0,"cache":{"read":0,"write":0}},"cost":0}"#,
             ),
             ("not an object", "42"),
         ] {
@@ -526,5 +568,8 @@ mod tests {
         assert_eq!(add_counter(10, -5), 10);
         assert_eq!(add_counter(i64::MAX, 1), i64::MAX);
         assert_eq!(add_counter(i64::MAX - 1, 1), i64::MAX);
+        // Negative total: upstream's `math.MaxInt64-total` wraps
+        // negative, so `step > …` holds and the sum saturates.
+        assert_eq!(add_counter(-5, 3), i64::MAX);
     }
 }

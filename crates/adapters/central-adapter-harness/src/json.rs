@@ -547,19 +547,103 @@ fn hex4(s: &[u8]) -> Option<u32> {
     Some(v)
 }
 
+/// `isValidNumber` — the JSON number grammar `encoding/json` applies
+/// to a *quoted* `json.Number` value: `-?(0|[1-9][0-9]*)` with
+/// optional `\.[0-9]+` fraction and `[eE][+-]?[0-9]+` exponent, the
+/// whole string, no whitespace and no `+` sign.
+fn is_valid_number(s: &str) -> bool {
+    let mut s = s.as_bytes();
+    if s.is_empty() {
+        return false;
+    }
+    if s[0] == b'-' {
+        s = &s[1..];
+        if s.is_empty() {
+            return false;
+        }
+    }
+    match s[0] {
+        b'0' => s = &s[1..],
+        b'1'..=b'9' => {
+            s = &s[1..];
+            while !s.is_empty() && s[0].is_ascii_digit() {
+                s = &s[1..];
+            }
+        }
+        _ => return false,
+    }
+    if s.len() >= 2 && s[0] == b'.' {
+        s = &s[1..];
+        while !s.is_empty() && s[0].is_ascii_digit() {
+            s = &s[1..];
+        }
+    }
+    if s.len() >= 2 && matches!(s[0], b'e' | b'E') {
+        s = &s[1..];
+        if matches!(s[0], b'+' | b'-') {
+            s = &s[1..];
+            if s.is_empty() {
+                return false;
+            }
+        }
+        while !s.is_empty() && s[0].is_ascii_digit() {
+            s = &s[1..];
+        }
+    }
+    s.is_empty()
+}
+
+/// A `json.Number` member as an integral int64 — the full Go rule:
+/// a bare number literal keeps its text; a string member is unquoted
+/// and its content must satisfy `isValidNumber` (`"5"` is the number
+/// 5, while `"+5"`, `"05"` and `" 5"` fail the whole decode
+/// upstream). The literal then parses as `strconv.ParseInt`:
+/// fractions, exponents and out-of-range values are all unusable.
+pub(crate) fn number_int64(raw: &[u8]) -> Option<i64> {
+    if raw.first() == Some(&b'"') {
+        // `literalStore`: the member is a string — `unquoteBytes`,
+        // then `isValidNumber` before the value reaches the Number.
+        let s = field::<String>(raw, &(0..raw.len())).ok()?;
+        if !is_valid_number(&s) {
+            return None;
+        }
+        return s.parse::<i64>().ok();
+    }
+    std::str::from_utf8(raw).ok()?.parse::<i64>().ok()
+}
+
 /// `json.Marshal(s)` via Go's `appendString` with EscapeHTML off — the
-/// mode `encodeLine` sets: `"` `\` shorthand escapes, `\n`/`\r`/`\t`,
-/// other controls as `\u00xx`, U+2028/U+2029 escaped, everything else
-/// raw UTF-8 (`<`/`>`/`&` unescaped).
+/// mode `encodeLine` sets: `"` `\` shorthand escapes, `\b`/`\f`,
+/// `\n`/`\r`/`\t`, other controls as `\u00xx`, U+2028/U+2029 escaped,
+/// everything else raw UTF-8 (`<`/`>`/`&` unescaped).
 pub(crate) fn push_json_string(out: &mut Vec<u8>, s: &str) {
+    push_json_string_mode(out, s, false);
+}
+
+/// `json.Marshal(s)` via Go's `appendString` with EscapeHTML on —
+/// `encoding/json`'s default, the mode plain `json.Marshal` uses:
+/// identical to [`push_json_string`] except `<`, `>` and `&` also
+/// encode as `\u003c`, `\u003e`, `\u0026`.
+pub(crate) fn push_json_string_html(out: &mut Vec<u8>, s: &str) {
+    push_json_string_mode(out, s, true);
+}
+
+/// `appendString` — the shared escape walk; `html` selects Go's
+/// `htmlSafeSet` over `safeSet`.
+fn push_json_string_mode(out: &mut Vec<u8>, s: &str, html: bool) {
     out.push(b'"');
     for c in s.chars() {
         match c {
             '"' => out.extend_from_slice(b"\\\""),
             '\\' => out.extend_from_slice(b"\\\\"),
+            '\u{8}' => out.extend_from_slice(b"\\b"),
+            '\u{c}' => out.extend_from_slice(b"\\f"),
             '\n' => out.extend_from_slice(b"\\n"),
             '\r' => out.extend_from_slice(b"\\r"),
             '\t' => out.extend_from_slice(b"\\t"),
+            '<' | '>' | '&' if html => {
+                out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes());
+            }
             '\u{2028}' => out.extend_from_slice(b"\\u2028"),
             '\u{2029}' => out.extend_from_slice(b"\\u2029"),
             c if (c as u32) < 0x20 => {

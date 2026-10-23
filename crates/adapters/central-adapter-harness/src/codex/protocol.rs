@@ -447,26 +447,30 @@ pub(crate) fn decode_usage(raw: &[u8]) -> Option<Usage> {
 }
 
 /// `tokenInt64` — one token counter strictly: only an integral int64
-/// JSON number is usable. `json.Number.Int64` rejects fractions,
+/// JSON number is usable. The field decodes as Go's `json.Number`, so
+/// a string member is accepted when its content is a valid JSON
+/// number (`"5"` is 5 — `encoding/json` unquotes and applies
+/// `isValidNumber`). `json.Number.Int64` then rejects fractions,
 /// exponents and out-of-range values alike; a missing member decodes
 /// as `""` and is rejected too.
 fn token_int64(raw: &[u8], span: &json::Span) -> Option<i64> {
-    // Go's json.Number accepts only the bare JSON number token; a
-    // string or other type fails the whole decode upstream (the field
-    // is json.Number, not *). Number.Int64 then rejects fractions and
-    // exponents.
-    let n = json::field::<serde_json::Number>(raw, span).ok()?;
-    n.as_i64()
+    json::number_int64(&raw[span.clone()])
 }
 
 /// `addCounter` — folds one counter into a running total: values at
 /// or below zero are ignored, and the sum saturates.
 #[allow(dead_code)]
 fn add_counter(total: i64, step: i64) -> i64 {
-    if step <= 0 {
-        return total;
+    // `total >= 0` gates the subtraction: Go's `math.MaxInt64-total`
+    // wraps negative for a negative total, so `step > …` is true and
+    // the sum saturates — the gate reproduces that without wrapping.
+    if step > 0 && total >= 0 && step <= i64::MAX - total {
+        total + step
+    } else if step > 0 {
+        i64::MAX
+    } else {
+        total
     }
-    total.saturating_add(step)
 }
 
 #[cfg(test)]
@@ -679,6 +683,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(u.cache_write, 0);
+        // Quoted counters: `json.Number` accepts a string holding a
+        // valid JSON number.
+        let u = decode_usage(
+            br#"{"input_tokens":"5","cached_input_tokens":"2","output_tokens":"3","reasoning_output_tokens":"4","cache_write_input_tokens":"1"}"#,
+        )
+        .unwrap();
+        assert_eq!(u.tokens_in, 5);
+        assert_eq!(u.tokens_out, 7);
+        assert_eq!(u.cache_read, 2);
+        assert_eq!(u.cache_write, 1);
         // saturation.
         let u = decode_usage(
             br#"{"input_tokens":0,"cached_input_tokens":0,"output_tokens":9223372036854775807,"reasoning_output_tokens":1}"#,
@@ -691,7 +705,12 @@ mod tests {
             br#"{"input_tokens":-1,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
             br#"{"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
             br#"{"input_tokens":1e3,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
-            br#"{"input_tokens":"5","cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
+            // Quoted but not a valid JSON number: `isValidNumber`
+            // rejects "+5", "05" and " 5" upstream.
+            br#"{"input_tokens":"+5","cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
+            br#"{"input_tokens":"05","cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
+            br#"{"input_tokens":" 5","cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
+            br#"{"input_tokens":"1e3","cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}"#.as_slice(),
             br#"{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"cache_write_input_tokens":-1}"#.as_slice(),
             b"not json".as_slice(),
         ] {
@@ -701,6 +720,8 @@ mod tests {
         assert_eq!(add_counter(10, -3), 10);
         assert_eq!(add_counter(i64::MAX - 1, 5), i64::MAX);
         assert_eq!(add_counter(5, 5), 10);
+        // Negative total saturates upstream (MaxInt64-total wraps).
+        assert_eq!(add_counter(-5, 3), i64::MAX);
     }
 
     /// `skippableItem` + `inProgressCompleted`.
