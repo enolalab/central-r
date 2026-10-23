@@ -1,10 +1,11 @@
 //! The in-process scheduler worker — port of
 //! `central/internal/scheduler/app/worker.go` (spec-2 decisions 2, 4, 7
 //! and 8). [`Worker::register`] performs the registration handshake;
-//! the kernel supervisor then calls [`Worker::heartbeat_once`] per
-//! `tick_interval` and [`Worker::deregister`] on shutdown, releasing
-//! never-started leases back to `ready` in the store's single
-//! transaction.
+//! the kernel supervisor then calls [`Worker::heartbeat_once`] once at
+//! component start and again per `tick_interval` (upstream `Run`'s
+//! `heartbeat()` before the ticker, worker.go:102), and
+//! [`Worker::deregister`] on shutdown, releasing never-started leases
+//! back to `ready` in the store's single transaction.
 //!
 //! The heartbeat IS the lease renewal (decision 4): a worker holding
 //! no leases has no deadlines to miss and stays active. A renewal
@@ -111,6 +112,13 @@ impl<S: Store> Worker<S> {
     /// The heartbeat cadence the supervisor ticks [`heartbeat_once`]
     /// on; resolves `interval <= ZERO` to the locked
     /// [`domain::heartbeat_interval`].
+    ///
+    /// TICK CONTRACT (upstream `Run`, worker.go:102): the supervisor
+    /// runs one [`heartbeat_once`] pass at component start — after a
+    /// successful [`register`](Self::register) — BEFORE the ticker
+    /// begins, then ticks every `tick_interval`. A naive interval-only
+    /// loop delays the first renewal by a full beat (15 s by
+    /// default).
     #[must_use]
     pub fn tick_interval(&self) -> Duration {
         if self.interval <= Duration::ZERO {
@@ -149,11 +157,14 @@ impl<S: Store> Worker<S> {
     }
 
     /// Renews every live lease the worker holds once (upstream
-    /// `heartbeat`). The renewal set comes from the store each beat
-    /// rather than from the claim loop, so leases claimed between
-    /// beats join the set at the next beat and released leases drop
-    /// out on their own. A worker that never registered has no leases
-    /// to renew and the pass is a no-op.
+    /// `heartbeat`). This is the run-once pass: the supervisor calls
+    /// it once at component start, then again on every
+    /// [`tick_interval`](Self::tick_interval) tick. The renewal set
+    /// comes from the store each beat rather than from the claim
+    /// loop, so leases claimed between beats join the set at the next
+    /// beat and released leases drop out on their own. A worker that
+    /// never registered has no leases to renew and the pass is a
+    /// no-op.
     pub async fn heartbeat_once(&self) {
         let Some(id) = self.registered_id() else {
             return;

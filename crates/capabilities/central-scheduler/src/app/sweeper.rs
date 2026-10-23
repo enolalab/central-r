@@ -1,14 +1,15 @@
 //! The Central-internal lease monitor — port of
 //! `central/internal/scheduler/app/sweeper.go` (spec-2 decisions 5 and
-//! 6 — the missed-beat ladder is its job, never the worker's). Every
-//! `tick_interval` the supervisor calls [`Sweeper::sweep_once`], which
-//! runs one sequential pass: `expire_leases(now)` closes every lease
-//! whose TTL lapsed, then `sweep_suspects(now)` walks the worker
-//! ladder — suspect at `MISSED_BEATS_SUSPECT` missed beats (observable
-//! only), lost at `MISSED_BEATS_LOST` (all of the worker's leases
-//! expire in one transaction). The default cadence is the heartbeat
-//! interval itself: beats are evaluated at the same rate they are
-//! expected.
+//! 6 — the missed-beat ladder is its job, never the worker's). The
+//! supervisor calls [`Sweeper::sweep_once`] once at component start
+//! and again every `tick_interval` (upstream `Run`'s `sweepOnce`
+//! before the ticker, sweeper.go:51). Each call runs one sequential
+//! pass: `expire_leases(now)` closes every lease whose TTL lapsed,
+//! then `sweep_suspects(now)` walks the worker ladder — suspect at
+//! `MISSED_BEATS_SUSPECT` missed beats (observable only), lost at
+//! `MISSED_BEATS_LOST` (all of the worker's leases expire in one
+//! transaction). The default cadence is the heartbeat interval
+//! itself: beats are evaluated at the same rate they are expected.
 
 use std::sync::Arc;
 
@@ -48,6 +49,12 @@ impl<S: Store> Sweeper<S> {
     /// The pass cadence the supervisor ticks [`sweep_once`] on;
     /// resolves `interval <= ZERO` to the locked
     /// [`domain::heartbeat_interval`].
+    ///
+    /// TICK CONTRACT (upstream `Run`, sweeper.go:51): the supervisor
+    /// runs one [`sweep_once`] pass at component start BEFORE the
+    /// ticker begins, then ticks every `tick_interval`. A naive
+    /// interval-only loop delays the first expiry/ladder pass by a
+    /// full beat (15 s by default).
     #[must_use]
     pub fn tick_interval(&self) -> Duration {
         if self.interval <= Duration::ZERO {
@@ -58,10 +65,13 @@ impl<S: Store> Sweeper<S> {
     }
 
     /// Runs one expiry pass then one ladder pass at a single timestamp
-    /// (upstream `sweepOnce`). The two are independent: a sweep still
-    /// runs when the expiry pass failed part-way, and both retry on
-    /// the next tick. Pass errors are deliberately dropped — a failed
-    /// pass must not kill the serve process.
+    /// (upstream `sweepOnce`). This is the run-once pass: the
+    /// supervisor calls it once at component start, then again on
+    /// every [`tick_interval`](Self::tick_interval) tick. The two
+    /// passes are independent: a sweep still runs when the expiry pass
+    /// failed part-way, and both retry on the next tick. Pass errors
+    /// are deliberately dropped — a failed pass must not kill the
+    /// serve process.
     pub async fn sweep_once(&self) {
         let now = self
             .clock

@@ -1,8 +1,16 @@
 //! The worker's ready-queue poller — port of
-//! `central/internal/scheduler/app/claim_loop.go` (spec-2). Every tick
-//! the supervisor calls [`ClaimLoop::claim_once`]: it asks the store to
-//! atomically claim up to `limit` ready nodes for its worker id, then
-//! hands each claimed attempt to the [`Dispatcher`].
+//! `central/internal/scheduler/app/claim_loop.go` (spec-2). One poll
+//! splits into two halves: [`ClaimLoop::claims`] runs upstream
+//! `claimOnce`'s store call — atomically claiming up to `limit` ready
+//! nodes for the worker id — and returns the batch, and
+//! [`ClaimLoop::dispatch`] runs one claimed attempt through the
+//! [`Dispatcher`]. [`ClaimLoop::claim_once`] composes the pair into
+//! the pass-shaped sequential driver.
+//!
+//! TICK CONTRACT (upstream `Run`, claim_loop.go:79): the supervisor
+//! runs one poll at component start BEFORE the ticker begins, then
+//! ticks every [`ClaimLoop::tick_interval`] — a naive interval-only
+//! loop delays the first claim by a full 2 s cadence.
 //!
 //! In-flight dispatches stay bounded without a local cap:
 //! `claim_ready` never returns more attempts than the worker's
@@ -11,26 +19,36 @@
 //! exceed the registered ceiling.
 //!
 //! Upstream hands each claim to `Dispatcher.Dispatch` on its own
-//! goroutine; this port awaits them SEQUENTIALLY inside
-//! `claim_once`. The observable contract is unchanged — every
-//! `Dispatch` error is dropped (the dispatcher's fenced writes already
-//! committed the outcome, a fence rejection means the sweeper owns the
-//! attempt, and an abandoned dispatch leaves the lease to the expiry
-//! ladder) — and the claim-side concurrency ceiling lives in the
-//! store's lease headroom, not in the spawn shape. The sequential form
-//! is what makes the upstream `Shutdown`-waits-for-in-flight invariant
-//! structural: a supervisor awaiting `claim_once` to completion is
-//! drained by construction, and dropping the future mid-dispatch is
-//! upstream's `dispatchCtx` cancel — the attempt stays `claimed` until
-//! the lease ladder closes it (`LEASE_EXPIRED_NOT_STARTED` requeues the
-//! node).
+//! goroutine (claim_loop.go:110-117). The capability crate owns no
+//! executor, so the fan-out is the KERNEL's: poll
+//! [`ClaimLoop::claims`], then spawn one task per claim running
+//! [`ClaimLoop::dispatch`]. That seam — not
+//! [`ClaimLoop::claim_once`] — is the recommended driver under tokio:
+//! sequential dispatch delays the next poll by the summed dispatch
+//! latency, and one permanently stuck invoke would wedge the whole
+//! claim path, where upstream degrades to headroom−1 (a stuck
+//! invoke's claim is a durable lease, not a borrow — while the worker
+//! heartbeats, the lease stays live and occupies its slot; the
+//! sweeper's lease TTL is the bound once the worker dies, and
+//! `LEASE_EXPIRED_NOT_STARTED` requeues the node). To reproduce
+//! upstream's `wg`-backed `Shutdown` drain, the spawned dispatches
+//! must be tracked (e.g. a `JoinSet`); cancellation is still
+//! future-drop, upstream's `dispatchCtx` cancel.
+//!
+//! Every `dispatch` error may be dropped — the dispatcher's fenced
+//! writes already committed the outcome, a fence rejection means the
+//! sweeper owns the attempt, and an abandoned dispatch leaves the
+//! lease to the expiry ladder. [`ClaimLoop::dispatch`] returns the
+//! `Result` only so a fan-out driver may log it.
 
 use std::sync::Arc;
 
+use central_foundation::failure::Failure;
 use central_foundation::identity::WorkerId;
 use time::Duration;
 
 use crate::app::dispatch::Dispatcher;
+use crate::domain::ClaimedAttempt;
 use crate::port::{NodeLauncher, Provisioner, Store};
 
 /// The ready-queue poll cadence when the loop carries no explicit
@@ -86,7 +104,10 @@ impl<S: Store + ?Sized, P: Provisioner, L: NodeLauncher> ClaimLoop<S, P, L> {
         }
     }
 
-    /// The poll cadence the supervisor ticks [`claim_once`] on.
+    /// The poll cadence the supervisor ticks on; resolves `interval
+    /// <= ZERO` to [`DEFAULT_CLAIM_LOOP_INTERVAL`]. Per the module's
+    /// TICK CONTRACT the supervisor runs one poll at component start
+    /// before the first tick, then every `tick_interval`.
     #[must_use]
     pub fn tick_interval(&self) -> Duration {
         if self.interval <= Duration::ZERO {
@@ -96,23 +117,63 @@ impl<S: Store + ?Sized, P: Provisioner, L: NodeLauncher> ClaimLoop<S, P, L> {
         }
     }
 
-    /// Runs one poll (upstream `claimOnce`): claim up to the limit,
-    /// then dispatch each claimed attempt in claim order. A failed
-    /// poll is retried on the next tick: a transient store error must
-    /// not kill the component, and a permanently refused worker is
-    /// fenced out of every durable write by the store regardless.
-    /// Each dispatch error is dropped deliberately — see the module
-    /// docs for the sequential-dispatch rationale.
-    pub async fn claim_once(&self) {
-        let Ok(claimed) = self
-            .store
+    /// The claim half of one poll (upstream `claimOnce`'s store call)
+    /// — the FAN-OUT SEAM and the recommended driver. Claims up to
+    /// [`claim_limit`](Self::claim_limit) ready attempts for
+    /// `worker_id` and returns the batch for the caller to dispatch.
+    /// A failed poll returns an empty batch and is retried on the
+    /// next tick: a transient store error must not kill the
+    /// component, and a permanently refused worker is fenced out of
+    /// every durable write by the store regardless.
+    ///
+    /// Under tokio the kernel calls `claims()` per tick — plus once
+    /// at component start, per the module's TICK CONTRACT — and
+    /// spawns one task per returned claim running
+    /// [`dispatch`](Self::dispatch) (upstream's goroutine-per-claim,
+    /// claim_loop.go:110-117), keeping the poll on cadence and a
+    /// stuck invoke's blast radius at one headroom slot.
+    pub async fn claims(&self) -> Vec<ClaimedAttempt> {
+        self.store
             .claim_ready(self.worker_id, self.claim_limit())
             .await
-        else {
-            return;
-        };
-        for claim in claimed {
-            let _ = self.dispatcher.dispatch(claim).await;
+            .unwrap_or_default()
+    }
+
+    /// Dispatches one claimed attempt — the body of upstream's
+    /// per-claim goroutine (claim_loop.go:113-116). The `Result` is
+    /// returned only so a fan-out driver may log it; dropping it is
+    /// the correct default — the dispatcher's fenced writes already
+    /// committed the outcome, a fence rejection means the sweeper
+    /// owns the attempt, and an abandoned dispatch leaves the lease
+    /// to the expiry ladder.
+    ///
+    /// Stuck-invoke bound: the claim is a durable lease, not a
+    /// borrow. An invoke that never returns leaves the attempt
+    /// `claimed` under a live lease — the sibling worker's heartbeat
+    /// keeps renewing it, so while the worker lives the bound is one
+    /// headroom slot under `max_concurrent_attempts` (upstream's
+    /// degrade-to-headroom−1); once the worker dies the sweeper's
+    /// lease TTL closes it (`LEASE_EXPIRED_NOT_STARTED` requeues the
+    /// node). Nothing else bounds a permanently stuck invoke — that
+    /// is upstream's contract.
+    pub async fn dispatch(&self, claim: ClaimedAttempt) -> Result<(), Failure> {
+        self.dispatcher.dispatch(claim).await
+    }
+
+    /// Runs one poll end to end, dispatching each claim SEQUENTIALLY
+    /// in claim order — the pass-shaped simple driver for supervisors
+    /// without spawn (upstream `claimOnce` minus the fan-out). Prefer
+    /// the [`claims`](Self::claims) + spawned-[`dispatch`](Self::dispatch)
+    /// seam under tokio: sequential dispatch delays the next poll by
+    /// the summed dispatch latency, and one permanently stuck invoke
+    /// wedges the claim path entirely where upstream degrades to
+    /// headroom−1. This driver remains the drain-by-construction
+    /// shape: a returned `claim_once` has observed all its
+    /// dispatches' outcome writes, which is what a blocking
+    /// supervisor's shutdown relies on.
+    pub async fn claim_once(&self) {
+        for claim in self.claims().await {
+            let _ = self.dispatch(claim).await;
         }
     }
 }
@@ -166,6 +227,39 @@ mod tests {
         // consumed per call.
         block_on(l.claim_once());
         assert_eq!(store.count("mark_started"), 2);
+    }
+
+    // -- fix-round-1 seam pin: `claims` + `dispatch` split the poll so
+    // the kernel can fan dispatch out onto spawned tasks (upstream's
+    // goroutine-per-claim, claim_loop.go:110-117).
+
+    /// `claims` polls the store but never dispatches; `dispatch`
+    /// drives one claim through the launcher to `mark_started`. A
+    /// claim-store failure yields an empty batch, not a poisoned
+    /// component.
+    #[test]
+    fn claims_and_dispatch_split_the_poll() {
+        let store = Arc::new(RecordingStore::default());
+        store.set_claim_results(vec![vec![test_claim(), test_claim()]]);
+        let launcher = FakeLauncher::new(LaunchVerdict::Started("sess".to_string()));
+        let launched = launcher.calls_handle();
+        let d = Dispatcher::new(store.clone(), FakeProvisioner::new("/w"), launcher);
+        let l = ClaimLoop::new(store.clone(), d, WorkerId::new());
+
+        let claimed = block_on(l.claims());
+        assert_eq!(claimed.len(), 2, "claims returns the claimed batch");
+        assert!(
+            launched.lock().unwrap().is_empty(),
+            "claims must not dispatch — fan-out is the caller's"
+        );
+        for claim in claimed {
+            block_on(l.dispatch(claim)).unwrap();
+        }
+        assert_eq!(launched.lock().unwrap().len(), 2);
+        assert_eq!(store.count("mark_started"), 2);
+
+        store.set_claim_err(Failure::unavailable("STORE_UNAVAILABLE", "pg down"));
+        assert!(block_on(l.claims()).is_empty(), "claim error = empty batch");
     }
 
     // -- upstream components_test.go: TestClaimLoopClaimErrorKeepsTicking

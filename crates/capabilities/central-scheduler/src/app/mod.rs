@@ -17,8 +17,25 @@
 //! ([`worker::Worker::heartbeat_once`],
 //! [`claim_loop::ClaimLoop::claim_once`],
 //! [`sweeper::Sweeper::sweep_once`], [`reconciler::Reconciler::run`])
-//! plus each component's `tick_interval`/`claim_once`-per-tick cadence
-//! contract the supervisor ticks on. Passes never overlap by
+//! plus each component's `tick_interval` cadence contract the
+//! supervisor ticks on.
+//!
+//! SHARED TICK CONTRACT — every ticked component runs its pass ONCE
+//! at component start, then again on every `tick_interval` tick:
+//! upstream `Run` calls `heartbeat()`/`claimOnce()`/`sweepOnce()`
+//! before creating the ticker (worker.go:102, claim_loop.go:79,
+//! sweeper.go:51). The run-once pass is the same `*_once` method —
+//! a supervisor that only sleeps on `tick_interval` delays the first
+//! heartbeat/sweep by 15 s and the first claim by 2 s. The claim
+//! loop additionally splits its poll into
+//! [`claim_loop::ClaimLoop::claims`] and
+//! [`claim_loop::ClaimLoop::dispatch`] so the kernel can fan
+//! dispatch out onto spawned tasks — the recommended driver;
+//! `claim_once` remains the sequential simple driver.
+//! [`reconciler::Reconciler::run`] is not ticked at all: it is the
+//! one-shot preflight gate.
+//!
+//! Passes never overlap by
 //! construction (one `&self`/`&mut self` call), and cancellation is
 //! future-drop: a pass abandoned mid-await is the upstream `ctx.Done`
 //! case — no durable write beyond what already committed, and the
