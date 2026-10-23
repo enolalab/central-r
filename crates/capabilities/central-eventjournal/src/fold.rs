@@ -78,8 +78,10 @@ pub struct NodeDeclaredPayload {
     /// The node's run-unique key — required by the fold.
     #[serde(default, deserialize_with = "null_default")]
     pub node_key: String,
-    /// The `node_key`s this node waits on (`ordering` edges).
-    #[serde(default, deserialize_with = "null_default")]
+    /// The `node_key`s this node waits on (`ordering` edges). Decodes
+    /// through `null_default_vec`: `["a",null]` yields `["a",""]`,
+    /// matching `json.Unmarshal` into `[]string`.
+    #[serde(default, deserialize_with = "null_default_vec")]
     pub depends_on: Vec<String>,
     /// The launchable harness name.
     #[serde(default, deserialize_with = "null_default")]
@@ -91,13 +93,27 @@ pub struct NodeDeclaredPayload {
     #[serde(default, deserialize_with = "null_default")]
     pub depth: i64,
     /// Declared `(artifact_id, checksum)` input refs (the RTM-14
-    /// declared-read edge set).
-    #[serde(default, deserialize_with = "null_default")]
+    /// declared-read edge set). Decodes through `null_default_vec`:
+    /// `[null]` yields `[{uuid.Nil,""}]`, matching `json.Unmarshal`
+    /// into `[]ArtifactRef`.
+    #[serde(default, deserialize_with = "null_default_vec")]
     pub input_artifact_refs: Vec<ArtifactRef>,
 }
 
 const fn is_zero_version(version: &i64) -> bool {
     *version == 0
+}
+
+/// `encoding/json`'s zero value for an `ArtifactRef` struct — Go
+/// unmarshals a `null` element of `[]ArtifactRef` as a no-op leaving
+/// `{uuid.Nil, ""}`.
+impl Default for ArtifactRef {
+    fn default() -> Self {
+        Self {
+            artifact_id: nil_artifact_id(),
+            checksum: String::new(),
+        }
+    }
 }
 
 /// Go `null`-tolerant decode: an absent or explicit-`null` member
@@ -111,13 +127,31 @@ where
     Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
+/// Go `null`-tolerant decode for slice members: an absent or
+/// explicit-`null` member yields an empty vec, and each `null`
+/// *element* yields `T::default()` — `json.Unmarshal` decodes
+/// `["a",null]` into `[]string` as `["a",""]` and `[null]` into
+/// `[]ArtifactRef` as `[{uuid.Nil,""}]`. Non-null elements of the
+/// wrong type still error the whole payload, as upstream's
+/// `UnmarshalTypeError` does.
+fn null_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    let items = Option::<Vec<Option<T>>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(items.into_iter().map(Option::unwrap_or_default).collect())
+}
+
 const fn nil_artifact_id() -> ArtifactId {
     ArtifactId::from_trusted_db_bytes([0; 16])
 }
 
-/// `artifact_id` decode: an explicit `null` yields the nil id (gofrs
-/// `UnmarshalJSON` leaves `uuid.Nil` on `null`); any other value must
-/// parse under the gofrs `uuid.FromString` grammar.
+/// `artifact_id` decode: an explicit `null` yields the nil id
+/// (`encoding/json`'s null no-op leaves `uuid.Nil` — gofrs `UUID`
+/// implements only `UnmarshalText`, so `null` never reaches a parser);
+/// any other value must parse under the gofrs `uuid.FromString`
+/// grammar.
 fn lenient_or_nil_uuid<'de, D>(deserializer: D) -> Result<ArtifactId, D::Error>
 where
     D: Deserializer<'de>,
@@ -132,37 +166,62 @@ where
 }
 
 /// The gofrs `uuid.FromString` grammar upstream scans artifact refs
-/// with: an optional case-insensitive `urn:uuid:` prefix, optional
-/// `{...}` braces, then either 36-char hyphenated or 32-char
-/// unhyphenated hex, case-insensitive. Returns the raw 16 bytes — no
-/// version or variant gating (upstream accepts every version).
+/// with — a byte-exact port of `parseBytes`
+/// (vendor/github.com/gofrs/uuid/v5/codec.go:68-120): length-dispatched
+/// as 32 unhyphenated hex, 36 canonical hyphenated, 34/38 wrapped in
+/// `{...}` braces, or 41/45 carrying the byte-exact prefix `urn:uuid:`.
+/// The prefix compare is case-sensitive (`URN:UUID:` fails upstream)
+/// and the forms never combine (`urn:uuid:{...}` is 43/47 bytes and
+/// falls off the dispatch). Returns the raw 16 bytes — no version or
+/// variant gating (upstream accepts every version).
 fn lenient_uuid_bytes(text: &str) -> Option<[u8; 16]> {
-    let mut s = text;
-    if s.len() >= 9 && s[..9].eq_ignore_ascii_case("urn:uuid:") {
-        s = &s[9..];
+    fn hex_val(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
     }
-    if s.len() >= 2 && s.starts_with('{') && s.ends_with('}') {
-        s = &s[1..s.len() - 1];
-    }
-    let compact;
-    if s.len() == 36 {
-        let hyphen_ok = [8usize, 13, 18, 23]
-            .iter()
-            .all(|&i| s.as_bytes()[i] == b'-');
-        if !hyphen_ok {
+
+    let raw = text.as_bytes();
+    let b: &[u8] = match raw.len() {
+        32 | 36 => raw,
+        34 | 38 => {
+            if raw[0] != b'{' || raw[raw.len() - 1] != b'}' {
+                return None;
+            }
+            &raw[1..raw.len() - 1]
+        }
+        41 | 45 => {
+            if raw[..9] != *b"urn:uuid:" {
+                return None;
+            }
+            &raw[9..]
+        }
+        _ => return None,
+    };
+
+    let mut bytes = [0u8; 16];
+    if b.len() == 36 {
+        // canonical: dashes at fixed positions 8/13/18/23, hex pairs
+        // elsewhere.
+        if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
             return None;
         }
-        compact = s.replace('-', "");
-        s = &compact;
+        for (i, x) in [
+            0usize, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            bytes[i] = (hex_val(b[x])? << 4) | hex_val(b[x + 1])?;
+        }
+        return Some(bytes);
     }
-    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut bytes = [0u8; 16];
-    for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let hi = (chunk[0] as char).to_digit(16)?;
-        let lo = (chunk[1] as char).to_digit(16)?;
-        bytes[i] = ((hi << 4) | lo) as u8;
+    // hash-like: 32 hex chars, no dashes.
+    for i in 0..16 {
+        bytes[i] = (hex_val(b[2 * i])? << 4) | hex_val(b[2 * i + 1])?;
     }
     Some(bytes)
 }
@@ -1466,17 +1525,20 @@ mod tests {
     }
 
     // The lenient uuid grammar the payload scanner shares with
-    // ArtifactRef decode.
+    // ArtifactRef decode — gofrs `parseBytes` length dispatch
+    // (codec.go:68-86): only the four admitted forms, never combined,
+    // with a byte-exact `urn:uuid:` prefix.
     #[test]
     fn lenient_uuid_grammar() {
-        // Canonical, unhyphenated, braces, urn — every version and
-        // case upstream accepts.
+        // Canonical (36), unhyphenated (32), braced (38 and 34), urn
+        // (45 and 41) — every version and hex case upstream accepts.
         for text in [
             "00000000-0000-4000-8000-0000000000D2",
             "000000000000400080000000000000d2",
             "{00000000-0000-4000-8000-0000000000d2}",
+            "{000000000000400080000000000000d2}",
             "urn:uuid:00000000-0000-4000-8000-0000000000d2",
-            "URN:UUID:00000000-0000-4000-8000-0000000000D2",
+            "urn:uuid:000000000000400080000000000000d2",
         ] {
             assert!(lenient_uuid_bytes(text).is_some(), "rejected: {text}");
         }
@@ -1487,8 +1549,132 @@ mod tests {
             "{00000000-0000-4000-8000-0000000000d2",
             "urn:uuid:00000000-0000-4000-8000-0000000000d",
             "gggggggg-0000-4000-8000-0000000000d2",
+            // gofrs compares `string(b[:9]) != "urn:uuid:"` byte-exact:
+            // a mixed/upper-case prefix is not a UUID upstream.
+            "URN:UUID:00000000-0000-4000-8000-0000000000D2",
+            "Urn:Uuid:00000000-0000-4000-8000-0000000000d2",
+            // The dispatch admits the urn form (41/45) or the brace
+            // form (34/38) — never combined (43/47 falls off).
+            "urn:uuid:{00000000-0000-4000-8000-0000000000d2}",
+            "urn:uuid:{000000000000400080000000000000d2}",
+            // A brace body is hex only — urns do not nest either way.
+            "{urn:uuid:000000004000800000000000000}",
         ] {
             assert!(lenient_uuid_bytes(text).is_none(), "accepted: {text}");
         }
+    }
+
+    // Upstream decode failure in `input_artifact_refs` fails the whole
+    // `node_declared` payload (`json.Unmarshal` propagates the
+    // `UnmarshalText` error) — INVALID_EVENT_PAYLOAD and the event is
+    // excluded, so `URN:UUID:` and `urn:uuid:{...}` never fold.
+    #[test]
+    fn fold_rejects_nongofrs_uuid_forms_in_declared_refs() {
+        for artifact_id in [
+            "URN:UUID:00000000-0000-4000-8000-0000000000d2",
+            "urn:uuid:{00000000-0000-4000-8000-0000000000d2}",
+        ] {
+            let f = fold(&[ev(
+                1,
+                "node_declared",
+                EvOpt::on_node(node1()).and(EvOpt::payload(json!({
+                    "node_key": "root",
+                    "input_artifact_refs": [
+                        {"artifact_id": artifact_id, "checksum": "sha256:x"}
+                    ]
+                }))),
+            )]);
+            let bad = findings_for(&f, ReasonCode::InvalidEventPayload);
+            assert_eq!(bad.len(), 1, "{artifact_id}: {:?}", f.findings);
+            assert!(bad[0].detail.contains("node_declared"), "{artifact_id}");
+            assert!(f.nodes.is_empty(), "{artifact_id}");
+            assert!(f.artifact_refs.is_empty(), "{artifact_id}");
+        }
+    }
+
+    // The same non-gofrs forms in a generic payload position (outside
+    // the declared schema) are skipped by `collectRefs` upstream — the
+    // pair is dropped, not unioned, and the event still folds.
+    #[test]
+    fn collect_refs_skips_nongofrs_uuid_forms() {
+        let refs = collect_refs(
+            json!({
+                "a": {"artifact_id": "URN:UUID:00000000-0000-4000-8000-0000000000d2", "checksum": "sha256:a"},
+                "b": {"artifact_id": "urn:uuid:{00000000-0000-4000-8000-0000000000d3}", "checksum": "sha256:b"},
+                "ok": {"artifact_id": "urn:uuid:00000000-0000-4000-8000-0000000000d4", "checksum": "sha256:c"},
+            })
+            .as_object()
+            .unwrap(),
+        );
+        assert_eq!(refs.len(), 1, "refs: {refs:?}");
+        assert_eq!(refs[0].checksum, "sha256:c");
+        assert_eq!(
+            refs[0].artifact_id.to_string(),
+            "00000000-0000-4000-8000-0000000000d4"
+        );
+    }
+
+    // Go `json.Unmarshal` semantics for `null` array elements (upstream
+    // fold.go:296, `json.Unmarshal(ev.Payload, &p)`): `["a",null]` into
+    // `[]string` is `["a",""]` and `[null]` into `[]ArtifactRef` is
+    // `[{uuid.Nil,""}]` — the event folds, never INVALID_EVENT_PAYLOAD.
+    #[test]
+    fn fold_tolerates_null_elements_like_go_unmarshal() {
+        let f = fold(&[
+            ev(
+                1,
+                "node_declared",
+                EvOpt::on_node(node1()).and(EvOpt::payload(json!({
+                    "node_key": "root",
+                }))),
+            ),
+            ev(
+                2,
+                "node_declared",
+                EvOpt::on_node(node2()).and(EvOpt::payload(json!({
+                    "node_key": "child",
+                    "depends_on": ["root", null],
+                    "input_artifact_refs": [null, {"artifact_id": null}]
+                }))),
+            ),
+        ]);
+        assert!(
+            f.findings.is_empty(),
+            "unexpected findings: {:?}",
+            f.findings
+        );
+        // ["root", null] folds to ["root", ""] — the zero-value string
+        // element unions into the edge set exactly as upstream's
+        // mergeStrings does.
+        assert_eq!(f.graph["child"], &["root", ""]);
+        // [null, {"artifact_id": null}] folds to two {Nil, ""} refs —
+        // deduped by mergeRefs into one.
+        let refs = &f.artifact_refs["child"];
+        assert_eq!(
+            refs,
+            &[ArtifactRef {
+                artifact_id: nil_artifact_id(),
+                checksum: String::new(),
+            }],
+            "refs: {refs:?}"
+        );
+    }
+
+    // The tolerance is element-scoped, not type-scoped: a non-null
+    // element of the wrong type still fails the payload, matching
+    // upstream's UnmarshalTypeError -> INVALID_EVENT_PAYLOAD.
+    #[test]
+    fn fold_rejects_typed_elements_of_wrong_type() {
+        let f = fold(&[ev(
+            1,
+            "node_declared",
+            EvOpt::on_node(node1()).and(EvOpt::payload(json!({
+                "node_key": "root",
+                "depends_on": ["a", 42]
+            }))),
+        )]);
+        let bad = findings_for(&f, ReasonCode::InvalidEventPayload);
+        assert_eq!(bad.len(), 1, "findings: {:?}", f.findings);
+        assert!(f.nodes.is_empty());
     }
 }
