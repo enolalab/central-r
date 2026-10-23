@@ -17,6 +17,7 @@
 //! - [`fake`] — scripted `port::Adapter`/`port::ProcessLauncher` test
 //!   doubles.
 
+pub mod claudecode;
 pub mod fake;
 pub mod launcher;
 pub mod localexec;
