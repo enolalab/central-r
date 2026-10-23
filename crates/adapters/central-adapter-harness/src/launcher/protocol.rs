@@ -359,13 +359,79 @@ impl fmt::Debug for LaunchRequest {
     }
 }
 
+/// The decoded LAUNCH surface — upstream `LaunchRequest` as
+/// `DecodeRequest` fills it. Fields are raw wire bytes: Go strings
+/// keep any bytes, so `Vec<u8>` is the faithful equivalent (only NUL
+/// is banned on the wire; decoding must never mangle non-UTF-8).
+/// The client-side [`LaunchRequest`] keeps `String`. `Debug`/`Display`
+/// redact like [`fmt::Display`]'s: argv, workdir and env values can
+/// carry secrets and are never printed.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct RawLaunch {
+    /// The scope id.
+    pub scope: Scope,
+    /// The harness id bytes the daemon resolves.
+    pub harness: Vec<u8>,
+    /// The workdir bytes: relative to `worktree_root`, or empty for a
+    /// probe.
+    pub work_dir: Vec<u8>,
+    /// The argv entries — never printed.
+    pub argv: Vec<Vec<u8>>,
+    /// The `NAME=value` env entries — values never printed.
+    pub env: Vec<Vec<u8>>,
+}
+
+impl fmt::Display for RawLaunch {
+    /// Upstream `String`/`GoString`: never argv or env values.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "harnesslauncher.LaunchRequest{{Scope:{} Harness:{} WorkDirBytes:{} Args:<{}> Env:<{}>}}",
+            self.scope,
+            String::from_utf8_lossy(&self.harness),
+            self.work_dir.len(),
+            self.argv.len(),
+            self.env.len()
+        )
+    }
+}
+
+impl fmt::Debug for RawLaunch {
+    /// `GoString` — the same redaction `Display` applies.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl PartialEq<LaunchRequest> for RawLaunch {
+    /// A decoded launch equals a text request field-for-field —
+    /// mostly for tests.
+    fn eq(&self, other: &LaunchRequest) -> bool {
+        self.scope == other.scope
+            && self.harness.as_slice() == other.harness.as_bytes()
+            && self.work_dir.as_slice() == other.work_dir.as_bytes()
+            && self.argv.len() == other.argv.len()
+            && self.env.len() == other.env.len()
+            && self
+                .argv
+                .iter()
+                .zip(other.argv.iter())
+                .all(|(a, b)| a.as_slice() == b.as_bytes())
+            && self
+                .env
+                .iter()
+                .zip(other.env.iter())
+                .all(|(a, b)| a.as_slice() == b.as_bytes())
+    }
+}
+
 /// One decoded request frame — upstream `Request`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Request {
     /// The frame's opcode.
     pub op: Opcode,
     /// The decoded LAUNCH surface ([`Opcode::Launch`] only).
-    pub launch: LaunchRequest,
+    pub launch: RawLaunch,
     /// The scope (`Opcode::Alive`/`Opcode::Kill`, and `launch.scope` for
     /// `Opcode::Launch`).
     pub scope: Scope,
@@ -407,50 +473,60 @@ fn header(op: Opcode) -> Vec<u8> {
     frame
 }
 
-fn valid_harness(h: &str) -> bool {
+fn valid_harness(h: &[u8]) -> bool {
     !h.is_empty()
         && h.len() <= MAX_HARNESS
-        && h.bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        && h.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 /// `validateLaunch` — every per-field cap and shape rule of PROTOCOL.md
-/// §3.1 except the total size, which needs the encoding.
-fn validate_launch(r: &LaunchRequest) -> Result<(), Failure> {
-    if r.scope.is_nil() {
+/// §3.1 except the total size, which needs the encoding. Byte-level:
+/// shared by the encode path ([`LaunchRequest`]) and the decode path
+/// ([`RawLaunch`]) — the wire holds bytes and only NUL is banned.
+fn validate_launch_fields<B: AsRef<[u8]>>(
+    scope: &Scope,
+    harness: &[u8],
+    work_dir: &[u8],
+    argv: &[B],
+    env: &[B],
+) -> Result<(), Failure> {
+    if scope.is_nil() {
         return Err(malformed("nil scope"));
     }
-    if !valid_harness(&r.harness) {
+    if !valid_harness(harness) {
         return Err(malformed(format!(
             "harness id must be 1-{MAX_HARNESS} bytes of [a-z0-9-]"
         )));
     }
-    if r.work_dir.len() > MAX_WORK_DIR || r.work_dir.as_bytes().contains(&0) {
+    if work_dir.len() > MAX_WORK_DIR || work_dir.contains(&0) {
         return Err(malformed(format!(
             "workdir exceeds {MAX_WORK_DIR} bytes or holds NUL"
         )));
     }
-    if r.argv.len() > MAX_ARGS {
+    if argv.len() > MAX_ARGS {
         return Err(malformed(format!("more than {MAX_ARGS} args")));
     }
-    for (i, a) in r.argv.iter().enumerate() {
-        if a.len() > MAX_ARG || a.as_bytes().contains(&0) {
+    for (i, a) in argv.iter().enumerate() {
+        let a = a.as_ref();
+        if a.len() > MAX_ARG || a.contains(&0) {
             return Err(malformed(format!(
                 "arg {i} exceeds {MAX_ARG} bytes or holds NUL"
             )));
         }
     }
-    if r.env.len() > MAX_ENV {
+    if env.len() > MAX_ENV {
         return Err(malformed(format!("more than {MAX_ENV} env entries")));
     }
-    let mut names: HashSet<&str> = HashSet::with_capacity(r.env.len());
-    for (i, e) in r.env.iter().enumerate() {
-        if e.is_empty() || e.len() > MAX_ENV_ENTRY || e.as_bytes().contains(&0) {
+    let mut names: HashSet<&[u8]> = HashSet::with_capacity(env.len());
+    for (i, e) in env.iter().enumerate() {
+        let e = e.as_ref();
+        if e.is_empty() || e.len() > MAX_ENV_ENTRY || e.contains(&0) {
             return Err(malformed(format!(
                 "env entry {i} is empty, exceeds {MAX_ENV_ENTRY} bytes or holds NUL"
             )));
         }
-        let Some(eq) = e.find('=') else {
+        let Some(eq) = e.iter().position(|b| *b == b'=') else {
             return Err(malformed(format!("env entry {i} has no '='")));
         };
         if !names.insert(&e[..eq]) {
@@ -458,6 +534,17 @@ fn validate_launch(r: &LaunchRequest) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+/// `validateLaunch` on the client-side request (text fields).
+fn validate_launch(r: &LaunchRequest) -> Result<(), Failure> {
+    validate_launch_fields(
+        &r.scope,
+        r.harness.as_bytes(),
+        r.work_dir.as_bytes(),
+        &r.argv,
+        &r.env,
+    )
 }
 
 /// Upstream `EncodeLaunch`: the LAUNCH frame, or a
@@ -615,17 +702,18 @@ pub fn decode_request(frame: &[u8]) -> Result<Request, Failure> {
         b: &frame[HEADER_SIZE..],
         bad: false,
     };
-    let mut l = LaunchRequest::default();
+    let mut l = RawLaunch::default();
     // A short take copies a prefix, as Go's `copy` does; the frame is
     // then refused as truncated below.
     let scope_bytes = r.take(16);
     l.scope.0[..scope_bytes.len()].copy_from_slice(scope_bytes);
     // Reads past a marked-bad reader stay empty, exactly as upstream's
-    // `take` returning nil leaves zero values.
+    // `take` returning nil leaves zero values. Fields keep the raw
+    // wire bytes — Go strings do, and only NUL is banned.
     let hlen = r.u8();
-    l.harness = String::from_utf8_lossy(r.take(hlen)).into_owned();
+    l.harness = r.take(hlen).to_vec();
     let wlen = r.u16();
-    l.work_dir = String::from_utf8_lossy(r.take(wlen)).into_owned();
+    l.work_dir = r.take(wlen).to_vec();
     let argc = r.u8();
     if argc > MAX_ARGS {
         return Err(malformed(format!("more than {MAX_ARGS} args")));
@@ -635,8 +723,7 @@ pub fn decode_request(frame: &[u8]) -> Result<Request, Failure> {
             break;
         }
         let alen = r.u16();
-        l.argv
-            .push(String::from_utf8_lossy(r.take(alen)).into_owned());
+        l.argv.push(r.take(alen).to_vec());
     }
     let envc = r.u8();
     if envc > MAX_ENV {
@@ -647,8 +734,7 @@ pub fn decode_request(frame: &[u8]) -> Result<Request, Failure> {
             break;
         }
         let elen = r.u16();
-        l.env
-            .push(String::from_utf8_lossy(r.take(elen)).into_owned());
+        l.env.push(r.take(elen).to_vec());
     }
     if r.bad {
         return Err(malformed("LAUNCH frame is truncated"));
@@ -659,7 +745,7 @@ pub fn decode_request(frame: &[u8]) -> Result<Request, Failure> {
             r.b.len()
         )));
     }
-    validate_launch(&l)?;
+    validate_launch_fields(&l.scope, &l.harness, &l.work_dir, &l.argv, &l.env)?;
     Ok(Request {
         op,
         scope: l.scope,
@@ -713,7 +799,10 @@ pub fn decode_response(frame: &[u8], want: Opcode) -> Result<Response, Failure> 
     if frame[..4] != MAGIC || frame[4] != PROTOCOL_VERSION || frame[7] != 0 {
         return bad("bad magic, version or reserved byte");
     }
-    if Opcode::from_byte(frame[5]) != want {
+    // Upstream compares the raw byte (`Opcode(frame[5]) != want`): an
+    // unrecognized opcode is never `want`, so a frame[5] outside
+    // {1,2,3,4} cannot decode as a valid EXIT on the lifeline path.
+    if frame[5] != want as u8 {
         return bad("unexpected opcode");
     }
     let Some(status) = Reason::from_byte(frame[6]) else {
@@ -850,9 +939,29 @@ mod tests {
         let want = 8 + 16 + 1 + 6 + 2 + 1 + 2 + 9 + 1;
         assert_eq!(frame.len(), want, "probe frame = {} bytes", frame.len());
         let got = decode_request(&frame).unwrap();
-        assert_eq!(got.launch.work_dir, "");
-        assert_eq!(got.launch.argv, probe.argv);
-        assert!(got.launch.env.is_empty());
+        assert_eq!(got.launch, probe);
+    }
+
+    /// Non-UTF-8 bytes survive decoding — upstream keeps Go-string
+    /// bytes verbatim; only NUL is banned on the wire.
+    #[test]
+    fn decode_request_keeps_non_utf8_fields() {
+        let mut frame = b"CHL1\x01\x01\x00\x00".to_vec();
+        frame.extend_from_slice(&TEST_SCOPE.0);
+        frame.push(6);
+        frame.extend_from_slice(b"claude");
+        frame.extend_from_slice(&3u16.to_be_bytes());
+        frame.extend_from_slice(b"\xffw/");
+        frame.push(1);
+        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(b"\xff\xfe");
+        frame.push(1);
+        frame.extend_from_slice(&4u16.to_be_bytes());
+        frame.extend_from_slice(b"K=\x80\x81");
+        let got = decode_request(&frame).unwrap();
+        assert_eq!(got.launch.work_dir, b"\xffw/");
+        assert_eq!(got.launch.argv, vec![b"\xff\xfe".to_vec()]);
+        assert_eq!(got.launch.env, vec![b"K=\x80\x81".to_vec()]);
     }
 
     /// Upstream `TestLaunchRequestStringHidesValues`.
@@ -1326,6 +1435,8 @@ mod tests {
         check(&ok_exit, Opcode::Exit, &|f: &mut Vec<u8>| {
             f[6] = Reason::LaunchFailed as u8
         });
+        // An unknown opcode byte is not EXIT — the raw byte is compared.
+        check(&ok_exit, Opcode::Exit, &|f: &mut Vec<u8>| f[5] = 9);
         check(&ok_exit, Opcode::Exit, &|f: &mut Vec<u8>| f[8] = 2);
         check(&ok_exit, Opcode::Exit, &|f: &mut Vec<u8>| f[9] = 1);
         check(&ok_exit, Opcode::Exit, &|f: &mut Vec<u8>| {

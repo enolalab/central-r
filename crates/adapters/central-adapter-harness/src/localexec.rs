@@ -33,7 +33,7 @@
 //! `central-adapter-linux`; tests use scripted signals.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,8 +42,8 @@ use central_harness::port::{ExitStatus, PortFuture, Process, ProcessLauncher, Pr
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
 use crate::process::{
-    GroupGone, KillLadder, Outcome, ReadEnd, async_write, await_group_gone, group_gone, is_gone,
-    mark_gone,
+    GroupGone, KillLadder, Outcome, ReadEnd, async_write, await_group_gone, clean_path, group_gone,
+    is_gone, mark_gone,
 };
 
 /// `DefaultKillGrace` — the SIGTERM to SIGKILL grace when
@@ -282,24 +282,6 @@ impl LocalExec {
     }
 }
 
-/// `filepath.Clean` for an absolute path — keeps `RootDir`/`Normal`
-/// components only.
-fn clean_path(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::RootDir => out.push(c.as_os_str()),
-            Component::Normal(n) => out.push(n),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::Prefix(_) => {}
-        }
-    }
-    out
-}
-
 impl ProcessLauncher for LocalExec {
     /// `Launch` starts `spec.program` in its own process group. The
     /// environment is built from empty: `spec.env` plus `HOME`, `USER`
@@ -330,21 +312,24 @@ impl ProcessLauncher for LocalExec {
             env.insert("HOME".to_string(), home);
             env.insert("USER".to_string(), user.clone());
             env.insert("LOGNAME".to_string(), user);
-            {
-                let stale = {
-                    let m = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
-                    m.scopes.get(&spec.scope_id).copied()
-                };
-                if let Some(pgid) = stale {
-                    // `forget_if_gone` clears the entry when the group
-                    // is dead; a live group means the scope is in use.
-                    if !self.forget_if_gone(&spec.scope_id, pgid) {
-                        return Err(Failure::conflict(
-                            codes::SCOPE_IN_USE,
-                            "localexec: scope already has a live process",
-                        ));
-                    }
+            // Upstream holds `l.mu` across the stale-scope check, the
+            // pipes/`Start` and both map inserts
+            // (localexec.go:159-224): check→spawn→insert is one
+            // critical section, so two concurrent launches for one
+            // scope cannot both spawn. The spawn is synchronous, so
+            // no `.await` ever crosses this guard.
+            let mut m = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(&stale) = m.scopes.get(&spec.scope_id) {
+                if self.signals.group_alive(stale) {
+                    return Err(Failure::conflict(
+                        codes::SCOPE_IN_USE,
+                        "localexec: scope already has a live process",
+                    ));
                 }
+                // The group is gone — drop the stale entry now (the
+                // `forget_if_gone` rule, inlined under this guard).
+                m.scopes.remove(&spec.scope_id);
+                m.procs.remove(&spec.scope_id);
             }
             let mut cmd = Command::new(&path);
             cmd.args(&spec.args)
@@ -366,7 +351,11 @@ impl ProcessLauncher for LocalExec {
                     ));
                 }
             };
+            // Early returns after a successful spawn must not leave a
+            // running, unreaped child — nothing here wires a
+            // kill-on-drop, so kill it and reap it in the background.
             let Some(pid) = child.id() else {
+                kill_and_reap(child);
                 return Err(Failure::internal(
                     codes::LAUNCH_FAILED,
                     "localexec: spawned child has no pid",
@@ -377,6 +366,7 @@ impl ProcessLauncher for LocalExec {
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
+                kill_and_reap(child);
                 return Err(Failure::internal(
                     codes::LAUNCH_FAILED,
                     "localexec: spawned child is missing a stdio end",
@@ -425,11 +415,11 @@ impl ProcessLauncher for LocalExec {
                         }
                     }));
             }
-            {
-                let mut m = self.scopes.lock().unwrap_or_else(|p| p.into_inner());
-                m.scopes.insert(spec.scope_id.clone(), pgid);
-                m.procs.insert(spec.scope_id.clone(), inner.clone());
-            }
+            m.scopes.insert(spec.scope_id.clone(), pgid);
+            m.procs.insert(spec.scope_id.clone(), inner.clone());
+            // The claim is published; the reaper starts only after the
+            // guard is dropped so its `forget` can never deadlock.
+            drop(m);
             // The reaper: `go func() { err := cmd.Wait(); ...;
             // p.forget(); close(p.done) }()`.
             {
@@ -481,6 +471,16 @@ impl ProcessLauncher for LocalExec {
             Ok(!self.forget_if_gone(scope_id, pgid))
         })
     }
+}
+
+/// Kills `child` and reaps it in the background — the post-spawn
+/// early-return paths of `launch` must not leave a running, unreaped
+/// child.
+fn kill_and_reap(mut child: tokio::process::Child) {
+    let _ = child.start_kill();
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
 }
 
 /// `exitStatus` — `ExitStatus` from `ExitStatusExt`: `128 + signal`

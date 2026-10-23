@@ -107,6 +107,17 @@ enum RefSlot {
     Closed(Option<SessionRef>),
 }
 
+/// `reconcile`'s scripted result — the clonable form of
+/// `ReconcileResult`: `reattached` is shared so every call returns a
+/// handle to the same session, as upstream's stored `port.Session`
+/// does.
+#[derive(Clone)]
+struct ReconcileScript {
+    scope_alive: bool,
+    reattached: Option<SharedSession>,
+    terminal: Option<Terminal>,
+}
+
 /// `FakeAdapter` — a scripted `port::Adapter`, upstream `fake.Adapter`.
 pub struct FakeAdapter {
     kind: Kind,
@@ -115,7 +126,7 @@ pub struct FakeAdapter {
     calls: Mutex<Vec<Call>>,
     inputs: Arc<Mutex<Vec<OperatorInput>>>,
     probe: Mutex<ProbeResult>,
-    reconcile: Mutex<Option<ReconcileResult>>,
+    reconcile: Mutex<Option<ReconcileScript>>,
 }
 
 impl FakeAdapter {
@@ -139,10 +150,16 @@ impl FakeAdapter {
         *self.probe.lock().unwrap_or_else(|p| p.into_inner()) = r;
     }
 
-    /// `SetReconcile` configures `reconcile`'s result. A boxed session
-    /// is handed out once; a second call sees the empty result.
+    /// `SetReconcile` configures `reconcile`'s result. Upstream
+    /// returns it on every call; a configured `reattached` session is
+    /// shared ([`SharedSession`]) so each call hands back a handle to
+    /// the same session, as upstream's stored `port.Session` does.
     pub fn set_reconcile(&self, r: ReconcileResult) {
-        *self.reconcile.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
+        *self.reconcile.lock().unwrap_or_else(|p| p.into_inner()) = Some(ReconcileScript {
+            scope_alive: r.scope_alive,
+            reattached: r.reattached.map(SharedSession::new),
+            terminal: r.terminal,
+        });
     }
 
     /// `Calls` — the recorded start/resume calls.
@@ -263,13 +280,19 @@ impl Adapter for FakeAdapter {
         })
     }
 
+    /// `Reconcile` — upstream returns the configured result on every
+    /// call; a configured `reattached` session is handed out as a new
+    /// handle on the same shared session each time.
     fn reconcile<'a>(
         &'a self,
         _input: ReconcileInput,
     ) -> PortFuture<'a, Result<ReconcileResult, Failure>> {
         Box::pin(async move {
-            let mut r = self.reconcile.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(result) = r.take() else {
+            let result = {
+                let r = self.reconcile.lock().unwrap_or_else(|p| p.into_inner());
+                r.clone()
+            };
+            let Some(result) = result else {
                 return Ok(ReconcileResult {
                     scope_alive: false,
                     reattached: None,
@@ -279,8 +302,58 @@ impl Adapter for FakeAdapter {
             if result.reattached.is_some() && !self.caps.reattach {
                 return Err(unsupported("reattach"));
             }
-            Ok(result)
+            Ok(ReconcileResult {
+                scope_alive: result.scope_alive,
+                reattached: result.reattached.map(|s| Box::new(s) as Box<dyn Session>),
+                terminal: result.terminal,
+            })
         })
+    }
+}
+
+/// A `port::Session` shared between reconcile results — upstream's
+/// configured `ReconcileResult.Reattached` is one session pointer
+/// handed out on every `Reconcile` call. The mutex is `tokio::sync` so
+/// the guard can cross the forwarded call's `.await` and stay `Send`.
+#[derive(Clone)]
+struct SharedSession(Arc<tokio::sync::Mutex<Box<dyn Session>>>);
+
+impl SharedSession {
+    fn new(sess: Box<dyn Session>) -> Self {
+        Self(Arc::new(tokio::sync::Mutex::new(sess)))
+    }
+}
+
+impl Session for SharedSession {
+    fn session_ref(&self) -> PortFuture<'_, Option<SessionRef>> {
+        Box::pin(async move { self.0.lock().await.session_ref().await })
+    }
+
+    fn next_event(&self) -> PortFuture<'_, Option<Event>> {
+        Box::pin(async move { self.0.lock().await.next_event().await })
+    }
+
+    fn send<'a>(&'a self, input: OperatorInput) -> PortFuture<'a, Result<(), Failure>> {
+        Box::pin(async move { self.0.lock().await.send(input).await })
+    }
+
+    fn interrupt(&self) -> PortFuture<'_, Result<(), Failure>> {
+        Box::pin(async move { self.0.lock().await.interrupt().await })
+    }
+
+    fn respond_permission<'a>(
+        &'a self,
+        decision: PermissionDecision,
+    ) -> PortFuture<'a, Result<(), Failure>> {
+        Box::pin(async move { self.0.lock().await.respond_permission(decision).await })
+    }
+
+    fn wait(&self) -> PortFuture<'_, Result<Terminal, Failure>> {
+        Box::pin(async move { self.0.lock().await.wait().await })
+    }
+
+    fn kill(&self) -> PortFuture<'_, Result<(), Failure>> {
+        Box::pin(async move { self.0.lock().await.kill().await })
     }
 }
 
@@ -333,10 +406,43 @@ fn event_at(seq: u64) -> OffsetDateTime {
     }
 }
 
+/// The `{"kind": ..., "payload": ...}` envelope upstream marshals for
+/// `Event.Raw` (fake.go's anonymous struct): `kind` is the upstream
+/// `EventKind` spelling, `payload` the concrete payload's own fields.
+fn raw_frame(payload: &EventPayload) -> serde_json::Result<Vec<u8>> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a, T: serde::Serialize> {
+        kind: &'a str,
+        payload: &'a T,
+    }
+    macro_rules! envelope {
+        ($p:expr) => {
+            serde_json::to_vec(&Envelope {
+                kind: payload.event_kind().as_str(),
+                payload: $p,
+            })
+        };
+    }
+    match payload {
+        EventPayload::SessionStarted(p) => envelope!(p),
+        EventPayload::Message(p) => envelope!(p),
+        EventPayload::Reasoning(p) => envelope!(p),
+        EventPayload::ToolCall(p) => envelope!(p),
+        EventPayload::ToolResult(p) => envelope!(p),
+        EventPayload::PermissionRequested(p) => envelope!(p),
+        EventPayload::PermissionResolved(p) => envelope!(p),
+        EventPayload::Plan(p) => envelope!(p),
+        EventPayload::UsageReport(p) => envelope!(p),
+        EventPayload::Retry(p) => envelope!(p),
+        EventPayload::Warning(p) => envelope!(p),
+        EventPayload::TerminalReported(p) => envelope!(p),
+    }
+}
+
 impl FakeSessionInner {
     async fn emit(&self, seq: &mut u64, id: &str, payload: EventPayload) {
         *seq += 1;
-        let raw = serde_json::to_vec(&payload)
+        let raw = raw_frame(&payload)
             .unwrap_or_else(|_| payload.event_kind().as_str().as_bytes().to_vec());
         let tx = self.events_tx.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(tx) = tx.as_ref() {
@@ -818,7 +924,9 @@ mod tests {
     use super::*;
     use central_foundation::identity::HarnessAttemptId;
     use central_harness::domain::{Fence, PermissionPolicy, Workspace};
-    use central_harness::event::{PermissionRequested, SessionStarted as SessionStartedPayload};
+    use central_harness::event::{
+        PermissionRequested, SessionStarted as SessionStartedPayload, Warning,
+    };
     use std::collections::BTreeMap;
 
     fn caps() -> Capabilities {
@@ -1237,5 +1345,91 @@ mod tests {
         };
         let err = l.launch(spec).await.map(|_| ()).unwrap_err();
         assert!(is_code(&err, codes::LAUNCH_UNSUPPORTED));
+    }
+
+    /// `Event.Raw` is the upstream `{"kind","payload"}` envelope
+    /// (fake.go marshals the anonymous struct, not the bare payload).
+    #[tokio::test]
+    async fn event_raw_is_the_kind_payload_envelope() {
+        let adapter = FakeAdapter::new(
+            Kind::new("claude-code"),
+            caps(),
+            vec![Script {
+                payloads: vec![EventPayload::Warning(Warning {
+                    message: "w".to_string(),
+                })],
+                ..Script::default()
+            }],
+        );
+        let s = adapter.start(spec()).await.unwrap();
+        let e = s.next_event().await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&e.raw).unwrap();
+        assert_eq!(v["kind"], "warning", "raw = {:?}", e.raw);
+        assert_eq!(v["payload"]["message"], "w");
+    }
+
+    /// Upstream `Reconcile` returns the configured result on every
+    /// call — and a configured `reattached` session is the same
+    /// session each time.
+    #[tokio::test]
+    async fn reconcile_returns_the_configured_result_each_time() {
+        let input = ReconcileInput {
+            attempt: HarnessAttemptId::new(),
+            sandbox_scope_id: "s".to_string(),
+            harness_session_id: "h".to_string(),
+            last_event_seq: 0,
+        };
+
+        let adapter = FakeAdapter::new(Kind::new("claude-code"), caps(), vec![]);
+        adapter.set_reconcile(ReconcileResult {
+            scope_alive: true,
+            reattached: None,
+            terminal: Some(Terminal {
+                status: TerminalStatus::Succeeded,
+                ..Terminal::default()
+            }),
+        });
+        for i in 0..2 {
+            let r = adapter.reconcile(input.clone()).await.unwrap();
+            assert!(r.scope_alive, "call {i}");
+            assert_eq!(
+                r.terminal.as_ref().unwrap().status,
+                TerminalStatus::Succeeded,
+                "call {i}"
+            );
+        }
+
+        // A reattached session is handed out on every call, as the
+        // same underlying session.
+        let adapter = FakeAdapter::new(
+            Kind::new("claude-code"),
+            Capabilities {
+                reattach: true,
+                ..caps()
+            },
+            vec![Script::default()],
+        );
+        let s = adapter.start(spec()).await.unwrap();
+        adapter.set_reconcile(ReconcileResult {
+            scope_alive: true,
+            reattached: Some(s),
+            terminal: None,
+        });
+        for i in 0..2 {
+            let r = adapter.reconcile(input.clone()).await.unwrap();
+            assert!(r.reattached.is_some(), "call {i}: no reattached session");
+            r.reattached.unwrap().wait().await.unwrap();
+        }
+
+        // Reattach without the capability is still refused.
+        let adapter = FakeAdapter::new(Kind::new("claude-code"), caps(), vec![Script::default()]);
+        let s = adapter.start(spec()).await.unwrap();
+        adapter.set_reconcile(ReconcileResult {
+            scope_alive: true,
+            reattached: Some(s),
+            terminal: None,
+        });
+        let err = adapter.reconcile(input).await.map(|_| ()).unwrap_err();
+        assert!(is_code(&err, port::codes::UNSUPPORTED));
     }
 }

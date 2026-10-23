@@ -11,6 +11,7 @@
 //! semantics.
 
 use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -92,8 +93,12 @@ impl FrameReader {
             if let Some(nl) = self.buf[self.pos..].iter().position(|b| *b == b'\n') {
                 // The newline does not rescue an over-cap line: the
                 // token cap is on bytes scanned, not on reads —
-                // `bufio.ErrTooLong` upstream.
-                if nl > MAX_FRAME_BYTES {
+                // `bufio.ErrTooLong` upstream. A token of exactly
+                // `maxFrameBytes` is already too long: upstream's
+                // scanner reports ErrTooLong at
+                // `len(buffer) >= maxTokenSize` — the newline could
+                // never be read into a full buffer.
+                if nl >= MAX_FRAME_BYTES {
                     return Err(Failure::invalid(
                         codes::FRAME_TOO_LONG,
                         "harness frame exceeds the 16 MiB cap",
@@ -115,7 +120,7 @@ impl FrameReader {
                 }
                 return Ok(None);
             }
-            if self.buf.len() - self.pos > MAX_FRAME_BYTES {
+            if self.buf.len() - self.pos >= MAX_FRAME_BYTES {
                 return Err(Failure::invalid(
                     codes::FRAME_TOO_LONG,
                     "harness frame exceeds the 16 MiB cap",
@@ -359,6 +364,25 @@ impl<R> ReadEnd<R> {
     }
 }
 
+/// `filepath.Clean` for an absolute path — keeps `RootDir`/`Normal`
+/// components only. Shared by the launchers' path rules (localexec's
+/// program table, hostlauncher's config and workdir checks).
+pub(crate) fn clean_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::RootDir => out.push(c.as_os_str()),
+            Component::Normal(n) => out.push(n),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
 /// `GroupGone` — the shared "the process group was observed gone"
 /// record of upstream localexec's `groupGone` atomic: set once a
 /// reaper, kill ladder or liveness probe observes the group empty, so a
@@ -539,16 +563,29 @@ mod tests {
         assert_eq!(err.code(), codes::FRAME_TOO_LONG);
     }
 
-    /// Exactly at the cap still scans — the refusal is `> max`, not
-    /// `>=`.
+    /// A token of exactly `maxFrameBytes` is already too long —
+    /// `bufio.Scanner` reports ErrTooLong at `len(buffer) >=
+    /// maxTokenSize` (the newline could never fit in the buffer).
+    /// One byte under scans.
     #[tokio::test]
-    async fn frame_reader_accepts_a_cap_sized_line() {
+    async fn frame_reader_refuses_a_cap_sized_line() {
         let mut data = vec![b'y'; MAX_FRAME_BYTES];
         data.push(b'\n');
         let p = ScriptProc::output(&data);
         let mut r = FrameReader::new();
+        let err = r
+            .next(&p)
+            .await
+            .err()
+            .unwrap_or_else(|| unreachable!("cap-sized frame must fail"));
+        assert_eq!(err.code(), codes::FRAME_TOO_LONG);
+
+        let mut data = vec![b'y'; MAX_FRAME_BYTES - 1];
+        data.push(b'\n');
+        let p = ScriptProc::output(&data);
+        let mut r = FrameReader::new();
         let line = r.next(&p).await.unwrap_or(None).unwrap_or_default();
-        assert_eq!(line.len(), MAX_FRAME_BYTES);
+        assert_eq!(line.len(), MAX_FRAME_BYTES - 1);
     }
 
     /// `probeOutputCap`: `read_capped` keeps `cap + 1` bytes and drains

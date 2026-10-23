@@ -25,7 +25,9 @@ use central_harness::port::{ExitStatus, PortFuture, Process, ProcessLauncher, Pr
 use crate::launcher::protocol::{
     self, Exit, LaunchRequest, Opcode, Scope, codes, decode_response, parse_scope,
 };
-use crate::process::{KillLadder, ReadEnd, async_shutdown, async_write, codes as process_codes};
+use crate::process::{
+    KillLadder, ReadEnd, async_shutdown, async_write, clean_path, codes as process_codes,
+};
 
 /// `SocketPath` — the fixed, socket-activated launcher socket (spec
 /// decision 16), upstream `harnesslauncher.SocketPath`.
@@ -70,12 +72,10 @@ fn beneath(root: &Path, p: &Path) -> bool {
     })
 }
 
-/// A clean absolute non-root path, as upstream `New` requires.
+/// A clean absolute non-root path, as upstream `New` requires
+/// (`filepath.IsAbs` plus `filepath.Clean(p) == p`; `/` is refused).
 fn clean_absolute(p: &Path) -> bool {
-    p.is_absolute()
-        && p != Path::new("/")
-        && p.components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+    p.is_absolute() && p != Path::new("/") && clean_path(p) == p
 }
 
 /// `validHarness` — the program is a harness id the daemon resolves.
@@ -189,7 +189,10 @@ impl HostLauncher {
 
     /// `workDir` maps a spec workdir to the request's workdir field:
     /// the probe workdir maps to empty, a path beneath the worktree
-    /// root to its relative form, anything else is refused.
+    /// root to its relative form, anything else is refused. Upstream
+    /// cleans first (`filepath.Clean`), so an in-bounds path spelled
+    /// with `.`/`..` is accepted in its clean form — `/a/b/../probe`
+    /// is the probe workdir, not a refusal.
     fn work_dir(&self, wd: &Path) -> Result<String, Failure> {
         let refused = || {
             invalid(
@@ -197,13 +200,14 @@ impl HostLauncher {
                 "workdir is neither the probe workdir nor beneath the worktree root",
             )
         };
-        if !wd.is_absolute() || !clean_absolute(wd) {
+        if !wd.is_absolute() {
             return Err(refused());
         }
+        let wd = clean_path(wd);
         if wd == self.probe {
             return Ok(String::new());
         }
-        if !beneath(&self.root, wd) {
+        if !beneath(&self.root, &wd) {
             return Err(refused());
         }
         let rel = wd.strip_prefix(&self.root).map_err(|_| refused())?;
@@ -271,7 +275,13 @@ impl ProcessLauncher for HostLauncher {
                     "scope id is not a canonical UUID",
                 )
             })?;
-            self.client.alive(scope).await
+            self.client.alive(scope).await.map_err(|e| {
+                Failure::new(
+                    e.kind(),
+                    e.code(),
+                    format!("hostlauncher: alive: {}", e.message()),
+                )
+            })
         })
     }
 
@@ -289,29 +299,39 @@ impl ProcessLauncher for HostLauncher {
                     "scope id is not a canonical UUID",
                 )
             })?;
-            self.client.kill(scope, KILL_GRACE).await
+            self.client.kill(scope, KILL_GRACE).await.map_err(|e| {
+                Failure::new(
+                    e.kind(),
+                    e.code(),
+                    format!("hostlauncher: kill scope: {}", e.message()),
+                )
+            })
         })
     }
 }
 
 /// `process` — one launched session mapped to `port::Process`.
-/// `tokio::sync::Mutex` guards are `Send`, so the port futures stay
-/// `Send` while they serialize access to the session and stdio ends —
-/// upstream's `waitMu` plus the shared `*os.File`s.
+/// `state` is upstream's `waitMu`: it serializes `wait` callers only.
+/// The stdio ends get their own `tokio::sync::Mutex`es — as
+/// `LocalProcessInner`'s do — so a `wait` pending on EXIT never blocks
+/// `read_stdout`/`read_stderr`: a child that fills a pipe can still be
+/// drained to EXIT. The `tokio::sync` guards are `Send`, so the port
+/// futures stay `Send`.
 struct HostProcess {
     scope_id: String,
     scope: Scope,
     client: std::sync::Arc<dyn LauncherClient>,
     state: tokio::sync::Mutex<ProcessState>,
     stdin: tokio::sync::Mutex<Option<tokio::fs::File>>,
+    stdout: tokio::sync::Mutex<ReadEnd<tokio::fs::File>>,
+    stderr: tokio::sync::Mutex<ReadEnd<tokio::fs::File>>,
     exited: AtomicBool,
     kill_ladder: KillLadder,
 }
 
+/// `waitMu`'s state — the session plus the cached `wait` result.
 struct ProcessState {
     sess: Box<dyn LauncherSession>,
-    stdout: ReadEnd<tokio::fs::File>,
-    stderr: ReadEnd<tokio::fs::File>,
     /// `ended` — EXIT or the lifeline's end was read; the lifeline is
     /// closed. `result` caches what `wait` returns from then on.
     ended: bool,
@@ -340,12 +360,12 @@ impl HostProcess {
             client,
             state: tokio::sync::Mutex::new(ProcessState {
                 sess,
-                stdout: ReadEnd::new(stdout),
-                stderr: ReadEnd::new(stderr),
                 ended: false,
                 result: None,
             }),
             stdin: tokio::sync::Mutex::new(Some(stdin)),
+            stdout: tokio::sync::Mutex::new(ReadEnd::new(stdout)),
+            stderr: tokio::sync::Mutex::new(ReadEnd::new(stderr)),
             exited: AtomicBool::new(false),
             kill_ladder: KillLadder::new(),
         })
@@ -384,15 +404,15 @@ impl Process for HostProcess {
 
     fn read_stdout<'a>(&'a self, buf: &'a mut [u8]) -> PortFuture<'a, Result<usize, Failure>> {
         Box::pin(async move {
-            let mut st = self.state.lock().await;
-            st.stdout.read(buf).await
+            let mut g = self.stdout.lock().await;
+            g.read(buf).await
         })
     }
 
     fn read_stderr<'a>(&'a self, buf: &'a mut [u8]) -> PortFuture<'a, Result<usize, Failure>> {
         Box::pin(async move {
-            let mut st = self.state.lock().await;
-            st.stderr.read(buf).await
+            let mut g = self.stderr.lock().await;
+            g.read(buf).await
         })
     }
 
@@ -581,7 +601,20 @@ impl LauncherSession for WireSession {
                     self.err = Some(e.clone());
                     Err(e)
                 }
-                Ok((data, _fds)) => {
+                Ok((data, fds)) => {
+                    // `receivePacket(conn, 0)`: descriptors on the
+                    // lifeline are a malformed response — the files
+                    // close on drop.
+                    if !fds.is_empty() {
+                        drop(fds);
+                        self.done = true;
+                        let e = Failure::internal(
+                            codes::MALFORMED_RESPONSE,
+                            "harness launcher: lifeline response carried descriptors",
+                        );
+                        self.err = Some(e.clone());
+                        return Err(e);
+                    }
                     if data.is_empty() {
                         self.done = true;
                         let e = Failure::internal(
@@ -892,13 +925,42 @@ mod tests {
             "att-1/repo"
         );
 
-        // Unrelated paths are refused.
+        // Unclean spellings are cleaned first, as upstream's
+        // `filepath.Clean`: `..` back into bounds is accepted in its
+        // clean form.
+        let c3 = std::sync::Arc::new(FakeClient::with_session(Box::new(FakeSession::script(
+            vec![Ok(Exit::default())],
+        ))));
+        let l3 = HostLauncher::new(cfg(), c3.clone()).unwrap();
+        l3.launch(spec("/srv/central/worktrees/../probe"))
+            .await
+            .unwrap();
+        assert_eq!(
+            c3.launched.lock().unwrap().last().unwrap().work_dir,
+            "",
+            "an unclean spelling of the probe workdir maps to empty"
+        );
+        let c4 = std::sync::Arc::new(FakeClient::with_session(Box::new(FakeSession::script(
+            vec![Ok(Exit::default())],
+        ))));
+        let l4 = HostLauncher::new(cfg(), c4.clone()).unwrap();
+        l4.launch(spec("/srv/central/worktrees/att-1/./repo"))
+            .await
+            .unwrap();
+        assert_eq!(
+            c4.launched.lock().unwrap().last().unwrap().work_dir,
+            "att-1/repo",
+            "an unclean in-bounds spelling maps to its clean relative"
+        );
+
+        // Unrelated paths are refused — including an unclean spelling
+        // that cleans out of bounds.
         for wd in [
             "/etc",
             "/srv/central/worktrees",
             "/srv/central/other",
             "rel/path",
-            "/srv/central/worktrees/../probe",
+            "/srv/central/worktrees/../other",
         ] {
             let err = l2.launch(spec(wd)).await.map(|_| ()).unwrap_err();
             assert_eq!(
@@ -958,6 +1020,58 @@ mod tests {
         assert_eq!(s2, s1, "second wait returns the cached EXIT");
         // Kill after EXIT is a no-op.
         p.kill().await.unwrap();
+    }
+
+    /// Regression for the wait/stdio deadlock: a `wait` pending on
+    /// EXIT must not block `read_stdout` — `waitMu` serializes waiters
+    /// only. A child writing more than a pipe buffer's worth of output
+    /// must be drainable to EXIT; holding the wait mutex across
+    /// `wait_exit` deadlocked this (the pipe fills, the child never
+    /// exits, EXIT never arrives).
+    #[tokio::test]
+    async fn wait_does_not_block_stdio() {
+        let (_r0, w0) = pipe();
+        let (r1, mut w1) = pipe();
+        let (r2, _w2) = pipe();
+        let sess = FakeSession {
+            stdin: Some(w0),
+            stdout: Some(r1),
+            stderr: Some(r2),
+            // An empty script pends `wait_exit` forever.
+            exits: Mutex::new(VecDeque::new()),
+            closes: Mutex::new(0),
+        };
+        let client = std::sync::Arc::new(FakeClient::with_session(Box::new(sess)));
+        let l = HostLauncher::new(cfg(), client).unwrap();
+        let p = std::sync::Arc::new(l.launch(spec("/srv/central/probe")).await.unwrap());
+        let pw = p.clone();
+        let waiter = tokio::spawn(async move { pw.wait().await });
+        tokio::task::yield_now().await;
+        let payload = vec![b'x'; 128 << 10];
+        let want = payload.len();
+        let writer = tokio::spawn(async move {
+            let mut off = 0usize;
+            while off < payload.len() {
+                match async_write(&mut w1, &payload[off..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => off += n,
+                }
+            }
+            off
+        });
+        let mut got = 0usize;
+        let mut buf = [0u8; 8192];
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while got < want {
+                let n = p.read_stdout(&mut buf).await.unwrap();
+                assert!(n > 0, "stdout closed early");
+                got += n;
+            }
+        })
+        .await
+        .expect("read_stdout must not be blocked by a pending wait");
+        assert_eq!(writer.await.unwrap(), want);
+        waiter.abort();
     }
 
     /// Upstream `TestKillLeavesLifelineForWait`.
@@ -1112,6 +1226,22 @@ mod tests {
 
         // Malformed frame.
         let mut s = wire_session(vec![Ok((b"garbage".to_vec(), vec![]))]);
+        let err = s.wait_exit().await.map(|_| ()).unwrap_err();
+        assert_eq!(err.code(), codes::MALFORMED_RESPONSE);
+
+        // Descriptors on the lifeline are a malformed response
+        // (`receivePacket(conn, 0)` upstream).
+        let (_r, w) = pipe();
+        let frame = protocol::encode_response(&protocol::Response {
+            op: Opcode::Exit,
+            exit: Exit {
+                code: 3,
+                signaled: false,
+            },
+            ..protocol::Response::default()
+        })
+        .unwrap();
+        let mut s = wire_session(vec![Ok((frame, vec![w]))]);
         let err = s.wait_exit().await.map(|_| ()).unwrap_err();
         assert_eq!(err.code(), codes::MALFORMED_RESPONSE);
 
