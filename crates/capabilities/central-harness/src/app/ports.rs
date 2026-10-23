@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
+use std::time::Instant;
 
 use central_foundation::failure::Failure;
 use central_foundation::identity::{
@@ -509,6 +511,148 @@ pub trait WorkspaceCapture: Send + Sync + 'static {
 
     /// Upstream `Release`: removes the Run's capture files; idempotent.
     fn release<'a>(&'a self, run: RunId) -> PortFuture<'a, Result<(), Failure>>;
+}
+
+/// `objectLimits` — bounds the clone object copy (harness phase 3b
+/// decision 4). Defaults: one object file (a pack) may be up to 1 GiB,
+/// the copy up to 2 GiB in total, and at most 1,048,576 entries are
+/// visited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLimits {
+    /// `maxFileBytes` — the per-object-file byte cap.
+    pub max_file_bytes: u64,
+    /// `maxTotalBytes` — the whole copy's byte cap.
+    pub max_total_bytes: u64,
+    /// `maxEntries` — the visited-entry cap.
+    pub max_entries: usize,
+}
+
+impl Default for ObjectLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 1 << 30,
+            max_total_bytes: 2 << 30,
+            max_entries: 1 << 20,
+        }
+    }
+}
+
+/// `walkLimits` — bounds the nested-repository pre-walk of the work
+/// tree (decision 5). Defaults: at most 1,048,576 entries, 256
+/// directories deep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkLimits {
+    /// `maxEntries` — the visited-entry cap.
+    pub max_entries: usize,
+    /// `maxDepth` — the directory-depth cap.
+    pub max_depth: usize,
+}
+
+impl Default for WalkLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 1 << 20,
+            max_depth: 256,
+        }
+    }
+}
+
+/// The untrusted-clone OS boundary — R3 open decision D2's extraction
+/// of upstream gitclone's Linux-only syscall surface
+/// (`acl_linux.go`'s `grantTree`/`freeBytes`, `seal_linux.go`'s
+/// seal/unseal and the `openat2` walkers, `reopen_linux.go`'s ACL
+/// check, `capture_linux.go`'s `RLIMIT_AS` on capture git children).
+/// `central-adapter-linux::workspace_seal` is the production
+/// implementation over `rustix` safe wrappers; `gitclone` tests
+/// substitute a filesystem-level in-memory sealer. The provisioner
+/// receives one by constructor injection; `central-adapter-harness`
+/// never imports `central-adapter-linux`.
+///
+/// Errors carry the [`codes`] token matching the upstream sentinel the
+/// operation maps to: [`codes::WORKSPACE_UNAVAILABLE`] (or
+/// [`codes::LOW_DISK`]) for the provisioning surface,
+/// [`codes::CAPTURE_FAILED`] for the seal and capture-walk surface.
+pub trait WorkspaceSealer: Send + Sync + 'static {
+    /// Upstream `CheckFreeSpace`/`freeBytes` — [`codes::LOW_DISK`]
+    /// when free space at the data root is below the configured
+    /// minimum; a zero minimum disables the check.
+    fn check_free_space<'a>(&'a self) -> PortFuture<'a, Result<(), Failure>>;
+
+    /// Upstream `grantTree` — grants the provisioned ACLs on `run`'s
+    /// freshly cloned tree, children before their directory and the Run
+    /// directory last (security review S4).
+    fn grant_run<'a>(&'a self, run: RunId) -> PortFuture<'a, Result<(), Failure>>;
+
+    /// The syscall half of upstream `Reopen` — verifies, without git
+    /// and without reading clone content, that `run`'s Run directory
+    /// and clone root are still the provisioned, runtime-owned ones
+    /// (harness phase 3g decision 7). Writes nothing; a half-sealed Run
+    /// is refused, never repaired.
+    fn verify_clone<'a>(&'a self, run: RunId) -> PortFuture<'a, Result<(), Failure>>;
+
+    /// Upstream `seal` — takes the operator's access to
+    /// `run`'s directory away, verifies the clone root is a real
+    /// runtime-owned directory opened through `openat2`
+    /// (`RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH`), and returns the sealed
+    /// handle the capture reads the clone through. A refused seal
+    /// restores the operator's access before returning. Idempotent.
+    fn seal<'a>(&'a self, run: RunId) -> PortFuture<'a, Result<Box<dyn SealedClone>, Failure>>;
+
+    /// Upstream `capture.start`'s `Prlimit(RLIMIT_AS)` — bounds one
+    /// capture git child's address space so a zlib bomb in a pack
+    /// cannot make git exhaust the host's memory. An error kills the
+    /// child and fails the capture.
+    fn limit_process_memory<'a>(
+        &'a self,
+        pid: u32,
+        bytes: u64,
+    ) -> PortFuture<'a, Result<(), Failure>>;
+}
+
+/// One sealed Run clone — upstream `sealedRun`: the verified clone
+/// root plus the descriptor-scoped reads of the untrusted tree. `unseal`
+/// restores the operator's access exactly as provisioned; an
+/// implementation also restores on drop, so a dropped capture never
+/// leaves the Run sealed.
+pub trait SealedClone: Send + Sync + 'static {
+    /// The verified clone root — `sealed.repo`, the path the patch
+    /// shadow's `--work-tree` names.
+    fn repo_path(&self) -> &str;
+
+    /// Upstream `findNestedRepos` — the sorted `/`-relative paths of
+    /// every directory below the clone root holding a `.git` entry of
+    /// any type (decision 5). Names are raw bytes: a path component may
+    /// be non-UTF-8 and the exclude pathspec must still name it.
+    fn nested_repos<'a>(
+        &'a self,
+        deadline: Instant,
+        limits: WalkLimits,
+    ) -> PortFuture<'a, Result<Vec<Vec<u8>>, Failure>>;
+
+    /// Upstream `copyObjects` — copies the clone's object files (the
+    /// loose/pack allowlist only) into `dst`, the log shadow's objects
+    /// directory. `Ok(false)` when `.git` or `.git/objects` is not a
+    /// real directory: the after HEAD is then usable only if the source
+    /// already holds it.
+    fn copy_objects<'a>(
+        &'a self,
+        dst: PathBuf,
+        deadline: Instant,
+        limits: ObjectLimits,
+    ) -> PortFuture<'a, Result<bool, Failure>>;
+
+    /// Upstream `readAfterHEAD` — the sealed clone's HEAD resolved
+    /// without git (bounded opens only; it never blocks, so it takes
+    /// no deadline). `None` when the after HEAD is unavailable for any
+    /// reason.
+    fn after_head(&self) -> Option<String>;
+
+    /// Upstream `unseal` — writes the recorded ACLs and mode back on
+    /// the Run directory's descriptor. A failure leaves the operator
+    /// locked out of the retained clone (root restores it with
+    /// setfacl); it does not fail the capture, and the caller may
+    /// discard the result.
+    fn unseal(&self) -> Result<(), Failure>;
 }
 
 /// Creates the per-Run clone — upstream `app.WorkspaceProvisioner`

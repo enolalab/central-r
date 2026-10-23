@@ -34,6 +34,10 @@
 //! - [`env`] — the launch-environment allowlist/denylist filter
 //!   ([`env::validate_launch_env`]) enforcing ADR 0035's rule that Central
 //!   never injects, relocates, or redirects harness credentials.
+//! - [`gitmeta`] — the bounded grammar of the untrusted clone (object-id
+//!   and ref-name predicates, `packed-refs` lookup, the loose-object
+//!   header check with its in-tree bounded zlib decode) shared by the
+//!   D2 [`app::ports::WorkspaceSealer`] implementations.
 //! - [`recovery`] — [`recovery::attempt_id_for_step_attempt`] and
 //!   [`attempt::Attempt::fail_unlaunched`] for the startup reconciler.
 //! - [`port`] — the three contract seams (port of
@@ -59,6 +63,7 @@ pub mod capability;
 pub mod domain;
 pub mod env;
 pub mod event;
+pub mod gitmeta;
 pub mod port;
 pub mod query;
 pub mod record;

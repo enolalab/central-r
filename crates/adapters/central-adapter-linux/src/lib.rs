@@ -5,3 +5,5 @@
 //!
 //! Stub crate: implementations land in this adapter's R-slice
 //! (rust-application-boundaries.md §2.4).
+
+pub mod workspace_seal;

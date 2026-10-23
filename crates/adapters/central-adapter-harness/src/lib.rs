@@ -21,6 +21,7 @@ pub mod antigravity;
 pub mod claudecode;
 pub mod codex;
 pub mod fake;
+pub mod gitclone;
 pub mod launcher;
 pub mod localexec;
 pub mod opencode;
