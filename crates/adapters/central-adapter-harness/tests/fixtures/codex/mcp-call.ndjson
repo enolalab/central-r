@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"search","tool":"web_run","arguments":{"q":"codex"},"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"search","tool":"web_run","arguments":{"q":"codex"},"result":{"content":[{"type":"text","text":"docs"}]},"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Found the docs."}}
+{"type":"turn.completed","usage":{"input_tokens":300,"cached_input_tokens":90,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":490}}

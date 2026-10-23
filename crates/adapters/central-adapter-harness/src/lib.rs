@@ -18,6 +18,7 @@
 //!   doubles.
 
 pub mod claudecode;
+pub mod codex;
 pub mod fake;
 pub mod launcher;
 pub mod localexec;

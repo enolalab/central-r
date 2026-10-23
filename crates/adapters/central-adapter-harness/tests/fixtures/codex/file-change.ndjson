@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"file_change","changes":[{"path":"/work/hello.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Created hello.txt."}}
+{"type":"turn.completed","usage":{"input_tokens":300,"cached_input_tokens":90,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":490}}

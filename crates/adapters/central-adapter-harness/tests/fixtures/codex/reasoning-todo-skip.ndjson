@@ -1,0 +1,8 @@
+{"type":"thread.started","thread_id":"bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"Considering the plan."}}
+{"type":"item.started","item":{"id":"item_1","type":"todo_list","items":[{"text":"write file","completed":false}]}}
+{"type":"item.updated","item":{"id":"item_1","type":"todo_list","items":[{"text":"write file","completed":true}]}}
+{"type":"item.completed","item":{"id":"item_1","type":"todo_list","items":[{"text":"write file","completed":true}]}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Done."}}
+{"type":"turn.completed","usage":{"input_tokens":300,"cached_input_tokens":90,"output_tokens":80,"reasoning_output_tokens":20,"total_tokens":490}}

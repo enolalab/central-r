@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"cat missing.txt","aggregated_output":"","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"cat missing.txt","aggregated_output":"cat: missing.txt: No such file or directory","exit_code":1,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"The file does not exist yet."}}
+{"type":"turn.completed","usage":{"input_tokens":200,"cached_input_tokens":60,"output_tokens":50,"reasoning_output_tokens":12,"total_tokens":322}}
