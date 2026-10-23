@@ -51,6 +51,7 @@
 //!   [`query::BudgetUsageRead`]); keyset pagination only, never
 //!   `OFFSET`.
 
+pub mod app;
 pub mod approval;
 pub mod attempt;
 pub mod budget;
