@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT l.id AS lease_id, l.node_id, l.attempt_id, a.run_id, a.workspace_id, a.state AS attempt_state, a.started_at FROM central.node_leases l JOIN central.session_attempts a ON a.id = l.attempt_id WHERE l.worker_id = $1 AND l.released_at IS NULL ORDER BY a.run_id, l.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lease_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "attempt_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ee7d07e9222c7ec895844fa184ada5f83d4c9b84d9fc738bbe2994d06ffb101e"
+}

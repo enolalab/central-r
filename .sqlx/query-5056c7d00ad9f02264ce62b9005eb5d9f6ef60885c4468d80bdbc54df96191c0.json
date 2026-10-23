@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.worker_registrations (id, workspace_id, protocol_version, harness_kinds, workspace_kinds, max_concurrent_attempts, state, registered_at, last_seen_at) VALUES ($1, $2, $3, $4, $5, $6, 'active', now(), now())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "TextArray",
+        "TextArray",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5056c7d00ad9f02264ce62b9005eb5d9f6ef60885c4468d80bdbc54df96191c0"
+}

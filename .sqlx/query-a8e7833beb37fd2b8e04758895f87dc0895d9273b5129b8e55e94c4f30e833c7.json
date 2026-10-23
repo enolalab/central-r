@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.node_leases (id, node_id, attempt_id, worker_id, issued_at, last_heartbeat_at, expires_at, heartbeat_interval_seconds) VALUES ($1, $2, $3, $4, now(), now(), now() + make_interval(secs => $5), $6) RETURNING issued_at, last_heartbeat_at, expires_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "issued_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_heartbeat_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Float8",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a8e7833beb37fd2b8e04758895f87dc0895d9273b5129b8e55e94c4f30e833c7"
+}

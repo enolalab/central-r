@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.workflow_nodes SET state = 'attempt_ambiguous' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "977b3209a30b88b5d74391e040d92a3d736797740b750d49b2b2a2f37b2029bb"
+}

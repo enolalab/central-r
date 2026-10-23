@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) FROM central.session_attempts WHERE run_id = $1 AND state IN ('claimed', 'provisioning', 'started')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5cd3cf371f784e16448e9fa41c083a3047f2996c0c48852c0920b244918a204b"
+}

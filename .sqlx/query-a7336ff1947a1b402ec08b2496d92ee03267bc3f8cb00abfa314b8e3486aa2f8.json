@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.session_attempts SET state = $2, ended_at = now(), dispatch_reason_code = $3, outcome_fingerprint = $4 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a7336ff1947a1b402ec08b2496d92ee03267bc3f8cb00abfa314b8e3486aa2f8"
+}

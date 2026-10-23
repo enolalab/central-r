@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.worker_registrations SET state = 'lost' WHERE id = $1 AND state IN ('active', 'suspect')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1d793e6cbf0b964f7d288d51ebb938fe60301181c2fbf73729e7d6483c16711e"
+}

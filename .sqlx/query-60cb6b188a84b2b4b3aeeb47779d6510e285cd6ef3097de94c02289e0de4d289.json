@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.session_attempts SET state = $2, ended_at = now(), outcome_fingerprint = $3 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "60cb6b188a84b2b4b3aeeb47779d6510e285cd6ef3097de94c02289e0de4d289"
+}

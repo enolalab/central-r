@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.session_attempts (id, workspace_id, run_id, node_id, attempt_seq, worker_id, workspace_kind, state, claimed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'claimed', now()) RETURNING claimed_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "claimed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "22d3b5a26cf8caaa8669b69094556da4b2ce4fd31b911634e6f9cf0a5c66eedb"
+}

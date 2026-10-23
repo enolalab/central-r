@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT o.failure_class, COUNT(*) AS n FROM central.attempt_outcomes o JOIN central.session_attempts a ON a.id = o.attempt_id WHERE a.node_id = $1 AND o.outcome_kind = 'failed' GROUP BY o.failure_class",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "failure_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "n",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "510e916fec57bf36949b66c58178f811ce44295cd4260f255ca8004bcdf742e4"
+}

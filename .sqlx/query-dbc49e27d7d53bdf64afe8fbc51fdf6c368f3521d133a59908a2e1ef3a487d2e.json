@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT n.id FROM central.workflow_nodes n WHERE n.node_timeout_seconds IS NOT NULL AND n.state IN ('ready', 'dispatched', 'running', 'attempt_ambiguous') AND (SELECT MIN(a.claimed_at) FROM central.session_attempts a WHERE a.node_id = n.id) + make_interval(secs => n.node_timeout_seconds) <= $1 ORDER BY n.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "dbc49e27d7d53bdf64afe8fbc51fdf6c368f3521d133a59908a2e1ef3a487d2e"
+}

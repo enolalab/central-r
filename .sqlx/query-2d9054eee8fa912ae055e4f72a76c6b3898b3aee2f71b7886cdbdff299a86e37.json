@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(SELECT 1 FROM central.session_attempts a WHERE a.node_id = $1 AND a.state = 'ambiguous' AND NOT EXISTS (SELECT 1 FROM central.attempt_decisions d WHERE d.attempt_id = a.id))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2d9054eee8fa912ae055e4f72a76c6b3898b3aee2f71b7886cdbdff299a86e37"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id FROM central.runs WHERE deadline IS NOT NULL AND deadline <= $1 AND status IN ('queued', 'running', 'waiting', 'cancelling') ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "72ceac276643f54bd572e0ea50ce2cbf69f345a355d1e85c8da935f3f6494ec8"
+}

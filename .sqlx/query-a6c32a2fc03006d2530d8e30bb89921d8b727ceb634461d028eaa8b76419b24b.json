@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT w.id, w.state, MAX(l.last_heartbeat_at) AS last_beat FROM central.worker_registrations w JOIN central.node_leases l ON l.worker_id = w.id AND l.released_at IS NULL WHERE w.state IN ('active', 'suspect') GROUP BY w.id, w.state ORDER BY w.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "last_beat",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "a6c32a2fc03006d2530d8e30bb89921d8b727ceb634461d028eaa8b76419b24b"
+}

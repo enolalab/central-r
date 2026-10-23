@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT l.worker_id FROM central.node_leases l JOIN central.worker_registrations w ON w.id = l.worker_id WHERE l.released_at IS NULL AND w.state IN ('lost', 'deregistered') ORDER BY l.worker_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "worker_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7df5ae00275e15fb38ba7c4036927c041f1a8e928ea6a366b366d56e7fff05b4"
+}

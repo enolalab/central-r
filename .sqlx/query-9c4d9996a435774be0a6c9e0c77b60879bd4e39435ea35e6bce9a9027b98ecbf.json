@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.node_leases SET released_at = now() WHERE id = $1 AND released_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c4d9996a435774be0a6c9e0c77b60879bd4e39435ea35e6bce9a9027b98ecbf"
+}

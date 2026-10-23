@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.worker_registrations SET state = 'suspect' WHERE id = $1 AND state = 'active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ee957013603bacd94936007a8c808b41722bf4c6a40fb517cabf4db68ee760f0"
+}

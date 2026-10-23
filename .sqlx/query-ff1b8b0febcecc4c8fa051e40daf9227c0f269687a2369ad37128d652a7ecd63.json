@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT attempt_id, run_id, node_id, decision, payload_fingerprint, decided_by, decided_at FROM central.attempt_decisions WHERE attempt_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "decision",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "payload_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "decided_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "decided_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ff1b8b0febcecc4c8fa051e40daf9227c0f269687a2369ad37128d652a7ecd63"
+}

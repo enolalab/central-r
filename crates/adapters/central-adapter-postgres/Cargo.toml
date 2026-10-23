@@ -16,6 +16,8 @@ central-event = { path = "../../capabilities/central-event", version = "0.1.0" }
 central-task = { path = "../../capabilities/central-task", version = "0.1.0" }
 central-execution = { path = "../../capabilities/central-execution", version = "0.1.0" }
 central-eventjournal = { path = "../../capabilities/central-eventjournal", version = "0.1.0" }
+central-retry = { path = "../../capabilities/central-retry", version = "0.1.0" }
+central-scheduler = { path = "../../capabilities/central-scheduler", version = "0.1.0" }
 central-workflow = { path = "../../capabilities/central-workflow", version = "0.1.0" }
 central-workspace = { path = "../../capabilities/central-workspace", version = "0.1.0" }
 serde.workspace = true

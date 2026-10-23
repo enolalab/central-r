@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT MIN(claimed_at) AS first_dispatch, COUNT(*) AS total FROM central.session_attempts WHERE node_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "first_dispatch",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "total",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "4642bf5de20142e00345c7abf35a281491ab676c79e3617aeb0f7dbd016793cb"
+}

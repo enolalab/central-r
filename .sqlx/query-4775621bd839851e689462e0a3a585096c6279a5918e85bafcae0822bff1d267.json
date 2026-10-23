@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, run_id, node_id, attempt_seq, worker_id, harness_attempt_id, workspace_path, workspace_kind, state, dispatch_reason_code, reservation_id, harness_session_id, claimed_at, started_at, ended_at FROM central.session_attempts WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "attempt_seq",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "worker_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "harness_attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "workspace_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "workspace_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "dispatch_reason_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "reservation_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "harness_session_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "claimed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "ended_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "4775621bd839851e689462e0a3a585096c6279a5918e85bafcae0822bff1d267"
+}

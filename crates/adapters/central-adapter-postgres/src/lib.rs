@@ -30,6 +30,7 @@ pub mod event;
 pub mod eventjournal;
 pub mod execution;
 pub mod migrate;
+pub mod scheduler;
 mod store_support;
 pub mod task;
 pub mod workflow;

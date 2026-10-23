@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id, a.node_id, a.run_id, a.workspace_id, a.state, a.attempt_seq, l.id AS lease_id, l.worker_id FROM central.session_attempts a JOIN central.node_leases l ON l.attempt_id = a.id WHERE a.id = $1 AND l.released_at IS NULL AND l.expires_at > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "attempt_seq",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "lease_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "worker_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "609b4cc5a2efbe211bc9717faae3239019eaa5ce515c285374f0a13947d3d311"
+}

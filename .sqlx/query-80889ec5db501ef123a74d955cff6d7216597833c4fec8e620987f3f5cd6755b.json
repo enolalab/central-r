@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT o.attempt_id, a.attempt_seq, o.outcome_kind, o.reason_code, o.failure_class, o.payload_fingerprint, o.recorded_at FROM central.attempt_outcomes o JOIN central.session_attempts a ON a.id = o.attempt_id WHERE a.node_id = $1 ORDER BY a.attempt_seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "attempt_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "attempt_seq",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "outcome_kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "reason_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "failure_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "payload_fingerprint",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "recorded_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "80889ec5db501ef123a74d955cff6d7216597833c4fec8e620987f3f5cd6755b"
+}

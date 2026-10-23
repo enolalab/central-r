@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT failure_class, payload_fingerprint FROM central.attempt_outcomes WHERE attempt_id = $1 AND outcome_kind = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "failure_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "payload_fingerprint",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "0b8acf69ad917b70fec6811dc75d8655a780f78c2307b33a2ff83a5fcad40bee"
+}

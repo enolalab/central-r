@@ -566,6 +566,8 @@ dependencies = [
  "central-eventjournal",
  "central-execution",
  "central-foundation",
+ "central-retry",
+ "central-scheduler",
  "central-task",
  "central-workflow",
  "central-workspace",

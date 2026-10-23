@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, protocol_version, harness_kinds, workspace_kinds, max_concurrent_attempts, state, registered_at, last_seen_at FROM central.worker_registrations WHERE workspace_id = $1 ORDER BY registered_at DESC, id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "protocol_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "harness_kinds",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "workspace_kinds",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_concurrent_attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "registered_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "4fb13bb9d2f38b42c39f00a6e6d25606946c5a47a2fd760c6443c75408f879cc"
+}

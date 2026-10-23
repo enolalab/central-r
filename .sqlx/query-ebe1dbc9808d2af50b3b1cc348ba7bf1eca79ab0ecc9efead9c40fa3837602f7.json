@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.run_id, a.workspace_id, l.node_id FROM central.node_leases l JOIN central.session_attempts a ON a.id = l.attempt_id WHERE l.worker_id = $1 ORDER BY l.issued_at DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "node_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ebe1dbc9808d2af50b3b1cc348ba7bf1eca79ab0ecc9efead9c40fa3837602f7"
+}
