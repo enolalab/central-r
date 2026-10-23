@@ -406,13 +406,20 @@ mod tests {
             workspace_id: WorkspaceId,
             run: RunId,
         ) -> Result<Option<PermissionApproval>, Failure> {
+            // Upstream orders `requested_at DESC, id DESC LIMIT 1` — the newest
+            // pending approval wins, matching `port.rs` MemStore.
             Ok(self
                 .approvals
                 .iter()
-                .find(|a| {
+                .filter(|a| {
                     a.workspace_id == workspace_id
                         && a.run_id == run
                         && a.state == crate::approval::ApprovalState::Pending
+                })
+                .max_by(|a, b| {
+                    a.requested_at
+                        .cmp(&b.requested_at)
+                        .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
                 })
                 .cloned())
         }
