@@ -761,6 +761,11 @@ version = "0.1.0"
 [[package]]
 name = "central-scheduler"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-session"
