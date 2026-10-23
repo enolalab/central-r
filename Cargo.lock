@@ -558,6 +558,16 @@ dependencies = [
 [[package]]
 name = "central-adapter-harness"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "central-harness",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "time",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "central-adapter-linux"
