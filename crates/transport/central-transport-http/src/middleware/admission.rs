@@ -45,12 +45,15 @@ use crate::policy::{
 /// The admission-layer configuration. `expected_host`/`expected_origin`
 /// must always be set explicitly on the application listener — a zero
 /// value would silently admit any Host/Origin. `expected_host: None`
-/// skips the Host check for the loopback operations listener (health +
-/// metrics), matching upstream's per-listener policy.
+/// skips the Host check; the only legitimate `None` is the loopback
+/// operations listener (health + metrics) built by
+/// [`crate::router::build_ops_router`]. [`crate::router::build_app_router`]
+/// rejects a `None` at startup — fail closed, not per-request.
 #[derive(Debug, Clone)]
 pub struct AdmissionConfig {
     /// Exact raw `Host` value the application listener binds
-    /// (e.g. `127.0.0.1:8080`); `None` disables the check (ops listener).
+    /// (e.g. `127.0.0.1:8080`); `None` disables the check (ops listener
+    /// only — the app router refuses to build without one).
     pub expected_host: Option<String>,
     /// Caps on concurrently admitted in-flight requests. `0` → default.
     pub active_limit: usize,
@@ -209,6 +212,27 @@ impl Drop for WaiterGuard<'_> {
     }
 }
 
+/// Pairs a gauge `.inc()` with the matching `.dec()` on drop — a panic,
+/// early return, or dropped future cannot drift the gauge.
+struct GaugeGuard {
+    gauge: prometheus_client::metrics::gauge::Gauge<i64>,
+}
+
+impl GaugeGuard {
+    fn inc_tracked(gauge: &prometheus_client::metrics::gauge::Gauge<i64>) -> Self {
+        gauge.inc();
+        Self {
+            gauge: gauge.clone(),
+        }
+    }
+}
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 impl Admission {
     async fn serve(&self, mut req: Request, next: Next) -> Response {
         // 1. Loopback peer.
@@ -272,14 +296,13 @@ impl Admission {
             return self.reject(StatusCode::SERVICE_UNAVAILABLE, "ADMISSION_FULL");
         };
         let _permit = permit;
-        if let Some(m) = &self.cfg.metrics {
-            m.active_requests.inc();
-        }
+        let _active = self
+            .cfg
+            .metrics
+            .as_ref()
+            .map(|m| GaugeGuard::inc_tracked(&m.active_requests));
         // 8. Per-route deadline.
         let ran = tokio::time::timeout(self.cfg.route_deadline, next.run(req)).await;
-        if let Some(m) = &self.cfg.metrics {
-            m.active_requests.dec();
-        }
         match ran {
             Ok(mut resp) => {
                 // Propagate the matched template to the response so the
@@ -308,17 +331,16 @@ impl Admission {
             self.waiters.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        if let Some(m) = &self.cfg.metrics {
-            m.waiting_requests.inc();
-        }
+        let _waiting = self
+            .cfg
+            .metrics
+            .as_ref()
+            .map(|m| GaugeGuard::inc_tracked(&m.waiting_requests));
         let _guard = WaiterGuard {
             waiters: &self.waiters,
         };
         let got =
             tokio::time::timeout(self.cfg.wait_timeout, self.slots.clone().acquire_owned()).await;
-        if let Some(m) = &self.cfg.metrics {
-            m.waiting_requests.dec();
-        }
         match got {
             Ok(Ok(p)) => Some(p),
             _ => None,
@@ -358,7 +380,9 @@ pub fn request_host(req: &Request) -> &str {
 /// `WireHeaderBytes` — the exact HTTP/1.1 request-line + header framing
 /// accounted for by the admission budget, including Host and the
 /// terminal CRLF. `GET /p?q HTTP/1.1\r\n` + `Host: h\r\n` +
-/// `Name: v\r\n`×N + `\r\n`.
+/// `Name: v\r\n`×N + `\r\n`. Host is written once explicitly (upstream
+/// hoists it out of `r.Header`); the `host` entry in `req.headers()`
+/// is skipped so it is never double-counted.
 #[must_use]
 pub fn wire_header_bytes(req: &Request) -> usize {
     let target = req
@@ -369,6 +393,9 @@ pub fn wire_header_bytes(req: &Request) -> usize {
     let mut total = req.method().as_str().len() + 1 + target.len() + " HTTP/1.1\r\n".len();
     total += "Host: ".len() + request_host(req).len() + 2;
     for (name, value) in req.headers() {
+        if *name == header::HOST {
+            continue;
+        }
         total += name.as_str().len() + 2 + value.len() + 2;
     }
     total + 2

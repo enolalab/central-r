@@ -10,9 +10,13 @@
 //! `{param}` placeholders (e.g. `/app/tasks/{task_id}/cancel`), matching
 //! the §4.3/api-v1 route shapes. A `{param}` matches exactly one
 //! non-empty segment. Literal-vs-parameter ambiguity across different
-//! templates is resolved by preferring the template with more literal
-//! segments (most specific), mirroring `matchit`'s static-over-param
-//! precedence.
+//! templates is resolved exactly like `matchit`: comparing segment
+//! kinds left to right, the template whose literal comes earlier wins
+//! (matchit tries the static child edge before the parameter edge).
+//! [`RouteTable::match_route`] then checks the method on that single
+//! winning template — never on a lower-precedence sibling — so the
+//! admission `405`/`Allow` outcome is the same one axum's dispatcher
+//! would produce.
 
 use axum::http::Method;
 use central_foundation::failure::{Failure, FailureKind};
@@ -255,7 +259,11 @@ pub fn allow_header(methods: &[Method]) -> String {
 struct CompiledPath {
     segments: Vec<Segment>,
     methods: Vec<(Method, RoutePolicy)>,
-    literal_count: usize,
+    /// `matchit` precedence key: one byte per segment, `Literal` (0)
+    /// before `Param` (1). Compared left to right — the template with
+    /// the earlier literal wins, which is matchit's static-edge-first
+    /// descent reproduced as a sort key.
+    precedence: Vec<u8>,
     path: &'static str,
 }
 
@@ -305,10 +313,13 @@ impl RouteTable {
         let mut paths: Vec<CompiledPath> = Vec::new();
         for spec in specs {
             let segments = compile_path(spec.path)?;
-            let literal_count = segments
+            let precedence = segments
                 .iter()
-                .filter(|s| matches!(s, Segment::Literal(_)))
-                .count();
+                .map(|s| match s {
+                    Segment::Literal(_) => 0u8,
+                    Segment::Param => 1u8,
+                })
+                .collect();
             match paths.iter_mut().find(|p| p.path == spec.path) {
                 Some(existing) => {
                     if existing.methods.iter().any(|(m, _)| *m == spec.method) {
@@ -323,43 +334,51 @@ impl RouteTable {
                 None => paths.push(CompiledPath {
                     segments,
                     methods: vec![(spec.method.clone(), spec.policy)],
-                    literal_count,
+                    precedence,
                     path: spec.path,
                 }),
             }
         }
-        // Most-literal-segments first so `/app/tasks/new` outranks
-        // `/app/tasks/{task_id}` on a concrete request path.
-        paths.sort_by_key(|a| std::cmp::Reverse(a.literal_count));
+        // `matchit` precedence: at the first segment position where two
+        // templates differ in kind, the literal side wins (the router
+        // tries the static edge before the parameter edge). Two
+        // templates that can both match a concrete path must share the
+        // segment count, and at every position where both are literal
+        // the values are identical (both equal the path segment) — so
+        // the kind sequence alone decides. A still-tied pair can only
+        // differ in parameter names (matchit refuses that registration
+        // outright); the template string breaks the tie so precedence
+        // never depends on registration order.
+        paths.sort_by(|a, b| a.precedence.cmp(&b.precedence).then(a.path.cmp(b.path)));
         Ok(Self { paths })
     }
 
     /// The admission lookup. `HEAD` falls back to a `GET` registration
     /// (axum `get()` answers HEAD too).
+    ///
+    /// Only the FIRST path-matching template — the same selection
+    /// `matchit` makes — is consulted for the method check. A
+    /// lower-precedence sibling that happens to register the method is
+    /// ignored, so the `405` + `Allow` outcome here is exactly the one
+    /// the axum dispatcher would produce (§4.1.1) instead of running a
+    /// param-route's policy guards.
     #[must_use]
     pub fn match_route(&self, method: &Method, path: &str) -> RouteMatch {
-        let mut method_allowed = false;
-        for entry in &self.paths {
-            if !entry.matches(path) {
-                continue;
-            }
-            let effective = if method == Method::HEAD {
-                Method::GET
-            } else {
-                method.clone()
-            };
-            if let Some((_, policy)) = entry.methods.iter().find(|(m, _)| *m == effective) {
-                return RouteMatch::Matched {
-                    policy: *policy,
-                    template: entry.path,
-                };
-            }
-            method_allowed = true;
-        }
-        if method_allowed {
-            RouteMatch::MethodNotAllowed
+        let Some(entry) = self.paths.iter().find(|entry| entry.matches(path)) else {
+            return RouteMatch::NotFound;
+        };
+        let effective = if method == Method::HEAD {
+            Method::GET
         } else {
-            RouteMatch::NotFound
+            method.clone()
+        };
+        if let Some((_, policy)) = entry.methods.iter().find(|(m, _)| *m == effective) {
+            RouteMatch::Matched {
+                policy: *policy,
+                template: entry.path,
+            }
+        } else {
+            RouteMatch::MethodNotAllowed
         }
     }
 
@@ -484,6 +503,96 @@ mod tests {
         .unwrap();
         assert_eq!(table.allow_for("/x").unwrap(), "GET,HEAD,POST");
         assert_eq!(table.allow_for("/only-get").unwrap(), "GET,HEAD");
+    }
+
+    /// §4.1.1 regression: `matchit` selects the single literal node and
+    /// checks methods on that node only — a lower-precedence param
+    /// sibling registering the method must NOT turn the 405 into a
+    /// match (its guards would run instead of the fixed outcome).
+    #[test]
+    fn method_check_uses_only_the_winning_template() {
+        // Register the param route FIRST so insertion order cannot
+        // accidentally supply the right answer.
+        let table = RouteTable::build(&[
+            spec(Method::POST, "/app/tasks/{task_id}"),
+            spec(Method::GET, "/app/tasks/new"),
+        ])
+        .unwrap();
+        // The literal `new` node wins the path; POST is not on it.
+        assert_eq!(
+            table.match_route(&Method::POST, "/app/tasks/new"),
+            RouteMatch::MethodNotAllowed
+        );
+        // The Allow header advertises only the winning node's methods.
+        assert_eq!(table.allow_for("/app/tasks/new").unwrap(), "GET,HEAD");
+        // GET on the literal still matches the literal template.
+        assert!(matches!(
+            table.match_route(&Method::GET, "/app/tasks/new"),
+            RouteMatch::Matched {
+                template: "/app/tasks/new",
+                ..
+            }
+        ));
+        // A param-matching path still reaches the param route.
+        assert!(matches!(
+            table.match_route(&Method::POST, "/app/tasks/abc"),
+            RouteMatch::Matched {
+                template: "/app/tasks/{task_id}",
+                ..
+            }
+        ));
+        assert_eq!(
+            table.match_route(&Method::GET, "/app/tasks/abc"),
+            RouteMatch::MethodNotAllowed
+        );
+    }
+
+    /// Positional precedence: with equal literal counts the template
+    /// whose literal appears earlier (left to right) wins, exactly like
+    /// matchit's static-edge-first descent.
+    #[test]
+    fn earlier_literal_position_wins_on_equal_literal_count() {
+        let table =
+            RouteTable::build(&[spec(Method::GET, "/a/{x}/c"), spec(Method::GET, "/a/b/{y}")])
+                .unwrap();
+        assert!(matches!(
+            table.match_route(&Method::GET, "/a/b/c"),
+            RouteMatch::Matched {
+                template: "/a/b/{y}",
+                ..
+            }
+        ));
+        assert_eq!(table.allow_for("/a/b/c").unwrap(), "GET,HEAD");
+        // Deterministic under reversed registration order.
+        let table =
+            RouteTable::build(&[spec(Method::GET, "/a/b/{y}"), spec(Method::GET, "/a/{x}/c")])
+                .unwrap();
+        assert!(matches!(
+            table.match_route(&Method::GET, "/a/b/c"),
+            RouteMatch::Matched {
+                template: "/a/b/{y}",
+                ..
+            }
+        ));
+    }
+
+    /// Positional precedence beats raw literal count: `/a/b/{y}/{z}`
+    /// has fewer literals than `/a/{x}/c/d` but wins `/a/b/c/d` because
+    /// its literal sits at the earlier position.
+    #[test]
+    fn earlier_literal_beats_higher_literal_count() {
+        let table = RouteTable::build(&[
+            spec(Method::GET, "/a/{x}/c/d"),
+            spec(Method::GET, "/a/b/{y}/{z}"),
+        ])
+        .unwrap();
+        assert!(matches!(
+            table.match_route(&Method::GET, "/a/b/c/d"),
+            RouteMatch::Matched {
+                template: "/a/b/{y}/{z}",
+                ..
+            }
+        ));
     }
 
     #[test]

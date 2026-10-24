@@ -10,7 +10,7 @@
 //!   `Access-Control-*` header is ever emitted (no CORS layer exists to
 //!   set one).
 //! - Fixed §4.1.1 outcomes ([`not_found`], [`method_not_allowed`],
-//!   [`unauthorized`], [`forbidden_csrf`], [`internal`],
+//!   [`unauthorized`], [`recovered_internal`],
 //!   [`task_action_failure`]): HTML pages for `/app/...` paths, the
 //!   canonical `{"error":{"code":"..."}}` envelope everywhere else.
 //!
@@ -114,13 +114,6 @@ pub fn method_not_allowed(path: &str, allow: &str) -> Response {
 #[must_use]
 pub fn unauthorized() -> Response {
     json_response(StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
-}
-
-/// Fixed `403` for a session-CSRF validation failure on a non-`/app`
-/// route.
-#[must_use]
-pub fn forbidden_csrf() -> Response {
-    json_response(StatusCode::FORBIDDEN, "CSRF_INVALID")
 }
 
 /// `renderTaskActionFailure` — the generic mutation-failure outcome

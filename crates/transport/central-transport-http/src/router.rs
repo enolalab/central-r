@@ -31,7 +31,7 @@ use axum::http::Uri;
 use axum::middleware::from_fn_with_state;
 use axum::response::Response;
 use axum::routing::{MethodRouter, get};
-use central_foundation::failure::Failure;
+use central_foundation::failure::{Failure, FailureKind};
 use central_session::domain::SecurityEpoch;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -94,7 +94,11 @@ where
 ///
 /// # Errors
 /// `Failure` on malformed route templates, duplicate `(method, path)`
-/// pairs, or §4.6 hard-cap violations in the admission config.
+/// pairs, §4.6 hard-cap violations in the admission config, or a
+/// missing `admission.expected_host` — the application listener must
+/// always bind an exact Host (upstream's `r.Host != ExpectedHost`
+/// compare rejects everything when unset, so `None` would silently
+/// admit any Host).
 pub fn build_app_router<P, V, D>(
     routes: Vec<RoutedSpec>,
     cfg: TransportConfig<P, V, D>,
@@ -104,6 +108,13 @@ where
     V: SessionValidator,
     D: DeliveryPrecommit,
 {
+    if cfg.admission.expected_host.is_none() {
+        return Err(Failure::new(
+            FailureKind::Invalid,
+            "transport_admission",
+            "application listener requires admission.expected_host".to_string(),
+        ));
+    }
     let specs: Vec<RouteSpec> = routes.iter().map(|r| r.spec.clone()).collect();
     let admission = Admission::new(cfg.admission, &specs)?;
 
@@ -169,12 +180,17 @@ async fn fallback_404(uri: Uri) -> Response {
 /// The operations listener (`/health/live`, `/health/ready`,
 /// `/metrics`) — loopback policy only: no session, no Origin, no CSRF.
 /// `expected_host` is `None` (upstream re-asserts loopback only; the
-/// listener binds `127.0.0.1`).
+/// listener binds `127.0.0.1`) — the only legitimate `None`; the
+/// application listener must set it (see [`build_app_router`]).
+///
+/// # Errors
+/// `Failure` on §4.6 hard-cap violations — a failed [`Admission`]
+/// build must never silently serve health/metrics unguarded.
 pub fn build_ops_router(
     probe: Arc<dyn health::ReadinessProbe>,
     registry: SharedRegistry,
     metrics_hooks: Option<HttpMetrics>,
-) -> Router {
+) -> Result<Router, Failure> {
     let health_routes = Router::new()
         .route("/health/live", get(health::live))
         .route("/health/ready", get(health::ready))
@@ -206,19 +222,16 @@ pub fn build_ops_router(
             ..AdmissionConfig::default()
         },
         &specs,
-    );
-    let mut router = health_routes.merge(metrics_routes).fallback(fallback_404);
-    if let Ok(adm) = admission {
-        let stack = ServiceBuilder::new()
-            .layer(recover::layer())
-            .layer(axum::middleware::from_fn(metadata::layer))
-            .layer(axum::middleware::from_fn(security_headers::layer))
-            .layer(from_fn_with_state(
-                Arc::new(TracingAccessObserver) as Arc<dyn AccessObserver>,
-                access::layer,
-            ))
-            .layer(from_fn_with_state(adm, admission::layer));
-        router = router.layer(stack);
-    }
-    router
+    )?;
+    let router = health_routes.merge(metrics_routes).fallback(fallback_404);
+    let stack = ServiceBuilder::new()
+        .layer(recover::layer())
+        .layer(axum::middleware::from_fn(metadata::layer))
+        .layer(axum::middleware::from_fn(security_headers::layer))
+        .layer(from_fn_with_state(
+            Arc::new(TracingAccessObserver) as Arc<dyn AccessObserver>,
+            access::layer,
+        ))
+        .layer(from_fn_with_state(admission, admission::layer));
+    Ok(router.layer(stack))
 }

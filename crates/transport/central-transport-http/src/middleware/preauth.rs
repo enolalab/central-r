@@ -83,10 +83,10 @@ async fn validate<S: PreAuthCsrf>(
     next: Next,
 ) -> Response {
     let cookie_values = cookies::cookie_values(req.headers(), cookies::PREAUTH_CSRF_COOKIE);
-    let Some(cookie_value) = (match cookie_values.as_slice() {
-        [one] if !one.is_empty() => Some(one.clone()),
-        _ => None,
-    }) else {
+    // Upstream `pickCSRFCookie` — the first value under the name; a
+    // missing or empty first value is CSRF_MISSING regardless of
+    // whether later duplicates exist (the duplicate check runs later).
+    let Some(cookie_value) = cookie_values.first().filter(|v| !v.is_empty()).cloned() else {
         return error::reject(StatusCode::FORBIDDEN, "CSRF_MISSING");
     };
     let header_values: Vec<&str> = req
@@ -97,6 +97,11 @@ async fn validate<S: PreAuthCsrf>(
         .collect();
     // Missing header or duplicate header (replay attempt) — reject.
     if header_values.len() != 1 {
+        return error::reject(StatusCode::FORBIDDEN, "CSRF_DUPLICATE");
+    }
+    // Upstream `hasDuplicateCookieValue` — the named cookie appearing
+    // more than once is ambiguous (replay signal) — reject.
+    if cookie_values.len() > 1 {
         return error::reject(StatusCode::FORBIDDEN, "CSRF_DUPLICATE");
     }
     // Constant-time match between cookie and header value. A mismatch

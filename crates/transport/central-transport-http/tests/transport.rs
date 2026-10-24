@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
@@ -373,6 +373,76 @@ async fn trailing_slash_does_not_redirect() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// §4.1.1 regression: with `GET /app/tasks/new` and
+/// `POST /app/tasks/{task_id}` coexisting, `POST /app/tasks/new` must
+/// produce the fixed `405` + `Allow` of the literal node — the param
+/// route's session/CSRF/Origin guards must never run (before the fix
+/// this request matched the param template and failed with 403/303).
+#[tokio::test]
+async fn param_sibling_method_does_not_shadow_literal_405() {
+    let sessions = Arc::new(FakeSessions::new());
+    let routes = vec![
+        routed(
+            axum::http::Method::POST,
+            "/app/tasks/{task_id}",
+            mutation_policy(RouteClass::App),
+            rpost(|| async { "param post" }),
+        ),
+        routed(
+            axum::http::Method::GET,
+            "/app/tasks/new",
+            policy_app(),
+            rget(|| async { "new form" }),
+        ),
+    ];
+    let app = test_app_with(routes, sessions, AdmissionConfig::default());
+    // No session, no Origin — if the param route's guards ran this
+    // would be 403 TASK_ACTION_FAILED, not 405.
+    let resp = app
+        .clone()
+        .oneshot(loopback_req(
+            Request::builder()
+                .method("POST")
+                .uri("/app/tasks/new")
+                .header("host", HOST),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers().get(header::ALLOW).unwrap(), "GET,HEAD");
+    // The literal GET still dispatches.
+    let resp = app
+        .oneshot(loopback_req(get("/app/tasks/new")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await, "new form");
+}
+
+/// I2 — the application listener refuses to build without an exact
+/// `expected_host` (upstream's `r.Host != ExpectedHost` compare would
+/// otherwise fail open and admit any Host).
+#[test]
+fn app_router_requires_expected_host() {
+    let sessions = Arc::new(FakeSessions::new());
+    let res = build_app_router(
+        routes_default(),
+        TransportConfig {
+            admission: AdmissionConfig {
+                expected_host: None,
+                ..AdmissionConfig::default()
+            },
+            expected_origin: ORIGIN.to_string(),
+            preauth: sessions.clone(),
+            sessions: sessions.clone(),
+            delivery: sessions,
+            epoch_source: Arc::new(|| SecurityEpoch(0)),
+            observer: None,
+        },
+    );
+    assert!(res.is_err());
+}
+
 #[tokio::test]
 async fn header_and_cookie_bounds() {
     let app = test_app(Arc::new(FakeSessions::new()));
@@ -402,6 +472,40 @@ async fn header_and_cookie_bounds() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_string(resp).await.trim(), "DUPLICATE_COOKIE");
+}
+
+/// M3 — `wire_header_bytes` accounts `Host:` exactly once on HTTP/1.1
+/// (upstream hoists Host out of `r.Header`; the `host` header map entry
+/// must be skipped, not double-counted).
+#[test]
+fn wire_header_bytes_counts_host_once() {
+    let req = loopback_req(
+        get("/app/tasks?x=1")
+            .header("x-a", "b")
+            .header("cookie", "k=v"),
+    );
+    // "GET /app/tasks?x=1 HTTP/1.1\r\n" + "Host: 127.0.0.1:8080\r\n"
+    // + "x-a: b\r\n" + "cookie: k=v\r\n" + "\r\n"
+    let expected = "GET".len()
+        + 1
+        + "/app/tasks?x=1".len()
+        + " HTTP/1.1\r\n".len()
+        + "Host: ".len()
+        + HOST.len()
+        + 2
+        + "x-a".len()
+        + 2
+        + "b".len()
+        + 2
+        + "cookie".len()
+        + 2
+        + "k=v".len()
+        + 2
+        + 2;
+    assert_eq!(
+        central_transport_http::middleware::admission::wire_header_bytes(&req),
+        expected
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +667,55 @@ async fn preauth_csrf_validation() {
     assert_eq!(body_string(resp).await, "exchanged");
 }
 
+/// M4 — upstream `hasDuplicateCookieValue`: a duplicated
+/// `central_preauth_csrf` name is `CSRF_DUPLICATE`, not `CSRF_MISSING`.
+/// At the composed router the generic admission duplicate-cookie guard
+/// (400 DUPLICATE_COOKIE) fires first, so this exercises the layer in
+/// isolation — the same defense-in-depth role the upstream check plays.
+#[tokio::test]
+async fn preauth_duplicate_cookie_is_csrf_duplicate() {
+    use central_transport_http::middleware::preauth::{self, PreAuthCsrfState};
+    use central_transport_http::policy::MatchedRoute;
+
+    let sessions = Arc::new(FakeSessions::new());
+    let mut policy = RoutePolicy::safe_get(RouteClass::Api);
+    policy.csrf_required = true;
+    // The outer layer stashes the route policy the way admission would;
+    // the inner layer is the pre-auth CSRF gate under test.
+    let app = Router::new()
+        .route("/x", rpost(|| async { "ok" }))
+        .layer(axum::middleware::from_fn_with_state(
+            PreAuthCsrfState { service: sessions },
+            preauth::layer,
+        ))
+        .layer(axum::middleware::from_fn(
+            move |mut req: Request, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(MatchedRoute {
+                    policy,
+                    path_template: "/x",
+                });
+                next.run(req).await
+            },
+        ));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/x")
+                .header(
+                    "cookie",
+                    "central_preauth_csrf=aaa; central_preauth_csrf=bbb",
+                )
+                .header("x-central-preauth-csrf", "aaa")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_string(resp).await.trim(), "CSRF_DUPLICATE");
+}
+
 // ---------------------------------------------------------------------------
 // Session gate
 // ---------------------------------------------------------------------------
@@ -612,8 +765,10 @@ async fn session_csrf_form_flow() {
     let token_b64 = b64::encode(&token);
     let csrf_value = [8u8; 32];
     let csrf_b64 = b64::encode(&csrf_value);
-    // The fake compares sha256(presented) to the session row's csrf_hash —
-    // register the row's hash as sha256(csrf_value).
+    // The fake enforces the persisted-hash comparison — register the
+    // row's csrf_hash as sha256(csrf_value). The `central_session_csrf`
+    // cookie itself is never consulted on the mutation path (upstream
+    // `activeSessionWithCSRF` delegates the check to the store).
     sessions
         .sessions
         .lock()
@@ -621,7 +776,8 @@ async fn session_csrf_form_flow() {
         .values_mut()
         .for_each(|s| s.csrf_hash = Sha256::digest(csrf_value).into());
     let app = test_app(sessions);
-    // valid: session cookie + csrf cookie + form csrf field match → 200
+    // valid: session cookie + form csrf field whose hash matches the
+    // persisted row → 200 (csrf cookie present, as delivered).
     let body = format!("csrf={csrf_b64}");
     let resp = app
         .clone()
@@ -637,7 +793,8 @@ async fn session_csrf_form_flow() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    // missing csrf cookie → CSRF_MISSING
+    // The `central_session_csrf` cookie is NOT consulted on this path —
+    // absent it, the same request still validates (upstream behavior).
     let resp = app
         .clone()
         .oneshot(loopback_req_body(
@@ -648,10 +805,12 @@ async fn session_csrf_form_flow() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_string(resp).await.trim(), "CSRF_MISSING");
-    // cookie/form mismatch → CSRF_MISMATCH
+    assert_eq!(resp.status(), StatusCode::OK);
+    // A form csrf whose hash does not match the persisted row → the
+    // store-side comparison fails → generic mutation-failure outcome.
     let other = b64::encode(&[4u8; 32]);
     let resp = app
+        .clone()
         .oneshot(loopback_req_body(
             post_origin("/app/logout")
                 .header("content-type", "application/x-www-form-urlencoded")
@@ -663,7 +822,70 @@ async fn session_csrf_form_flow() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_string(resp).await.trim(), "CSRF_MISMATCH");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_string(resp).await.trim(), "TASK_ACTION_FAILED");
+    // A missing csrf form field → the same generic failure.
+    let resp = app
+        .oneshot(loopback_req_body(
+            post_origin("/app/logout")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", format!("central_session={token_b64}")),
+            "unrelated=1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_string(resp).await.trim(), "TASK_ACTION_FAILED");
+}
+
+#[tokio::test]
+async fn session_csrf_api_header_flow() {
+    let sessions = Arc::new(FakeSessions::new());
+    let token = [9u8; 32];
+    sessions.insert_active(token);
+    let token_b64 = b64::encode(&token);
+    let csrf_value = [8u8; 32];
+    let csrf_b64 = b64::encode(&csrf_value);
+    sessions
+        .sessions
+        .lock()
+        .unwrap()
+        .values_mut()
+        .for_each(|s| s.csrf_hash = Sha256::digest(csrf_value).into());
+    let app = test_app(sessions);
+    let cookie = format!("central_session={token_b64}");
+    // valid: session cookie + X-CSRF-Token matching the persisted hash → 200
+    let resp = app
+        .clone()
+        .oneshot(loopback_req(
+            post_origin("/api/v1/tasks/cancel")
+                .header("cookie", &cookie)
+                .header("x-csrf-token", &csrf_b64),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // missing header → CSRF_DUPLICATE (missing/duplicate share the class)
+    let resp = app
+        .clone()
+        .oneshot(loopback_req(
+            post_origin("/api/v1/tasks/cancel").header("cookie", &cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_string(resp).await.trim(), "CSRF_DUPLICATE");
+    // header whose hash does not match the persisted row → 401 (Api
+    // mutation missing-session outcome).
+    let other = b64::encode(&[4u8; 32]);
+    let resp = app
+        .oneshot(loopback_req(
+            post_origin("/api/v1/tasks/cancel")
+                .header("cookie", &cookie)
+                .header("x-csrf-token", &other),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1201,37 @@ async fn panic_recovers_to_fixed_500() {
     );
 }
 
+/// M2 — the admission gauges are drop-guarded: a handler panic
+/// unwinding through the layer must still decrement `active_requests`.
+#[tokio::test]
+async fn metrics_gauge_does_not_drift_on_panic() {
+    use central_transport_http::metrics::HttpMetrics;
+
+    let mut registry = prometheus_client::registry::Registry::default();
+    let metrics = HttpMetrics::register(&mut registry);
+    let app = test_app_with(
+        routes_default(),
+        Arc::new(FakeSessions::new()),
+        AdmissionConfig {
+            metrics: Some(metrics.clone()),
+            ..AdmissionConfig::default()
+        },
+    );
+    // A clean request leaves the gauge at zero.
+    let resp = app
+        .clone()
+        .oneshot(loopback_req(get("/app/bootstrap")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(metrics.active_requests.get(), 0);
+    // A panicking handler unwinds through admission — the guard decrements.
+    let resp = app.oneshot(loopback_req(get("/app/panic"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(metrics.active_requests.get(), 0);
+    assert_eq!(metrics.waiting_requests.get(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Assets
 // ---------------------------------------------------------------------------
@@ -1011,12 +1264,22 @@ async fn embedded_assets_served() {
 // Health + metrics (operations listener)
 // ---------------------------------------------------------------------------
 
-struct Probe(ProbeState, &'static str);
+struct Probe(ProbeState, &'static str, String, u8);
+impl Probe {
+    fn simple(state: ProbeState, reason: &'static str) -> Self {
+        Self(state, reason, String::new(), 0)
+    }
+    fn diagnostic(state: ProbeState, reason: &'static str, remediation: &str, class: u8) -> Self {
+        Self(state, reason, remediation.to_string(), class)
+    }
+}
 impl ReadinessProbe for Probe {
     fn health(&self) -> ProbeSnapshot {
         ProbeSnapshot {
             state: self.0,
             reason: self.1.to_string(),
+            remediation: self.2.clone(),
+            failure_class: self.3,
         }
     }
 }
@@ -1025,10 +1288,11 @@ impl ReadinessProbe for Probe {
 async fn health_live_always_200_ready_profile_aware() {
     let registry = Arc::new(prometheus_client::registry::Registry::default());
     let app = build_ops_router(
-        Arc::new(Probe(ProbeState::NotReady, "POSTGRES_UNAVAILABLE")),
+        Arc::new(Probe::simple(ProbeState::NotReady, "POSTGRES_UNAVAILABLE")),
         registry.clone(),
         None,
-    );
+    )
+    .unwrap();
     let resp = app
         .clone()
         .oneshot(loopback_req(get("/health/live")))
@@ -1038,6 +1302,9 @@ async fn health_live_always_200_ready_profile_aware() {
     let body = body_string(resp).await;
     assert!(body.contains("\"status\":\"not_ready\""));
     assert!(body.contains("POSTGRES_UNAVAILABLE"));
+    // Absent diagnostics stay absent (omitempty).
+    assert!(!body.contains("remediation"));
+    assert!(!body.contains("failure_class"));
     let resp = app
         .oneshot(loopback_req(get("/health/ready")))
         .await
@@ -1045,28 +1312,32 @@ async fn health_live_always_200_ready_profile_aware() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let ready = build_ops_router(
-        Arc::new(Probe(ProbeState::Ready, "")),
+        Arc::new(Probe::simple(ProbeState::Ready, "")),
         registry.clone(),
         None,
-    );
+    )
+    .unwrap();
     let resp = ready
         .clone()
         .oneshot(loopback_req(get("/health/ready")))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // Upstream `MarshalHealth`: `safeReason("")` collapses to
+    // `UNAVAILABLE` rather than being omitted.
     assert_eq!(
         body_string(resp).await,
-        "{\"status\":\"ready\",\"reason\":\"\"}"
+        "{\"status\":\"ready\",\"reason\":\"UNAVAILABLE\"}"
     );
     let resp = ready.oneshot(loopback_req(get("/metrics"))).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     // unbounded reasons collapse
     let leaked = build_ops_router(
-        Arc::new(Probe(ProbeState::Failed, "db password: hunter2")),
+        Arc::new(Probe::simple(ProbeState::Failed, "db password: hunter2")),
         registry,
         None,
-    );
+    )
+    .unwrap();
     let resp = leaked
         .oneshot(loopback_req(get("/health/ready")))
         .await
@@ -1074,4 +1345,69 @@ async fn health_live_always_200_ready_profile_aware() {
     let body = body_string(resp).await;
     assert!(body.contains("UNAVAILABLE"));
     assert!(!body.contains("hunter2"));
+}
+
+#[tokio::test]
+async fn health_ready_emits_remediation_and_failure_class() {
+    let registry = Arc::new(prometheus_client::registry::Registry::default());
+    let app = build_ops_router(
+        Arc::new(Probe::diagnostic(
+            ProbeState::NotReady,
+            "MIGRATION_REQUIRED",
+            "run central migrate status",
+            5,
+        )),
+        registry,
+        None,
+    )
+    .unwrap();
+    let resp = app
+        .oneshot(loopback_req(get("/health/ready")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body_string(resp).await,
+        "{\"status\":\"not_ready\",\"reason\":\"MIGRATION_REQUIRED\",\"remediation\":\"run central migrate status\",\"failure_class\":5}"
+    );
+}
+
+#[tokio::test]
+async fn health_remediation_is_bounded() {
+    let registry = Arc::new(prometheus_client::registry::Registry::default());
+    // >256 bytes and control characters both collapse to omitted.
+    let long = build_ops_router(
+        Arc::new(Probe::diagnostic(
+            ProbeState::NotReady,
+            "LEASE_LOST",
+            &"x".repeat(300),
+            0,
+        )),
+        registry.clone(),
+        None,
+    )
+    .unwrap();
+    let resp = long
+        .oneshot(loopback_req(get("/health/ready")))
+        .await
+        .unwrap();
+    let body = body_string(resp).await;
+    assert!(!body.contains("remediation"));
+    let ctrl = build_ops_router(
+        Arc::new(Probe::diagnostic(
+            ProbeState::NotReady,
+            "LEASE_LOST",
+            "has\nnewline",
+            0,
+        )),
+        registry,
+        None,
+    )
+    .unwrap();
+    let resp = ctrl
+        .oneshot(loopback_req(get("/health/ready")))
+        .await
+        .unwrap();
+    let body = body_string(resp).await;
+    assert!(!body.contains("remediation"));
 }

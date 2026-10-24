@@ -11,10 +11,13 @@
 //!    session route), the presented CSRF evidence is exactly one
 //!    `X-CSRF-Token` header on `Api` routes or exactly one `csrf` field
 //!    of the `application/x-www-form-urlencoded` body on `App` routes.
-//!    The `central_session_csrf` cookie must equal the presented value
-//!    in constant time (the upstream handler-side double-submit); the
-//!    persisted-hash comparison is the store's job via
-//!    `presented_csrf_hash = SHA-256(decoded value)`.
+//!    The enforcement is the persisted-hash comparison: the decoded
+//!    value's `SHA-256` flows to `ValidationRequest.presented_csrf_hash`
+//!    and the store requires it to equal the session row's `csrf_hash`
+//!    (upstream `activeSessionWithCSRF`). The `central_session_csrf`
+//!    cookie is issued script-readable for the form helper but is not
+//!    consulted here — upstream compares cookie↔form only inside
+//!    `ServeLogout`.
 //! 3. `Service::validate` must return an `Active` session.
 //!
 //! Outcomes follow §4.3: a missing/expired session on an `App` safe
@@ -88,16 +91,13 @@ pub async fn layer<S: SessionValidator>(
         return missing();
     };
 
-    // 2. Session-CSRF evidence on state-changing routes.
+    // 2. Session-CSRF evidence on state-changing routes. The presented
+    //    value's hash is the only credential compared — upstream
+    //    `activeSessionWithCSRF` delegates the check to the store via
+    //    `PresentedCSRFHash`; the `central_session_csrf` cookie is not
+    //    consulted on this path.
     let mut presented_csrf_hash: Option<[u8; 32]> = None;
     if matched.policy.session_csrf_required && !safe {
-        let bound_cookie = cookies::cookie_values(req.headers(), cookies::SESSION_CSRF_COOKIE);
-        let Some(bound) = (match bound_cookie.as_slice() {
-            [one] if !one.is_empty() => Some(one.clone()),
-            _ => None,
-        }) else {
-            return error::reject(StatusCode::FORBIDDEN, "CSRF_MISSING");
-        };
         let presented = match class {
             RouteClass::App => match presented_form_csrf(&mut req).await {
                 Ok(v) => v,
@@ -110,9 +110,6 @@ pub async fn layer<S: SessionValidator>(
                 }
             },
         };
-        if !crate::ct_eq_str(&bound, &presented) {
-            return error::reject(StatusCode::FORBIDDEN, "CSRF_MISMATCH");
-        }
         let Some(csrf_value) = b64::decode(&presented) else {
             return error::reject(StatusCode::FORBIDDEN, "CSRF_MALFORMED");
         };

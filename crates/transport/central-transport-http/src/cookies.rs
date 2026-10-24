@@ -61,13 +61,6 @@ pub fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (String, String
         })
 }
 
-/// `pickCSRFCookie` — the first matching cookie value, mirroring
-/// upstream `r.Cookie(name)` (first match wins, order preserved).
-#[must_use]
-pub fn pick_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    cookie_pairs(headers).find_map(|(n, v)| (n == name).then_some(v))
-}
-
 /// Every value presented under `name` across the raw `Cookie`
 /// header(s), in order. Duplicates stay observable — callers decide
 /// whether zero, one, or many values are admissible.
@@ -93,27 +86,6 @@ pub fn has_duplicate_cookie_names(headers: &HeaderMap) -> bool {
         }
     }
     false
-}
-
-/// `hasDuplicateCookieValue` — whether the named cookie appears more
-/// than once, regardless of value (a replay signal). Used by the
-/// pre-auth CSRF layer as defense in depth (403 CSRF_DUPLICATE).
-#[must_use]
-pub fn has_duplicate_cookie_name(headers: &HeaderMap, name: &str) -> bool {
-    let prefix = format!("{name}=");
-    let mut seen = 0usize;
-    for raw in headers
-        .get_all(COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-    {
-        for part in raw.split(';') {
-            if part.trim().starts_with(&prefix) {
-                seen += 1;
-            }
-        }
-    }
-    seen > 1
 }
 
 /// Builds a `Set-Cookie` value. The attributes mirror upstream

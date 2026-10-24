@@ -106,12 +106,29 @@ impl PreAuthCsrf for FakeSessions {
 
 impl SessionValidator for FakeSessions {
     async fn validate(&self, req: ValidationRequest) -> Result<Session, Failure> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(&req.token_hash)
-            .cloned()
-            .ok_or_else(|| Failure::new(FailureClass::SessionInvalidated, "not found", ""))
+        let invalidated = || Failure::new(FailureClass::SessionInvalidated, "not found", "");
+        if req.token_hash == [0u8; 32] {
+            return Err(invalidated());
+        }
+        let sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get(&req.token_hash) else {
+            return Err(invalidated());
+        };
+        // Mirror the real store's WHERE clause (`Store::validate`):
+        // lifecycle Active, security-epoch equality, and — when the
+        // route presented a CSRF hash — `csrf_hash` equality. The
+        // `Some([0;32])` sentinel means "route did not require CSRF",
+        // exactly like the store's `checkCSRF` flag. This is the real
+        // session-CSRF enforcement path upstream's
+        // `activeSessionWithCSRF` relies on.
+        let check_csrf = matches!(req.presented_csrf_hash, Some(h) if h != [0u8; 32]);
+        if session.state != SessionState::Active
+            || session.security_epoch != req.epoch
+            || (check_csrf && req.presented_csrf_hash != Some(session.csrf_hash))
+        {
+            return Err(invalidated());
+        }
+        Ok(session.clone())
     }
 }
 

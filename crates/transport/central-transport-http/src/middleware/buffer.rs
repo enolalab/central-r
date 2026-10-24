@@ -12,9 +12,13 @@
 //!   exchange by calling [`PrecommitSlot::arm`]: `activate_delivery`
 //!   runs exactly once *before* any byte reaches the wire. Activation
 //!   failure revokes the pending session and emits the bare `500`. On
-//!   success the buffered response is flushed; a post-activation failure
-//!   also revokes, because the client may have received partial
-//!   credentials (fail closed).
+//!   success the buffered response is returned for flush. Known gap vs
+//!   upstream: upstream could still observe a mid-flush write failure
+//!   and revoke the now-active session (partial credentials may have
+//!   reached the client). Here the flush happens in hyper after the
+//!   layer has returned the `Response`, so a post-activation write
+//!   failure is unobservable and cannot trigger the revoke — activation
+//!   before return remains the enforcement.
 //! - **Otherwise** — the buffered response is returned unchanged;
 //!   `activate_delivery` is never called.
 //!
@@ -55,8 +59,9 @@ pub struct Precommit {
     pub identity: RequestIdentity,
     /// The current workspace security epoch.
     pub epoch: SecurityEpoch,
-    /// The pending session row, revoked when activation or the
-    /// post-activation flush fails.
+    /// The pending session row, revoked when activation fails. (A
+    /// post-return write failure is unobservable here — see the module
+    /// doc.)
     pub session_id: SessionId,
 }
 
