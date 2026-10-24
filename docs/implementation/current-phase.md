@@ -1,12 +1,26 @@
 # Current Phase
 
-## Active slice: Phase R3 — Harness Control Plane & `central serve`
+## Active slice: Phase R4 — Multi-Agent Workflow Orchestration
 
-`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R3 is the active implementation slice**; Phases R1 and R2 are complete (see below) — R2 delivered the verified artifact lifecycle, the S3 object-store adapter, the fenced reconciler, and its kernel supervision.
+`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R4 is the active implementation slice**; Phases R1–R3 are complete (see below) — R3 delivered the harness control plane, the session/SSR web surface, `central serve`, and `central-harness-launcherd`.
 
-R3 scope (roadmap §6, ADR 0035/0036): implement the harness control plane and `central serve` — `central-harness` plus `central-adapter-harness` (Claude Code, OpenCode, Codex, Antigravity adapters, gitclone, launcher client, capture, permission bridging, budgets, cancel/resume/rerun), `central-session`, `central-transport-http` (API v1 JSON controllers plus the `askama` SSR Web UI and health/metrics endpoints), the `central-kernel` serve composition wiring the R2 reconciler component behind the recovery-coordinator fence, the `bins/central` serve surface, and `central-harness-launcherd`.
+R4 scope (roadmap §7): Phase 2 orchestration parity — `central-workflow`, `central-eventjournal`, `central-scheduler`, `central-retry`, `central-runview`, `central-runsubmit`, the `b36` subtree-anchored checkpoints, and the 23-scenario recovery test matrix. R4 tasks T1–T9 (retry taxonomy, workflow graph domain, event journal, `b33`/`b35`/`b37` stores, scheduler claim/dispatch, `node decide`) already landed on this branch while gated on R3 T5/T12/T13; with R3 complete those gates are open and R4 T10–T14 (run submit, runview UI, subtree checkpoints, recovery matrix, acceptance) remain.
 
-Verification for every R3 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+Verification for every R4 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+
+## Completed: Phase R3 — Harness Control Plane & `central serve`
+
+Phase R3 delivered, per roadmap §6 and ADRs [0035](../adr/0035-freeze-b09-loop-coordinator-and-adopt-harness-session-boundary.md)/[0036](../adr/0036-add-a-separate-harness-launcher-for-operator-harness-sessions.md):
+
+- `central-harness`: the harness control-plane domain — adapter identity/capabilities vocabulary, the session boundary, capture, permission bridging, budget metering, and the cancel/resume/rerun + ambiguity-resolution state machines.
+- `central-adapter-harness`: the Claude Code, OpenCode, Codex, and Antigravity adapters (protocol codecs, argv grammars, probe pins), `gitclone` provision/capture, the CHL1 launcher client, and the `CENTRAL_LOCALEXEC` dev executor.
+- `central-session`: bootstrap-generation exchange, session cookies, and CSRF token issuance/verification.
+- `central-transport-http`: the API v1 JSON controllers and the `askama` SSR Web UI (bootstrap exchange, task list/detail, harness resolve and permission PRG flows, artifact preview/download), plus health/metrics with loopback-peer admission.
+- `central-adapter-postgres`: the fenced execution/recovery stores — recovery epochs with bounded claim batches and degraded-epoch quarantine, step-attempt reconciliation, command receipts, and the outbox.
+- `central-kernel`: the `central serve` composition — supervised listeners, the R2 artifact reconciler behind the recovery-coordinator fence, bootstrap reconciliation, bounded startup recovery, and graceful drain.
+- `bins/central`: the `serve` verb plus harness/session/node CLI surfaces; `bins/central-harness-launcherd` ports the ADR 0036 socket-activated launcher.
+- `scripts/r3-acceptance.sh` + `tests/acceptance/`: the Tier 4 Playwright SSR acceptance suite and its bounded end-to-end runner (provision → migrate → serve → seed → Playwright → teardown).
+- Committed `.sqlx/` offline query metadata for every new checked statement; the §7 fail-fast pipeline and the `CENTRAL_TEST_DSN`/`CENTRAL_TEST_MINIO_ENDPOINT`-gated integration suites are green.
 
 ## Completed: Phase R2 — Verified Artifact Lifecycle & Object Storage
 
@@ -52,7 +66,7 @@ Two upstream decisions shape everything below: [ADR 0035](../adr/0035-freeze-b09
 | --- | --- | --- |
 | R1 | Workspace scaffold, `v0..b37` extraction, native migration runner, durable Task/Execution core | **Complete** |
 | R2 | Verified artifact lifecycle, `central-adapter-s3` | **Complete** |
-| R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | **Active** |
-| R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | Pending |
+| R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | **Complete** |
+| R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | **Active** |
 | R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | Pending |
 | R6 | Backup, restore, wipe, maintenance, launcher daemons | Pending |

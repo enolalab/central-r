@@ -82,7 +82,16 @@ required-git-spec = "rev"
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # Recorded exception: RUSTSEC-2026-0374 flags `basic-toml` as
+    # unmaintained. It reaches the workspace only through
+    # `askama_derive` (compile-time template-config parsing in the
+    # `askama` proc-macro); it never runs at runtime and parses only the
+    # committed `askama.toml`. askama 0.16.x keeps the pin and the
+    # advisory offers no safe upgrade, so the recorded exception stands
+    # until upstream moves off `basic-toml`.
+    "RUSTSEC-2026-0374",
+]
 
 # --- 4. Bans and duplicates ---------------------------------------------------
 # Unexpected duplicate versions fail; each expected duplicate is recorded in

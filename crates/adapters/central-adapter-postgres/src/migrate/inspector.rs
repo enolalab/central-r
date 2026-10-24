@@ -1,7 +1,7 @@
 //! `Inspector` — read-only migration facts plus `verify_serve_baseline`,
 //! the authoritative serve-readiness audit (`inspector.go`).
 
-use sqlx::{Connection as _, PgConnection, PgPool, Row};
+use sqlx::{Connection as _, PgConnection, Row};
 
 use super::verify_shape::{
     schema_exists, table_exists, verify_baseline_shape, verify_full_chain, verify_migration_shapes,
@@ -18,13 +18,14 @@ fn invalid(code: &'static str, msg: impl Into<String>) -> Failure {
 
 enum Conn<'a> {
     Dedicated(&'a mut PgConnection),
-    Pool(PgPool),
+    Owned(PgConnection),
 }
 
 /// Read-only inspector. `for_connection` keeps operator inspection on the
 /// migration operator's one non-rebinding session (upstream
-/// `NewInspectorForConn`); `connect` uses a max-1 pool (upstream
-/// `NewInspector`).
+/// `NewInspectorForConn`); `connect` opens its own dedicated session —
+/// upstream `NewInspector` — which `verify_serve_baseline`'s
+/// dedicated-connection gate also accepts.
 pub struct Inspector<'a> {
     conn: Conn<'a>,
 }
@@ -37,40 +38,35 @@ impl<'a> Inspector<'a> {
         }
     }
 
-    /// Inspection through a max-1 pool (`NewInspector`).
+    /// Inspection on its own dedicated session (`NewInspector`) — the
+    /// same non-rebinding connection serves `inspect` and the
+    /// serve-baseline audit, matching upstream's dedicated conn.
     ///
     /// # Errors
-    /// The pool cannot connect.
+    /// The session cannot connect.
     pub async fn connect(dsn: &str) -> Result<Inspector<'static>> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(dsn)
-            .await
-            .ctx("inspector: connect")?;
+        let conn = PgConnection::connect(dsn).await.ctx("inspector: connect")?;
         Ok(Inspector {
-            conn: Conn::Pool(pool),
+            conn: Conn::Owned(conn),
         })
     }
 
     /// `Inspect` — read-only [`PostgresMigrationFacts`].
     ///
     /// # Errors
-    /// Pool acquisition or any inspection query fails, or a dirty record or
-    /// non-terminal chain is observed.
+    /// Any inspection query fails, or a dirty record or non-terminal
+    /// chain is observed.
     pub async fn inspect(&mut self) -> Result<PostgresMigrationFacts> {
         match &mut self.conn {
             Conn::Dedicated(conn) => inspect_facts(conn).await,
-            Conn::Pool(pool) => {
-                let mut conn = pool.acquire().await.ctx("inspector: acquire conn")?;
-                inspect_facts(&mut conn).await
-            }
+            Conn::Owned(conn) => inspect_facts(conn).await,
         }
     }
 
     fn dedicated_conn(&mut self) -> Option<&mut PgConnection> {
         match &mut self.conn {
             Conn::Dedicated(conn) => Some(conn),
-            Conn::Pool(_) => None,
+            Conn::Owned(conn) => Some(conn),
         }
     }
 

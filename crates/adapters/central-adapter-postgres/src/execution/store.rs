@@ -4343,8 +4343,38 @@ impl RecoveryStore for Store {
         }
         let mut tx = begin_recovery_scan(&self.pool).await?;
         Self::lock_recovery_coordinator(&mut tx, &request.lease).await?;
-        // Requeue expired claims (bounded retry → failed).
-        sqlx::query!(
+        let mut epoch = read_locked_recovery_epoch_for_claim(
+            &mut tx,
+            request.epoch_generation,
+            request.lease.fence.generation,
+            &request.lease.recovery_domain,
+        )
+        .await?;
+        // A sealed epoch returns one terminal claim so the caller's
+        // batch loop records it and exits — an empty vector would spin
+        // the claim loop forever (upstream `Completed: true`).
+        if epoch.state == RecoveryEpochState::RecoveryEpochCompleted {
+            tx.commit().await.ctx("execution: commit claim")?;
+            return Ok(vec![RecoveryWorkspaceClaim {
+                epoch,
+                coordinator_lease: request.lease.clone(),
+                completed: true,
+                ..RecoveryWorkspaceClaim::default()
+            }]);
+        }
+        // Anything neither open nor running is a durable quarantine:
+        // refuse the claim so the caller degrades-and-continues
+        // (upstream `RECOVERY_EPOCH_QUARANTINED`).
+        if !matches!(
+            epoch.state,
+            RecoveryEpochState::RecoveryEpochOpen | RecoveryEpochState::RecoveryEpochRunning
+        ) {
+            return Err(conflict("RECOVERY_EPOCH_QUARANTINED"));
+        }
+        // Requeue expired claims (bounded retry → failed). When any
+        // row exhausted its retry budget the epoch is degraded and the
+        // claim refused (upstream `RECOVERY_RETRY_EXHAUSTED`).
+        let exhausted = sqlx::query!(
             "WITH requeued AS ( \
              UPDATE central.recovery_epoch_workspaces AS work \
              SET delivery_state = CASE \
@@ -4375,20 +4405,22 @@ impl RecoveryStore for Store {
         )
         .fetch_one(&mut *tx)
         .await
-        .ctx("execution: requeue expired claims")?;
-        let epoch = read_locked_recovery_epoch_for_claim(
-            &mut tx,
-            request.epoch_generation,
-            request.lease.fence.generation,
-            &request.lease.recovery_domain,
-        )
-        .await?;
-        if matches!(
-            epoch.state,
-            RecoveryEpochState::RecoveryEpochCompleted | RecoveryEpochState::RecoveryEpochFailed
-        ) {
+        .ctx("execution: requeue expired claims")?
+        .failed;
+        if exhausted != 0 {
+            sqlx::query!(
+                "UPDATE central.recovery_epochs \
+                 SET state = 'degraded', completed_at = NULL, \
+                 updated_at = clock_timestamp() \
+                 WHERE epoch_generation = $1 AND coordinator_domain = $2",
+                request.epoch_generation,
+                request.lease.recovery_domain,
+            )
+            .execute(&mut *tx)
+            .await
+            .ctx("execution: degrade exhausted recovery epoch")?;
             tx.commit().await.ctx("execution: commit claim")?;
-            return Ok(Vec::new());
+            return Err(conflict("RECOVERY_RETRY_EXHAUSTED"));
         }
         let batch = select_recovery_workspace_batch(
             &mut tx,
@@ -4398,6 +4430,86 @@ impl RecoveryStore for Store {
             &request.lease.recovery_domain,
         )
         .await?;
+        // Upstream's empty-batch arm: no claimable row means either
+        // the epoch is done (seal it and return the terminal claim) or
+        // work is waiting on a retry deadline (return the
+        // database-derived delay so the caller sleeps instead of
+        // spinning).
+        if batch.is_empty() {
+            let incomplete = sqlx::query!(
+                "SELECT count(*) AS \"incomplete!\" \
+                 FROM central.recovery_epoch_workspaces AS work \
+                 JOIN central.recovery_epochs AS epoch \
+                   ON epoch.epoch_generation = work.epoch_generation \
+                  AND epoch.coordinator_domain = $2 \
+                 WHERE work.epoch_generation = $1 \
+                   AND work.delivery_state IN ('pending', 'claimed', 'failed')",
+                request.epoch_generation,
+                request.lease.recovery_domain,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .ctx("execution: count incomplete recovery work")?
+            .incomplete;
+            if incomplete == 0 {
+                sqlx::query!(
+                    "UPDATE central.recovery_epochs \
+                     SET state = 'completed', \
+                     completed_at = clock_timestamp(), \
+                     updated_at = clock_timestamp() \
+                     WHERE epoch_generation = $1 AND coordinator_domain = $2",
+                    request.epoch_generation,
+                    request.lease.recovery_domain,
+                )
+                .execute(&mut *tx)
+                .await
+                .ctx("execution: complete recovery epoch")?;
+                epoch.state = RecoveryEpochState::RecoveryEpochCompleted;
+            }
+            let mut retry_after = time::Duration::ZERO;
+            if incomplete != 0 {
+                let row = sqlx::query!(
+                    "SELECT GREATEST( \
+                       COALESCE( \
+                         min(CASE \
+                           WHEN work.delivery_state = 'pending' THEN work.retry_not_before \
+                           WHEN work.delivery_state = 'claimed' THEN work.claim_expires_at \
+                         END), \
+                         clock_timestamp() + interval '100 milliseconds'), \
+                       clock_timestamp() + interval '100 milliseconds') \
+                       AS \"next_ready_at!\", \
+                     clock_timestamp() AS \"database_now!\" \
+                     FROM central.recovery_epoch_workspaces AS work \
+                     JOIN central.recovery_epochs AS epoch \
+                       ON epoch.epoch_generation = work.epoch_generation \
+                      AND epoch.coordinator_domain = $2 \
+                     WHERE work.epoch_generation = $1 \
+                       AND work.delivery_state IN ('pending', 'claimed')",
+                    request.epoch_generation,
+                    request.lease.recovery_domain,
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .ctx("execution: read next recovery workspace deadline")?;
+                retry_after = row.next_ready_at - row.database_now;
+                const CLAIM_POLL_MINIMUM: time::Duration = time::Duration::milliseconds(100);
+                const RENEW_INTERVAL_CAP: time::Duration = time::Duration::seconds(10);
+                if retry_after < CLAIM_POLL_MINIMUM {
+                    retry_after = CLAIM_POLL_MINIMUM;
+                }
+                if retry_after > RENEW_INTERVAL_CAP {
+                    retry_after = RENEW_INTERVAL_CAP;
+                }
+            }
+            tx.commit().await.ctx("execution: commit claim")?;
+            return Ok(vec![RecoveryWorkspaceClaim {
+                epoch,
+                coordinator_lease: request.lease.clone(),
+                completed: incomplete == 0,
+                retry_after,
+                ..RecoveryWorkspaceClaim::default()
+            }]);
+        }
         let mut claims = Vec::with_capacity(batch.len());
         let mut last_cursor = epoch.scheduler_cursor;
         for work in &batch {

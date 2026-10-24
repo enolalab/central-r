@@ -24,7 +24,7 @@ use central_harness::port::{
     Adapter as _, ExitStatus, LaunchEnv, OperatorInput, PermissionDecision, PortFuture, Process,
     ProcessLauncher, ProcessSpec, ReconcileInput, Session, SessionRef, StartSpec,
 };
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 fn fixture(name: &str) -> Vec<u8> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1514,23 +1514,31 @@ async fn send_delivered_before_result() {
     }
     assert!(!rest.is_empty(), "fixture has no second turn");
     let workdir = tmpdir();
+    // The event stream is the only clock that orders the session's
+    // decode against the stdin writes. The second `FIX_ONE` message is
+    // turn one's result emitted turn-only — proof `queued()` was still
+    // true when it was processed. Only then may the held writes
+    // release, and turn two is emitted once the Send has resolved so
+    // its result finds an empty pipeline and ends the session.
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let (rest_tx, rest_rx) = oneshot::channel::<()>();
     let script: Script = Box::new(move |p: Arc<ScriptedProcess>| {
         Box::pin(async move {
+            // Arm before the stdin receiver attaches: no write can pass
+            // the attach gate and still see the hold unarmed, so the
+            // prompt write is always in flight when turn one's result
+            // lands — `queued()` cannot lose the race the fixed sleeps
+            // left open.
+            p.arm_hold();
             let mut rx = p.take_stdin_rx();
             let line1 = read_line(&mut rx).await;
             assert!(String::from_utf8_lossy(&line1).contains("marker-prompt"));
-            // Hold the follow-up write so the first result observes it
-            // in the pipeline (io.Pipe semantics).
-            p.arm_hold();
-            // Give the test a moment to call Send before turn one.
-            tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = p.emit_raw(turn_one.as_bytes()).await;
-            // Turn one ends while the follow-up is queued; release the
-            // write and read the follow-up line.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            release_rx.await.expect("release signal");
             p.release_writes();
             let line2 = read_line(&mut rx).await;
             assert!(String::from_utf8_lossy(&line2).contains("follow-up"));
+            rest_rx.await.expect("rest signal");
             let _ = p.emit_raw(rest.as_bytes()).await;
             while rx.recv().await.is_some() {}
             p.exit(ExitStatus {
@@ -1547,8 +1555,43 @@ async fn send_delivered_before_result() {
         })
         .await
     });
-    let ev = collect(&*run.session).await;
-    send.await.expect("send task").expect("send delivered");
+    // Drain the whole stream; the second `FIX_ONE` message (step
+    // update, then the queued-path result) proves turn one's result
+    // was processed with `queued()` true, so the held writes may
+    // release and — once the Send resolved, leaving an empty pipeline
+    // — turn two is fed and its result ends the session.
+    let mut ev = Vec::new();
+    let mut fix_one = 0;
+    let mut send = Some(send);
+    let mut release_tx = Some(release_tx);
+    let mut rest_tx = Some(rest_tx);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let e = match tokio::time::timeout_at(deadline, run.session.next_event())
+            .await
+            .expect("timed out draining events")
+        {
+            Some(e) => e,
+            None => break,
+        };
+        e.validate().expect("invalid event");
+        assert_eq!(e.seq as usize, ev.len() + 1, "seq");
+        if let Some(EventPayload::Message(m)) = &e.payload
+            && m.text == "FIX_ONE\n"
+        {
+            fix_one += 1;
+        }
+        ev.push(e);
+        if fix_one == 2 && release_tx.is_some() {
+            let _ = release_tx.take().expect("release sent once").send(());
+            tokio::time::timeout_at(deadline, send.take().expect("send awaited once"))
+                .await
+                .expect("timed out awaiting send")
+                .expect("send task")
+                .expect("send delivered");
+            let _ = rest_tx.take().expect("rest sent once").send(());
+        }
+    }
     assert_eq!(terminal_of(&ev).status, TerminalStatus::Succeeded);
     let msgs = messages(&ev);
     assert_eq!(msgs.last().unwrap(), "FIX_TWO\n");

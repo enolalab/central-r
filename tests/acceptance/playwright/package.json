@@ -1,0 +1,16 @@
+{
+  "name": "central-r3-acceptance",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Phase R3 Playwright SSR acceptance suite for central serve",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.11.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@playwright/test": "^1.64.0",
+    "@types/node": "^24.0.0"
+  }
+}

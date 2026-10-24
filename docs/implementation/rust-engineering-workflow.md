@@ -174,7 +174,7 @@ The audited syscall boundary (`central-adapter-linux`) and the launcher binaries
 
 ### 8.4 Tier 4 — Playwright SSR browser acceptance
 
-When `central-transport-http` + SSR Web UI lands (R3), Playwright drives the server-rendered surfaces end to end: bootstrap exchange, session delivery, approval flows, artifact download, and accessibility smoke flows. Until R3, this tier is documented but not yet wired — an explicit statement, not a silent omission.
+Wired since R3 closeout. `tests/acceptance/playwright/` drives the server-rendered surfaces end to end against a live `central serve`: bootstrap exchange and session delivery, pre-auth CSRF handling, the task list/detail pages, the harness resolve panel ("Mark cancelled" settles an ambiguous attempt), the permission approve/deny PRG flow, artifact preview/download against the object store, and an accessibility smoke pass (landmarks, labels, required markers, skip link). `scripts/r3-acceptance.sh` is the bounded runner: it provisions a scratch database through the native migration runner, starts `central serve` with `CENTRAL_LOCALEXEC=1`, waits for `/health/ready`, seeds the rerunnable fixtures in `tests/acceptance/seed.sql` (plus the artifact object body when `CENTRAL_TEST_MINIO_ENDPOINT` or the `adobe/s3mock` fallback supplies an S3 endpoint), runs Playwright, and tears down with bounded timeouts and meaningful exit codes.
 
 ## 9. Change rules
 

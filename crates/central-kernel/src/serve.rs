@@ -529,10 +529,17 @@ impl Component for HttpListenerComponent {
         let router = self.router.clone();
         let token = self.token.clone();
         Box::pin(async move {
-            axum::serve(listener, router.into_make_service())
-                .with_graceful_shutdown(token.cancelled_owned())
-                .await
-                .map_err(|e| Failure::internal("http_listener_serve", e.to_string()))
+            // `into_make_service_with_connect_info` injects
+            // `ConnectInfo<SocketAddr>` — the admission middleware's
+            // loopback-peer check (upstream `r.RemoteAddr`) reads it;
+            // without it every request fails `PEER_NOT_LOOPBACK`.
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(token.cancelled_owned())
+            .await
+            .map_err(|e| Failure::internal("http_listener_serve", e.to_string()))
         })
     }
 

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"incomplete!\" FROM central.recovery_epoch_workspaces AS work JOIN central.recovery_epochs AS epoch ON epoch.epoch_generation = work.epoch_generation AND epoch.coordinator_domain = $2 WHERE work.epoch_generation = $1 AND work.delivery_state IN ('pending', 'claimed', 'failed')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "incomplete!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8671e62b2043bb698ab0835c9b7cbdaae9126e4e3606764c494bcac3a3c1ed0c"
+}
