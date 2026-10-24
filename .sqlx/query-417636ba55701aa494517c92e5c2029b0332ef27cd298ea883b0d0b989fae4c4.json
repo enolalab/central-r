@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT final_state, invocation_generation, producer_id,          eligible_after > clock_timestamp() + interval '89 days' AS \"windowed!\",          (SELECT string_agg(evidence_id, ',' ORDER BY evidence_kind, evidence_id)            FROM central.provider_completion_references            WHERE completion_receipt_id = r.id) AS \"refs!\"          FROM central.execution_completion_receipts r          WHERE workspace_id = $1 AND step_attempt_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "final_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "invocation_generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "producer_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "windowed!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "refs!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "417636ba55701aa494517c92e5c2029b0332ef27cd298ea883b0d0b989fae4c4"
+}

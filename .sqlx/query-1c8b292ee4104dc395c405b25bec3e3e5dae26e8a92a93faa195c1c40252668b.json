@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.provider_completion_references ( workspace_id, completion_receipt_id, evidence_kind, evidence_id) VALUES ($1, $2, $3, $4) ON CONFLICT (workspace_id, completion_receipt_id, evidence_kind, evidence_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1c8b292ee4104dc395c405b25bec3e3e5dae26e8a92a93faa195c1c40252668b"
+}

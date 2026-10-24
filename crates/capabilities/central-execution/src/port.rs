@@ -16,7 +16,9 @@ use crate::domain::{
     ExecutionState, ExpectedVersions, LeaseCredential, LogicalOperationId, RequestFingerprint,
     TrustedScope,
 };
-use crate::harness_run::{B09EvidenceReference, DispatchableRun, ListDispatchableRunsRequest};
+use crate::harness_run::{
+    B09EvidenceReference, CompletionReceipt, DispatchableRun, ListDispatchableRunsRequest,
+};
 use crate::resume::{
     RecoveryCoordinatorFence, RecoveryEpoch, RecoveryEpochState, RecoveryWorkspaceState,
     RecoveryWorkspaceWork,
@@ -566,6 +568,32 @@ pub trait DispatchableRunReader {
         &self,
         request: ListDispatchableRunsRequest,
     ) -> Result<Vec<DispatchableRun>, Failure>;
+}
+
+/// `CompletionReceiptStore` records bounded immutable evidence after an
+/// invocation and before settlement (upstream `port.CompletionReceiptStore`).
+/// A future external-effect owner may call this boundary; B08 itself
+/// performs no provider or Tool invocation.
+#[trait_variant::make(Send)]
+pub trait CompletionReceiptStore {
+    /// `RecordCompletionReceipt`.
+    async fn record_completion_receipt(
+        &self,
+        request: RecordCompletionReceiptRequest,
+    ) -> Result<(), Failure>;
+}
+
+/// `RecordCompletionReceiptRequest`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordCompletionReceiptRequest {
+    /// The authenticated scope.
+    pub scope: TrustedScope,
+    /// The immutable completion evidence.
+    pub receipt: CompletionReceipt,
+    /// The held lease bearer fencing the write.
+    pub lease_credential: LeaseCredential,
+    /// The held lease generation fencing the write.
+    pub lease_generation: i64,
 }
 
 /// `Clock` — the single time source services depend on.

@@ -32,9 +32,8 @@
 //! - `LOCK TABLE` and `pg_advisory_xact_lock` are runtime statements
 //!   (not leaf queries), so they use `sqlx::query`, consistent with
 //!   `store_support::begin_tx`'s `set_config` precedent.
-//! - The Rust port carries no `RecordCompletionReceipt`,
-//!   `ReadB09Admission`, outbox scheduler claim, or metrics surface;
-//!   completion receipts are read only inside the recovery scan.
+//! - The Rust port carries no `ReadB09Admission`, outbox scheduler
+//!   claim, or metrics surface.
 
 use central_execution::domain::{
     ExpectedVersions, InvocationId, LogicalOperationId, PhysicalAttemptId, ZERO_TIME,
@@ -44,6 +43,7 @@ use central_foundation::identity::{ApprovalId, RunId, StepAttemptId, StepId, Too
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 
+mod completion_receipt;
 mod dispatchable;
 mod failed_recovery_workspaces;
 mod queries;

@@ -14,20 +14,21 @@ use central_adapter_postgres::execution::Store;
 use central_adapter_postgres::migrate::BaselineInstaller;
 use central_execution::domain::{
     self, Approval, ApprovalState, ApprovalSubject, ApprovalSuccessorActionDescriptor,
-    AttemptState, Capability, EventIntent, ExecutionChangeSet, ExpectedVersions, Lease,
-    LeaseAssertion, LeaseCredential, LogicalOperationId, NIL_APPROVAL_ID, NIL_STEP_ID,
+    AttemptState, Capability, EventIntent, ExecutionChangeSet, ExpectedVersions, InvocationId,
+    Lease, LeaseAssertion, LeaseCredential, LogicalOperationId, NIL_APPROVAL_ID, NIL_STEP_ID,
     OutboxIntent, PhysicalAttemptId, Step, StepAttempt, StepState, TrustedScope,
 };
 use central_execution::harness_run::{
-    B09EvidenceReference, DispatchCase, ListDispatchableRunsRequest,
+    B09EvidenceReference, CompletionReceipt, DispatchCase, ListDispatchableRunsRequest,
 };
 use central_execution::port::{
     B09EvidenceStore, ClaimRecoveryWorkspaceRequest, CommitRequest,
-    CompleteRecoveryWorkspaceRequest, CompositeExecutionStore, CompositeStore,
-    DispatchableRunReader, ExecutionRead, ExecutionReadRequest, LeaseCredentialValidator,
-    LeaseValidationRequest, OutboxStore, ReceiptBinding, ReceiptLookupRequest,
-    RecoveryClaimabilityReader, RecoveryCoordinatorAcquireRequest, RecoveryStore,
-    ResumeRecoveryEpochRequest, StartRecoveryEpochRequest,
+    CompleteRecoveryWorkspaceRequest, CompletionReceiptStore, CompositeExecutionStore,
+    CompositeStore, DispatchableRunReader, ExecutionRead, ExecutionReadRequest,
+    LeaseCredentialValidator, LeaseValidationRequest, OutboxStore, ReceiptBinding,
+    ReceiptLookupRequest, RecordCompletionReceiptRequest, RecoveryClaimabilityReader,
+    RecoveryCoordinatorAcquireRequest, RecoveryStore, ResumeRecoveryEpochRequest,
+    StartRecoveryEpochRequest,
 };
 use central_execution::resume::{
     self, RecoveryEpochState, RecoveryWorkspaceState, ResumeRecoveryEpochCommand,
@@ -1940,5 +1941,254 @@ async fn resume_replays_stored_payload_and_rejects_rebinding() -> Result<()> {
         .unwrap_err();
     assert_eq!(err.kind(), FailureKind::Conflict);
     assert_eq!(err.code(), "IDEMPOTENCY_CONFLICT");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CompletionReceiptStore — the fenced, idempotent B10 handoff evidence.
+// ---------------------------------------------------------------------------
+
+/// Fixture: task + run + prepared step/attempt committed under the
+/// no-active-lease fence, then `execution.claim`'s lease grant, then
+/// `mark_attempt_invoked`. Returns everything `record_completion_receipt`
+/// needs.
+async fn receipt_target(
+    pool: &PgPool,
+    store: &Store,
+    ws: WorkspaceId,
+    task_id: TaskId,
+    run_id: RunId,
+    label: &str,
+) -> Result<(Step, StepAttempt, LeaseCredential, uuid::Uuid)> {
+    let (req, step, att, _) = prepare_request(ws, task_id, run_id, label);
+    let binding = req.receipt_binding.clone();
+    store.commit(req).await?;
+
+    let credential = store.issue_lease_credential()?;
+    let expires = OffsetDateTime::now_utc() + time::Duration::seconds(60);
+    let claim_event = event_intent(
+        ws,
+        task_id,
+        run_id,
+        step.id,
+        att.id,
+        domain::EVENT_ATTEMPT_CLAIMED,
+    );
+    let claim_outbox = outbox_intent(
+        ws,
+        &claim_event,
+        &format!("execution.claim:{label}"),
+        domain::OUTBOX_ATTEMPT_CLAIMED,
+    );
+    let mut cs = ExecutionChangeSet::new();
+    cs.events.push(claim_event);
+    cs.outbox.push(claim_outbox);
+    cs.leases.push(Lease {
+        workspace_id: ws,
+        run_id,
+        credential,
+        generation: 1,
+        expires_at: expires,
+        updated_at: expires,
+    });
+    let mut claim_req = commit_req(ws, task_id, run_id, "execution.claim", binding, cs, label);
+    claim_req.assert_no_active_lease = false;
+    claim_req.require_recovery_claimable = true;
+    claim_req.expected_versions.step = 1;
+    claim_req.expected_versions.attempt = 1;
+    store.commit(claim_req).await?;
+
+    let invocation = uuid::Uuid::now_v7();
+    mark_attempt_invoked(pool, att.id, invocation).await?;
+    Ok((step, att, credential, invocation))
+}
+
+fn receipt_of(
+    ws: WorkspaceId,
+    task_id: TaskId,
+    run_id: RunId,
+    step: &Step,
+    att: &StepAttempt,
+    invocation: uuid::Uuid,
+) -> CompletionReceipt {
+    CompletionReceipt {
+        workspace_id: ws,
+        task_id,
+        run_id,
+        step_id: step.id,
+        attempt_id: att.id,
+        logical_operation_id: att.logical_operation_id,
+        physical_attempt_id: att.physical_attempt_id,
+        invocation_id: InvocationId(*invocation.as_bytes()),
+        invocation_generation: 1,
+        final_state: AttemptState::AttemptFailed,
+        outcome: serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "status": "failed",
+            "reason_code": "execution_failed",
+        }))
+        .unwrap_or_default(),
+        context: Vec::new(),
+        b09_references: Vec::new(),
+        producer_id: "harness-dispatcher".to_owned(),
+    }
+}
+
+fn receipt_req(
+    ws: WorkspaceId,
+    receipt: CompletionReceipt,
+    credential: LeaseCredential,
+    generation: i64,
+) -> RecordCompletionReceiptRequest {
+    RecordCompletionReceiptRequest {
+        scope: scope(ws),
+        receipt,
+        lease_credential: credential,
+        lease_generation: generation,
+    }
+}
+
+#[tokio::test]
+async fn completion_receipt_persists_and_replays() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "rcpt").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "rcpt-task").await?;
+    let run_id = run_id_of(&committed);
+    let (step, att, credential, invocation) =
+        receipt_target(&pool, &store, ws, committed.task.id, run_id, "rcpt").await?;
+
+    let mut receipt = receipt_of(ws, committed.task.id, run_id, &step, &att, invocation);
+    receipt.b09_references = vec![
+        B09EvidenceReference {
+            kind: "provider_evidence".to_owned(),
+            id: "ev-2".to_owned(),
+        },
+        B09EvidenceReference {
+            kind: "provider_evidence".to_owned(),
+            id: "ev-1".to_owned(),
+        },
+    ];
+    store
+        .record_completion_receipt(receipt_req(ws, receipt.clone(), credential, 1))
+        .await?;
+
+    // The receipt row, its sorted references and the 90-day eligibility
+    // window all landed in one commit.
+    let row = sqlx::query!(
+        "SELECT final_state, invocation_generation, producer_id,          eligible_after > clock_timestamp() + interval '89 days' AS \"windowed!\",          (SELECT string_agg(evidence_id, ',' ORDER BY evidence_kind, evidence_id)            FROM central.provider_completion_references            WHERE completion_receipt_id = r.id) AS \"refs!\"          FROM central.execution_completion_receipts r          WHERE workspace_id = $1 AND step_attempt_id = $2",
+        uuid_of!(ws),
+        uuid_of!(att.id),
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.final_state, "failed");
+    assert_eq!(row.invocation_generation, 1);
+    assert_eq!(row.producer_id, "harness-dispatcher");
+    assert!(row.windowed);
+    assert_eq!(row.refs, "ev-1,ev-2");
+
+    // An identical retry is a no-op even without the lease bearer:
+    // the digest replay check precedes the lease fence.
+    store
+        .record_completion_receipt(receipt_req(ws, receipt, LeaseCredential::default(), 0))
+        .await?;
+
+    // Drift under the same attempt is the conflict.
+    let mut drifted = receipt_of(ws, committed.task.id, run_id, &step, &att, invocation);
+    drifted.outcome = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "status": "succeeded",
+    }))
+    .unwrap_or_default();
+    drifted.final_state = AttemptState::AttemptSucceeded;
+    let err = store
+        .record_completion_receipt(receipt_req(ws, drifted, credential, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "COMPLETION_RECEIPT_CONFLICT");
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_receipt_refuses_fences() -> Result<()> {
+    skip!();
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, "rcptf").await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    let committed = submit_task(&pool, ws, "rcptf-task").await?;
+    let run_id = run_id_of(&committed);
+    let (step, att, credential, invocation) =
+        receipt_target(&pool, &store, ws, committed.task.id, run_id, "rcptf").await?;
+    let receipt = receipt_of(ws, committed.task.id, run_id, &step, &att, invocation);
+
+    // A wrong bearer is fenced.
+    let wrong = store.issue_lease_credential()?;
+    let err = store
+        .record_completion_receipt(receipt_req(ws, receipt.clone(), wrong, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "STALE_LEASE_FENCE");
+
+    // A wrong generation is fenced.
+    let err = store
+        .record_completion_receipt(receipt_req(ws, receipt.clone(), credential, 2))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "STALE_LEASE_FENCE");
+
+    // An invalid credential is denied outright.
+    let err = store
+        .record_completion_receipt(receipt_req(
+            ws,
+            receipt.clone(),
+            LeaseCredential::default(),
+            1,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "COMPLETION_RECEIPT_DENIED");
+
+    // A scope without the executor capability is denied.
+    let mut denied_req = receipt_req(ws, receipt.clone(), credential, 1);
+    denied_req.scope = TrustedScope::new("exec-principal", ws, &[Capability::Approver])
+        .unwrap_or_else(|_| unreachable!("approver scope builds"));
+    let err = store
+        .record_completion_receipt(denied_req)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "COMPLETION_RECEIPT_DENIED");
+
+    // The persisted attempt selector must match: another invocation id
+    // is the mismatch.
+    let mut drifted = receipt.clone();
+    drifted.invocation_id = InvocationId(*uuid::Uuid::now_v7().as_bytes());
+    let err = store
+        .record_completion_receipt(receipt_req(ws, drifted, credential, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "COMPLETION_RECEIPT_MISMATCH");
+
+    // A selector outside the lease-bound attempt (a fresh prepared
+    // fixture that was never claimed) is fenced before persistence.
+    let (_, step2, att2, _) = prepare_request(ws, committed.task.id, run_id, "rcptf-2");
+    let mut second = receipt_of(ws, committed.task.id, run_id, &step2, &att2, invocation);
+    second.invocation_id = InvocationId(*uuid::Uuid::now_v7().as_bytes());
+    // The lease binds the first attempt, so the fence refuses first.
+    let err = store
+        .record_completion_receipt(receipt_req(ws, second.clone(), credential, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "STALE_LEASE_FENCE");
     Ok(())
 }
