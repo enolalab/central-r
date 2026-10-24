@@ -24,6 +24,13 @@ central-checkpoint = { path = "../../crates/capabilities/central-checkpoint", ve
 # store seam; the binary composes the PostgreSQL workflow store
 # exactly as upstream's `cmd/central/node_composition.go` does.
 central-workflow = { path = "../../crates/capabilities/central-workflow", version = "0.1.0" }
+# `central serve` + `harness resume|rerun|cancel` (Phase R3 task 13):
+# the verbs compose the execution/task/harness stores and the same
+# kernel operator the web surface runs — no second authority.
+central-execution = { path = "../../crates/capabilities/central-execution", version = "0.1.0" }
+central-task = { path = "../../crates/capabilities/central-task", version = "0.1.0" }
+central-harness = { path = "../../crates/capabilities/central-harness", version = "0.1.0" }
+central-transport-http = { path = "../../crates/transport/central-transport-http", version = "0.1.0" }
 central-adapter-postgres = { path = "../../crates/adapters/central-adapter-postgres", version = "0.1.0" }
 central-adapter-s3 = { path = "../../crates/adapters/central-adapter-s3", version = "0.1.0" }
 serde_json.workspace = true

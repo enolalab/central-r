@@ -31,6 +31,7 @@
 //! `Shutdown`: the durable claim is left fenced and resumable, so the
 //! same coordinator generation resumes the work.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use central_artifact::app::ResumeLifecycle;
@@ -72,6 +73,16 @@ where
     }
 }
 
+/// `Arc<T>` shares one reconciler between the startup gate (which
+/// needs the same instance's `reconcile` for the one-shot recovery
+/// pass) and the supervised component — upstream passes the same
+/// `*Reconciler` to both.
+impl<T: ArtifactPass + ?Sized> ArtifactPass for Arc<T> {
+    fn reconcile<'a>(&'a self, fence: &'a Fence) -> BoxFuture<'a, Result<PassReport, Failure>> {
+        (**self).reconcile(fence)
+    }
+}
+
 /// The artifact-work fence source — upstream `artifactFenceSource`,
 /// normally B08's recovery coordinator. It yields and renews the
 /// single artifact-reconciliation claim derived from the coordinator
@@ -93,6 +104,26 @@ pub trait ArtifactFenceSource: Send + Sync + 'static {
         &'a self,
         held: &'a ArtifactWorkClaim,
     ) -> BoxFuture<'a, Result<ArtifactWorkClaim, Failure>>;
+}
+
+/// `Arc<T>` shares one coordinator between the startup gate (the
+/// artifact-recovery pass needs the same lease authority) and the
+/// component — upstream passes the same `*RecoveryCoordinator` to
+/// both.
+impl<T: ArtifactFenceSource + ?Sized> ArtifactFenceSource for Arc<T> {
+    fn claim_artifact_work<'a>(
+        &'a self,
+        epoch: &'a RecoveryEpoch,
+    ) -> BoxFuture<'a, Result<ArtifactWorkClaim, Failure>> {
+        (**self).claim_artifact_work(epoch)
+    }
+
+    fn renew_artifact_work<'a>(
+        &'a self,
+        held: &'a ArtifactWorkClaim,
+    ) -> BoxFuture<'a, Result<ArtifactWorkClaim, Failure>> {
+        (**self).renew_artifact_work(held)
+    }
 }
 
 impl<R, C> ArtifactFenceSource for RecoveryCoordinatorService<R, C>

@@ -18,9 +18,22 @@ central-task = { path = "../capabilities/central-task", version = "0.1.0" }
 central-adapter-harness = { path = "../adapters/central-adapter-harness", version = "0.1.0" }
 central-adapter-linux = { path = "../adapters/central-adapter-linux", version = "0.1.0" }
 central-adapter-postgres = { path = "../adapters/central-adapter-postgres", version = "0.1.0" }
+# The serve root binds the B10 object store to the artifact capability
+# (rust-application-boundaries.md §2.2 kernel edge).
+central-adapter-s3 = { path = "../adapters/central-adapter-s3", version = "0.1.0" }
+# The operator surface implements the transport's `web::HarnessOperator`
+# port; the serve root also builds the app/ops routers (Task 13).
+central-transport-http = { path = "../transport/central-transport-http", version = "0.1.0" }
 # The dev-gated bootstrap returns the session capability's own typed
 # contract (`central-session` is a capability peer, not an adapter).
 central-session = { path = "../capabilities/central-session", version = "0.1.0" }
+# Task 13 serve edge: the kernel opens the runtime pool, serves the
+# axum routers it builds, reads the audited uid for the sealer, and
+# owns the metrics registry the ops listener encodes.
+axum.workspace = true
+prometheus-client.workspace = true
+rustix.workspace = true
+sqlx.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

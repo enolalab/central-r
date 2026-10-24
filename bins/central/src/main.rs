@@ -25,7 +25,9 @@ use central_kernel::lifecycle;
 
 mod artifact_cli;
 mod checkpoint_cli;
+mod harness_cli;
 mod node_cli;
+mod serve;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,8 +50,15 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
         }
         Resolution::Command(command_id) => {
             // The landed slices own their envelopes end to end:
-            // `artifact read` (plus its `--stdout` byte ownership),
-            // every `checkpoint *` verb, and `node decide`.
+            // `serve`, `harness resume|rerun|cancel`, `artifact read`
+            // (plus its `--stdout` byte ownership), every
+            // `checkpoint *` verb, and `node decide`.
+            if command_id == "serve" {
+                return serve::serve(&verb_tokens(args), stdout, stderr);
+            }
+            if command_id.starts_with("harness.") {
+                return harness_cli::harness(&command_id, &verb_tokens(args), stdout, stderr);
+            }
             if command_id == "artifact.read" {
                 return artifact_cli::artifact_read(&verb_tokens(args), stdout, stderr);
             }
@@ -309,22 +318,23 @@ mod tests {
     }
 
     #[test]
-    fn version_flag_after_a_positional_verb_reaches_the_deferred_path() {
-        // `central serve --version` is a deferred `serve` invocation,
-        // not a version print — the flag belongs to the command.
-        for argv in [
-            &["serve", "--version"][..],
-            &["serve", "-V"][..],
-            &["local", "up", "--version"][..],
-        ] {
+    fn version_flag_after_a_positional_verb_reaches_the_command() {
+        // `central serve --version` is a `serve` invocation, not a
+        // version print — the flag belongs to the command (upstream
+        // `runCentralServe` takes no flags). Without the runtime env
+        // serve refuses at exit 3, never a version print and never
+        // the deferred-verb placeholder.
+        for argv in [&["serve", "--version"][..], &["serve", "-V"][..]] {
             let (code, stdout, _) = invoke(argv);
-            assert_eq!(code, 5, "argv {argv:?}");
             let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
-            assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
+            assert_eq!(parsed["command_id"], "serve", "argv {argv:?}");
+            assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE", "argv {argv:?}");
+            assert_eq!(code, 3, "argv {argv:?}");
         }
-        let (_, stdout, _) = invoke(&["serve", "--version"]);
+        let (code, stdout, _) = invoke(&["local", "up", "--version"]);
+        assert_eq!(code, 5);
         let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
-        assert_eq!(parsed["command_id"], "serve");
+        assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
     }
 
     #[test]
@@ -349,7 +359,11 @@ mod tests {
         // sensitive ids — all UNSUPPORTED_IN_THIS_SLICE until the owning
         // slice lands (local-development-environment.md §11).
         let cases: &[(&[&str], &str)] = &[
-            (&["serve"], "serve"),
+            // `serve` and `harness resume|rerun|cancel` are landed
+            // (task 13): they route to their own composition and
+            // report their own unavailable reasons — covered by
+            // `serve_without_env_is_unavailable` and
+            // `harness_verbs_without_env_are_unavailable` below.
             (&["local", "init"], "local.init"),
             (&["local", "init", "--status"], "local.init.status"),
             (&["local", "init", "--resume=abc"], "local.init.resume"),
@@ -429,7 +443,10 @@ mod tests {
                 &["--config", "/abs/central.json", "local", "up"],
                 "local.up",
             ),
-            (&["--config=/abs/central.json", "serve"], "serve"),
+            // `serve` is landed (task 13): it no longer sits in the
+            // deferred-verb table — the dedicated
+            // `serve_without_env_is_unavailable_at_exit_3` test below
+            // covers its exit-3 dependency refusal.
         ];
         for (argv, want_id) in cases {
             let (code, stdout, _) = invoke(argv);
@@ -465,6 +482,59 @@ mod tests {
         assert_eq!(parsed["command_id"], "artifact.read");
         assert_eq!(parsed["exit_code"], 5);
         assert_eq!(parsed["reason"], "ARTIFACT_READ_UNAVAILABLE");
+    }
+
+    #[test]
+    fn serve_without_env_is_unavailable_at_exit_3() {
+        // `serve` is landed (task 13): without the runtime credential
+        // env it reports DEPENDENCY_UNAVAILABLE at exit 3, never the
+        // deferred-verb placeholder.
+        let (code, stdout, _) = invoke(&["serve"]);
+        assert_eq!(code, 3);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["schema_version"], "central.local-result/v1");
+        assert_eq!(parsed["command_id"], "serve");
+        assert_eq!(parsed["exit_code"], 3);
+        assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE");
+    }
+
+    #[test]
+    fn harness_verbs_without_env_are_unavailable() {
+        // `harness resume|rerun|cancel` are landed (task 13): a
+        // missing flag is a usage refusal at exit 2; fully flagged
+        // but without a DSN they report HARNESS_UNAVAILABLE at exit 3.
+        let (code, stdout, _) = invoke(&["harness", "resume"]);
+        assert_eq!(code, 2);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "harness.resume");
+        assert_eq!(parsed["reason"], "HARNESS_USAGE");
+
+        let (code, stdout, _) = invoke(&[
+            "harness",
+            "cancel",
+            "--workspace",
+            "00000000-0000-7000-8000-000000000001",
+            "--task",
+            "00000000-0000-7000-8000-000000000002",
+            "--run",
+            "00000000-0000-7000-8000-000000000003",
+        ]);
+        assert_eq!(code, 3);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "harness.cancel");
+        assert_eq!(parsed["reason"], "HARNESS_UNAVAILABLE");
+
+        // Every other harness verb stays fail-closed (R4–R6 slices).
+        for argv in [
+            &["harness", "status"][..],
+            &["harness", "launch", "--x"][..],
+            &["harness"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, 5, "argv {argv:?}");
+            let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+            assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
+        }
     }
 
     #[test]
