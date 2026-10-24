@@ -144,6 +144,55 @@ fn render_fields(fields: &[(&str, String)]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// TaskEventSink — upstream `harnessMilestones`.
+// ---------------------------------------------------------------------------
+
+/// Upstream `harnessMilestones` — maps every dispatcher/orchestrator
+/// [`Milestone`] onto the task event log writer. Appends are
+/// best-effort: the caller logs a failure and never fails the attempt.
+#[derive(Debug, Clone)]
+pub struct ServeTaskEventSink {
+    store: Arc<central_adapter_postgres::task::MilestoneStore>,
+}
+
+impl ServeTaskEventSink {
+    /// Binds the sink to the composed milestone store.
+    pub fn new(store: Arc<central_adapter_postgres::task::MilestoneStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl central_harness::app::ports::TaskEventSink for ServeTaskEventSink {
+    /// Upstream `Record` — `Append` dedups on `key`, so a repeated
+    /// milestone is a no-op, including a concurrent unique-race loser.
+    fn record<'a>(
+        &'a self,
+        m: central_harness::app::ports::Milestone,
+    ) -> PortFuture<'a, Result<(), central_foundation::failure::Failure>> {
+        Box::pin(async move {
+            let attempt_id = if m.step_attempt_id.is_nil() {
+                None
+            } else {
+                Some(m.step_attempt_id)
+            };
+            self.store
+                .append(&central_adapter_postgres::task::Milestone {
+                    key: m.key,
+                    kind: m.kind.as_str().to_string(),
+                    workspace_id: m.workspace_id,
+                    task_id: m.task_id,
+                    run_id: m.run_id,
+                    attempt_id,
+                    status: m.status,
+                    reason: m.reason,
+                    at: m.at,
+                })
+                .await
+        })
+    }
+}
+
 /// Convenience bundle — the four adapters serve composition hands to
 /// the harness chain in one place.
 #[derive(Debug, Clone)]

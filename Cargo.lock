@@ -877,6 +877,7 @@ version = "0.1.0"
 dependencies = [
  "central-adapter-harness",
  "central-adapter-linux",
+ "central-adapter-postgres",
  "central-artifact",
  "central-execution",
  "central-foundation",

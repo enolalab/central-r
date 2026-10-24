@@ -17,6 +17,7 @@ central-harness = { path = "../capabilities/central-harness", version = "0.1.0" 
 central-task = { path = "../capabilities/central-task", version = "0.1.0" }
 central-adapter-harness = { path = "../adapters/central-adapter-harness", version = "0.1.0" }
 central-adapter-linux = { path = "../adapters/central-adapter-linux", version = "0.1.0" }
+central-adapter-postgres = { path = "../adapters/central-adapter-postgres", version = "0.1.0" }
 # The dev-gated bootstrap returns the session capability's own typed
 # contract (`central-session` is a capability peer, not an adapter).
 central-session = { path = "../capabilities/central-session", version = "0.1.0" }
