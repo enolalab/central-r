@@ -546,7 +546,7 @@ pub struct DeliveryResult {
 /// mints the opaque session identifier and session-bound CSRF
 /// (request-scoped plaintext), hashes them, and supplies only the
 /// hashes here.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ActivationRequest {
     /// Ties the activation to the exact `delivery_pending` row.
     pub delivery_id: DeliveryId,
@@ -561,6 +561,18 @@ pub struct ActivationRequest {
     pub epoch: SecurityEpoch,
 }
 
+impl std::fmt::Debug for ActivationRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivationRequest")
+            .field("delivery_id", &self.delivery_id)
+            .field("token_hash", &"<redacted>")
+            .field("csrf_hash", &"<redacted>")
+            .field("identity", &self.identity)
+            .field("epoch", &self.epoch)
+            .finish()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation — request-time session validation
 // ---------------------------------------------------------------------------
@@ -569,7 +581,7 @@ pub struct ActivationRequest {
 /// The transport supplies the hash of the presented session token (and,
 /// where the route requires it, the presented session CSRF hash for
 /// comparison).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ValidationRequest {
     /// The hash of the session token presented by the browser.
     pub token_hash: [u8; 32],
@@ -579,6 +591,19 @@ pub struct ValidationRequest {
     pub presented_csrf_hash: Option<[u8; 32]>,
     /// The current workspace security epoch to validate against.
     pub epoch: SecurityEpoch,
+}
+
+impl std::fmt::Debug for ValidationRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidationRequest")
+            .field("token_hash", &"<redacted>")
+            .field(
+                "presented_csrf_hash",
+                &self.presented_csrf_hash.map(|_| "<redacted>"),
+            )
+            .field("epoch", &self.epoch)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

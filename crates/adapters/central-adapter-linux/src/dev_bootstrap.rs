@@ -259,10 +259,15 @@ fn load(inner: &mut Inner) -> Result<(), Failure> {
         Ok(_) => {}
     }
     let state: StateFile = serde_json::from_slice(&data).map_err(|_| denied())?;
-    if state.candidate_id.is_empty() && state.generation == 0 && state.digest.is_empty() {
-        // The all-empty record is a persisted Reset — still an empty
-        // registry regardless of the `activated` bit (upstream clears
-        // it through the same zero record).
+    if state.candidate_id.is_empty()
+        && state.generation == 0
+        && state.digest.is_empty()
+        && !state.activated
+    {
+        // The all-empty record is a persisted Reset — upstream requires
+        // `!Activated` in this conjunct, so an `{"activated":true}`-only
+        // file falls through to the digest decode and fails as invalid
+        // bootstrap candidate state.
         return Ok(());
     }
     let digest = hex_decode_32(&state.digest).map_err(|_| denied())?;
@@ -300,9 +305,13 @@ fn persist(inner: &Inner) -> Result<(), ()> {
     let data = serde_json::to_vec(&state).map_err(|_| ())?;
     let tmp = tmp_path(&inner.path);
     {
+        // Upstream `os.WriteFile(tmp, data, 0600)` truncates: a stale tmp
+        // left by a crash must not wedge every later persist (create_new
+        // would fail Exists forever).
         let mut f = OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(&tmp)
             .map_err(|_| ())?;
