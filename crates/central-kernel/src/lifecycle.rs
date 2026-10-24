@@ -212,6 +212,151 @@ pub trait Preflight: Send + 'static {
     fn run(&mut self) -> BoxFuture<'_, Result<PreflightReport, Failure>>;
 }
 
+/// The serving admission gate — port of upstream
+/// `kernel.ServingPreflight`. Unlike a bounded [`Preflight`], it owns
+/// the durable recovery drain: `startup_deadline` bounds only the
+/// inspection and the bounded connection acquisition, while recovery
+/// itself runs on `runtime` — the profile's runtime cancellation
+/// boundary — and may outlive the admission window (upstream
+/// `RunForServe(runtimeCtx, startupCtx)`). Cancelling `runtime` is the
+/// cooperative shutdown signal the gate observes at every cancellation
+/// point; the supervisor additionally drops the future on lease loss.
+pub trait ServingPreflight: Send + 'static {
+    /// Runs the admission inspection under `startup_deadline`, then the
+    /// durable recovery drain under `runtime`.
+    fn run_for_serve(
+        &mut self,
+        runtime: CancellationToken,
+        startup_deadline: Instant,
+    ) -> BoxFuture<'_, Result<PreflightReport, Failure>>;
+}
+
+/// The deployment-wide singleton — port of upstream
+/// `kernel.ControlLock`. `acquire` runs under the startup deadline; the
+/// returned lease is held for the whole runtime.
+pub trait ControlLock: Send + 'static {
+    /// Acquires the singleton; refusal while the startup budget holds is
+    /// a classified failure (upstream maps it to `LEASE_LOST`/exit 4).
+    fn acquire(&mut self) -> BoxFuture<'_, Result<Box<dyn ControlLockLease>, Failure>>;
+}
+
+/// The held singleton lease — port of upstream
+/// `kernel.ControlLockLease`. `lost` resolves once with the loss
+/// failure (a closed channel is itself a loss); it never resolves while
+/// the lease holds. `close` releases the lock and the dedicated
+/// connection exactly once.
+pub trait ControlLockLease: Send + 'static {
+    /// A fresh future resolving with the loss failure.
+    fn lost(&self) -> BoxFuture<'static, Failure>;
+    /// `Close` — release the lock and its dedicated connection.
+    fn close(&mut self) -> BoxFuture<'_, Result<(), Failure>>;
+}
+
+/// Bootstrap reconciliation — port of upstream
+/// `kernel.BootstrapReconciler`. Runs inside the startup budget after
+/// the serving gate and before readiness is published, so an
+/// interrupted bootstrap delivery reaches a terminal outcome before
+/// claims are exposed.
+pub trait BootstrapReconciler: Send + 'static {
+    /// Drives pending bootstrap candidates to a terminal outcome.
+    fn reconcile_bootstrap(&mut self) -> BoxFuture<'_, Result<(), Failure>>;
+}
+
+/// One supervised boundary the runtime select consumes — port of the
+/// upstream `<-chan error` behind `ControllerDisconnect`,
+/// `ParentDeath`, and `EpochChange`. `tripped` returns a fresh future
+/// each call; it resolves once when the boundary trips and stays
+/// pending while it holds.
+pub trait BoundaryWatch: Send + 'static {
+    /// A fresh future resolving with the boundary's failure.
+    fn tripped(&self) -> BoxFuture<'static, Failure>;
+}
+
+/// A shared one-shot failure notifier — the channel half of a
+/// [`BoundaryWatch`]. A producer signals the trip once; every `watch`
+/// call returns a future that observes the same value. `Clone` shares
+/// the same channel (upstream's buffered one-slot `chan error`).
+#[derive(Clone)]
+pub struct WatchSource {
+    tx: tokio::sync::watch::Sender<Option<Failure>>,
+    rx: tokio::sync::watch::Receiver<Option<Failure>>,
+}
+
+impl WatchSource {
+    /// A quiet source: `watch` pends until [`signal`](Self::signal).
+    #[must_use]
+    pub fn new() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        Self { tx, rx }
+    }
+
+    /// Trips the boundary (first signal wins — upstream's buffered
+    /// one-shot `chan error`).
+    pub fn signal(&self, failure: Failure) {
+        let _ = self.tx.send(Some(failure));
+    }
+
+    /// A fresh future over the trip, [`'static`](static) so the runtime
+    /// select may hold it across the supervisor's own borrows. A sender
+    /// that closed without a value is itself a boundary loss (upstream
+    /// treats a closed channel the same way).
+    pub fn watch(&self) -> BoxFuture<'static, Failure> {
+        let mut rx = self.rx.clone();
+        Box::pin(async move {
+            loop {
+                if let Some(failure) = rx.borrow().clone() {
+                    return failure;
+                }
+                if rx.changed().await.is_err() {
+                    return Failure::internal(
+                        "kernel_boundary_watch_closed",
+                        "boundary watch channel closed without a value",
+                    );
+                }
+            }
+        })
+    }
+}
+
+impl Default for WatchSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The pending arm for an optional watch: resolves with the boundary
+/// failure, or never resolves when no watch is installed.
+async fn watch_or_pending(watch: &mut Option<BoxFuture<'static, Failure>>) -> Failure {
+    match watch {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A non-blocking poll of a watch — the port of upstream
+/// `startupControlLeaseFailure`'s `select … default` check on
+/// `lease.Lost()`.
+async fn watch_now(watch: &mut Option<BoxFuture<'static, Failure>>) -> Option<Failure> {
+    tokio::select! {
+        biased;
+        failure = watch_or_pending(watch) => Some(failure),
+        () = std::future::ready(()) => None,
+    }
+}
+
+/// The startup-deadline failure inside the admission window: upstream
+/// maps a deadline-expired startup context error to `exitError(5,
+/// "POSTGRES_INCOMPATIBLE")` — [`FailureKind`](central_foundation::failure::FailureKind)::Conflict
+/// classifies to [`ExitClass::Incompatible`] so [`startup_failure`]
+/// lands the same code and reason.
+fn startup_deadline_failure(message: &'static str) -> Failure {
+    Failure::new(
+        central_foundation::failure::FailureKind::Conflict,
+        "kernel_startup_deadline",
+        message,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Profile configuration
 // ---------------------------------------------------------------------------
@@ -344,12 +489,14 @@ impl ProofSession<'_> {
 
 /// How the supervised phase ended.
 enum Cause {
-    /// `stop` completed or the profile token was cancelled.
+    /// `stop` completed, the profile token was cancelled, or the
+    /// controller boundary tripped (upstream treats controller
+    /// disconnect as an intentional stop).
     Stop,
-    /// A component's `run` completed — always terminal, even when it
-    /// returned `Ok` (upstream treats nil error as "terminated
-    /// unexpectedly").
-    Terminal(Failure),
+    /// A terminal boundary: a component's `run` completed, a parent
+    /// process died, the lease was lost, or the security epoch changed.
+    /// Carries the safe reason upstream `fail(reason, cause)` marks.
+    Terminal(&'static str, Failure),
 }
 
 /// The supervised serve profile: manual dependency composition +
@@ -363,6 +510,12 @@ pub struct Profile {
     cancel: CancellationToken,
     components: Vec<Box<dyn Component>>,
     preflights: Vec<Box<dyn Preflight>>,
+    serving_preflight: Option<Box<dyn ServingPreflight>>,
+    control_lock: Option<Box<dyn ControlLock>>,
+    bootstrap: Option<Box<dyn BootstrapReconciler>>,
+    controller: Option<Box<dyn BoundaryWatch>>,
+    parent: Option<Box<dyn BoundaryWatch>>,
+    epoch: Option<Box<dyn BoundaryWatch>>,
     publisher: Option<Box<dyn ReadyProofPublisher>>,
     launch_id: Option<String>,
 }
@@ -380,6 +533,12 @@ impl Profile {
             cancel: CancellationToken::new(),
             components: Vec::new(),
             preflights: Vec::new(),
+            serving_preflight: None,
+            control_lock: None,
+            bootstrap: None,
+            controller: None,
+            parent: None,
+            epoch: None,
             publisher: None,
             launch_id: None,
         }
@@ -392,9 +551,48 @@ impl Profile {
     }
 
     /// Registers a startup preflight (runs before the ready proof is
-    /// issued, inside the startup budget).
+    /// issued, inside the startup budget — after the serving gate, the
+    /// way upstream's fresh `startupCtx` covers the post-recovery
+    /// stages).
     pub fn add_preflight(&mut self, preflight: impl Preflight) {
         self.preflights.push(Box::new(preflight));
+    }
+
+    /// Installs the serving admission gate — the upstream
+    /// `cfg.Preflight` serving kind that runs inspection under the
+    /// startup deadline and the durable recovery drain on the runtime
+    /// context.
+    pub fn set_serving_preflight(&mut self, gate: impl ServingPreflight) {
+        self.serving_preflight = Some(Box::new(gate));
+    }
+
+    /// Installs the deployment-wide singleton lock
+    /// (upstream `cfg.ControlLock`).
+    pub fn set_control_lock(&mut self, lock: impl ControlLock) {
+        self.control_lock = Some(Box::new(lock));
+    }
+
+    /// Installs the bootstrap reconciler (upstream `cfg.Bootstrap`).
+    pub fn set_bootstrap_reconciler(&mut self, reconciler: impl BootstrapReconciler) {
+        self.bootstrap = Some(Box::new(reconciler));
+    }
+
+    /// Installs the controller-disconnect boundary
+    /// (upstream `cfg.Controller` — a trip is an intentional stop).
+    pub fn set_controller_watch(&mut self, watch: impl BoundaryWatch) {
+        self.controller = Some(Box::new(watch));
+    }
+
+    /// Installs the parent-death boundary
+    /// (upstream `cfg.Parent` — a trip is a terminal failure).
+    pub fn set_parent_watch(&mut self, watch: impl BoundaryWatch) {
+        self.parent = Some(Box::new(watch));
+    }
+
+    /// Installs the epoch-change boundary
+    /// (upstream `cfg.Epoch` — a trip fails `EPOCH_MISMATCH`).
+    pub fn set_epoch_watch(&mut self, watch: impl BoundaryWatch) {
+        self.epoch = Some(Box::new(watch));
     }
 
     /// Installs the proof publisher that transfers the ready proof to
@@ -456,7 +654,17 @@ impl Profile {
         session: &mut ProofSession<'_>,
         readiness: &Readiness,
     ) -> Result<(), ExitError> {
-        let startup_deadline = Instant::now() + self.config.startup_limit;
+        let mut startup_deadline = Instant::now() + self.config.startup_limit;
+
+        /// Releases the singleton lease on an early-exit path — the port
+        /// of upstream's deferred `lease.Close(context.Background())`.
+        macro_rules! close_lease {
+            ($lease:expr) => {
+                if let Some(held) = $lease.as_mut() {
+                    let _ = held.close().await;
+                }
+            };
+        }
 
         // The persistent proof guard is the outer singleton; taking it
         // before admission closes the acquire->revoke race.
@@ -518,20 +726,18 @@ impl Profile {
             }
         }
 
-        // Startup admission: preflights run sequentially inside the
-        // startup budget.
-        for preflight in &mut self.preflights {
-            match timeout_at(startup_deadline, preflight.run()).await {
-                Ok(Ok(report)) => {
-                    if let Some(epoch) = report.security_epoch {
-                        readiness.set_security_epoch(epoch);
-                    }
-                }
+        // The deployment singleton must be held before any serving
+        // preflight can publish or reconcile durable recovery state —
+        // a losing serve process stops here without opening an epoch
+        // against the incumbent runtime (upstream `ControlLock.Acquire`
+        // under `startupCtx`; any refusal maps to LEASE_LOST/exit 4).
+        let mut lease: Option<Box<dyn ControlLockLease>> = match self.control_lock.as_mut() {
+            Some(lock) => match timeout_at(startup_deadline, lock.acquire()).await {
+                Ok(Ok(held)) => Some(held),
                 Ok(Err(cause)) => {
                     let _ = session.abort().await;
-                    let err = startup_failure(cause, "POSTGRES_INCOMPATIBLE");
-                    mark_startup_failure(readiness, &err);
-                    return Err(err);
+                    readiness.mark_not_ready("LEASE_LOST");
+                    return Err(ExitError::new(ExitClass::Timeout, "LEASE_LOST", cause));
                 }
                 Err(_) => {
                     let _ = session.abort().await;
@@ -541,10 +747,128 @@ impl Profile {
                         "LEASE_LOST",
                         Failure::internal(
                             "kernel_startup_deadline",
-                            "startup admission exceeded its budget",
+                            "control lock acquisition exceeded the startup budget",
                         ),
                     ));
                 }
+            },
+            None => None,
+        };
+
+        // The serving gate runs under the singleton lease
+        // (upstream `runPreflightUnderControlLease`): the bounded
+        // inspection/acquisition window under `startup_deadline`, the
+        // durable recovery drain on the runtime token — it may outlive
+        // the admission window but never the profile's cancellation. A
+        // lease loss observed mid-gate refuses startup instead of
+        // letting a second runtime reconcile under a dead lease.
+        if let Some(gate) = self.serving_preflight.as_mut() {
+            enum GateOutcome {
+                Done(Result<PreflightReport, Failure>),
+                LeaseLost(Failure),
+            }
+            let runtime = self.cancel.clone();
+            let mut lost = lease.as_ref().map(|held| held.lost());
+            let outcome = {
+                let gate_future = gate.run_for_serve(runtime, startup_deadline);
+                tokio::pin!(gate_future);
+                tokio::select! {
+                    failure = watch_or_pending(&mut lost) => GateOutcome::LeaseLost(failure),
+                    result = &mut gate_future => GateOutcome::Done(result),
+                }
+            };
+            match outcome {
+                GateOutcome::Done(Ok(report)) => {
+                    // Upstream `SetSecurityEpoch` lands from the serving
+                    // preflight's inspection result.
+                    if let Some(epoch) = report.security_epoch {
+                        readiness.set_security_epoch(epoch);
+                    }
+                }
+                GateOutcome::Done(Err(cause)) => {
+                    close_lease!(lease);
+                    let _ = session.abort().await;
+                    let err = startup_failure(cause, "POSTGRES_INCOMPATIBLE");
+                    mark_startup_failure(readiness, &err);
+                    return Err(err);
+                }
+                GateOutcome::LeaseLost(cause) => {
+                    close_lease!(lease);
+                    let _ = session.abort().await;
+                    readiness.mark_not_ready("LEASE_LOST");
+                    return Err(ExitError::new(ExitClass::Timeout, "LEASE_LOST", cause));
+                }
+            }
+            // Durable recovery deliberately outlives the bounded
+            // admission window; upstream re-arms a complete startup
+            // budget for the remaining bootstrap/bind/publication
+            // stages after recovery succeeds.
+            startup_deadline = Instant::now() + self.config.startup_limit;
+        }
+
+        // Startup admission: bounded preflights run sequentially inside
+        // the startup budget. A deadline expiry on this path is the
+        // admission-window failure upstream maps to
+        // `exitError(5, "POSTGRES_INCOMPATIBLE")`.
+        for preflight in &mut self.preflights {
+            match timeout_at(startup_deadline, preflight.run()).await {
+                Ok(Ok(report)) => {
+                    if let Some(epoch) = report.security_epoch {
+                        readiness.set_security_epoch(epoch);
+                    }
+                }
+                Ok(Err(cause)) => {
+                    close_lease!(lease);
+                    let _ = session.abort().await;
+                    let err = startup_failure(cause, "POSTGRES_INCOMPATIBLE");
+                    mark_startup_failure(readiness, &err);
+                    return Err(err);
+                }
+                Err(_) => {
+                    close_lease!(lease);
+                    let _ = session.abort().await;
+                    let err = startup_failure(
+                        startup_deadline_failure("startup admission exceeded its budget"),
+                        "POSTGRES_INCOMPATIBLE",
+                    );
+                    mark_startup_failure(readiness, &err);
+                    return Err(err);
+                }
+            }
+        }
+
+        // Bootstrap reconciliation — upstream `cfg.Bootstrap.
+        // ReconcileBootstrap(startupCtx)` runs under the singleton
+        // lease, after the serving gate and before readiness is
+        // published, so an interrupted bootstrap delivery reaches a
+        // terminal outcome before claims are exposed.
+        if let Some(bootstrap) = self.bootstrap.as_mut() {
+            let cause = match timeout_at(startup_deadline, bootstrap.reconcile_bootstrap()).await {
+                Ok(Ok(())) => None,
+                Ok(Err(cause)) => Some(cause),
+                Err(_) => Some(startup_deadline_failure(
+                    "bootstrap reconciliation exceeded the startup budget",
+                )),
+            };
+            if let Some(cause) = cause {
+                close_lease!(lease);
+                let _ = session.abort().await;
+                let err = startup_failure(cause, "BOOTSTRAP_RECONCILIATION_FAILED");
+                mark_startup_failure(readiness, &err);
+                return Err(err);
+            }
+        }
+
+        // `startupControlLeaseFailure` — a lease lost between the gate
+        // and proof publication refuses startup rather than publishing
+        // a proof under a dead lease.
+        if lease.is_some() {
+            let mut lost = lease.as_ref().map(|held| held.lost());
+            if let Some(cause) = watch_now(&mut lost).await {
+                close_lease!(lease);
+                let _ = session.abort().await;
+                readiness.mark_not_ready("LEASE_LOST");
+                return Err(ExitError::new(ExitClass::Timeout, "LEASE_LOST", cause));
             }
         }
 
@@ -562,6 +886,7 @@ impl Profile {
         ) {
             Ok(proof) => proof,
             Err(cause) => {
+                close_lease!(lease);
                 let _ = session.abort().await;
                 readiness.mark_not_ready("CONFIG_INVALID");
                 return Err(ExitError::new(ExitClass::Usage, "CONFIG_INVALID", cause));
@@ -583,6 +908,7 @@ impl Profile {
                 )),
             };
             if let Some(cause) = cause {
+                close_lease!(lease);
                 let _ = session.revoke().await;
                 readiness.mark_failed("BACKGROUND_LOOP_FAILED");
                 tracing::warn!(code = cause.code(), "kernel: ready proof publish failed");
@@ -599,7 +925,10 @@ impl Profile {
 
         // Supervised phase. Every component's run future is borrowed and
         // polled by the supervisor: cancellation is future drop — there
-        // is no detach and no hidden task.
+        // is no detach and no hidden task. The boundary arms port
+        // upstream's runtime select: controller disconnect is an
+        // intentional stop; parent death, lease loss, and an epoch
+        // change are terminal with their own safe reasons.
         let mut running: Vec<Option<BoxFuture<'_, Result<(), Failure>>>> = self
             .components
             .iter_mut()
@@ -608,13 +937,27 @@ impl Profile {
 
         let mut stop = std::pin::pin!(stop);
         let cancel = self.cancel.clone();
+        let mut controller = self.controller.as_ref().map(|watch| watch.tripped());
+        let mut parent = self.parent.as_ref().map(|watch| watch.tripped());
+        let mut epoch = self.epoch.as_ref().map(|watch| watch.tripped());
+        let mut lease_lost = lease.as_ref().map(|held| held.lost());
         let cause = tokio::select! {
             () = stop.as_mut() => Cause::Stop,
             () = cancel.cancelled() => Cause::Stop,
+            _failure = watch_or_pending(&mut controller) => Cause::Stop,
+            failure = watch_or_pending(&mut parent) => {
+                Cause::Terminal("BACKGROUND_LOOP_FAILED", failure)
+            }
+            failure = watch_or_pending(&mut epoch) => {
+                Cause::Terminal("EPOCH_MISMATCH", failure)
+            }
+            failure = watch_or_pending(&mut lease_lost) => {
+                Cause::Terminal("LEASE_LOST", failure)
+            }
             result = next_completion(&mut running) => {
                 // A component that returns `Ok` still terminated
                 // unexpectedly (upstream treats nil error the same).
-                Cause::Terminal(match result {
+                Cause::Terminal("BACKGROUND_LOOP_FAILED", match result {
                     Ok(()) => Failure::internal(
                         "kernel_component_exit",
                         "runtime component terminated unexpectedly",
@@ -639,14 +982,14 @@ impl Profile {
                 }
                 readiness.mark_shutting_down();
             }
-            Cause::Terminal(_) => {
+            Cause::Terminal(reason, _) => {
                 if session.revoke().await.is_err() {
                     shutdown_cause = Some(Failure::internal(
                         "kernel_proof_revoke_failed",
                         "ready proof revocation failed",
                     ));
                 }
-                readiness.mark_failed("BACKGROUND_LOOP_FAILED");
+                readiness.mark_failed(reason);
             }
         }
 
@@ -659,8 +1002,15 @@ impl Profile {
         drop(running);
 
         // Settlement: reverse registration order, shared shutdown
-        // deadline (upstream `shutdown`).
-        let settle = self.settle_components().await;
+        // deadline (upstream `shutdown`); the singleton lease closes
+        // inside that same budget before the profile returns.
+        let shutdown_deadline = Instant::now() + self.config.shutdown;
+        let settle = self.settle_components(shutdown_deadline).await;
+        // The lease release shares the shutdown budget (upstream
+        // `lease.Close(totalCtx)`).
+        if let Some(held) = lease.as_mut() {
+            let _ = timeout_at(shutdown_deadline, held.close()).await;
+        }
         match cause {
             Cause::Stop => {
                 if let Err(failure) = settle {
@@ -680,7 +1030,7 @@ impl Profile {
                     None => Ok(()),
                 }
             }
-            Cause::Terminal(result) => {
+            Cause::Terminal(reason, result) => {
                 // Upstream `errors.Join`: the component failure stays the
                 // reported cause; the revoke and settlement failures are
                 // attached, not substituted.
@@ -695,11 +1045,7 @@ impl Profile {
                     );
                     cause = join_failure(cause, failure);
                 }
-                Err(ExitError::new(
-                    ExitClass::Terminal,
-                    "BACKGROUND_LOOP_FAILED",
-                    cause,
-                ))
+                Err(ExitError::new(ExitClass::Terminal, reason, cause))
             }
         }
     }
@@ -707,8 +1053,7 @@ impl Profile {
     /// Reverse-registration-order bounded settlement: each `settle` call
     /// is bounded by the shared `shutdown` deadline. The first failure
     /// wins, matching `errors.Join`'s reported cause.
-    async fn settle_components(&mut self) -> Result<(), Failure> {
-        let deadline = Instant::now() + self.config.shutdown;
+    async fn settle_components(&mut self, deadline: Instant) -> Result<(), Failure> {
         let mut failure: Option<Failure> = None;
         for component in self.components.iter_mut().rev() {
             let result = match timeout_at(deadline, component.settle()).await {

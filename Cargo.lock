@@ -885,6 +885,7 @@ dependencies = [
  "central-adapter-postgres",
  "central-adapter-s3",
  "central-artifact",
+ "central-backup",
  "central-execution",
  "central-foundation",
  "central-harness",

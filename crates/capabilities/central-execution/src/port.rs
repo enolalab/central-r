@@ -630,5 +630,32 @@ pub struct Invocation {
     pub meta: EvaluationMetadata,
 }
 
+/// `port.ExecutionMetricsSnapshot` — only aggregates and durations. It
+/// never contains IDs, payloads, principals, tokens, or error strings,
+/// so it is safe to project through serving monitors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionMetricsSnapshot {
+    /// `RecoveryBatchDuration` nanoseconds.
+    pub recovery_batch_nanos: i64,
+    /// `RecoveredRows`.
+    pub recovered_rows: i64,
+    /// `RecoveryLockWait` nanoseconds.
+    pub recovery_lock_nanos: i64,
+    /// `SchedulerQueueDepth`.
+    pub scheduler_queue_depth: i64,
+    /// `PoolWait` nanoseconds.
+    pub pool_wait_nanos: i64,
+    /// `OldestRecordAge` nanoseconds.
+    pub oldest_record_nanos: i64,
+    /// `TableRowCount`.
+    pub table_row_count: i64,
+    /// `HeldRecordCount`.
+    pub held_record_count: i64,
+    /// `PendingOutboxCount`.
+    pub pending_outbox_count: i64,
+    /// `ReconciliationBacklog`.
+    pub reconciliation_backlog: i64,
+}
+
 /// The task domain's aggregate, re-exported for signature clarity.
 pub type TaskAggregate = task::TaskAggregate;

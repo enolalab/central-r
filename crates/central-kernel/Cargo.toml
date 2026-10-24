@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 central-foundation = { path = "../central-foundation", version = "0.1.0" }
+central-backup = { path = "../capabilities/central-backup", version = "0.1.0" }
 central-artifact = { path = "../capabilities/central-artifact", version = "0.1.0" }
 # The artifact-work fence (`ArtifactWorkClaim`/`RecoveryEpoch`) and the
 # `RecoveryCoordinatorService` fence-source impl the reconciler

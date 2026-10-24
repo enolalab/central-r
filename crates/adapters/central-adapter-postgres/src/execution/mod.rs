@@ -46,6 +46,7 @@ use time::OffsetDateTime;
 mod completion_receipt;
 mod dispatchable;
 mod failed_recovery_workspaces;
+mod metrics;
 mod queries;
 mod reconciliation_attempt;
 mod store;
@@ -211,8 +212,9 @@ pub(crate) fn uuid_for_invocation(id: &InvocationId) -> Option<uuid::Uuid> {
     (!id.is_nil()).then(|| uuid_of(&id.0))
 }
 
-/// Upstream `invocationGeneration` — generation 1 iff an invocation
-/// identity exists; `None` binds NULL.
+/// `invocationGeneration` — upstream hardcodes `int64(1)` for any
+/// non-zero invocation (`store.go`); no upstream derivation exists, so
+/// the Rust port keeps the same constant. `None` binds NULL.
 pub(crate) fn invocation_generation(id: &InvocationId) -> Option<i64> {
     (!id.is_nil()).then_some(1)
 }

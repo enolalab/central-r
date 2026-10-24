@@ -142,6 +142,22 @@ impl Backend {
     fn reports_cost(self) -> bool {
         matches!(self, Self::ClaudeCode | Self::Opencode)
     }
+
+    /// `adapterVersion` — the *adapter* identifier a Run records: a
+    /// fixed constant per backend (`harnessAdapterVersion`,
+    /// `opencodeAdapterVersion`, `codexAdapterVersion`,
+    /// `antigravityAdapterVersion` in `harness_backend.go`), never the
+    /// pinned tool version. The version is a launch-time pin; the
+    /// adapter id names the adapter contract the Run executed under.
+    #[must_use]
+    pub const fn adapter_version(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claudecode/phase-3a",
+            Self::Opencode => "opencode/issue-126",
+            Self::Codex => "codex/issue-128",
+            Self::Antigravity => "antigravity/issue-129",
+        }
+    }
 }
 
 /// `harnessConfig` — the validated harness environment. Defaults are

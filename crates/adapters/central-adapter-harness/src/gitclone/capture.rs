@@ -592,6 +592,32 @@ impl GitClone {
         out.finish().await
     }
 
+    /// `CheckCaptureDir` — the startup probe half of
+    /// `probeHarnessCaptureHost`: `data_root/capture` must exist as a
+    /// runtime-owned, non-symlink 0700 directory before serve admits
+    /// the harness (upstream's sync check — the async
+    /// [`require_runtime_private_dir`] variant stays for the run-time
+    /// temp provisioning).
+    ///
+    /// # Errors
+    /// `Failure::invalid`-shaped capture failure when the directory is
+    /// missing or not a runtime-owned 0700 directory.
+    pub fn check_capture_dir(&self) -> Result<(), Failure> {
+        let md = std::fs::symlink_metadata(self.capture_root())
+            .map_err(|_| failed("the capture directory is missing (run the harness setup)"))?;
+        use std::os::unix::fs::MetadataExt;
+        let ok = md.is_dir()
+            && !md.file_type().is_symlink()
+            && md.uid() == self.runtime_uid
+            && md.mode() & 0o777 == 0o700;
+        if !ok {
+            return Err(failed(
+                "the capture directory is not a runtime-owned 0700 directory",
+            ));
+        }
+        Ok(())
+    }
+
     /// `requireRuntimePrivateDir` — the capture directory must be a
     /// runtime-owned 0700 directory, as the installation creates it.
     async fn require_runtime_private_dir(&self, path: &Path) -> Result<(), Failure> {

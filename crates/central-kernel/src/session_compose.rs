@@ -38,6 +38,10 @@ pub struct SessionComposition {
     /// `sessionSvc` injected into session validation, pre-auth CSRF,
     /// delivery precommit, and the web handler's session surface).
     pub service: Arc<Service<PgSessionStore, DevFileProtectedBootstrap>>,
+    /// The store's `DiscoverBootstrapCandidates` half — the
+    /// `bootstrapCandidateSource` the startup reconciler consumes
+    /// (upstream `candidates: store`).
+    pub candidates: PgSessionStore,
 }
 
 /// `pgsession.New(pool)` + broker-activator selection +
@@ -57,6 +61,7 @@ pub fn compose_session(
     let bootstrap =
         crate::harness_compose::select_bootstrap(|name| std::env::var_os(name), bootstrap_root)?;
     Ok(SessionComposition {
-        service: Arc::new(Service::new(PgSessionStore::new(pool), bootstrap)),
+        service: Arc::new(Service::new(PgSessionStore::new(pool.clone()), bootstrap)),
+        candidates: PgSessionStore::new(pool),
     })
 }
