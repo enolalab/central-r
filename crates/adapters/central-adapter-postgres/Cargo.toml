@@ -19,6 +19,7 @@ central-eventjournal = { path = "../../capabilities/central-eventjournal", versi
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
 central-retry = { path = "../../capabilities/central-retry", version = "0.1.0" }
 central-scheduler = { path = "../../capabilities/central-scheduler", version = "0.1.0" }
+central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
 central-workflow = { path = "../../capabilities/central-workflow", version = "0.1.0" }
 central-workspace = { path = "../../capabilities/central-workspace", version = "0.1.0" }
 serde.workspace = true
@@ -32,6 +33,7 @@ tracing.workspace = true
 trait-variant.workspace = true
 uuid.workspace = true
 time.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

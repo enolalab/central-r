@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.bootstrap_generations\n               SET state = 'consumed',\n                   consumed_at = clock_timestamp(),\n                   candidate_id = $2,\n                   candidate_digest = $3,\n                   registered_generation = $4\n               WHERE id = $1 AND state = 'active'\n               RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2919e58140af00efada7c40e9a824f6d94fad6e139cee0ae5b0ea8441ae10d97"
+}

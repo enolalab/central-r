@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.sessions\n               SET lifecycle_state = 'revoked',\n                   revoked_at = COALESCE(revoked_at, clock_timestamp()),\n                   delivery_outcome = 'revoked'\n               WHERE id = $1\n                 AND workspace_id = $2\n                 AND lifecycle_state IN ('pending_bootstrap', 'delivery_pending', 'active')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e2181b408499e4d21339b77dde5125b1de6e4e6d315daa00777fd0243c174279"
+}

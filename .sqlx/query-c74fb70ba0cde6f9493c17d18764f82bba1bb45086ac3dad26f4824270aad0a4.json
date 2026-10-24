@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, generation, verifier_hash, principal_identity,\n                      throttle_failure_window_start, throttle_failure_count,\n                      throttle_next_eligible, presentation_deadline,\n                      clock_timestamp() AS \"database_now!\"\n               FROM central.bootstrap_generations\n               WHERE workspace_id = $1 AND state = 'active'\n               ORDER BY generation DESC\n               LIMIT 1\n               FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "verifier_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "principal_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "throttle_failure_window_start",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "throttle_failure_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "throttle_next_eligible",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "presentation_deadline",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "database_now!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "c74fb70ba0cde6f9493c17d18764f82bba1bb45086ac3dad26f4824270aad0a4"
+}

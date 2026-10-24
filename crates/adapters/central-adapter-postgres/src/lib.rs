@@ -32,6 +32,7 @@ pub mod execution;
 pub mod harness;
 pub mod migrate;
 pub mod scheduler;
+pub mod session;
 mod store_support;
 pub mod task;
 pub mod workflow;

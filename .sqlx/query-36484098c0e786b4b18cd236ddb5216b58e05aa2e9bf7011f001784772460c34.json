@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.sessions\n                   (id, workspace_id, token_hash, csrf_hash, principal_identity, lifecycle_state,\n                    security_epoch, created_at, last_seen_at, idle_expiry, absolute_expiry)\n               VALUES ($1, $2, $3, $4, $5, 'pending_bootstrap', $6,\n                       clock_timestamp(), clock_timestamp(),\n                       clock_timestamp() + ($7::double precision * interval '1 second'),\n                       clock_timestamp() + ($8::double precision * interval '1 second'))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Bytea",
+        "Text",
+        "Int8",
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "36484098c0e786b4b18cd236ddb5216b58e05aa2e9bf7011f001784772460c34"
+}

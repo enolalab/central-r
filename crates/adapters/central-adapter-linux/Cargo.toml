@@ -13,8 +13,12 @@ publish.workspace = true
 [dependencies]
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
+central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
 rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

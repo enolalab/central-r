@@ -575,8 +575,12 @@ version = "0.1.0"
 dependencies = [
  "central-foundation",
  "central-harness",
+ "central-session",
  "rustix",
+ "serde",
+ "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -594,6 +598,7 @@ dependencies = [
  "central-harness",
  "central-retry",
  "central-scheduler",
+ "central-session",
  "central-task",
  "central-workflow",
  "central-workspace",
@@ -608,6 +613,7 @@ dependencies = [
  "tracing",
  "trait-variant",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -807,6 +813,14 @@ dependencies = [
 [[package]]
 name = "central-session"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "rand 0.10.3",
+ "sha2 0.11.1",
+ "time",
+ "trait-variant",
+ "zeroize",
+]
 
 [[package]]
 name = "central-task"

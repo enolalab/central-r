@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.sessions\n               SET last_seen_at = clock_timestamp(),\n                   first_used_at = COALESCE(first_used_at, clock_timestamp())\n               WHERE token_hash = $1\n                 AND workspace_id = $5\n                 AND lifecycle_state = 'active'\n                 AND security_epoch = $2\n                 AND absolute_expiry >= clock_timestamp()\n                 AND idle_expiry >= clock_timestamp()\n                 AND (first_used_at IS NOT NULL OR first_use_deadline IS NULL OR clock_timestamp() <= first_use_deadline)\n                 AND ($3::boolean = false OR csrf_hash = $4)\n               RETURNING id, workspace_id, token_hash, csrf_hash,\n                         principal_identity, lifecycle_state, security_epoch,\n                         created_at, last_seen_at, idle_expiry, absolute_expiry,\n                         first_use_deadline, first_used_at, revoked_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "token_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "csrf_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "principal_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "lifecycle_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "security_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "idle_expiry",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "absolute_expiry",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "first_use_deadline",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "first_used_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "revoked_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Int8",
+        "Bool",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "555515d473e6946d256bbeadfb70ab37d1b79675e650c9ccde5316fe17ac4ab1"
+}

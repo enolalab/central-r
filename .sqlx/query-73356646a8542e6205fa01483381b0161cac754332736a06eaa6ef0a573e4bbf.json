@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.sessions s\n               SET lifecycle_state = 'delivery_pending',\n                   delivery_outcome = 'prepared'\n               FROM central.bootstrap_generations g\n               WHERE s.id = $1\n                 AND s.workspace_id = $2\n                 AND s.lifecycle_state = 'pending_bootstrap'\n                 AND g.workspace_id = s.workspace_id\n                 AND g.state = 'consumed'\n                 AND g.generation = $4 - 1\n                 AND g.candidate_id = $3\n                 AND g.registered_generation = $4\n                 AND g.candidate_digest = $5\n               RETURNING s.id, s.workspace_id, s.token_hash, s.csrf_hash,\n                         s.principal_identity, s.lifecycle_state, s.security_epoch,\n                         s.created_at, s.last_seen_at, s.idle_expiry, s.absolute_expiry,\n                         s.first_use_deadline, s.first_used_at, s.revoked_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "token_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "csrf_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 4,
+        "name": "principal_identity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "lifecycle_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "security_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "idle_expiry",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "absolute_expiry",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "first_use_deadline",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "first_used_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "revoked_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "73356646a8542e6205fa01483381b0161cac754332736a06eaa6ef0a573e4bbf"
+}

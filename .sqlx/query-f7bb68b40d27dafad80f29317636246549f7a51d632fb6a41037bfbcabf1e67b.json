@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, lifecycle_state, COALESCE(delivery_outcome, '') AS \"outcome!\",\n                      first_use_deadline, first_used_at\n               FROM central.sessions\n               WHERE workspace_id = $1\n                 AND (\n                   lifecycle_state IN ('pending_bootstrap', 'delivery_pending')\n                   OR (lifecycle_state = 'active' AND first_used_at IS NULL AND first_use_deadline <= clock_timestamp())\n                 )\n               ORDER BY created_at ASC, id ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "lifecycle_state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "outcome!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "first_use_deadline",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "first_used_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      true,
+      true
+    ]
+  },
+  "hash": "f7bb68b40d27dafad80f29317636246549f7a51d632fb6a41037bfbcabf1e67b"
+}

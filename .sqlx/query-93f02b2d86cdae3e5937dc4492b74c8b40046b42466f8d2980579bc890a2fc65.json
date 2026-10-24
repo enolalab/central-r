@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.bootstrap_generations\n                   (id, workspace_id, generation, verifier_hash, state, principal_identity, created_at)\n               VALUES ($1, $2, $3, $4, 'active', $5, clock_timestamp())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "93f02b2d86cdae3e5937dc4492b74c8b40046b42466f8d2980579bc890a2fc65"
+}

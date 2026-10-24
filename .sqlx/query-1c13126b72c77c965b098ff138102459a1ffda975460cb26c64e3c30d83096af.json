@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.bootstrap_generations\n               SET presentation_deadline = clock_timestamp() + ($2::double precision * interval '1 second')\n               WHERE workspace_id = $1 AND state = 'active'\n               RETURNING generation, presentation_deadline",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "generation",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "presentation_deadline",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "1c13126b72c77c965b098ff138102459a1ffda975460cb26c64e3c30d83096af"
+}
