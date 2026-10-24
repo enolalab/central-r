@@ -38,6 +38,11 @@ SERVE_BIN="${CENTRAL_SERVE_BIN:-$REPO_ROOT/target/debug/central}"
 S3MOCK_IMAGE="${CENTRAL_ACCEPTANCE_S3MOCK_IMAGE:-adobe/s3mock:latest}"
 S3MOCK_MODE="${CENTRAL_ACCEPTANCE_S3MOCK:-auto}"
 
+# ACCEPT_DB interpolates into DROP/CREATE DDL — hold it to a plain
+# PostgreSQL identifier before anything runs.
+[[ "$ACCEPT_DB" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] \
+    || die "CENTRAL_ACCEPTANCE_DB is not a plain identifier ([A-Za-z_][A-Za-z0-9_]*, max 63 bytes)" 2
+
 SERVE_PID=""
 S3MOCK_CONTAINER=""
 ARTIFACT_ENABLED=false
@@ -61,7 +66,7 @@ cleanup() {
     fi
     if [ "${CENTRAL_ACCEPTANCE_KEEP_DB:-0}" != "1" ] && [ -n "${MIGRATION_DSN:-}" ]; then
         psql "$CENTRAL_TEST_DSN" -v ON_ERROR_STOP=0 \
-            -c "DROP DATABASE IF EXISTS $ACCEPT_DB" >/dev/null 2>&1 || true
+            -c "DROP DATABASE IF EXISTS $ACCEPT_DB WITH (FORCE)" >/dev/null 2>&1 || true
     fi
     exit "$rc"
 }
@@ -98,7 +103,8 @@ fi
 if [ -z "$S3_ENDPOINT" ] && [ "$S3MOCK_MODE" != "off" ] && command -v docker >/dev/null \
     && docker image inspect "$S3MOCK_IMAGE" >/dev/null 2>&1; then
     S3MOCK_CONTAINER=$(docker run -d --rm -p 127.0.0.1:19093:9090 \
-        -e initialBuckets=central-artifacts "$S3MOCK_IMAGE" 2>/dev/null) || S3MOCK_CONTAINER=""
+        -e "initialBuckets=${CENTRAL_TEST_MINIO_BUCKET:-central-artifacts}" \
+        "$S3MOCK_IMAGE" 2>/dev/null) || S3MOCK_CONTAINER=""
     if [ -n "$S3MOCK_CONTAINER" ]; then
         S3_ENDPOINT="http://127.0.0.1:19093"
         for _ in $(seq 1 30); do
@@ -184,7 +190,16 @@ REPORT_SHA256=$(sha256sum "$REPO_ROOT/tests/acceptance/report.md" | cut -d' ' -f
 REPORT_SIZE=$(wc -c < "$REPO_ROOT/tests/acceptance/report.md")
 
 if [ -n "$S3_ENDPOINT" ] && [ "$PW_OK" = "true" ]; then
-    if (cd "$PLAYWRIGHT_DIR" && node seed-object.mjs); then
+    # seed-object.mjs reads the CENTRAL_TEST_MINIO_* env — export it even
+    # when the endpoint came from the auto-provisioned s3mock container.
+    if (cd "$PLAYWRIGHT_DIR" && \
+        CENTRAL_TEST_MINIO_ENDPOINT="$S3_ENDPOINT" \
+        CENTRAL_TEST_MINIO_BUCKET="${CENTRAL_TEST_MINIO_BUCKET:-central-artifacts}" \
+        CENTRAL_TEST_MINIO_ACCESS_KEY="${CENTRAL_TEST_MINIO_ACCESS_KEY:-minioadmin}" \
+        CENTRAL_TEST_MINIO_SECRET_KEY="${CENTRAL_TEST_MINIO_SECRET_KEY:-minioadmin}" \
+        CENTRAL_TEST_MINIO_TLS="${CENTRAL_TEST_MINIO_TLS:-0}" \
+        CENTRAL_TEST_MINIO_REGION="${CENTRAL_TEST_MINIO_REGION:-us-east-1}" \
+        node seed-object.mjs); then
         ARTIFACT_ENABLED=true
     else
         note "object seed failed — artifact leg disabled"

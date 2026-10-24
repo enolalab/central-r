@@ -786,8 +786,10 @@ struct ServeInspection {
     /// The dedicated `preflight` connection — held alive for the
     /// composition so the role check upstream performs on it stays
     /// bound to a live session (upstream `NewInspectorForConn` shares
-    /// this connection; the Rust inspector opens its own max-1
-    /// session through `Inspector::connect`). `None` is the test seam.
+    /// this connection; the Rust inspector opens its own dedicated
+    /// session — the same `NewInspectorForConn` semantics, not the
+    /// pooled `NewInspector` — through `Inspector::connect`). `None`
+    /// is the test seam.
     _preflight_conn: Option<sqlx::PgConnection>,
     b08_ready: bool,
 }

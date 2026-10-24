@@ -38,6 +38,23 @@ async fn main() {
         .unwrap_or_else(|| "central_r3_acceptance".to_owned());
     let keep = std::env::var("CENTRAL_ACCEPTANCE_KEEP_DB").as_deref() == Ok("1");
 
+    // The name interpolates into DDL — restrict it to a plain
+    // PostgreSQL identifier (alnum + `_`, not a leading digit, inside
+    // the 63-byte identifier cap) before any statement is built.
+    let identifier_ok = db.len() <= 63
+        && db
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && db.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !identifier_ok {
+        fail(
+            "CONFIG_INVALID",
+            "CENTRAL_ACCEPTANCE_DB must be a plain identifier \
+             ([A-Za-z_][A-Za-z0-9_]*, max 63 bytes)",
+        );
+    }
+
     let opts = match sqlx::postgres::PgConnectOptions::from_str(&dsn) {
         Ok(o) => o,
         Err(e) => fail("CONFIG_INVALID", &format!("CENTRAL_TEST_DSN: {e}")),
@@ -48,7 +65,9 @@ async fn main() {
         Err(e) => fail("DEPENDENCY_UNAVAILABLE", classify_sqlx(&e).message()),
     };
     if !keep {
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {db}"))
+        // `WITH (FORCE)` terminates straggler sessions from a previous
+        // run so the drop does not stall on a held connection.
+        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"))
             .execute(&mut admin)
             .await;
     }
@@ -56,10 +75,16 @@ async fn main() {
         .execute(&mut admin)
         .await
     {
-        fail(
-            "DEPENDENCY_UNAVAILABLE",
-            &format!("create {db}: {}", classify_sqlx(&e).message()),
-        );
+        // `42P04` duplicate_database is the keep-mode rerun: the
+        // leftover database is reused and the installer is idempotent.
+        let duplicate =
+            matches!(&e, sqlx::Error::Database(dbe) if dbe.code().as_deref() == Some("42P04"));
+        if !(keep && duplicate) {
+            fail(
+                "DEPENDENCY_UNAVAILABLE",
+                &format!("create {db}: {}", classify_sqlx(&e).message()),
+            );
+        }
     }
 
     let mig_opts = opts

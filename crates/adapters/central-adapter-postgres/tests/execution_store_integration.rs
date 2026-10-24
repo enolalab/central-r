@@ -27,8 +27,8 @@ use central_execution::port::{
     CompositeStore, DispatchableRunReader, ExecutionRead, ExecutionReadRequest,
     LeaseCredentialValidator, LeaseValidationRequest, OutboxStore, ReceiptBinding,
     ReceiptLookupRequest, RecordCompletionReceiptRequest, RecoveryClaimabilityReader,
-    RecoveryCoordinatorAcquireRequest, RecoveryStore, ResumeRecoveryEpochRequest,
-    StartRecoveryEpochRequest,
+    RecoveryCoordinatorAcquireRequest, RecoveryCoordinatorLease, RecoveryStore,
+    RecoveryWorkspaceClaim, ResumeRecoveryEpochRequest, StartRecoveryEpochRequest,
 };
 use central_execution::resume::{
     self, RecoveryEpochState, RecoveryWorkspaceState, ResumeRecoveryEpochCommand,
@@ -40,7 +40,7 @@ use central_foundation::identity::{
 };
 use central_task::domain as task;
 use central_task::port::{ChangeSetStore, CommitTaskChangeSetRequest};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool, Row};
 use std::str::FromStr;
 use time::OffsetDateTime;
 
@@ -750,6 +750,288 @@ async fn degraded_workspace_lists_as_failed() -> Result<()> {
         .await?;
     assert_eq!(failed.total, 1);
     assert_eq!(failed.ids, vec![ws]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `claim_recovery_workspaces` arm coverage — the upstream regression
+// tests behind the claim-loop rewrite (store_test.go:
+// CompletedEpochSentinel ~2315, DatabaseRetryDelay ~2370,
+// ExpiredClaimExhaustion ~2569, quarantined-epoch claim ~1355/~5101).
+// Each arm guards the hot-spin fix: an unanswered claim must never
+// collapse into an empty page the caller would poll forever.
+// ---------------------------------------------------------------------------
+
+/// Coordinator lease + running epoch over one submitted run — the
+/// shared preamble the claim-arm assertions start from.
+async fn recovery_claim_fixture(
+    label: &str,
+    task_key: &str,
+) -> Result<(
+    PgPool,
+    Store,
+    RecoveryCoordinatorLease,
+    resume::RecoveryEpoch,
+    WorkspaceId,
+)> {
+    let mut admin = admin_conn().await?;
+    let db = installed(&mut admin, label).await?;
+    let mut mig = role_conn(&db, "central_migration").await?;
+    let ws = WorkspaceId::new();
+    insert_workspace(&mut mig, uuid_of!(ws)).await?;
+    let pool = role_pool(&db, "central_runtime").await?;
+    let store = Store::new(pool.clone());
+    submit_task(&pool, ws, task_key).await?;
+    let lease = store
+        .acquire_recovery_coordinator(RecoveryCoordinatorAcquireRequest {
+            recovery_domain: "central.execution.recovery.v1".to_owned(),
+            instance_id: InstanceId::new(),
+        })
+        .await?;
+    let epoch = store
+        .start_recovery_epoch(StartRecoveryEpochRequest {
+            lease: lease.clone(),
+            batch_size: 10,
+        })
+        .await?;
+    Ok((pool, store, lease, epoch, ws))
+}
+
+async fn claim_recovery_once(
+    store: &Store,
+    lease: &RecoveryCoordinatorLease,
+    epoch_generation: i64,
+) -> Result<Vec<RecoveryWorkspaceClaim>> {
+    store
+        .claim_recovery_workspaces(ClaimRecoveryWorkspaceRequest {
+            lease: lease.clone(),
+            epoch_generation,
+            batch_size: 10,
+        })
+        .await
+}
+
+/// Upstream `TestIntegrationRecoveryClaimReturnsCompletedEpochSentinel`
+/// — a sealed epoch answers one terminal `completed` claim so the
+/// caller's batch loop records it and exits instead of spinning on an
+/// empty page.
+#[tokio::test]
+async fn recovery_claim_on_sealed_epoch_returns_completed_sentinel() -> Result<()> {
+    skip!();
+    let (pool, store, lease, epoch, ws) = recovery_claim_fixture("claimseal", "seal-task").await?;
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    let claim = claims.into_iter().next().unwrap_or_default();
+    assert!(claim.claimed);
+    store
+        .complete_recovery_workspace(CompleteRecoveryWorkspaceRequest {
+            lease: lease.clone(),
+            epoch_generation: epoch.generation,
+            workspace_id: ws,
+            claim_token: claim.claim_token,
+            degraded: false,
+            failure_class: String::new(),
+            failure_reason: String::new(),
+        })
+        .await?;
+    let sealed: String =
+        sqlx::query_scalar("SELECT state FROM central.recovery_epochs WHERE epoch_generation = $1")
+            .bind(epoch.generation)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(sealed, "completed");
+
+    // The next claim is the terminal sentinel, never an empty page.
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    assert_eq!(claims.len(), 1);
+    let sentinel = claims.into_iter().next().unwrap_or_default();
+    assert!(sentinel.completed);
+    assert!(!sentinel.claimed);
+    assert_eq!(sentinel.epoch.generation, epoch.generation);
+    assert_eq!(sentinel.epoch.coordinator_fence, epoch.coordinator_fence);
+    assert_eq!(
+        sentinel.epoch.state,
+        RecoveryEpochState::RecoveryEpochCompleted
+    );
+    Ok(())
+}
+
+/// Upstream's quarantined-epoch claim refusals (store_test.go ~1355 and
+/// ~5101): anything neither open nor running is a durable quarantine —
+/// the claim is refused so the caller degrades-and-continues instead of
+/// re-entering the claim loop.
+#[tokio::test]
+async fn recovery_claim_on_degraded_epoch_is_quarantined() -> Result<()> {
+    skip!();
+    let (pool, store, lease, epoch, ws) = recovery_claim_fixture("claimquar", "quar-task").await?;
+    // Drive the epoch to `degraded` the way upstream does — a failed
+    // workspace scan quarantines the work row and the epoch.
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    let claim = claims.into_iter().next().unwrap_or_default();
+    store
+        .complete_recovery_workspace(CompleteRecoveryWorkspaceRequest {
+            lease: lease.clone(),
+            epoch_generation: epoch.generation,
+            workspace_id: ws,
+            claim_token: claim.claim_token,
+            degraded: true,
+            failure_class: "scan_failed".to_owned(),
+            failure_reason: "forced".to_owned(),
+        })
+        .await?;
+    let err = claim_recovery_once(&store, &lease, epoch.generation)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "RECOVERY_EPOCH_QUARANTINED");
+
+    // `failed` takes the same arm — only open/running admit claims.
+    sqlx::query("UPDATE central.recovery_epochs SET state = 'failed' WHERE epoch_generation = $1")
+        .bind(epoch.generation)
+        .execute(&pool)
+        .await
+        .map_err(|e| classify_sqlx(&e))?;
+    let err = claim_recovery_once(&store, &lease, epoch.generation)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "RECOVERY_EPOCH_QUARANTINED");
+    Ok(())
+}
+
+/// Upstream `TestIntegrationExpiredClaimExhaustionDegradesInsteadOfStalling`
+/// — a claimed row whose claim expired at the retry budget is requeued
+/// as `failed`, the epoch degrades, and the claim is refused with
+/// `RECOVERY_RETRY_EXHAUSTED` instead of stalling the claim loop.
+#[tokio::test]
+async fn recovery_claim_expired_at_retry_budget_degrades_epoch() -> Result<()> {
+    skip!();
+    let (pool, store, lease, epoch, ws) = recovery_claim_fixture("claimexh", "exh-task").await?;
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    assert!(claims.iter().any(|c| c.claimed));
+
+    // Park the claim at the last retry with an already-expired lease —
+    // the next claim requeues it into `failed` and degrades the epoch.
+    sqlx::query(
+        "UPDATE central.recovery_epoch_workspaces \
+         SET retry_attempt = 4, \
+         claim_expires_at = clock_timestamp() - interval '1 second' \
+         WHERE epoch_generation = $1 AND workspace_id = $2",
+    )
+    .bind(epoch.generation)
+    .bind(uuid_of!(ws))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+
+    let err = claim_recovery_once(&store, &lease, epoch.generation)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), FailureKind::Conflict);
+    assert_eq!(err.code(), "RECOVERY_RETRY_EXHAUSTED");
+
+    // The work row is quarantined at the retry budget and the epoch is
+    // degraded — upstream's durable exhaustion facts.
+    let row = sqlx::query(
+        "SELECT work.retry_attempt, work.delivery_state, work.failure_class, epoch.state \
+         FROM central.recovery_epoch_workspaces AS work \
+         JOIN central.recovery_epochs AS epoch \
+           ON epoch.epoch_generation = work.epoch_generation \
+         WHERE work.epoch_generation = $1 AND work.workspace_id = $2",
+    )
+    .bind(epoch.generation)
+    .bind(uuid_of!(ws))
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(row.get::<i64, _>("retry_attempt"), 5); // recoveryRetryLimit
+    assert_eq!(row.get::<String, _>("delivery_state"), "failed");
+    assert_eq!(row.get::<String, _>("failure_class"), "retry_exhausted");
+    assert_eq!(row.get::<String, _>("state"), "degraded");
+    Ok(())
+}
+
+/// Upstream `TestIntegrationRecoveryClaimReturnsDatabaseRetryDelay` —
+/// an empty batch over incomplete work answers one placeholder claim
+/// carrying the database-derived delay (bounded by the claim floor and
+/// the renew cap) so the caller sleeps instead of spinning.
+#[tokio::test]
+async fn recovery_claim_returns_retry_after_for_not_ready_work() -> Result<()> {
+    skip!();
+    let (pool, store, lease, epoch, ws) = recovery_claim_fixture("claimwait", "wait-task").await?;
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    assert!(claims.iter().any(|c| c.claimed));
+
+    // Requeue the row as pending-but-not-yet-due: still claimable work,
+    // nothing claimable now.
+    sqlx::query(
+        "UPDATE central.recovery_epoch_workspaces \
+         SET delivery_state = 'pending', claim_token_hash = NULL, \
+         claim_expires_at = NULL, \
+         retry_not_before = clock_timestamp() + interval '2 seconds' \
+         WHERE epoch_generation = $1 AND workspace_id = $2",
+    )
+    .bind(epoch.generation)
+    .bind(uuid_of!(ws))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    assert_eq!(claims.len(), 1);
+    let placeholder = claims.into_iter().next().unwrap_or_default();
+    assert!(!placeholder.claimed);
+    assert!(!placeholder.completed);
+    // ~2s out: inside the [100ms, 10s] floor/cap, matching upstream's
+    // tighter [1s, 2s] window for a 2-second `retry_not_before`.
+    assert!(
+        placeholder.retry_after >= time::Duration::seconds(1)
+            && placeholder.retry_after <= time::Duration::seconds(2),
+        "retry_after out of bounds: {:?}",
+        placeholder.retry_after
+    );
+    Ok(())
+}
+
+/// The empty-batch seal arm — when no incomplete work remains the claim
+/// itself seals the epoch and answers the terminal `completed` claim.
+#[tokio::test]
+async fn recovery_claim_seals_epoch_when_no_incomplete_work() -> Result<()> {
+    skip!();
+    let (pool, store, lease, epoch, ws) = recovery_claim_fixture("claimdone", "done-task").await?;
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    assert!(claims.iter().any(|c| c.claimed));
+
+    // Complete the work row underneath the still-running epoch so the
+    // empty-batch arm — not the sealed-epoch fast path — seals it.
+    sqlx::query(
+        "UPDATE central.recovery_epoch_workspaces \
+         SET delivery_state = 'completed', claim_token_hash = NULL, \
+         claim_expires_at = NULL \
+         WHERE epoch_generation = $1 AND workspace_id = $2",
+    )
+    .bind(epoch.generation)
+    .bind(uuid_of!(ws))
+    .execute(&pool)
+    .await
+    .map_err(|e| classify_sqlx(&e))?;
+
+    let claims = claim_recovery_once(&store, &lease, epoch.generation).await?;
+    assert_eq!(claims.len(), 1);
+    let sentinel = claims.into_iter().next().unwrap_or_default();
+    assert!(sentinel.completed);
+    assert!(!sentinel.claimed);
+    assert_eq!(
+        sentinel.epoch.state,
+        RecoveryEpochState::RecoveryEpochCompleted
+    );
+    let sealed: String =
+        sqlx::query_scalar("SELECT state FROM central.recovery_epochs WHERE epoch_generation = $1")
+            .bind(epoch.generation)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| classify_sqlx(&e))?;
+    assert_eq!(sealed, "completed");
     Ok(())
 }
 

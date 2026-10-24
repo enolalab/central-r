@@ -24,7 +24,8 @@ enum Conn<'a> {
 /// Read-only inspector. `for_connection` keeps operator inspection on the
 /// migration operator's one non-rebinding session (upstream
 /// `NewInspectorForConn`); `connect` opens its own dedicated session —
-/// upstream `NewInspector` — which `verify_serve_baseline`'s
+/// the same `NewInspectorForConn` semantics, not the pooled
+/// `NewInspector` — which `verify_serve_baseline`'s
 /// dedicated-connection gate also accepts.
 pub struct Inspector<'a> {
     conn: Conn<'a>,
@@ -38,9 +39,10 @@ impl<'a> Inspector<'a> {
         }
     }
 
-    /// Inspection on its own dedicated session (`NewInspector`) — the
-    /// same non-rebinding connection serves `inspect` and the
-    /// serve-baseline audit, matching upstream's dedicated conn.
+    /// Inspection on its own dedicated session — upstream
+    /// `NewInspectorForConn` semantics rather than the pooled
+    /// `NewInspector`: the same non-rebinding connection serves
+    /// `inspect` and the serve-baseline audit.
     ///
     /// # Errors
     /// The session cannot connect.

@@ -1,7 +1,9 @@
 /**
  * Uploads the acceptance report body (`tests/acceptance/report.md`) to
- * the object store at the fixed key `r3-acceptance/report.md`. Reads
- * the `CENTRAL_TEST_MINIO_*` environment — the same variables the
+ * the object store at the derived ready key
+ * `v1/ready/<workspace>/<artifact>/<content-generation>` — the durable
+ * `ready_key`/`object_key` the seeded `central.artifacts` row carries.
+ * Reads the `CENTRAL_TEST_MINIO_*` environment — the same variables the
  * integration suites use.
  *
  * Exits non-zero on any failure; invoked only when the runner confirmed
