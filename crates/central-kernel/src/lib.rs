@@ -27,6 +27,7 @@ pub mod harness_compose;
 pub mod lifecycle;
 pub mod readiness;
 pub mod readyproof;
+pub mod serve_lifecycle;
 pub mod serve_support;
 
 /// Object-safe boxed future shared by the kernel-owned trait objects —
