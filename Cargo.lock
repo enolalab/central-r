@@ -687,6 +687,7 @@ dependencies = [
 name = "central-adapter-linux"
 version = "0.1.0"
 dependencies = [
+ "central-adapter-harness",
  "central-foundation",
  "central-harness",
  "central-session",

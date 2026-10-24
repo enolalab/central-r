@@ -11,6 +11,7 @@ publish.workspace = true
 # rustix-wrapped syscall boundary only. The stub inherits the workspace
 # forbid until then.
 [dependencies]
+central-adapter-harness = { path = "../central-adapter-harness", version = "0.1.0" }
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }

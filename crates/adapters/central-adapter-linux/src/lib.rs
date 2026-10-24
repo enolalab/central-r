@@ -10,6 +10,13 @@
 //! - [`dev_bootstrap`] — the `central-session` `ProtectedBootstrap` port
 //!   (D1): the dev-gated file-backed candidate registry standing in for
 //!   the R5 protected broker.
+//! - [`launcher_client`] — the production CHL1 transport: the
+//!   `AF_UNIX`/`SOCK_SEQPACKET` + `SCM_RIGHTS` + `SO_PEERCRED` socket
+//!   client upstream `internal/harnesslauncher/client_linux.go` carries.
+//! - [`group_signals`] — the production `kill(-pgid, …)` boundary for
+//!   the dev-gated `LocalExec` launcher.
 
 pub mod dev_bootstrap;
+pub mod group_signals;
+pub mod launcher_client;
 pub mod workspace_seal;
