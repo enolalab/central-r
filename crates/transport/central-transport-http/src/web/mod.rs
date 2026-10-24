@@ -303,8 +303,10 @@ pub(crate) fn authenticated(req: &Request) -> Option<(Session, HashMap<String, V
 /// logout/exchange handlers perform themselves (the session middleware
 /// is deliberately absent on those routes). The admission
 /// `RequestBodyLimitLayer` already bounds the read; `to_bytes` re-bounds
-/// defensively at the same hard cap. Takes `&mut` so request extensions
-/// (validated pre-auth pair, armed precommit slot) survive the read.
+/// at `DefaultBootstrapBodyLimit` — the self-cap upstream's
+/// `parseBodyForm` applies on every caller (handler.go:1681). Takes
+/// `&mut` so request extensions (validated pre-auth pair, armed
+/// precommit slot) survive the read.
 pub(crate) async fn parse_body_form(
     req: &mut Request,
 ) -> Result<HashMap<String, Vec<String>>, Box<Response>> {
@@ -319,10 +321,10 @@ pub(crate) async fn parse_body_form(
         // an empty PostForm — mirror that with an empty map so the
         // caller's field checks produce the same "could not be read"
         // outcome instead of a second failure shape.
-        let _ = axum::body::to_bytes(body, policy::MAX_BODY_BUFFER).await;
+        let _ = axum::body::to_bytes(body, policy::DEFAULT_BOOTSTRAP_BODY_LIMIT).await;
         return Ok(HashMap::new());
     }
-    let bytes = axum::body::to_bytes(body, policy::MAX_BODY_BUFFER)
+    let bytes = axum::body::to_bytes(body, policy::DEFAULT_BOOTSTRAP_BODY_LIMIT)
         .await
         .map_err(|_| Box::new(error::task_action_failure(StatusCode::FORBIDDEN)))?;
     Ok(session_auth::parse_urlencoded(&bytes))
