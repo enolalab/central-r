@@ -1,0 +1,19 @@
+# central-harness-launcher socket (ADR 0036; phase 2b design decision 16).
+# Only root and the central-runtime group may connect; the daemon further
+# admits only the configured runtime_user through SO_PEERCRED. The directory
+# is traversable so central-runtime can reach the 0660 socket inside it.
+[Unit]
+Description=Central harness launcher socket
+PartOf=central-harness-launcher.service
+
+[Socket]
+ListenSequentialPacket=/run/central-harness-launcher/launcher.sock
+DirectoryMode=0755
+SocketMode=0660
+SocketUser=root
+SocketGroup=central-runtime
+RemoveOnStop=true
+Service=central-harness-launcher.service
+
+[Install]
+WantedBy=sockets.target

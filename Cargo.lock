@@ -870,6 +870,11 @@ dependencies = [
 [[package]]
 name = "central-harness-launcherd"
 version = "0.1.0"
+dependencies = [
+ "central-adapter-harness",
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "central-infra"

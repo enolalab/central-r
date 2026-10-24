@@ -6,5 +6,34 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[dependencies]
+central-adapter-harness = { path = "../../crates/adapters/central-adapter-harness", version = "0.1.0" }
+rustix = { workspace = true, features = ["event", "mount", "pipe", "thread"] }
+# The launcher binaries are one of the two places audited `unsafe` may
+# live (workflow §5.2): libc carries the syscall sites rustix has no safe
+# wrapper for (fork/execve, the clone3 args block, signals, capset/capget,
+# NSS lookups, the new-mount API and Landlock). Every use sits inside
+# `sys`, behind a named safe wrapper with a comment, like upstream's own
+# syscall layer.
+libc = "=0.2.191"
+
+[features]
+# `test-build` compiles in every CHL_TEST_* knob (upstream chl.h:
+# test knobs must never reach a production build). Tests and the fake
+# no-isolation cgroup exist only behind it; a production build carries
+# none of them and none of the CHL_TEST_* environment names is read.
+test-build = []
+
+# The launcher binaries are the audited `unsafe` sites (workflow §5.2):
+# `sys.rs` opts back in per module, so this crate lists the workspace
+# lints by hand (it cannot both inherit and override `unsafe_code`) with
+# `unsafe_code` at "deny" instead of "forbid".
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"

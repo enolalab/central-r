@@ -1,0 +1,109 @@
+# central-harness-launcher (ADR 0036; phase 2b design decision 16).
+#
+# DISCLOSED: stopping or restarting this service kills every running harness
+# session. Harness trees live in this unit's delegated cgroup, so the
+# control-group kill ends them; each client sees its lifeline close with no
+# EXIT and the session ends failed.
+#
+# DISCLOSED: harness sessions have full network egress in this iteration
+# (decision 13): there is no network namespace. Inbound is closed as far as
+# this unit can close it: SocketBindDeny=any below refuses binds to a port,
+# but a bind to port 0 or listen(2) on an unbound socket still gets an
+# ephemeral port, and so does UDP autobind (spec section 7). This is a
+# DEVIATION from Accepted ADR 0036 decision 6 ("Nothing inbound is allowed"),
+# not an implementation of it, until the egress-policy iteration adds a
+# network namespace with an egress path (spec section 12). Abstract Unix
+# sockets and signals outside a session are scoped off by Landlock in the
+# daemon (decision 7), not here.
+#
+# Host devices: DevicePolicy=closed below, with the private devpts the daemon
+# mounts in every view (decision 8), leaves a session only the pseudo devices
+# and ptys of its own; the operator's terminals and seat devices (uaccess
+# ACLs on sound, video, hidraw, dri) cannot be opened.
+#
+# DevicePolicy= and SocketBindDeny= below are cgroup BPF programs; on a
+# systemd/kernel without BPF-cgroup support, systemd skips them (logging a
+# warning) rather than failing the unit. This daemon does not verify either
+# directive is actually enforced. The reference-host root gate does, by
+# checking that a disallowed device open and a disallowed bind both fail
+# EPERM on the production unit (spec section 12, M-4).
+#
+# Every directive below is inherited by the harness processes this daemon
+# launches, so each one is classified on the comment line above it:
+#   [unit]      service plumbing with no effect on the harness sandbox;
+#   [required]  the daemon or the containment needs it;
+#   [allowed]   hardening the harness tolerates.
+# FORBIDDEN here, because the harness or the daemon breaks under them:
+#   ProtectHome            (the harness home lies under the operator's HOME);
+#   ProtectSystem=strict   (it would make the rw binds read-only);
+#   ProtectControlGroups   (it blocks the scope cgroup writes);
+#   MemoryDenyWriteExecute (it breaks the claude JIT);
+#   PrivateTmp             (the daemon builds each session's private /tmp).
+[Unit]
+Description=Central harness launcher
+Requires=central-harness-launcher.socket
+After=central-harness-launcher.socket
+
+[Service]
+# [unit]
+Type=simple
+# [unit]
+ExecStart=/usr/lib/central/central-harness-launcherd
+# [unit] root is needed to build namespaces and drop to the operator.
+User=root
+# [unit]
+Group=root
+# [unit]
+Restart=on-failure
+# [required] the scope cgroups live in this delegated subtree (decision 12).
+Delegate=yes
+# [required] stop and restart end every session; disclosed above.
+KillMode=control-group
+# [required]
+NoNewPrivileges=yes
+# [required] exactly the decided set: identity change, securebits and the
+# bounding set, namespaces and mounts, signalling operator processes, and
+# reading the operator's home. No CAP_CHOWN: the daemon chowns nothing (the
+# harness home is created by installation).
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_SYS_ADMIN CAP_KILL CAP_DAC_READ_SEARCH
+# [required] the same set as ambient: with User=root under NoNewPrivileges
+# systemd leaves CAP_SETUID out of the daemon's permitted/effective sets unless
+# it is also ambient, and every launch then fails at step=harness_setid EPERM
+# (found by the root gate; same root cause as SC-DEF-73). Not inherited by a
+# harness: the drop clears the ambient set and setresuid away from 0 clears
+# it again before exec.
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_SYS_ADMIN CAP_KILL CAP_DAC_READ_SEARCH
+# [required] an aggregate ceiling on the daemon, its monitors and every
+# harness (the delegated subtree), below what 64 scopes at their per-scope
+# defaults (512 pids, 2 GiB) could reach, so a compromised runtime cannot
+# launch its way to the host's limits. The per-scope limits still apply.
+TasksMax=4096
+# [required] the memory side of the same ceiling.
+MemoryMax=8G
+# [allowed]
+ProtectSystem=full
+# [allowed]
+ProtectKernelTunables=yes
+# [allowed]
+ProtectKernelModules=yes
+# [allowed]
+LockPersonality=yes
+# [allowed]
+SystemCallArchitectures=native
+# [allowed] the harness needs its model provider (full egress, disclosed).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# [required] no host device but the standard pseudo devices: a device-cgroup
+# BPF program on this cgroup, inherited by the delegated scopes, allows only
+# /dev/null, zero, full, random, urandom, tty, ptmx and the ptys. The view's
+# private devpts keeps the host's ptys out of reach. The daemon opens no
+# device, and claude needs none beyond these, so there is no DeviceAllow=.
+DevicePolicy=closed
+# [required] nothing inbound (ADR 0036 decision 6): cgroup bind4/bind6 BPF on
+# this cgroup, inherited by the scopes, refuses bind(2) of AF_INET and
+# AF_INET6 sockets to any port from 1 to 65535. Egress connect(2) is not
+# affected. A port-0 bind and listen(2) on an unbound socket are not covered
+# (disclosed above). The daemon binds no inet socket.
+SocketBindDeny=any
+
+[Install]
+Also=central-harness-launcher.socket
