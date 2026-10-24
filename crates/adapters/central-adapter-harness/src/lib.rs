@@ -20,6 +20,10 @@
 pub mod antigravity;
 pub mod claudecode;
 pub mod codex;
+// `fake` stays `pub` (not `#[cfg(test)]`) because other crates'
+// integration tests consume the scripted doubles; it is hidden from
+// the public API surface so `docs.rs` never lists test fixtures.
+#[doc(hidden)]
 pub mod fake;
 pub mod gitclone;
 pub mod launcher;

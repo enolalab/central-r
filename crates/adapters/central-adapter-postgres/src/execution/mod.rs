@@ -15,6 +15,11 @@
 //! - [`port::DispatchableRunReader`] — harness phase 3a decision 1.
 //! - [`port::OutboxStore`] / [`port::B09EvidenceStore`] — the narrowed
 //!   Rust-side publication and evidence-reference lanes.
+//! - [`EpochMarkerRead`] — the serve-time epoch monitor's
+//!   `central.epoch_markers` leaf; a deployment-level fact rather than
+//!   an execution-domain contract, so the trait lives here (beside the
+//!   `execution_metrics` monitor read), not in `central-execution`'s
+//!   `port.rs`.
 //!
 //! Lock ordering (postgresql-adapter-mapping §6, upstream `commitNew`):
 //! `workspace_event_counters` → `tasks` → `runs` →
@@ -45,12 +50,14 @@ use time::OffsetDateTime;
 
 mod completion_receipt;
 mod dispatchable;
+mod epoch_markers;
 mod failed_recovery_workspaces;
 mod metrics;
 mod queries;
 mod reconciliation_attempt;
 mod store;
 
+pub use epoch_markers::{EpochMarkerPair, EpochMarkerRead};
 pub(crate) use queries::{lock_event_counter, reserve_event_sequence};
 pub use store::Store;
 pub(crate) use store::go_rfc3339_local;

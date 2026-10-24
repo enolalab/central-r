@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(security_epoch, 0) AS \"security!\", COALESCE(restore_epoch, 0) AS \"restore!\" FROM central.epoch_markers ORDER BY updated_at DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "security!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "restore!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "b7630db971396f75be9e44b75c9375d117c2dd0e1d4ee1259b699d7beb1cffe4"
+}

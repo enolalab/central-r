@@ -25,10 +25,13 @@
 //! Upstream `newHarnessHostLauncher` constructs its socket client
 //! inside the launcher constructor (`hostlauncher.NewSocket` dials
 //! lazily per request). The Rust port keeps the audited
-//! `AF_UNIX`/`SOCK_SEQPACKET` + `SCM_RIGHTS` CHL1 transport outside
-//! `central-adapter-harness` (rust-application-boundaries.md §2.1);
+//! `AF_UNIX`/`SOCK_SEQPACKET` + `SCM_RIGHTS` CHL1 transport in
+//! `central-adapter-linux::launcher_client` (`SocketLauncherClient`),
+//! which wraps `central-adapter-harness::launcher` under the
+//! sanctioned `central-adapter-linux → central-adapter-harness`
+//! launcher-protocol edge (rust-application-boundaries.md §2.4/§3.3);
 //! the composition root injects the concrete
-//! [`client::LauncherClient`] — see `socket_client` in this module.
+//! [`client::LauncherClient`] into [`build_host_launcher`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

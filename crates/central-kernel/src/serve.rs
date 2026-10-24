@@ -57,9 +57,10 @@ use central_adapter_linux::lifecycle_watch::{
 };
 use central_adapter_linux::workspace_seal::LinuxWorkspaceSealer;
 use central_adapter_postgres::artifact::Store as PgArtifactStore;
-use central_adapter_postgres::execution::Store as PgExecutionStore;
+use central_adapter_postgres::execution::{EpochMarkerRead, Store as PgExecutionStore};
 use central_adapter_postgres::harness::PgHarnessStore;
 use central_adapter_postgres::migrate::Inspector as PgMigrateInspector;
+use central_adapter_postgres::serve_support as pg_serve;
 use central_adapter_postgres::session::PgSessionStore;
 use central_adapter_postgres::task::{
     DetailStore as PgTaskDetailStore, EventLogStore as PgTaskEventLogStore,
@@ -890,10 +891,9 @@ async fn open_dedicated_conn(
     .await
     .map_err(|_| dep_err(format!("{label} connection: connect timed out")))?
     .map_err(|e| dep_err(format!("{label} connection: {e}")))?;
-    let role: String = sqlx::query_scalar("SELECT current_user")
-        .fetch_one(&mut conn)
+    let role = pg_serve::role_check(&mut conn)
         .await
-        .map_err(|e| dep_err(format!("{label} connection: role check: {e}")))?;
+        .map_err(|e| dep_err(format!("{label} connection: role check: {}", e.message())))?;
     if role != "central_runtime" {
         return Err(dep_err(format!(
             "{label} connection: authenticated postgres role is not central_runtime"
@@ -904,8 +904,11 @@ async fn open_dedicated_conn(
 
 /// `pgControlLock` — the deployment-wide singleton on a dedicated,
 /// non-borrowable connection (upstream `ControlConnectionDedicatedNonBorrowable`).
+/// The statements live behind [`pg_serve::ControlLock`]; this wrapper
+/// owns only the connection and the lease lifecycle.
 struct PgControlLock {
     conn: Option<sqlx::PgConnection>,
+    lock: pg_serve::ControlLock,
 }
 
 impl ControlLock for PgControlLock {
@@ -921,18 +924,14 @@ impl ControlLock for PgControlLock {
                     "control lock acquire is single-shot",
                 ));
             };
-            if let Err(e) = sqlx::query("SELECT pg_advisory_lock($1)")
-                .bind(SERVE_TARGET_EXCLUSION_LOCK_KEY)
-                .execute(&mut conn)
-                .await
-            {
+            if let Err(e) = self.lock.acquire(&mut conn).await {
                 self.conn = Some(conn);
                 return Err(Failure::unavailable(
                     "control_lock_acquire",
-                    format!("control lock: acquire advisory lock: {e}"),
+                    format!("control lock: acquire advisory lock: {}", e.message()),
                 ));
             }
-            Ok(Box::new(PgControlLease::start(conn)) as Box<dyn ControlLockLease>)
+            Ok(Box::new(PgControlLease::start(conn, self.lock)) as Box<dyn ControlLockLease>)
         })
     }
 }
@@ -942,13 +941,14 @@ impl ControlLock for PgControlLock {
 /// `pg_advisory_unlock` and closes the dedicated connection.
 struct PgControlLease {
     conn: Arc<tokio::sync::Mutex<Option<sqlx::PgConnection>>>,
+    lock: pg_serve::ControlLock,
     lost: WatchSource,
     stop: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl PgControlLease {
-    fn start(conn: sqlx::PgConnection) -> Self {
+    fn start(conn: sqlx::PgConnection, lock: pg_serve::ControlLock) -> Self {
         let shared = Arc::new(tokio::sync::Mutex::new(Some(conn)));
         let lost = WatchSource::new();
         let stop = CancellationToken::new();
@@ -1006,6 +1006,7 @@ impl PgControlLease {
         };
         Self {
             conn: shared,
+            lock,
             lost,
             stop,
             task: Some(task),
@@ -1029,14 +1030,10 @@ impl ControlLockLease for PgControlLease {
                 return Ok(());
             };
             let mut failure = None;
-            if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(SERVE_TARGET_EXCLUSION_LOCK_KEY)
-                .execute(&mut conn)
-                .await
-            {
+            if let Err(e) = self.lock.release(&mut conn).await {
                 failure = Some(Failure::unavailable(
                     "control_lock_release",
-                    format!("control lock: release advisory lock: {e}"),
+                    format!("control lock: release advisory lock: {}", e.message()),
                 ));
             }
             if let Err(e) = conn.close().await
@@ -1060,12 +1057,14 @@ impl ControlLockLease for PgControlLease {
 // ---------------------------------------------------------------------------
 
 /// `serveEpochMonitor` — a bounded, read-only watch on
-/// `central.epoch_markers`. The serving gate's inspection installs the
-/// authoritative pair via [`EpochMonitorShared::set_epochs`]; every
-/// later read must match or the runtime fails `EPOCH_MISMATCH` — a
-/// query failure is a security loss, not a transient success.
+/// `central.epoch_markers` through the adapter's
+/// [`EpochMarkerRead`] port (no `central.*` SQL in the kernel). The
+/// serving gate's inspection installs the authoritative pair via
+/// [`EpochMonitorShared::set_epochs`]; every later read must match or
+/// the runtime fails `EPOCH_MISMATCH` — a query failure is a security
+/// loss, not a transient success.
 struct ServeEpochMonitor {
-    pool: sqlx::PgPool,
+    reader: Arc<PgExecutionStore>,
     shared: Arc<EpochMonitorShared>,
 }
 
@@ -1111,23 +1110,13 @@ impl Component for ServeEpochMonitor {
     /// look like a normal component exit (the boundary arm reports the
     /// drift deterministically).
     fn run(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
-        let pool = self.pool.clone();
+        let reader = self.reader.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
             let mut tick = tokio::time::interval(SERVE_MONITOR_INTERVAL);
             loop {
                 tick.tick().await;
-                let check = sqlx::query(
-                    "SELECT COALESCE(security_epoch, 0), COALESCE(restore_epoch, 0) \
-                     FROM central.epoch_markers ORDER BY updated_at DESC LIMIT 1",
-                )
-                .map(|row: sqlx::postgres::PgRow| {
-                    use sqlx::Row;
-                    let security: i64 = row.get(0);
-                    let restore: i64 = row.get(1);
-                    (security, restore)
-                })
-                .fetch_one(&pool);
+                let check = reader.read_epoch_markers();
                 match tokio::time::timeout(EPOCH_CHECK_TIMEOUT, check).await {
                     Err(_) | Ok(Err(_)) => {
                         shared.changed.signal(Failure::unavailable(
@@ -1136,7 +1125,9 @@ impl Component for ServeEpochMonitor {
                         ));
                         std::future::pending::<()>().await;
                     }
-                    Ok(Ok((security, restore))) => {
+                    Ok(Ok(pair)) => {
+                        let security = pair.security;
+                        let restore = pair.restore;
                         let initial = *shared.initial.lock().unwrap_or_else(|p| p.into_inner());
                         match initial {
                             Some((expected_security, expected_restore))
@@ -2627,6 +2618,7 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
     }
     profile.set_control_lock(PgControlLock {
         conn: Some(control_conn),
+        lock: pg_serve::ControlLock::new(SERVE_TARGET_EXCLUSION_LOCK_KEY),
     });
 
     let opened: OpenedEpoch = Arc::new(StdMutex::new(None));
@@ -2668,7 +2660,7 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
     // lifecycleMonitor, executionMonitor, listeners..., dispatcher,
     // artifactReconciler}`.
     profile.add_component(ServeEpochMonitor {
-        pool: pool.clone(),
+        reader: exec_store.clone(),
         shared: epochs.clone(),
     });
     profile.add_component(lifecycle_monitor);
