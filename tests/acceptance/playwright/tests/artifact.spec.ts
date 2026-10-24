@@ -4,8 +4,8 @@ import { ARTIFACT_ENABLED, ARTIFACT_TASK } from '../support/fixtures';
 /**
  * Artifact delivery — gated on the object-store leg
  * (`CENTRAL_ACCEPTANCE_ARTIFACT=1` from the runner when a MinIO/S3
- * endpoint was reachable and the report body was seeded at
- * `r3-acceptance/report.md`).
+ * endpoint was reachable and the report body was seeded at the
+ * `v1/ready/…` object key the runner prints).
  */
 test.describe('artifact preview and download', () => {
   test.skip(!ARTIFACT_ENABLED, 'object store not provisioned');
