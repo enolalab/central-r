@@ -1,0 +1,43 @@
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+h1 { font-size: 1.4rem; }
+form { display: grid; gap: 1rem; }
+fieldset { border: 1px solid currentColor; padding: 1rem; margin: 0; }
+legend { font-weight: 700; padding: 0 0.25rem; }
+label { font-weight: 600; display: block; margin-bottom: 0.25rem; }
+input { width: 100%; padding: 0.5rem; font-size: 1rem; font-family: inherit; }
+button, a.button { display: inline-block; padding: 0.6rem 1.2rem; font-size: 1rem; font-family: inherit; cursor: pointer; border: 1px solid currentColor; background: Canvas; color: inherit; text-decoration: none; }
+button:active { transform: translateY(1px); }
+:focus-visible { outline: 3px solid Highlight; outline-offset: 2px; }
+.alert { border: 1px solid currentColor; padding: 0.75rem 1rem; min-height: 1.5rem; }
+.alert-icon { font-weight: 700; margin-right: 0.5rem; }
+.hint { font-size: 0.875rem; opacity: 0.85; margin: 0; }
+.status { font-weight: 700; }
+code { font-family: ui-monospace, monospace; }
+body.office-body { max-width: 60rem; }
+.office-stage { border: 1px solid currentColor; border-radius: 10px; overflow: hidden; margin-top: 1rem; background: #0e1220; }
+.office-stage canvas { display: block; width: 100%; }
+nav { margin: 0 0 1rem; }
+nav a { margin-right: 0.5rem; }
+pre.permission-input { white-space: pre-wrap; overflow-wrap: anywhere; direction: ltr; unicode-bidi: bidi-override; border: 1px solid currentColor; padding: 0.75rem; }
+code.permission-label { white-space: pre-wrap; overflow-wrap: anywhere; direction: ltr; unicode-bidi: bidi-override; }
+
+/* Run views (issue #96): tables, the DAG, and state badges. Badges carry
+   the vocabulary token as their TEXT; the border/weight accents below are
+   additive only, never the sole carrier of meaning. */
+body.wide-body { max-width: 72rem; }
+table { border-collapse: collapse; margin: 0.5rem 0 1rem; }
+th, td { border: 1px solid currentColor; padding: 0.3rem 0.6rem; text-align: left; vertical-align: top; }
+caption, th { font-weight: 700; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+dl { display: grid; grid-template-columns: max-content auto; gap: 0.15rem 1rem; margin: 0.5rem 0 1rem; }
+dt { font-weight: 700; }
+dd { margin: 0; }
+.badge { display: inline-block; border: 1px solid currentColor; border-radius: 0.4rem; padding: 0 0.35rem; margin: 0.1rem 0.15rem 0.1rem 0; font-size: 0.8rem; font-weight: 600; white-space: nowrap; }
+.badge-running, .badge-dispatched { border-width: 2px; }
+.badge-succeeded { border-style: double; border-width: 3px; }
+.badge-failed, .badge-failed_terminal, .badge-attempt_ambiguous { border-style: dashed; }
+.badge-cancelled { opacity: 0.75; }
+ul.dag, ul.dag ul { margin: 0.25rem 0 0.25rem 1.25rem; }
+ul.edge-badges { list-style: none; padding-left: 0; margin: 0.25rem 0; font-size: 0.875rem; }
