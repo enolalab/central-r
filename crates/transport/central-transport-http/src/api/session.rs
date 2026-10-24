@@ -43,14 +43,9 @@ const ABSOLUTE_EXPIRY: time::Duration = time::Duration::hours(12);
 
 /// `ServeExchange` — see the module doc.
 pub(crate) async fn serve_exchange(state: Arc<WebState>, req: Request) -> Response {
-    // The token must not arrive in the query string — it would land in
-    // access logs. Checked before the body parse just like upstream.
-    if req.uri().query().is_some_and(|q| {
-        q.split('&')
-            .any(|p| p.split('=').next() == Some("bootstrap_token"))
-    }) {
-        return web::render_bootstrap(&req, StatusCode::BAD_REQUEST, TOKEN_IN_QUERY);
-    }
+    // Upstream parses the body FIRST, then refuses a query-string
+    // token — an unreadable body keeps its own remediation even when
+    // the query also carries `bootstrap_token`.
     let mut req = req;
     let form = match web::parse_body_form(&mut req).await {
         Ok(f) => f,
@@ -58,6 +53,17 @@ pub(crate) async fn serve_exchange(state: Arc<WebState>, req: Request) -> Respon
             return web::render_bootstrap(&req, StatusCode::BAD_REQUEST, FORM_UNREADABLE);
         }
     };
+    // The token must not arrive in the query string — it would land in
+    // access logs. `r.URL.Query()` decodes percent-escapes, so the key
+    // check runs on the DECODED query map: `?bootstrap%5Ftoken=x`
+    // decodes to `bootstrap_token` and is refused exactly like the
+    // literal spelling.
+    if req.uri().query().is_some_and(|q| {
+        crate::middleware::session_auth::parse_urlencoded(q.as_bytes())
+            .contains_key("bootstrap_token")
+    }) {
+        return web::render_bootstrap(&req, StatusCode::BAD_REQUEST, TOKEN_IN_QUERY);
+    }
     let tokens = form.get("bootstrap_token").map_or(&[][..], Vec::as_slice);
     if tokens.len() != 1 || tokens[0].is_empty() {
         return web::render_bootstrap(&req, StatusCode::BAD_REQUEST, TOKEN_UNREADABLE);

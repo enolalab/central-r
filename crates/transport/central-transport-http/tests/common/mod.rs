@@ -406,6 +406,12 @@ fn exchange_session_placeholder(id: SessionId) -> Session {
 pub struct FakeTasks {
     /// `(workspace_id, task_id)` → aggregate.
     pub aggregates: Mutex<HashMap<(WorkspaceId, TaskId), LoadedAggregate>>,
+    /// Upstream `reloadAggregate`: when set, every `load_aggregate` call
+    /// after the first returns this snapshot — the "meanwhile" re-read
+    /// the cancel refusal-notice path performs.
+    pub reload_aggregate: Mutex<Option<LoadedAggregate>>,
+    /// `load_aggregate` call count (calls ≥ 2 read the reload snapshot).
+    pub load_calls: AtomicUsize,
     /// submitted requests, in order.
     pub submit_calls: Mutex<Vec<SubmitTaskRequest>>,
     /// cancel paths taken: "unclaimed" | "request".
@@ -414,6 +420,8 @@ pub struct FakeTasks {
     pub retry_calls: Mutex<Vec<TaskId>>,
     /// rerun calls.
     pub rerun_calls: Mutex<Vec<TaskId>>,
+    /// `CommandMeta` presented to each mutation entry point, in order.
+    pub metas: Mutex<Vec<CommandMeta>>,
     /// injected failures (one-shot each).
     pub submit_fail: Mutex<Option<central_foundation::failure::Failure>>,
     /// injected failures (one-shot each).
@@ -426,10 +434,13 @@ impl FakeTasks {
     pub fn new() -> Self {
         Self {
             aggregates: Mutex::new(HashMap::new()),
+            reload_aggregate: Mutex::new(None),
+            load_calls: AtomicUsize::new(0),
             submit_calls: Mutex::new(Vec::new()),
             cancel_calls: Mutex::new(Vec::new()),
             retry_calls: Mutex::new(Vec::new()),
             rerun_calls: Mutex::new(Vec::new()),
+            metas: Mutex::new(Vec::new()),
             submit_fail: Mutex::new(None),
             mutation_fail: Mutex::new(None),
             events: Mutex::new(Vec::new()),
@@ -616,9 +627,10 @@ impl TaskService for FakeTasks {
     fn submit_task(
         &self,
         req: SubmitTaskRequest,
-        _meta: CommandMeta,
+        meta: CommandMeta,
     ) -> BoxFuture<'_, Result<CommitResult, central_foundation::failure::Failure>> {
         Box::pin(async move {
+            self.metas.lock().unwrap().push(meta);
             self.submit_calls.lock().unwrap().push(req.clone());
             if let Some(f) = self.submit_fail.lock().unwrap().take() {
                 return Err(f);
@@ -638,9 +650,10 @@ impl TaskService for FakeTasks {
     fn request_cancellation(
         &self,
         _req: RequestCancellationRequest,
-        _meta: CommandMeta,
+        meta: CommandMeta,
     ) -> BoxFuture<'_, Result<CommitResult, central_foundation::failure::Failure>> {
         Box::pin(async move {
+            self.metas.lock().unwrap().push(meta);
             self.cancel_calls.lock().unwrap().push("request");
             if let Some(f) = self.mutation_fail.lock().unwrap().take() {
                 return Err(f);
@@ -656,9 +669,10 @@ impl TaskService for FakeTasks {
     fn cancel_unclaimed_task(
         &self,
         _req: CancelUnclaimedTaskRequest,
-        _meta: CommandMeta,
+        meta: CommandMeta,
     ) -> BoxFuture<'_, Result<CommitResult, central_foundation::failure::Failure>> {
         Box::pin(async move {
+            self.metas.lock().unwrap().push(meta);
             self.cancel_calls.lock().unwrap().push("unclaimed");
             if let Some(f) = self.mutation_fail.lock().unwrap().take() {
                 return Err(f);
@@ -674,9 +688,10 @@ impl TaskService for FakeTasks {
     fn retry_failed_task(
         &self,
         req: RetryFailedTaskRequest,
-        _meta: CommandMeta,
+        meta: CommandMeta,
     ) -> BoxFuture<'_, Result<CommitResult, central_foundation::failure::Failure>> {
         Box::pin(async move {
+            self.metas.lock().unwrap().push(meta);
             self.retry_calls
                 .lock()
                 .unwrap()
@@ -695,9 +710,10 @@ impl TaskService for FakeTasks {
     fn rerun_cancelled_task(
         &self,
         req: RerunCancelledTaskRequest,
-        _meta: CommandMeta,
+        meta: CommandMeta,
     ) -> BoxFuture<'_, Result<CommitResult, central_foundation::failure::Failure>> {
         Box::pin(async move {
+            self.metas.lock().unwrap().push(meta);
             self.rerun_calls.lock().unwrap().push(req.source.task.id);
             if let Some(f) = self.mutation_fail.lock().unwrap().take() {
                 return Err(f);
@@ -716,6 +732,16 @@ impl TaskService for FakeTasks {
         task_id: TaskId,
     ) -> BoxFuture<'_, Result<LoadedAggregate, central_foundation::failure::Failure>> {
         Box::pin(async move {
+            // Upstream `fakeTaskService.LoadAggregate`: calls after the
+            // first return the `reload_aggregate` snapshot verbatim —
+            // the durable "meanwhile" state the refusal-notice re-read
+            // observes.
+            let n = self.load_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n > 1
+                && let Some(reload) = self.reload_aggregate.lock().unwrap().as_ref()
+            {
+                return Ok(reload.clone());
+            }
             self.aggregates
                 .lock()
                 .unwrap()
@@ -900,6 +926,13 @@ pub struct FakeHarness {
     pub decisions: Mutex<Vec<HarnessPermissionDecision>>,
     /// injected failure on the next resolve/resume/decide.
     pub op_fail: Mutex<Option<central_foundation::failure::Failure>>,
+    /// `retry_state` call count — a gate that must not run for a
+    /// non-retry-eligible Task proves itself here.
+    pub retry_state_calls: AtomicUsize,
+    /// `retry_state` returns an infrastructure failure when set.
+    pub retry_state_fails: AtomicBool,
+    /// `retry_state` reports the cost cap reached when set.
+    pub retry_blocked: AtomicBool,
 }
 
 impl FakeHarness {
@@ -910,6 +943,9 @@ impl FakeHarness {
             resolves: Mutex::new(Vec::new()),
             decisions: Mutex::new(Vec::new()),
             op_fail: Mutex::new(None),
+            retry_state_calls: AtomicUsize::new(0),
+            retry_state_fails: AtomicBool::new(false),
+            retry_blocked: AtomicBool::new(false),
         }
     }
 
@@ -1045,7 +1081,16 @@ impl HarnessOperator for FakeHarness {
         _w: WorkspaceId,
         _t: TaskId,
     ) -> BoxFuture<'_, Result<HarnessRetryState, central_foundation::failure::Failure>> {
-        Box::pin(async move { Ok(HarnessRetryState::default()) })
+        Box::pin(async move {
+            self.retry_state_calls.fetch_add(1, Ordering::SeqCst);
+            if self.retry_state_fails.load(Ordering::SeqCst) {
+                return Err(Self::infra_err());
+            }
+            Ok(HarnessRetryState {
+                blocked: self.retry_blocked.load(Ordering::SeqCst),
+                ..HarnessRetryState::default()
+            })
+        })
     }
     fn run_budget(
         &self,

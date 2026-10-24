@@ -75,29 +75,33 @@ pub fn parse_repository_analysis_input(
     // the shape; duplicate members need a first pass of their own
     // (serde maps silently keep the last).
     reject_duplicate_members(raw)?;
+    // Owned `String` fields — `json.Unmarshal` decodes escapes
+    // (`\"`, `\\`, `\n`, `\uXXXX`) into the compared value; a borrowed
+    // `&str` deserializer cannot produce them and would reject every
+    // escaped instruction upstream accepts.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Fields<'a> {
-        schema_version: &'a str,
-        instruction: &'a str,
-        workspace_root_id: &'a str,
+    struct Fields {
+        schema_version: String,
+        instruction: String,
+        workspace_root_id: String,
     }
-    let fields: Fields<'_> = serde_json::from_slice(raw).map_err(|_| invalid())?;
+    let fields: Fields = serde_json::from_slice(raw).map_err(|_| invalid())?;
     if fields.schema_version != SCHEMA_VERSION
         || fields.instruction.is_empty()
         || fields.instruction.len() > MAX_INSTRUCTION_BYTES
         || fields.instruction.trim().is_empty()
         || fields.instruction.contains('\0')
-        || !is_nfc(fields.instruction)
+        || !is_nfc(&fields.instruction)
     {
         return Err(invalid());
     }
-    if !verified_root_id(fields.workspace_root_id, verified_root_ids) {
+    if !verified_root_id(&fields.workspace_root_id, verified_root_ids) {
         return Err(denied());
     }
     Ok(RepositoryAnalysisInput {
-        instruction: fields.instruction.to_string(),
-        workspace_root_id: fields.workspace_root_id.to_string(),
+        instruction: fields.instruction,
+        workspace_root_id: fields.workspace_root_id,
     })
 }
 
@@ -117,7 +121,10 @@ fn reject_duplicate_members(raw: &[u8]) -> Result<(), InvalidInput> {
     // serde_json::Value's Map keeps insertion order only under the
     // `preserve_order` feature; walk member names manually instead —
     // the input is bounded to 64 KiB so a second token pass is cheap.
-    let mut seen: HashSet<&str> = HashSet::new();
+    // Names decode to owned `String`s: upstream compares the DECODED
+    // member name, so `"instru\u0063tion"` IS `instruction` for the
+    // known-name, uniqueness, and NFC checks alike.
+    let mut seen: HashSet<String> = HashSet::new();
 
     let mut i = 0usize;
     let bytes = raw;
@@ -143,10 +150,13 @@ fn reject_duplicate_members(raw: &[u8]) -> Result<(), InvalidInput> {
                 if depth != 1 {
                     return Err(invalid());
                 }
-                let name: &str = serde_json::from_slice(&bytes[start..i]).map_err(|_| invalid())?;
-                if !matches!(name, "schema_version" | "instruction" | "workspace_root_id")
+                let name: String =
+                    serde_json::from_slice(&bytes[start..i]).map_err(|_| invalid())?;
+                if !matches!(
+                    name.as_str(),
+                    "schema_version" | "instruction" | "workspace_root_id"
+                ) || !is_nfc(&name)
                     || !seen.insert(name)
-                    || !is_nfc(name)
                 {
                     return Err(invalid());
                 }

@@ -115,7 +115,11 @@ pub fn routes(state: &Arc<WebState>) -> Vec<RoutedSpec> {
     let mutation = |restart_barrier: bool| RoutePolicy {
         class: RouteClass::App,
         response_cap: policy::HTML_RESPONSE_CAP,
-        body_limit: 0,
+        // Upstream `serve_composition.go` puts
+        // `middleware.DefaultBootstrapBodyLimit` (1 MiB) on every
+        // `/app/tasks/*` mutation route — submit, cancel, retry,
+        // rerun, and the three harness operator routes.
+        body_limit: policy::DEFAULT_BOOTSTRAP_BODY_LIMIT,
         origin_required: true,
         state_changing: true,
         csrf_required: false,

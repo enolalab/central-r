@@ -125,10 +125,30 @@ pub fn format_budget_duration(seconds: i64) -> String {
             format!("{m} minutes")
         }
     } else {
-        // `time.Duration.String()` — seconds precision suffices at the
-        // bounds this page renders.
-        format!("{seconds}s")
+        go_duration_string(seconds)
     }
+}
+
+/// Go `time.Duration.String()` for an integer-second value: the
+/// seconds field always renders, the minutes and hours fields join
+/// only while nonzero, and hours are the largest unit (Go renders no
+/// days). `90` → `"1m30s"`, `3600` → `"1h0m0s"`, `3661` → `"1h1m1s"`,
+/// `0` → `"0s"`, `-90` → `"-1m30s"`.
+fn go_duration_string(seconds: i64) -> String {
+    let mut u = seconds.unsigned_abs();
+    let mut out = format!("{}s", u % 60);
+    u /= 60;
+    if u > 0 {
+        out = format!("{}m{out}", u % 60);
+        u /= 60;
+        if u > 0 {
+            out = format!("{u}h{out}");
+        }
+    }
+    if seconds < 0 {
+        out.insert(0, '-');
+    }
+    out
 }
 
 /// `costPlaceholder` — serve's default cost bound in the field's own

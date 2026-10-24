@@ -99,10 +99,12 @@ pub async fn layer<S: SessionValidator>(
     let mut presented_csrf_hash: Option<[u8; 32]> = None;
     if matched.policy.session_csrf_required && !safe {
         let presented = match class {
-            RouteClass::App => match presented_form_csrf(&mut req).await {
-                Ok(v) => v,
-                Err(resp) => return *resp,
-            },
+            RouteClass::App => {
+                match presented_form_csrf(&mut req, matched.policy.effective_body_limit()).await {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                }
+            }
             _ => match presented_header_csrf(&req) {
                 Some(v) => v,
                 None => {
@@ -164,9 +166,12 @@ fn presented_header_csrf(req: &Request) -> Option<String> {
 
 /// Reads the bounded urlencoded body, extracts exactly one `csrf`
 /// field, and re-installs the body bytes so the handler can parse the
-/// same form again. The body is already size-capped by the admission
-/// `Limited` wrapper; `to_bytes` applies the same bound defensively.
-async fn presented_form_csrf(req: &mut Request) -> Result<String, Box<Response>> {
+/// same form again. This middleware is the FIRST body reader — the
+/// route-level `RequestBodyLimit` only wraps what the handler sees —
+/// so the bound must be the matched route's own
+/// `effective_body_limit` (upstream's `MaxBytesReader` wraps `r.Body`
+/// at admission, before any read).
+async fn presented_form_csrf(req: &mut Request, limit: usize) -> Result<String, Box<Response>> {
     let is_form = req
         .headers()
         .get(header::CONTENT_TYPE)
@@ -177,7 +182,7 @@ async fn presented_form_csrf(req: &mut Request) -> Result<String, Box<Response>>
     }
     let parts = std::mem::take(req);
     let (mut parts, body) = parts.into_parts();
-    let bytes = match axum::body::to_bytes(body, crate::policy::MAX_BODY_BUFFER).await {
+    let bytes = match axum::body::to_bytes(body, limit).await {
         Ok(b) => b,
         Err(_) => {
             return Err(Box::new(error::task_action_failure(StatusCode::FORBIDDEN)));

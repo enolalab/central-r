@@ -431,6 +431,13 @@ pub(crate) async fn serve_task_detail(state: Arc<WebState>, req: Request) -> Res
     // server-side mutation prelude refuses. UX consistency only — the
     // real boundary is `load_aggregate_for_mutation`'s claimability
     // check on every mutation POST.
+    // Deliberate divergence from upstream: `recovery_claimability`
+    // runs directly on the current run here rather than through
+    // upstream's decorated first-page detail read. That is MORE
+    // faithful to the §2.2 decorated projection (every page of the
+    // detail view is barrier-checked, not just page one), and the
+    // enforcement path is identical — the mutation prelude re-checks
+    // the same gate regardless of what this page rendered.
     let (restart_barrier, barrier_reason) = match projection.task.current_run_id {
         Some(run_id) => match claimability(&state, workspace_id, task_id, run_id).await {
             Ok(c) if !c.claimable => (true, c.reason.clone()),
@@ -966,6 +973,11 @@ async fn submit_with(
                 now: OffsetDateTime::now_utc(),
             },
             CommandMeta {
+                // Upstream passes `formValue(...)` verbatim (`""` when
+                // absent); the commit path treats `""` exactly like
+                // `None` (`commit_task_change_set` gates the receipt on
+                // `!k.is_empty()`, mirroring upstream's `!= ""`), so
+                // mapping `""` to `None` is byte-exact-equivalent.
                 idempotency_key: Some(form_value(form, "idempotency_key").to_string())
                     .filter(|k| !k.is_empty()),
                 ..CommandMeta::default()
@@ -1050,6 +1062,9 @@ fn detail_location(task_id: TaskId) -> String {
 
 fn meta_for(form: &HashMap<String, Vec<String>>) -> CommandMeta {
     CommandMeta {
+        // `""` → `None` is equivalent to upstream's verbatim `""`: the
+        // receipt dedup guards on a non-empty key either way (see the
+        // submit site's comment).
         idempotency_key: Some(form_value(form, "idempotency_key").to_string())
             .filter(|k| !k.is_empty()),
         ..CommandMeta::default()
@@ -1162,7 +1177,20 @@ async fn cancel_refusal_notice(state: &WebState, pre: &MutationPrelude) -> Optio
     if now.aggregate.task.status == TaskStatus::Cancelled {
         return Some(ACTION_NOTICE_ALREADY_CANCELLED);
     }
-    if !now.aggregate.unclaimed() {
+    // `actionNoticeCancelLostClaim` — upstream's exact five-conjunct
+    // predicate (`handler.go` `cancelRefusalNotice`): the loaded Task
+    // was Queued, the re-read Task is not terminal, the re-read has a
+    // current Run, it is the SAME Run this request loaded, and that
+    // Run is now claimed. Any other re-read state is the generic 409.
+    if t.status == TaskStatus::Queued
+        && !now.aggregate.task.is_terminal()
+        && let (Some(now_run), Some(loaded_run)) = (
+            now.aggregate.current_run.as_ref(),
+            pre.loaded.aggregate.current_run.as_ref(),
+        )
+        && now_run.id == loaded_run.id
+        && !now_run.ownership_token.is_empty()
+    {
         return Some(ACTION_NOTICE_CANCEL_LOST_CLAIM);
     }
     None
@@ -1182,14 +1210,21 @@ pub(crate) async fn serve_task_retry(state: Arc<WebState>, req: Request) -> Resp
         Ok(p) => p,
         Err(resp) => return *resp,
     };
-    if let Some(h) = &state.harness {
+    // The cost-cap check runs only for a retry-eligible Task
+    // (`taskRetryEligible` = Failed only — `handler.go:1226`); a
+    // non-Failed Task skips `retry_state` entirely so its failure can
+    // never mask the domain's own 409. A failed read is upstream's
+    // 500, never the retryable 503.
+    if let Some(h) = &state.harness
+        && task_view::task_retry_eligible(pre.loaded.aggregate.task.status)
+    {
         match h
             .retry_state(pre.session.workspace_id, pre.loaded.aggregate.task.id)
             .await
         {
             Ok(st) if st.blocked => return task_action_failure(StatusCode::CONFLICT),
             Ok(_) => {}
-            Err(_) => return task_action_failure(StatusCode::SERVICE_UNAVAILABLE),
+            Err(_) => return task_action_failure(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }
     match state
