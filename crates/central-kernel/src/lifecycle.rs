@@ -324,6 +324,14 @@ impl Default for WatchSource {
     }
 }
 
+/// Resolves when `stop` does — or immediately when the serving-gate
+/// select already consumed it (a completed future is never re-polled).
+async fn stop_or_done(stop: impl Future<Output = ()>, done: bool) {
+    if !done {
+        stop.await;
+    }
+}
+
 /// The pending arm for an optional watch: resolves with the boundary
 /// failure, or never resolves when no watch is installed.
 async fn watch_or_pending(watch: &mut Option<BoxFuture<'static, Failure>>) -> Failure {
@@ -632,7 +640,7 @@ impl Profile {
     /// failure, failed settlement).
     pub async fn run(&mut self, stop: impl Future<Output = ()>) -> Result<(), ExitError> {
         let readiness = self.readiness.clone();
-        if let Err(err) = self.config.validate() {
+        if let Err(err) = self.validate() {
             readiness.mark_not_ready("CONFIG_INVALID");
             return Err(err);
         }
@@ -648,6 +656,29 @@ impl Profile {
         result
     }
 
+    /// Upstream `validateConfig` — refuses a profile missing the
+    /// required runtime ports before any startup work begins: the
+    /// deployment singleton (`cfg.ControlLock`), the admission gate
+    /// (`cfg.Preflight` — the serving kind or a bounded preflight), and
+    /// the bootstrap reconciler (`cfg.Bootstrap`). Budget bounds follow
+    /// the ports check, matching upstream's field order.
+    fn validate(&self) -> Result<(), ExitError> {
+        if self.control_lock.is_none()
+            || (self.serving_preflight.is_none() && self.preflights.is_empty())
+            || self.bootstrap.is_none()
+        {
+            return Err(ExitError::new(
+                ExitClass::Usage,
+                "CONFIG_INVALID",
+                Failure::invalid(
+                    "kernel_required_ports_missing",
+                    "required runtime ports are missing",
+                ),
+            ));
+        }
+        self.config.validate()
+    }
+
     async fn drive(
         &mut self,
         stop: impl Future<Output = ()>,
@@ -655,6 +686,16 @@ impl Profile {
         readiness: &Readiness,
     ) -> Result<(), ExitError> {
         let mut startup_deadline = Instant::now() + self.config.startup_limit;
+        // `stop` is the host's runtime-context boundary (the SIGINT/
+        // SIGTERM relay): the serving gate races it during the
+        // unbounded drain exactly like upstream's
+        // `case <-runtimeCtx.Done()`, and the supervised phase polls it
+        // again as the intentional-stop arm.
+        let mut stop = std::pin::pin!(stop);
+        // Whether `stop` already resolved inside the serving-gate
+        // select — a completed future must never be re-polled by the
+        // supervised select below.
+        let mut stopped_early = false;
 
         /// Releases the singleton lease on an early-exit path — the port
         /// of upstream's deferred `lease.Close(context.Background())`.
@@ -693,44 +734,14 @@ impl Profile {
             }
         }
 
-        // Only the admitted singleton may invalidate an older generation,
-        // and it does so while retaining the outer proof guard. The call
-        // runs under the startup deadline exactly like upstream's
-        // `Revoke(startupCtx)` — upstream maps any failure on this path,
-        // deadline expiry included, to `BACKGROUND_LOOP_FAILED`.
-        if let Some(publisher) = session.publisher.as_mut() {
-            let revoked = timeout_at(startup_deadline, publisher.revoke()).await;
-            let cause = match revoked {
-                Ok(Ok(())) => None,
-                Ok(Err(cause)) => Some(cause),
-                Err(_) => Some(Failure::internal(
-                    "kernel_startup_deadline",
-                    "stale ready proof revoke exceeded the startup budget",
-                )),
-            };
-            if let Some(cause) = cause {
-                let _ = session.abort().await;
-                readiness.mark_failed("BACKGROUND_LOOP_FAILED");
-                tracing::warn!(
-                    code = cause.code(),
-                    "kernel: stale ready proof revoke failed"
-                );
-                return Err(ExitError::new(
-                    ExitClass::Terminal,
-                    "BACKGROUND_LOOP_FAILED",
-                    Failure::internal(
-                        "kernel_stale_proof_revoke_failed",
-                        "stale ready proof could not be revoked",
-                    ),
-                ));
-            }
-        }
-
         // The deployment singleton must be held before any serving
         // preflight can publish or reconcile durable recovery state —
         // a losing serve process stops here without opening an epoch
         // against the incumbent runtime (upstream `ControlLock.Acquire`
         // under `startupCtx`; any refusal maps to LEASE_LOST/exit 4).
+        // Upstream orders Acquire before the stale-proof Revoke: a
+        // contending serve that loses the advisory lock exits here
+        // without ever touching the incumbent's proof.
         let mut lease: Option<Box<dyn ControlLockLease>> = match self.control_lock.as_mut() {
             Some(lock) => match timeout_at(startup_deadline, lock.acquire()).await {
                 Ok(Ok(held)) => Some(held),
@@ -755,6 +766,41 @@ impl Profile {
             None => None,
         };
 
+        // Only the admitted singleton may invalidate an older generation,
+        // and it does so under the control lease while retaining the
+        // outer proof guard. The call runs under the startup deadline
+        // exactly like upstream's `Revoke(startupCtx)` — upstream maps
+        // any failure on this path, deadline expiry included, to
+        // `BACKGROUND_LOOP_FAILED`.
+        if let Some(publisher) = session.publisher.as_mut() {
+            let revoked = timeout_at(startup_deadline, publisher.revoke()).await;
+            let cause = match revoked {
+                Ok(Ok(())) => None,
+                Ok(Err(cause)) => Some(cause),
+                Err(_) => Some(Failure::internal(
+                    "kernel_startup_deadline",
+                    "stale ready proof revoke exceeded the startup budget",
+                )),
+            };
+            if let Some(cause) = cause {
+                close_lease!(lease);
+                let _ = session.abort().await;
+                readiness.mark_failed("BACKGROUND_LOOP_FAILED");
+                tracing::warn!(
+                    code = cause.code(),
+                    "kernel: stale ready proof revoke failed"
+                );
+                return Err(ExitError::new(
+                    ExitClass::Terminal,
+                    "BACKGROUND_LOOP_FAILED",
+                    Failure::internal(
+                        "kernel_stale_proof_revoke_failed",
+                        "stale ready proof could not be revoked",
+                    ),
+                ));
+            }
+        }
+
         // The serving gate runs under the singleton lease
         // (upstream `runPreflightUnderControlLease`): the bounded
         // inspection/acquisition window under `startup_deadline`, the
@@ -775,6 +821,22 @@ impl Profile {
                 tokio::select! {
                     failure = watch_or_pending(&mut lost) => GateOutcome::LeaseLost(failure),
                     result = &mut gate_future => GateOutcome::Done(result),
+                    // Upstream `case <-runtimeCtx.Done()`: a stop during
+                    // the deliberately-unbounded drain cancels the
+                    // profile's runtime token — the gate's cooperative
+                    // shutdown signal — then waits for the gate to
+                    // unwind before reporting its outcome, exactly like
+                    // upstream's `cancelRuntime(); <-completed`. The
+                    // unwound gate returns its cancellation failure,
+                    // which lands on upstream's startup-failure path.
+                    () = stop.as_mut() => {
+                        stopped_early = true;
+                        self.cancel.cancel();
+                        GateOutcome::Done(gate_future.as_mut().await)
+                    }
+                    () = self.cancel.cancelled() => {
+                        GateOutcome::Done(gate_future.as_mut().await)
+                    }
                 }
             };
             match outcome {
@@ -935,14 +997,13 @@ impl Profile {
             .map(|component| Some(component.run()))
             .collect();
 
-        let mut stop = std::pin::pin!(stop);
         let cancel = self.cancel.clone();
         let mut controller = self.controller.as_ref().map(|watch| watch.tripped());
         let mut parent = self.parent.as_ref().map(|watch| watch.tripped());
         let mut epoch = self.epoch.as_ref().map(|watch| watch.tripped());
         let mut lease_lost = lease.as_ref().map(|held| held.lost());
         let cause = tokio::select! {
-            () = stop.as_mut() => Cause::Stop,
+            () = stop_or_done(stop.as_mut(), stopped_early) => Cause::Stop,
             () = cancel.cancelled() => Cause::Stop,
             _failure = watch_or_pending(&mut controller) => Cause::Stop,
             failure = watch_or_pending(&mut parent) => {
@@ -1131,12 +1192,78 @@ async fn drain_running<'a>(running: &mut [Option<BoxFuture<'a, Result<(), Failur
     .await
 }
 
+/// Shared no-op fixtures for the required runtime ports — profiles in
+/// component-level tests install these so the `validateConfig` ports
+/// check admits them (upstream tests stub the same members).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// An always-granted control lock.
+    pub(crate) struct GrantingLock;
+
+    impl ControlLock for GrantingLock {
+        fn acquire(&mut self) -> BoxFuture<'_, Result<Box<dyn ControlLockLease>, Failure>> {
+            Box::pin(async { Ok(Box::new(QuietLease) as Box<dyn ControlLockLease>) })
+        }
+    }
+
+    /// A held lease that never trips and closes cleanly.
+    pub(crate) struct QuietLease;
+
+    impl ControlLockLease for QuietLease {
+        fn lost(&self) -> BoxFuture<'static, Failure> {
+            Box::pin(std::future::pending())
+        }
+        fn close(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A serving gate that admits immediately with no epoch.
+    pub(crate) struct PassingGate;
+
+    impl ServingPreflight for PassingGate {
+        fn run_for_serve(
+            &mut self,
+            _runtime: CancellationToken,
+            _deadline: Instant,
+        ) -> BoxFuture<'_, Result<PreflightReport, Failure>> {
+            Box::pin(async {
+                Ok(PreflightReport {
+                    security_epoch: None,
+                })
+            })
+        }
+    }
+
+    /// A bootstrap reconciler that always succeeds.
+    pub(crate) struct NoopBootstrap;
+
+    impl BootstrapReconciler for NoopBootstrap {
+        fn reconcile_bootstrap(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A profile admitted by `validateConfig`: the three required ports
+    /// installed as no-ops; tests override whichever they exercise.
+    pub(crate) fn stub_profile(config: ProfileConfig, readiness: Readiness) -> Profile {
+        let mut profile = Profile::new(config, readiness);
+        profile.set_control_lock(GrantingLock);
+        profile.set_serving_preflight(PassingGate);
+        profile.set_bootstrap_reconciler(NoopBootstrap);
+        profile
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::stub_profile;
     use super::*;
     use crate::readiness::State;
     use crate::readyproof::ReadyProof;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
     fn failure(code: &'static str) -> Failure {
@@ -1381,7 +1508,7 @@ mod tests {
     async fn components_start_and_settle_on_token_stop() {
         let started = Arc::new(AtomicUsize::new(0));
         let settled = Arc::new(StdMutex::new(Vec::new()));
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.add_component(RecordingComponent::new(
             "a",
             started.clone(),
@@ -1411,7 +1538,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stop_future_ends_profile_gracefully() {
         let settled = Arc::new(StdMutex::new(Vec::new()));
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.add_component(RecordingComponent::new(
             "only",
             Arc::new(AtomicUsize::new(0)),
@@ -1428,7 +1555,7 @@ mod tests {
     async fn terminal_component_failure_cancels_profile_with_exit_6() {
         let started = Arc::new(AtomicUsize::new(0));
         let settled = Arc::new(StdMutex::new(Vec::new()));
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         let mut failing = RecordingComponent::new("failing", started.clone(), settled.clone());
         failing.run_fails = true;
         profile.add_component(failing);
@@ -1457,7 +1584,7 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
         }
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.add_component(Completing);
         let err = profile.run(pending_stop()).await.unwrap_err();
         assert_eq!(err.class(), ExitClass::Terminal);
@@ -1481,7 +1608,7 @@ mod tests {
             shutdown: Duration::from_millis(40),
             ..test_config()
         };
-        let mut profile = Profile::new(config, Readiness::new());
+        let mut profile = stub_profile(config, Readiness::new());
         profile.add_component(SlowSettle);
         let token = profile.cancellation_token();
 
@@ -1501,7 +1628,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn settle_error_fails_the_stop() {
         let settled = Arc::new(StdMutex::new(Vec::new()));
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         let mut bad = RecordingComponent::new("bad", Arc::new(AtomicUsize::new(0)), settled);
         bad.settle_error = Some(failure("settle_failed"));
         profile.add_component(bad);
@@ -1513,7 +1640,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn preflight_epoch_reaches_readiness_and_failure_refuses() {
         let readiness = Readiness::new();
-        let mut profile = Profile::new(test_config(), readiness.clone());
+        let mut profile = stub_profile(test_config(), readiness.clone());
         profile.add_preflight(StubPreflight {
             epoch: Some(77),
             result: None,
@@ -1522,7 +1649,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(readiness.security_epoch(), 77);
 
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.add_preflight(StubPreflight {
             epoch: None,
             result: Some(Failure::unavailable("pg_down", "postgres down")),
@@ -1544,7 +1671,7 @@ mod tests {
             shutdown: Duration::from_secs(30), // < settlement
             ..test_config()
         };
-        let mut profile = Profile::new(config, Readiness::new());
+        let mut profile = stub_profile(config, Readiness::new());
         let err = profile.run(pending_stop()).await.unwrap_err();
         assert_eq!(err.class(), ExitClass::Usage);
         assert_eq!(err.class().code(), 2);
@@ -1554,7 +1681,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn proof_lifecycle_orders_begin_publish_revoke_by_generation() {
         let log = Arc::new(StdMutex::new(Vec::new()));
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.set_launch_id("launch-fixed");
         profile.set_proof_publisher(LoggedPublisher { log: log.clone() });
         let readiness = profile.readiness();
@@ -1593,7 +1720,7 @@ mod tests {
         // stale-proof window is not open for the whole settle budget.
         let log = Arc::new(StdMutex::new(Vec::new()));
         let readiness = Readiness::new();
-        let mut profile = Profile::new(test_config(), readiness.clone());
+        let mut profile = stub_profile(test_config(), readiness.clone());
         profile.set_launch_id("launch-order");
         profile.set_proof_publisher(OrderingPublisher {
             log: log.clone(),
@@ -1631,7 +1758,7 @@ mod tests {
         // the reported cause when the revoke also fails.
         let log = Arc::new(StdMutex::new(Vec::new()));
         let readiness = Readiness::new();
-        let mut profile = Profile::new(test_config(), readiness.clone());
+        let mut profile = stub_profile(test_config(), readiness.clone());
         profile.set_launch_id("launch-order");
         profile.set_proof_publisher(OrderingPublisher {
             log: log.clone(),
@@ -1686,7 +1813,7 @@ mod tests {
     async fn stop_with_failing_proof_revoke_exits_shutdown_failed() {
         // Upstream stop() returns `exitError(6, "SHUTDOWN_FAILED")` when
         // the proof revoke fails — never a warn-and-Ok.
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.set_launch_id("launch-revoke-fail");
         profile.set_proof_publisher(OrderingPublisher {
             log: Arc::new(StdMutex::new(Vec::new())),
@@ -1704,7 +1831,7 @@ mod tests {
             startup_limit: Duration::from_millis(30),
             ..test_config()
         };
-        let mut profile = Profile::new(config, Readiness::new());
+        let mut profile = stub_profile(config, Readiness::new());
         profile.set_launch_id("launch-hung-publish");
         profile.set_proof_publisher(HungPublisher { hang_on: "publish" });
         let started = Instant::now();
@@ -1725,7 +1852,7 @@ mod tests {
             startup_limit: Duration::from_millis(30),
             ..test_config()
         };
-        let mut profile = Profile::new(config, Readiness::new());
+        let mut profile = stub_profile(config, Readiness::new());
         profile.set_proof_publisher(HungPublisher { hang_on: "revoke" });
         let started = Instant::now();
         let err = profile.run(pending_stop()).await.unwrap_err();
@@ -1734,6 +1861,172 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "stale-proof revoke must be bounded by the startup deadline"
+        );
+    }
+
+    /// Upstream orders `ControlLock.Acquire` before the stale-proof
+    /// `Revoke`: a contending serve that loses the advisory lock must
+    /// leave the incumbent's proof untouched. The publisher log pins
+    /// the call sequence — with the wrong order this test observes a
+    /// `revoke` between `begin_startup` and `abort_startup`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn losing_acquire_never_revokes_the_incumbent_proof() {
+        struct RefusingLock;
+        impl ControlLock for RefusingLock {
+            fn acquire(&mut self) -> BoxFuture<'_, Result<Box<dyn ControlLockLease>, Failure>> {
+                Box::pin(async {
+                    Err(Failure::unavailable(
+                        "control_lock_held",
+                        "the deployment singleton is held",
+                    ))
+                })
+            }
+        }
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mut profile = stub_profile(test_config(), Readiness::new());
+        profile.set_control_lock(RefusingLock);
+        profile.set_proof_publisher(OrderingPublisher {
+            log: log.clone(),
+            fail_revoke: false,
+        });
+        let readiness = profile.readiness();
+        let err = profile.run(pending_stop()).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Timeout);
+        assert_eq!(err.reason(), "LEASE_LOST");
+        assert_eq!(readiness.state(), State::NotReady);
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &["begin_startup", "abort_startup"],
+            "a losing contender must never touch the incumbent's proof"
+        );
+    }
+
+    /// The revoke of a stale generation happens under the acquired
+    /// lease: the admitted singleton's call order is acquire → revoke →
+    /// gate. The publisher log cannot see the lock acquisition, so the
+    /// lock itself records its position relative to the publisher.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acquire_runs_before_the_stale_proof_revoke() {
+        struct RecordingLock {
+            log: Arc<StdMutex<Vec<String>>>,
+        }
+        impl ControlLock for RecordingLock {
+            fn acquire(&mut self) -> BoxFuture<'_, Result<Box<dyn ControlLockLease>, Failure>> {
+                self.log.lock().unwrap().push("acquire".to_string());
+                Box::pin(async {
+                    Ok(Box::new(super::test_support::QuietLease) as Box<dyn ControlLockLease>)
+                })
+            }
+        }
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let mut profile = stub_profile(test_config(), Readiness::new());
+        profile.set_control_lock(RecordingLock { log: log.clone() });
+        profile.set_proof_publisher(OrderingPublisher {
+            log: log.clone(),
+            fail_revoke: false,
+        });
+        let result = profile.run(std::future::ready(())).await;
+        assert!(result.is_ok());
+        let calls = log.lock().unwrap().clone();
+        let acquire = calls.iter().position(|c| c == "acquire").unwrap();
+        let revoke = calls.iter().position(|c| c == "revoke").unwrap();
+        assert!(
+            acquire < revoke,
+            "control-lock acquire must precede the stale-proof revoke: {calls:?}"
+        );
+    }
+
+    /// Upstream `case <-runtimeCtx.Done()`: a stop that lands while the
+    /// serving gate still drains cancels the gate's runtime token and
+    /// waits for it to unwind; the gate's cancellation failure resolves
+    /// on upstream's startup-failure path (POSTGRES_INCOMPATIBLE, exit
+    /// 5) — never a hang.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_during_gate_cancels_drain_and_refuses_startup() {
+        /// A gate that pends on its runtime token exactly like the
+        /// durable drain's `or_runtime` steps, then reports the
+        /// cancellation failure.
+        struct RuntimeBoundGate {
+            observed: Arc<AtomicBool>,
+        }
+        impl ServingPreflight for RuntimeBoundGate {
+            fn run_for_serve(
+                &mut self,
+                runtime: CancellationToken,
+                _deadline: Instant,
+            ) -> BoxFuture<'_, Result<PreflightReport, Failure>> {
+                let observed = self.observed.clone();
+                Box::pin(async move {
+                    runtime.cancelled().await;
+                    observed.store(true, Ordering::SeqCst);
+                    Err(Failure::new(
+                        central_foundation::failure::FailureKind::Conflict,
+                        "kernel_runtime_cancelled",
+                        "startup recovery interrupted by runtime shutdown",
+                    ))
+                })
+            }
+        }
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut profile = stub_profile(test_config(), Readiness::new());
+        profile.set_serving_preflight(RuntimeBoundGate {
+            observed: observed.clone(),
+        });
+        // `stop` resolves immediately — the gate select must race it
+        // into the runtime-cancel path rather than ignoring it.
+        let err = profile.run(std::future::ready(())).await.unwrap_err();
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "the drain must observe the cancelled runtime token"
+        );
+        assert_eq!(err.class(), ExitClass::Incompatible);
+        assert_eq!(err.reason(), "POSTGRES_INCOMPATIBLE");
+    }
+
+    /// Upstream `validateConfig`: `ControlLock`, `Preflight`, and
+    /// `Bootstrap` are required runtime ports; any missing member
+    /// refuses the profile with CONFIG_INVALID (exit 2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_required_ports_refuse_config_invalid() {
+        let readiness = Readiness::new();
+        // All three absent.
+        let mut bare = Profile::new(test_config(), readiness.clone());
+        let err = bare.run(pending_stop()).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Usage);
+        assert_eq!(err.reason(), "CONFIG_INVALID");
+        assert_eq!(readiness.state(), State::NotReady);
+
+        // Each missing member refuses independently.
+        let mut no_lock = stub_profile(test_config(), Readiness::new());
+        no_lock.control_lock = None;
+        let err = no_lock.run(pending_stop()).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Usage);
+        assert_eq!(err.reason(), "CONFIG_INVALID");
+
+        let mut no_gate = stub_profile(test_config(), Readiness::new());
+        no_gate.serving_preflight = None;
+        let err = no_gate.run(pending_stop()).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Usage);
+        assert_eq!(err.reason(), "CONFIG_INVALID");
+
+        let mut no_bootstrap = stub_profile(test_config(), Readiness::new());
+        no_bootstrap.bootstrap = None;
+        let err = no_bootstrap.run(pending_stop()).await.unwrap_err();
+        assert_eq!(err.class(), ExitClass::Usage);
+        assert_eq!(err.reason(), "CONFIG_INVALID");
+
+        // A bounded preflight satisfies upstream's `cfg.Preflight` slot
+        // when no serving gate is installed.
+        let mut bounded_only = stub_profile(test_config(), Readiness::new());
+        bounded_only.serving_preflight = None;
+        bounded_only.add_preflight(StubPreflight {
+            epoch: None,
+            result: None,
+        });
+        let result = bounded_only.run(std::future::ready(())).await;
+        assert!(
+            result.is_ok(),
+            "a bounded preflight fills upstream's cfg.Preflight slot"
         );
     }
 }

@@ -47,14 +47,22 @@ pub struct DevRestoreBarrier {
 
 impl DevRestoreBarrier {
     /// Creates (or opens) the private journal root — the dev layout
-    /// provisions the directory the way upstream's broker always does,
-    /// so an absent root is a first-run rather than a fault.
+    /// provisions the directory the way upstream's broker always does
+    /// (`os.MkdirAll(path, privateDirectoryMode)` → `0700`), so an
+    /// absent root is a first-run rather than a fault. A pre-existing
+    /// directory is adopted as-is: [`Self::inspect`] validates its
+    /// permissions and refuses a non-`0700` root — the barrier never
+    /// chmods what it did not create.
     ///
     /// # Errors
     /// `Failure::unavailable` when the root cannot be provisioned.
     pub fn new(root: PathBuf) -> Result<Self, Failure> {
         if !root.exists() {
-            std::fs::create_dir_all(&root)
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&root)
                 .map_err(|_| failed("create the restore journal root"))?;
         }
         Ok(Self { root })
@@ -150,4 +158,61 @@ fn validate_private_file(path: &Path) -> Result<(), Failure> {
         return Err(failed("a restore journal entry is not a private file"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    fn test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "central-restore-barrier-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// A first-run root is provisioned private — `0700`, not the umask
+    /// default — so `inspect` admits it instead of self-refusing.
+    #[test]
+    fn fresh_root_is_created_private_and_inactive() {
+        let root = test_root("fresh");
+        let barrier = DevRestoreBarrier::new(root.clone()).unwrap();
+        let md = std::fs::symlink_metadata(&root).unwrap();
+        assert_eq!(
+            md.mode() & 0o777,
+            0o700,
+            "the dev journal root must be provisioned private"
+        );
+        assert_eq!(
+            barrier.inspect().unwrap(),
+            None,
+            "an empty journal is an inactive barrier"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pre-existing root is adopted as-is: a non-private directory
+    /// stays non-private (no chmod) and `inspect` refuses it.
+    #[test]
+    fn preexisting_non_private_root_still_refuses() {
+        let root = test_root("nonprivate");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&root)
+            .unwrap();
+        let barrier = DevRestoreBarrier::new(root.clone()).unwrap();
+        let md = std::fs::symlink_metadata(&root).unwrap();
+        assert_eq!(
+            md.mode() & 0o777,
+            0o755,
+            "the barrier must not chmod a root it did not create"
+        );
+        let err = barrier.inspect().unwrap_err();
+        assert_eq!(err.code(), "restore_barrier");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

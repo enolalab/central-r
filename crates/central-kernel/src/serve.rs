@@ -106,6 +106,7 @@ use crate::BoxFuture;
 use crate::artifact_reconcile::ArtifactReconcilerComponent;
 use crate::harness_compose::{
     Backend, ENV_LOCALEXEC, HarnessConfig, LauncherSelection, LauncherSelectionArgs,
+    session_failure,
 };
 use crate::lifecycle::{
     BootstrapReconciler, BoundaryWatch, Component, ControlLock, ControlLockLease, ExitError,
@@ -862,7 +863,10 @@ fn select_restore_barrier(
 /// `openDedicatedConn` — connects with
 /// `application_name=central_serve_{label}` and refuses a credential
 /// that does not authenticate as `central_runtime` (the upstream role
-/// check for both dedicated connections).
+/// check for both dedicated connections). Every failure on this path —
+/// the post-connect role check included — flows through upstream's
+/// `mapConnError` → `DEPENDENCY_UNAVAILABLE` (exit 3); upstream's exit
+/// 7 is the credential-profile check only.
 async fn open_dedicated_conn(
     dsn: &str,
     label: &'static str,
@@ -882,14 +886,9 @@ async fn open_dedicated_conn(
         .await
         .map_err(|e| dep_err(format!("{label} connection: role check: {e}")))?;
     if role != "central_runtime" {
-        return Err(ExitError::new(
-            ExitClass::Denied,
-            "AUTHORITY_DENIED",
-            Failure::denied(
-                "serve_runtime_role",
-                "authenticated postgres role is not central_runtime",
-            ),
-        ));
+        return Err(dep_err(format!(
+            "{label} connection: authenticated postgres role is not central_runtime"
+        )));
     }
     Ok(conn)
 }
@@ -1480,13 +1479,26 @@ impl BootstrapReconciler for ServeBootstrapReconciler {
                 })
                 .await
                 .map(|_| ())
-                .map_err(|_| {
-                    Failure::conflict(
-                        "BOOTSTRAP_RECONCILIATION_FAILED",
-                        "retry central serve after reconciling bootstrap sessions",
-                    )
-                })
+                .map_err(bootstrap_reconcile_failure)
         })
+    }
+}
+
+/// The reconcile-service error mapping — upstream `errors.As`: a typed
+/// session failure passes through with its own class and reason (the
+/// kernel maps each `FailureClass` to its concrete exit code); an
+/// untyped adapter error — upstream's plain `fmt.Errorf` — collapses to
+/// the `BOOTSTRAP_RECONCILIATION_FAILED` fallback (`ClassUnsupported`
+/// → conflict). `startup_failure` keeps the safe
+/// `BOOTSTRAP_RECONCILIATION_FAILED` token while the propagated kind
+/// sets the exit class.
+fn bootstrap_reconcile_failure(cause: central_session::contract::Failure) -> Failure {
+    match cause.class {
+        Some(_) => session_failure(cause),
+        None => Failure::conflict(
+            "BOOTSTRAP_RECONCILIATION_FAILED",
+            "retry central serve after reconciling bootstrap sessions",
+        ),
     }
 }
 
@@ -1893,10 +1905,14 @@ impl ServingPreflight for ServeRecoveryPreflight {
             };
             // `runOpenedEpoch`: the acknowledged resume, then the epoch
             // the gate runs with is published (monitor, the periodic
-            // pass) and the gate steps drain it.
-            let current =
-                apply_recovery_resume(self.resume.as_ref(), epoch, self.coordinator.as_ref())
-                    .await?;
+            // pass) and the gate steps drain it. The resume runs on the
+            // runtime token — its store reads are interruptible by the
+            // same `ctx.Done` arm upstream selects on.
+            let current = or_runtime(
+                &runtime,
+                apply_recovery_resume(self.resume.as_ref(), epoch, self.coordinator.as_ref()),
+            )
+            .await?;
             self.recovery.record(&current);
             *self.opened.lock().unwrap_or_else(|p| p.into_inner()) = Some(current.clone());
             self.run_gate_steps(&runtime, &current).await?;
@@ -1922,16 +1938,17 @@ impl ServeRecoveryPreflight {
             result?;
         }
         // `runArtifactRecovery` — an unconfigured capability is not a
-        // degradation: nothing runs and readiness is untouched.
+        // degradation: nothing runs and readiness is untouched. The
+        // fenced pass is itself interruptible: a runtime stop while it
+        // drains resolves with the cancellation failure, never a hang.
         if let Some(startup) = &self.artifact_startup {
             let claim = or_runtime(runtime, self.coordinator.claim_artifact_work(epoch)).await?;
-            startup
-                .recover(&ArtifactFence {
-                    generation: claim.fence.generation,
-                    epoch_generation: claim.epoch_generation,
-                    claim_token: claim.claim_token.clone(),
-                })
-                .await?;
+            let fence = ArtifactFence {
+                generation: claim.fence.generation,
+                epoch_generation: claim.epoch_generation,
+                claim_token: claim.claim_token.clone(),
+            };
+            or_runtime(runtime, startup.recover(&fence)).await?;
         }
         Ok(())
     }
@@ -2127,8 +2144,8 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
 
     // 2. The two dedicated, non-borrowable sessions — control lock and
     //    preflight inspector (`openDedicatedConn` runs the
-    //    `central_runtime` role check; a role mismatch is
-    //    AUTHORITY_DENIED in upstream).
+    //    `central_runtime` role check; a role mismatch fails through
+    //    `mapConnError` → DEPENDENCY_UNAVAILABLE in upstream).
     let control_conn = open_dedicated_conn(&config.dsn, "control").await?;
     let preflight_conn = open_dedicated_conn(&config.dsn, "preflight").await?;
 
@@ -3315,6 +3332,7 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let saw_epoch = Arc::new(AtomicU64::new(0));
         let mut profile = Profile::new(ProfileConfig::default(), readiness.clone());
+        profile.set_control_lock(crate::lifecycle::test_support::GrantingLock);
         profile.set_serving_preflight(FakeGate);
         profile.set_bootstrap_reconciler(Spy {
             called: called.clone(),
@@ -3607,5 +3625,166 @@ mod tests {
         std::fs::set_permissions(&capture, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(probe_harness_capture_host(&clone, Some(sysctl.to_str().unwrap())).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The resume step's store reads are runtime-interruptible: a stop
+    /// while `list_failed_workspaces` is in flight resolves the gate
+    /// with the runtime-cancelled failure — upstream's `ctx.Done` arm —
+    /// never a hang.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_runtime_aborts_recovery_resume() {
+        struct PendingLists {
+            token: CancellationToken,
+        }
+        impl RecoveryGateCoordinator for PendingLists {
+            fn run_epoch<'a>(&'a self) -> BoxFuture<'a, Result<RecoveryEpoch, Failure>> {
+                Box::pin(async {
+                    Ok(RecoveryEpoch {
+                        state: RecoveryEpochState::RecoveryEpochDegraded,
+                        ..epoch()
+                    })
+                })
+            }
+            fn claim_batch<'a>(
+                &'a self,
+                epoch: &'a RecoveryEpoch,
+            ) -> BoxFuture<'a, Result<Vec<RecoveryWorkspaceClaim>, Failure>> {
+                let claims = vec![completed_claim(epoch)];
+                Box::pin(async move { Ok(claims) })
+            }
+            fn complete_workspace<'a>(
+                &'a self,
+                _claim: &'a RecoveryWorkspaceClaim,
+            ) -> BoxFuture<'a, Result<(), Failure>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn claim_artifact_work<'a>(
+                &'a self,
+                _epoch: &'a RecoveryEpoch,
+            ) -> BoxFuture<'a, Result<ArtifactWorkClaim, Failure>> {
+                Box::pin(async { Err(Failure::internal("unused", "unused")) })
+            }
+            fn list_failed_workspaces<'a>(
+                &'a self,
+                _epoch_generation: i64,
+                _limit: u32,
+            ) -> BoxFuture<'a, Result<FailedRecoveryWorkspaces, Failure>> {
+                let token = self.token.clone();
+                Box::pin(async move {
+                    // The in-flight read cancels the runtime token
+                    // (upstream's `ctx.Done`) and then pends — the
+                    // `or_runtime` arm must resolve the step.
+                    token.cancel();
+                    std::future::pending().await
+                })
+            }
+            fn resume_epoch<'a>(
+                &'a self,
+                _command: ResumeRecoveryEpochCommand,
+            ) -> BoxFuture<'a, Result<RecoveryEpoch, Failure>> {
+                Box::pin(async { Err(Failure::internal("unused", "unused")) })
+            }
+        }
+        let runtime = CancellationToken::new();
+        let mut preflight = ServeRecoveryPreflight {
+            inspection: test_inspection(42),
+            pool: None,
+            coordinator: Arc::new(PendingLists {
+                token: runtime.clone(),
+            }),
+            harness_reconcile: None,
+            artifact_startup: None,
+            recovery: ServeRecoveryMonitor::new(),
+            resume: Some(RecoveryResumeAck {
+                generation: 7,
+                retry_attempt: 0,
+                reason: "operator note".to_owned(),
+            }),
+            opened: Arc::new(StdMutex::new(None)),
+        };
+        let err = preflight
+            .run_for_serve(runtime, far_startup())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "kernel_runtime_cancelled");
+    }
+
+    /// The fenced artifact pass observes runtime cancellation mid-step:
+    /// `startup.recover` resolves with the cancellation failure, never
+    /// a hang (upstream's drain `ctx.Done` check).
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_runtime_aborts_fenced_artifact_drain() {
+        struct PendingRecovery {
+            entered: Arc<AtomicBool>,
+            token: CancellationToken,
+        }
+        impl ArtifactStartupRecovery for PendingRecovery {
+            fn recover<'a>(
+                &'a self,
+                _fence: &'a ArtifactFence,
+            ) -> BoxFuture<'a, Result<(), Failure>> {
+                self.entered.store(true, Ordering::SeqCst);
+                let token = self.token.clone();
+                Box::pin(async move {
+                    token.cancel();
+                    std::future::pending().await
+                })
+            }
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let runtime = CancellationToken::new();
+        let (mut preflight, _recovery) = test_gate(
+            Arc::new(ScriptedCoordinator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                order: Arc::new(StdMutex::new(Vec::new())),
+                epoch: epoch(),
+            }),
+            Some(Arc::new(PendingRecovery {
+                entered: entered.clone(),
+                token: runtime.clone(),
+            })),
+            Arc::new(StdMutex::new(None)),
+        );
+        let err = preflight
+            .run_for_serve(runtime, far_startup())
+            .await
+            .unwrap_err();
+        assert!(entered.load(Ordering::SeqCst));
+        assert_eq!(err.code(), "kernel_runtime_cancelled");
+    }
+
+    /// N7 — `bootstrap_reconcile_failure`: a typed session failure
+    /// passes through with its class and reason (upstream `errors.As`);
+    /// an untyped adapter error collapses to the
+    /// `BOOTSTRAP_RECONCILIATION_FAILED` fallback.
+    #[test]
+    fn bootstrap_reconcile_failure_preserves_typed_class() {
+        use central_session::contract::{Failure as SessionFailure, FailureClass, Sentinel};
+        let typed = bootstrap_reconcile_failure(
+            SessionFailure::new(
+                FailureClass::SessionInvalidated,
+                "acknowledged delivery cannot be recovered safely",
+                "request a fresh bootstrap token",
+            )
+            .with_cause(Sentinel::SessionInvalidated),
+        );
+        assert_eq!(typed.kind(), FailureKind::Denied);
+        assert_eq!(typed.code(), "SESSION_INVALIDATED");
+        assert_eq!(
+            typed.message(),
+            "acknowledged delivery cannot be recovered safely"
+        );
+
+        let throttled = bootstrap_reconcile_failure(SessionFailure::new(
+            FailureClass::BootstrapThrottled,
+            "throttle",
+            "retry later",
+        ));
+        assert_eq!(throttled.kind(), FailureKind::Conflict);
+        assert_eq!(throttled.code(), "BOOTSTRAP_THROTTLED");
+
+        let untyped = bootstrap_reconcile_failure(SessionFailure::untyped("session store: revoke"));
+        assert_eq!(untyped.kind(), FailureKind::Conflict);
+        assert_eq!(untyped.code(), "BOOTSTRAP_RECONCILIATION_FAILED");
     }
 }

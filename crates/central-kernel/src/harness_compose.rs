@@ -734,7 +734,7 @@ pub fn select_bootstrap(
 /// Maps a session-contract failure onto the foundation taxonomy the
 /// kernel classifies exits with. The session `reason` is already
 /// redacted-safe; the class becomes the foundation kind/code.
-fn session_failure(f: central_session::contract::Failure) -> Failure {
+pub(crate) fn session_failure(f: central_session::contract::Failure) -> Failure {
     use central_session::contract::FailureClass;
     let (kind, code) = match f.class {
         Some(FailureClass::CsrfInvalid | FailureClass::BootstrapInvalid) => {

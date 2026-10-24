@@ -376,7 +376,8 @@ mod tests {
     use central_execution::resume::{RecoveryCoordinatorFence, RecoveryEpochState};
     use central_foundation::identity::WorkspaceId;
 
-    use crate::lifecycle::{Profile, ProfileConfig};
+    use crate::lifecycle::ProfileConfig;
+    use crate::lifecycle::test_support::stub_profile;
     use crate::readiness::Readiness;
 
     fn test_epoch() -> RecoveryEpoch {
@@ -505,7 +506,7 @@ mod tests {
         )
         .with_interval(Duration::from_millis(10));
 
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.add_component(component);
         let token = profile.cancellation_token();
         let driver = tokio::spawn(async move { profile.run(std::future::pending()).await });
@@ -551,7 +552,7 @@ mod tests {
         )
         .with_interval(Duration::from_millis(10));
 
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.add_component(component);
         let token = profile.cancellation_token();
         let driver = tokio::spawn(async move { profile.run(std::future::pending()).await });
@@ -591,7 +592,7 @@ mod tests {
         )
         .with_interval(Duration::from_millis(10));
 
-        let mut profile = Profile::new(test_config(), Readiness::new());
+        let mut profile = stub_profile(test_config(), Readiness::new());
         profile.add_component(component);
         let token = profile.cancellation_token();
         let driver = tokio::spawn(async move { profile.run(std::future::pending()).await });

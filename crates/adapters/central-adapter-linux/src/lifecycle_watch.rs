@@ -68,18 +68,24 @@ pub fn configured_fd(
 }
 
 /// `configuredPID` — parse a process id, defaulting to `fallback`
-/// (upstream defaults to `os.Getppid()`); rejects `<= 1` and self.
+/// (upstream defaults to `os.Getppid()`) when the variable is unset or
+/// empty; rejects `<= 1` and self.
 ///
 /// # Errors
-/// `Failure::invalid` when the value is not a usable pid.
+/// `Failure::invalid` when the variable is set but not a usable pid —
+/// upstream `configuredPID` returns an error and monitor construction
+/// fails rather than silently falling back.
 pub fn configured_pid(
-    _name: &str,
+    name: &str,
     fallback: u32,
     getenv: impl Fn(&str) -> Option<String>,
 ) -> Result<u32, Failure> {
-    let value = getenv(_name)
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(i64::from(fallback));
+    let value = match getenv(name) {
+        Some(raw) if !raw.is_empty() => raw
+            .parse::<i64>()
+            .map_err(|_| invalid("boundary process id is invalid"))?,
+        _ => i64::from(fallback),
+    };
     if value <= 1 || value == i64::from(std::process::id()) {
         return Err(invalid("boundary process id is invalid"));
     }
@@ -165,5 +171,59 @@ impl BoundaryWatch {
                 _ => "process boundary exited",
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env<'a>(value: Option<&'a str>) -> impl Fn(&str) -> Option<String> + 'a {
+        move |_| value.map(str::to_owned)
+    }
+
+    /// `configuredPID` — unset and empty values default to the
+    /// fallback; a parseable pid wins.
+    #[test]
+    fn configured_pid_defaults_on_absent_value() {
+        assert_eq!(configured_pid("P", 4242, env(None)).unwrap(), 4242);
+        assert_eq!(configured_pid("P", 4242, env(Some(""))).unwrap(), 4242);
+    }
+
+    /// Upstream `configuredPID` returns an error — monitor
+    /// construction fails — on a malformed or unusable value; it
+    /// never silently falls back.
+    #[test]
+    fn configured_pid_refuses_malformed_and_unusable_values() {
+        let self_pid = std::process::id().to_string();
+        for value in [
+            "garbage",
+            "3.0",
+            " 4242",
+            "1",
+            "0",
+            "-3",
+            "99999999999999999999",
+            self_pid.as_str(),
+        ] {
+            assert!(
+                configured_pid("P", 4242, env(Some(value))).is_err(),
+                "{value:?} must be refused"
+            );
+        }
+    }
+
+    /// A well-formed, non-self pid above 1 parses through unchanged.
+    #[test]
+    fn configured_pid_accepts_a_valid_value() {
+        let parent = default_parent_pid();
+        if parent > 1 && parent != std::process::id() {
+            let text = parent.to_string();
+            assert_eq!(
+                configured_pid("P", 4242, env(Some(text.as_str()))).unwrap(),
+                parent
+            );
+        }
+        assert_eq!(configured_pid("P", 4242, env(Some("4242"))).unwrap(), 4242);
     }
 }
