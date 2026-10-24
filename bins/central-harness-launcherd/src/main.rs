@@ -327,6 +327,10 @@ fn handle_control(e: &mut ScopeEntry) {
         drop_scope(e);
         return;
     }
+    // Deliberately stricter than C: upstream calls monitor_gone only on
+    // n <= 0 (EOF/error) and ignores a well-formed unexpected datagram.
+    // A monitor emitting stray bytes is buggy or compromised — losing the
+    // session is the fail-closed side.
     monitor_gone(e);
 }
 
@@ -615,6 +619,9 @@ fn forward(e: &mut ScopeEntry, conn: RawFd, op: Opcode, grace_ms: u32) -> bool {
     } else {
         CTL_KILL
     };
+    // Grace field is big-endian here and in session.rs's decode; C uses
+    // native order on the same socketpair. Self-consistent within this
+    // binary pair — daemon and monitor are always built together.
     msg[1..5].copy_from_slice(&grace_ms.to_be_bytes());
     if send_control(control.as_raw_fd(), &msg, &[conn], 0) {
         return true;

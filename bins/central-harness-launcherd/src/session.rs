@@ -506,7 +506,9 @@ fn private_devpts(p: &Plan) -> Result<(), Errno> {
 
 /// `mkdirs_beneath` creates each component of `rel` beneath `dirfd`,
 /// which lies on a root-created tmpfs, and returns an O_PATH
-/// descriptor of the last one.
+/// descriptor of the last one. Every caller binds `rel` well under
+/// PATH_MAX (workdir ≤4096, fixed hidden-tree suffixes), so the C
+/// PATH_MAX guard has no reachable analogue here.
 fn mkdirs_beneath(dirfd: &OwnedFd, rel: &[u8]) -> Result<OwnedFd, Errno> {
     let mut cur = sys::dupfd_cloexec(dirfd.as_raw_fd(), 0)?;
     for part in rel.split(|b| *b == b'/') {

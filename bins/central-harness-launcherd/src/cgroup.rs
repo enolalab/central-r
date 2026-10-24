@@ -231,7 +231,10 @@ pub fn scope_populated(scope: &Scope) -> Result<bool, Errno> {
     let Some(p) = find_subslice(text, b"populated ") else {
         return Err(Errno::IO);
     };
-    Ok(text[p + 10] == b'1')
+    // C's 256-byte NUL-padded buffer makes the value read infallible; the
+    // un-padded slice can end exactly at "populated " — treat a missing
+    // value byte as not-populated (same answer C's NUL gives).
+    Ok(text.get(p + 10) == Some(&b'1'))
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {

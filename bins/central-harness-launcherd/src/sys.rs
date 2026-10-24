@@ -321,7 +321,9 @@ pub fn sig_wait(set: &libc::sigset_t) -> libc::c_int {
 /// `signal(s, SIG_DFL)` for every signal — the harness resets its whole
 /// disposition table before exec.
 pub fn reset_all_signals() {
-    for s in 1..libc::SIGRTMAX() {
+    // Inclusive: upstream resets `1..NSIG` (NSIG = SIGRTMAX+1), covering
+    // SIGRTMAX itself.
+    for s in 1..=libc::SIGRTMAX() {
         // SAFETY: installing SIG_DFL is always sound.
         unsafe { libc::signal(s, libc::SIG_DFL) };
     }

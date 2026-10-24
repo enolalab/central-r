@@ -207,3 +207,11 @@ mod production {
 }
 #[cfg(not(feature = "test-build"))]
 pub use production::*;
+
+/// Upstream `CHL_TEST_MARKER` (chl.h:30): a byte string embedded in the
+/// binary that packaging greps for to refuse shipping a test build.
+/// `#[used]` keeps it after LTO/strip.
+#[cfg(feature = "test-build")]
+#[used]
+static TEST_BUILD_MARKER: &[u8] =
+    b"CHL-TEST-BUILD-MARKER: a test build of central-harness-launcherd; never install it";
