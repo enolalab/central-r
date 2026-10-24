@@ -23,6 +23,7 @@
 //! of the upstream `Run` land with the R3 serve composition.
 
 pub mod artifact_reconcile;
+pub mod harness_compose;
 pub mod lifecycle;
 pub mod readiness;
 pub mod readyproof;

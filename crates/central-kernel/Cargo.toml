@@ -13,6 +13,13 @@ central-artifact = { path = "../capabilities/central-artifact", version = "0.1.0
 # `RecoveryCoordinatorService` fence-source impl the reconciler
 # component drives (rust-application-boundaries.md §2.2 kernel edge).
 central-execution = { path = "../capabilities/central-execution", version = "0.1.0" }
+central-harness = { path = "../capabilities/central-harness", version = "0.1.0" }
+central-task = { path = "../capabilities/central-task", version = "0.1.0" }
+central-adapter-harness = { path = "../adapters/central-adapter-harness", version = "0.1.0" }
+central-adapter-linux = { path = "../adapters/central-adapter-linux", version = "0.1.0" }
+# The dev-gated bootstrap returns the session capability's own typed
+# contract (`central-session` is a capability peer, not an adapter).
+central-session = { path = "../capabilities/central-session", version = "0.1.0" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

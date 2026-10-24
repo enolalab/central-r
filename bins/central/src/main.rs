@@ -250,6 +250,11 @@ fn command_id(verb: &str, rest: &[&str], flags: &[&str]) -> String {
         ("checkpoint", None) => "checkpoint".to_string(),
         ("artifact", Some(sub)) => format!("artifact.{sub}"),
         ("artifact", None) => "artifact".to_string(),
+        // R3 task 13: `harness resume|rerun|cancel` are the landed
+        // verb ids; anything else under `harness` keeps the
+        // deterministic derivation and stays fail-closed.
+        ("harness", Some(sub)) => format!("harness.{sub}"),
+        ("harness", None) => "harness".to_string(),
         ("maintenance", Some(sub)) => format!("maintenance.{sub}"),
         ("maintenance", None) => "maintenance".to_string(),
         ("bootstrap", Some(sub)) => format!("bootstrap.{sub}"),

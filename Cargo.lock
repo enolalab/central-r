@@ -874,9 +874,14 @@ version = "0.1.0"
 name = "central-kernel"
 version = "0.1.0"
 dependencies = [
+ "central-adapter-harness",
+ "central-adapter-linux",
  "central-artifact",
  "central-execution",
  "central-foundation",
+ "central-harness",
+ "central-session",
+ "central-task",
  "rand 0.10.3",
  "serde",
  "serde_json",
