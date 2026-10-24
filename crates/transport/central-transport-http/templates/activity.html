@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Activity</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Activity</h1>
+<nav><a href="/app/tasks">Tasks</a> <a href="/app/overview">Overview</a> <a href="/app/office">Office</a></nav>
+{% include "harness_banner.html" %}
+{% if empty %}
+<p role="status" aria-live="polite">No activity yet.</p>
+{% else %}
+<ul aria-live="polite">
+{% for row in rows %}
+<li><a href="/app/tasks/detail?id={{ row.task_id }}">{{ row.kind }}</a>{% if !row.state.is_empty() %} &mdash; <span>{{ row.state }}</span>{% endif %}{% if !row.at.is_empty() %} &middot; <time>{{ row.at }}</time>{% endif %}</li>
+{% endfor %}
+</ul>
+{% if truncated %}<p class="hint">Showing the most recent events; older activity exists.</p>{% endif %}
+{% endif %}
+</main>
+</body>
+</html>

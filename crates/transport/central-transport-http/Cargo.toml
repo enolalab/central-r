@@ -8,7 +8,10 @@ publish.workspace = true
 
 [dependencies]
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
+central-artifact = { path = "../../capabilities/central-artifact", version = "0.1.0" }
+central-execution = { path = "../../capabilities/central-execution", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
+central-task = { path = "../../capabilities/central-task", version = "0.1.0" }
 askama.workspace = true
 axum.workspace = true
 prometheus-client.workspace = true
@@ -16,11 +19,13 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+time.workspace = true
 tokio.workspace = true
 tower.workspace = true
 tower-http = { workspace = true, features = ["catch-panic", "limit"] }
 tracing.workspace = true
 trait-variant.workspace = true
+unicode-normalization.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

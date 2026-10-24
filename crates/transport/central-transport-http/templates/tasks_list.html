@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Tasks</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Tasks</h1>
+<nav><a href="/app/overview">Overview</a> <a href="/app/office">Office</a> <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
+<form method="post" action="/app/tasks/submit">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <label>Title <input name="title" required></label>
+  <label>Repository root
+    <select name="workspace_root_id" required>
+      {% for root in allowed_roots %}<option value="{{ root }}">{{ root }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Instruction <textarea name="instruction" required></textarea></label>
+  {% if policy_select %}
+  <label>Tool permissions
+    <select name="permission_policy">
+      <option value="deny" selected>Deny every tool permission request</option>
+      <option value="bridge">Ask me for each tool permission request</option>
+      <option value="auto_allow">Auto-allow every tool</option>
+    </select>
+  </label>
+  <p class="hint">{{ user_settings_note }}</p>
+  <label><input type="checkbox" name="auto_allow_ack" value="1"> I acknowledge, for auto-allow only: {{ auto_allow_warning }}</label>
+  {% endif %}
+  {% if !deny_only_note.is_empty() %}<p class="hint">{{ deny_only_note }}</p>{% endif %}
+  {% if budget_fields %}
+  <label>Cost limit (USD) <input name="budget_cost_usd" inputmode="decimal" pattern="[0-9]+([.][0-9]{1,2})?" placeholder="{{ cost_placeholder }}"{% if cost_disabled %} disabled{% endif %}></label>
+  <label>Wall clock (minutes) <input name="budget_wall_clock_minutes" inputmode="numeric" pattern="[0-9]+" placeholder="{{ wall_clock_placeholder }}"></label>
+  <p class="hint">{{ subscription_note }}</p>
+  {% endif %}
+  <button type="submit">Submit</button>
+</form>
+{% if empty %}
+<p role="status" aria-live="polite">No tasks yet. Status: Empty</p>
+{% else %}
+<ul aria-live="polite">
+{% for row in rows %}
+<li><a href="/app/tasks/detail?id={{ row.id }}">{{ row.title }}</a> &mdash; <span>Status: {{ row.label }}</span></li>
+{% endfor %}
+</ul>
+{% endif %}
+</main>
+</body>
+</html>

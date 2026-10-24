@@ -954,8 +954,11 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "axum",
+ "central-artifact",
+ "central-execution",
  "central-foundation",
  "central-session",
+ "central-task",
  "prometheus-client",
  "rand 0.10.3",
  "serde",
@@ -967,6 +970,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "trait-variant",
+ "unicode-normalization",
  "uuid",
 ]
 

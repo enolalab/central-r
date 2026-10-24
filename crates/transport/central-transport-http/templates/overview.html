@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Overview</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Overview</h1>
+<nav><a href="/app/tasks">Tasks</a> <a href="/app/office">Office</a> <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
+
+<section aria-labelledby="health-h">
+<h2 id="health-h">Instance</h2>
+<p role="status" aria-live="polite">
+  State: <strong>{{ state_label }}</strong>{% if healthy %} &mdash; healthy{% endif %}
+</p>
+{% if !reason.is_empty() %}<p>Reason: {{ reason }}</p>{% endif %}
+{% if !remediation.is_empty() %}<p>Remediation: {{ remediation }}</p>{% endif %}
+</section>
+
+<section aria-labelledby="counts-h">
+<h2 id="counts-h">Tasks by status</h2>
+{% if no_tasks %}
+<p role="status" aria-live="polite">No tasks yet. Status: Empty</p>
+{% else %}
+<ul>
+{% for c in counts %}<li>{{ c.label }}: <span>{{ c.count }}</span></li>{% endfor %}
+</ul>
+<p>Total: {{ total }}{% if truncated %} or more (counts shown are a lower bound; more tasks exist beyond this page){% endif %}</p>
+{% endif %}
+</section>
+
+<section aria-labelledby="attention-h">
+<h2 id="attention-h">Needs attention</h2>
+{% if !attention.is_empty() %}
+<ul aria-live="polite">
+{% for a in attention %}
+<li><a href="/app/tasks/detail?id={{ a.id }}">{{ a.title }}</a> &mdash; <span>Status: {{ a.label }}</span> &mdash; <span>{{ a.action }}</span></li>
+{% endfor %}
+</ul>
+{% else %}
+<p role="status" aria-live="polite">Nothing needs your attention right now.</p>
+{% endif %}
+</section>
+</main>
+</body>
+</html>

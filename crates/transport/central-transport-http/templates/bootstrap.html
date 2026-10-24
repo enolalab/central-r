@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Bootstrap</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Central Bootstrap</h1>
+<p>Enter the bootstrap token issued by <code>central bootstrap show</code>. The token is single-use and expires shortly after it is shown.</p>
+
+<div class="alert" role="alert" id="form-error" aria-live="polite">{% if !error.is_empty() %}<span class="alert-icon" aria-hidden="true">&#9888; Error</span>{{ error }}{% endif %}</div>
+
+<form method="post" action="/api/v1/session/bootstrap" autocomplete="off" aria-describedby="form-error" novalidate>
+<input type="hidden" name="csrf" value="{{ csrf_field }}">
+<fieldset>
+<legend>Bootstrap credentials</legend>
+<label for="bootstrap-token">Bootstrap token</label>
+<input id="bootstrap-token" name="bootstrap_token" type="password" autocomplete="off" required aria-required="true"{% if !error.is_empty() %} aria-invalid="true"{% endif %}{% if autofocus %} autofocus{% endif %}>
+<p class="hint">Submit promptly; the countdown shown in the terminal is authoritative.</p>
+</fieldset>
+<button type="submit">Submit token</button>
+</form>
+<script src="/assets/bootstrap.js" defer></script>
+</main>
+</body>
+</html>

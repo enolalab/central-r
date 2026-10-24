@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Artifact preview</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Artifact preview</h1>
+{% if truncated %}
+<p class="preview-truncated">This preview shows only the first part of the artifact. <a href="/app/tasks/artifact/download?id={{ artifact_id }}">Download the full artifact</a> to see the complete content.</p>
+{% endif %}
+<pre>{{ content }}</pre>
+</main>
+</body>
+</html>

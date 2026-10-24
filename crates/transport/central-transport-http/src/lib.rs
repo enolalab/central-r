@@ -34,6 +34,7 @@
 //! The transport stays generic over the session service through the
 //! narrow [`ports`] traits.
 
+pub mod api;
 pub mod assets;
 pub mod b64;
 pub mod cookies;
@@ -45,6 +46,7 @@ pub mod policy;
 pub mod ports;
 pub mod rendering;
 pub mod router;
+pub mod web;
 
 /// Constant-time string equality (`crypto/subtle.ConstantTimeCompare`
 /// on UTF-8 bytes — the length check exits early exactly like

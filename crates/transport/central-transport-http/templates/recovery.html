@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Recovery</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Central — Signed out</h1>
+<div class="alert" role="alert" aria-live="polite"><span class="alert-icon" aria-hidden="true">&#9888;</span> {% if !error.is_empty() %}{{ error }}{% else %}Your session has ended. A fresh bootstrap token is required to continue.{% endif %}</div>
+<p>To resume, run <code>central bootstrap show</code> and enter the new token on the bootstrap page. The previous token cannot be reused.</p>
+<form method="post" action="/api/v1/session/bootstrap" autocomplete="off" novalidate>
+<input type="hidden" name="csrf" value="{{ csrf_field }}">
+<label for="recovery-bootstrap-token">Bootstrap token</label>
+<input id="recovery-bootstrap-token" name="bootstrap_token" type="password" autocomplete="off" required aria-required="true">
+<button type="submit">Submit token</button>
+</form>
+<p><a class="button" href="/app/bootstrap">Return to bootstrap</a></p>
+<script src="/assets/bootstrap.js" defer></script>
+</main>
+</body>
+</html>

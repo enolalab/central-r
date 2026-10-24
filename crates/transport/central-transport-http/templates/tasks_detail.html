@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Task detail</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main id="task-detail" data-poll-interval-ms="{{ poll_interval_ms }}" data-projection-revision="{{ projection_revision }}" data-event-revision="{{ event_revision }}">
+<h1>{{ title }}</h1>
+<nav><a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/office">Office</a> &middot; <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
+<p>Status: <span aria-live="polite">{{ label }}</span></p>
+{% if !permission_policy.is_empty() %}<p>Permission policy: {{ permission_policy }}</p>{% endif %}
+{% if !auto_allow_warning.is_empty() %}<p role="alert" id="auto-allow-warning">{{ auto_allow_warning }}</p>{% endif %}
+{% if !permission_notice.is_empty() %}<p role="alert" id="permission-notice">{{ permission_notice }}</p>{% endif %}
+{% if !action_notice.is_empty() %}<p role="alert" id="action-notice">{{ action_notice }}</p>{% endif %}
+{% if let Some(panel) = permission_panel.as_ref() %}
+<section id="harness-permission-pending" aria-labelledby="permission-h">
+<h2 id="permission-h">Permission request</h2>
+<dl>
+<dt>Tool</dt><dd><code class="permission-label">{{ panel.tool_name }}</code></dd>
+{% if !panel.tool_call_id.is_empty() %}<dt>Tool call</dt><dd><code class="permission-label">{{ panel.tool_call_id }}</code></dd>{% endif %}
+{% if !panel.resources.is_empty() %}<dt>Resources</dt><dd><ul>{% for r in panel.resources %}<li><code class="permission-label">{{ r }}</code></li>{% endfor %}</ul></dd>{% endif %}
+<dt>Input size</dt><dd>{{ panel.input_size }}</dd>
+<dt>Expires</dt><dd><time>{{ panel.expires_at }}</time> ({{ panel.time_left }} left)</dd>
+</dl>
+{% if panel.allowable %}
+<h3>Input</h3>
+{% if !panel.fields.is_empty() %}<dl class="permission-input-fields">
+{% for f in panel.fields %}<dt><code class="permission-label">{{ f.key }}</code> <span>({{ f.lines }} lines, {{ f.bytes }} bytes)</span></dt>
+<dd><pre class="permission-input">{{ f.value }}</pre></dd>
+{% endfor %}</dl>
+{% else %}<p><span>({{ panel.raw_lines }} lines, {{ panel.raw_bytes }} bytes)</span></p>
+<pre class="permission-input">{{ panel.raw }}</pre>
+{% endif %}
+{% if panel.ambiguous %}<p role="alert">{{ panel.ambiguous_notice }}</p>{% else %}
+<form method="post" action="/app/tasks/harness/permission">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <input type="hidden" name="approval_id" value="{{ panel.approval_id }}">
+  <input type="hidden" name="input_mac" value="{{ panel.input_mac }}">
+  <input type="hidden" name="decision" value="allow">
+  <button type="submit">Allow</button>
+</form>
+{% endif %}
+<form method="post" action="/app/tasks/harness/permission">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <input type="hidden" name="approval_id" value="{{ panel.approval_id }}">
+  <input type="hidden" name="input_mac" value="{{ panel.input_mac }}">
+  <input type="hidden" name="decision" value="deny">
+  <button type="submit">Deny</button>
+</form>
+{% else %}
+<p role="status">{{ panel.waiting }}</p>
+{% endif %}
+</section>
+{% endif %}
+{% if !permission_history.is_empty() %}
+<section aria-labelledby="permission-history-h">
+<h2 id="permission-history-h">Permission requests</h2>
+<ul>
+{% for h in permission_history %}<li><code>{{ h.tool_name }}</code> &mdash; <span>{{ h.outcome }}</span>{% if !h.decided_by.is_empty() %} by {{ h.decided_by }}{% endif %}{% if !h.at.is_empty() %} &middot; <time>{{ h.at }}</time>{% endif %}</li>
+{% endfor %}</ul>
+</section>
+{% endif %}
+{% if !instruction.is_empty() %}
+<section aria-labelledby="instruction-h">
+<h2 id="instruction-h">Requested work</h2>
+{% if !workspace_root.is_empty() %}<p>Repository root: <code>{{ workspace_root }}</code></p>{% endif %}
+<pre>{{ instruction }}</pre>
+</section>
+{% endif %}
+{% if !waiting_reason.is_empty() %}<p role="status" aria-live="polite">Waiting: {{ waiting_reason }}</p>{% endif %}
+{% if !failure_reason.is_empty() && budget_reason.is_empty() %}<p role="alert">Failure: {{ failure_reason }}</p>{% endif %}
+{% if !budget_reason.is_empty() %}<p role="alert" id="budget-reason">{{ budget_reason }} (<code>{{ failure_reason }}</code>)</p>{% endif %}
+{% if let Some(b) = budget.as_ref() %}
+<section id="harness-budget" aria-labelledby="budget-h">
+<h2 id="budget-h">Budget</h2>
+<dl>
+<dt>Cost limit</dt><dd>{{ b.cost_limit }}{% if b.cost_default %} (default){% endif %}</dd>
+<dt>Wall clock</dt><dd>{{ b.wall_clock }}{% if b.wall_clock_default %} (default){% endif %}</dd>
+</dl>
+{% if b.usage_reported %}
+<dl>
+<dt>Tokens in</dt><dd>{{ b.tokens_in }}</dd>
+<dt>Tokens out</dt><dd>{{ b.tokens_out }}</dd>
+{% if b.cost_reported %}<dt>Cache read</dt><dd>{{ b.cache_read }}</dd>{% endif %}
+<dt>Cache write</dt><dd>{{ b.cache_write }}</dd>
+<dt>Cost</dt><dd>{% if b.cost_reported %}{{ b.cost }}{% if b.attempts > 1 %} (across {{ b.attempts }} attempts){% endif %}{% if b.estimated %} (estimated){% endif %}{% if b.over_limit %} <strong>over the limit</strong>{% endif %}{% else if b.ended %}not reported (Claude Code sent no cost or cache reads before the attempt ended){% else %}not reported yet (Claude Code reports cost and cache reads with each result){% endif %}</dd>
+</dl>
+{% else %}
+<p>No usage reported yet.</p>
+{% endif %}
+</section>
+{% endif %}
+{% if !task_cost.is_empty() %}<p id="harness-task-cost">{{ task_cost }}</p>{% endif %}
+{% if !created_at.is_empty() || !updated_at.is_empty() || retry_count != 0 %}
+<dl>
+{% if !created_at.is_empty() %}<dt>Created</dt><dd><time>{{ created_at }}</time></dd>{% endif %}
+{% if !updated_at.is_empty() %}<dt>Updated</dt><dd><time>{{ updated_at }}</time></dd>{% endif %}
+{% if retry_count != 0 %}<dt>Retries</dt><dd>{{ retry_count }}</dd>{% endif %}
+</dl>
+{% endif %}
+{% if has_parent %}<p>Rerun of <a href="/app/tasks/detail?id={{ parent_task_id }}">a prior cancelled task</a></p>{% endif %}
+{% if has_artifact %}
+<p>
+  <a href="/app/tasks/artifact/preview?id={{ artifact_id }}">Preview report</a>
+  &middot;
+  <a href="/app/tasks/artifact/download?id={{ artifact_id }}">Download report</a>
+</p>
+{% endif %}
+{% if !artifacts.is_empty() %}
+<section aria-labelledby="artifacts-h">
+<h2 id="artifacts-h">Artifacts</h2>
+<ul>
+{% for a in artifacts %}<li>{{ a.label }} <span>({{ a.size }})</span>: <a href="/app/tasks/artifact/preview?id={{ a.id }}">Preview</a> &middot; <a href="/app/tasks/artifact/download?id={{ a.id }}">Download</a></li>
+{% endfor %}</ul>
+</section>
+{% endif %}
+{% if restart_barrier %}
+<p role="alert">Restart barrier active: {{ barrier_reason }}. No action is permitted on this run until reconciliation completes.</p>
+{% endif %}
+{% if !runs.is_empty() %}
+<section aria-labelledby="runs-h">
+<h2 id="runs-h">Run history</h2>
+<ul>
+{% for r in runs %}<li>Attempt {{ r.index }}: <span>{{ r.status }}</span>{% if !r.reason.is_empty() %} &mdash; {{ r.reason }}{% endif %}{% if !r.started.is_empty() %} <time>{{ r.started }}</time>{% endif %}</li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+{% if !turn_activity.is_empty() %}
+<section aria-labelledby="turns-h">
+<h2 id="turns-h">Provider turns</h2>
+<ul>
+{% for t in turn_activity %}<li>Turn {{ t.index }}: <span>{{ t.state }}</span>{% if !t.started.is_empty() %} &middot; started <time>{{ t.started }}</time>{% endif %}{% if !t.responded.is_empty() %} &middot; responded <time>{{ t.responded }}</time>{% endif %}</li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+{% if !activity.is_empty() %}
+<section aria-labelledby="activity-h">
+<h2 id="activity-h">Activity</h2>
+<ul>
+{% for a in activity %}<li>{{ a.kind }}{% if !a.state.is_empty() %} &mdash; <span>{{ a.state }}</span>{% endif %}{% if !a.at.is_empty() %} &middot; <time>{{ a.at }}</time>{% endif %}</li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+{% if cancellable %}
+<form method="post" action="/app/tasks/cancel">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <button type="submit">Cancel</button>
+</form>
+{% endif %}
+{% if finish_cancelling %}
+<form method="post" action="/app/tasks/cancel" id="finish-cancelling">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  {% if finish_cancelling_prepared %}<p>This task was cancelled before its harness was launched. Finish cancelling it.</p>{% else %}<p>This task was cancelled before it started. Finish cancelling it.</p>{% endif %}
+  <button type="submit">Finish cancelling</button>
+</form>
+{% endif %}
+{% if retryable %}
+<form method="post" action="/app/tasks/retry">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <button type="submit">Retry</button>
+</form>
+{% else if !retry_unavailable.is_empty() %}
+<p id="harness-retry-unavailable">{{ retry_unavailable }}</p>
+{% endif %}
+{% if harness_resolvable %}
+<section id="harness-resolve" aria-labelledby="harness-resolve-h">
+<h2 id="harness-resolve-h">Harness attempt</h2>
+{% if harness_resolve.settling %}<p id="harness-settling">Settling: the harness stopped when serve stopped. Confirm it is not running, then Mark cancelled.</p>
+{% else %}<p>The harness attempt of this task is ambiguous: Central lost track of it (for example serve restarted while it ran). Check the Run clone, then mark the task failed or cancelled.</p>
+{% endif %}
+{% if harness_resolve.resume %}
+<form method="post" action="/app/tasks/harness/resume">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <p id="harness-attest-resume">By resuming, you confirm that the harness is no longer running.</p>
+  <button type="submit" aria-describedby="harness-attest-resume">Resume</button>
+</form>
+{% else if !harness_resolve.resume_unavailable.is_empty() %}
+<p id="harness-resume-unavailable">{{ harness_resolve.resume_unavailable }}</p>
+{% endif %}
+{% if harness_resolve.mark_failed %}
+<form method="post" action="/app/tasks/harness/resolve">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <input type="hidden" name="action" value="fail">
+  <p id="harness-attest-fail">By marking, you confirm that the harness is no longer running.</p>
+  <button type="submit" aria-describedby="harness-attest-fail">Mark failed (operator resolved)</button>
+</form>
+{% endif %}
+{% if harness_resolve.rerun %}
+<form method="post" action="/app/tasks/harness/resolve">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <input type="hidden" name="action" value="rerun">
+  <p id="harness-attest-rerun">By marking, you confirm that the harness is no longer running.</p>
+  <button type="submit" aria-describedby="harness-attest-rerun">Mark failed and rerun (operator resolved)</button>
+</form>
+{% endif %}
+{% if harness_resolve.mark_cancelled %}
+<form method="post" action="/app/tasks/harness/resolve">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <input type="hidden" name="action" value="cancel">
+  <p id="harness-attest-cancel">By marking, you confirm that the harness is no longer running.</p>
+  <button type="submit" aria-describedby="harness-attest-cancel">Mark cancelled (operator resolved)</button>
+</form>
+{% endif %}
+</section>
+{% endif %}
+{% if rerunnable %}
+<form method="post" action="/app/tasks/rerun">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <input type="hidden" name="task_id" value="{{ id }}">
+  <button type="submit">Rerun as new Task</button>
+</form>
+{% endif %}
+</main>
+<script src="/assets/tasks_poll.js" defer></script>
+</body>
+</html>

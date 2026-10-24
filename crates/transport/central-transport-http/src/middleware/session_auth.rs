@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
@@ -200,7 +200,9 @@ async fn presented_form_csrf(req: &mut Request) -> Result<String, Box<Response>>
 /// `url.ParseQuery` — `application/x-www-form-urlencoded` into a
 /// multi-map; malformed percent escapes are dropped like upstream's
 /// tolerant parser (a bad `csrf` value simply fails the compare).
-fn parse_urlencoded(body: &Bytes) -> HashMap<String, Vec<String>> {
+/// `pub(crate)` for the `/app/logout` and `/api/v1/session/bootstrap`
+/// handlers, which parse their own bodies upstream-style.
+pub(crate) fn parse_urlencoded(body: &[u8]) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for pair in std::str::from_utf8(body).unwrap_or("").split('&') {
         if pair.is_empty() {

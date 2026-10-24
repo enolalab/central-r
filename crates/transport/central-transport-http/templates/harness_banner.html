@@ -1,0 +1,2 @@
+{% if !banner.notice.is_empty() %}<p role="alert" id="harness-banner">{{ banner.notice }}</p>{% endif %}
+{% if banner.pending_permissions > 0 %}<p role="alert" id="harness-permission-banner"><a href="/app/tasks/detail?id={{ banner.task_id }}">{{ banner.pending_permissions }} harness permission request(s) waiting</a></p>{% endif %}

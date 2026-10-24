@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Ready</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Central</h1>
+<p><span class="status">Ready.</span> The local runtime is operational.</p>
+<p>Sessions are bound to this workspace epoch and the loopback origin. Use the controls below to sign out; you will need a fresh bootstrap token to return.</p>
+<form method="post" action="/app/logout" autocomplete="off">
+<input type="hidden" name="csrf" value="{{ csrf_field }}">
+<button type="submit">Sign out</button>
+</form>
+</main>
+</body>
+</html>

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Office</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body class="office-body">
+<main>
+<h1>Office</h1>
+<nav><a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
+<p>Instance: <span class="status">{{ state_label }}</span>{% if truncated %} &middot; showing a bounded page (more tasks exist){% endif %}</p>
+
+{% if no_tasks %}<p role="status" aria-live="polite">No tasks yet. The office is empty.</p>{% endif %}
+<div class="office-stage">
+  <canvas id="office" aria-label="Tasks shown as workers grouped into status rooms"></canvas>
+</div>
+<noscript><p>The office view needs JavaScript. See the <a href="/app/tasks">task list</a> instead.</p></noscript>
+
+<ul id="office-agents" hidden>
+{% for a in agents %}<li data-id="{{ a.id }}" data-title="{{ a.title }}" data-label="{{ a.label }}" data-reason="{{ a.reason }}"></li>{% endfor %}
+</ul>
+<ul id="office-events" hidden>
+{% for e in events %}<li data-task="{{ e.task_id }}" data-seq="{{ e.seq }}"></li>{% endfor %}
+</ul>
+</main>
+<script src="/assets/office.js" defer></script>
+</body>
+</html>
