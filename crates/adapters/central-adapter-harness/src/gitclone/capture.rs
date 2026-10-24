@@ -98,6 +98,35 @@ fn too_large() -> Failure {
     Failure::internal(codes::CAPTURE_TOO_LARGE, "a captured body exceeded its cap")
 }
 
+/// `gitExitError` vs every other capture failure — upstream's
+/// `errors.As(err, &gitExitError)`: a git that ran and exited
+/// non-zero is distinguished from a spawn, deadline, memory-limit or
+/// output-write failure because the commits artifact degrades to
+/// "unavailable" only on the former.
+struct GitAtError {
+    failure: Failure,
+    /// The git command ran and exited non-zero (upstream
+    /// `gitExitError`, including a signal death that is not the
+    /// deadline's).
+    git_exit: bool,
+}
+
+impl GitAtError {
+    /// A non-git-exit failure — `git_exit` is false.
+    fn plain(failure: Failure) -> Self {
+        Self {
+            failure,
+            git_exit: false,
+        }
+    }
+
+    /// `out.fail(err)` — the [`Failure`] for a caller that does not
+    /// degrade on a git exit.
+    fn into_failure(self) -> Failure {
+        self.failure
+    }
+}
+
 /// `cappedFile` — an artifact temp file that refuses to grow past `max`
 /// bytes (decision 14): the write that would exceed it fails, which
 /// ends the git command producing it, and the capture is too-large.
@@ -144,13 +173,35 @@ impl CappedFile {
         Ok(())
     }
 
+    /// `reset` — empties the file so a degraded body can replace a
+    /// partial one: truncate, rewind, and clear the overflow flag.
+    /// (`io-util` is not enabled, so the `AsyncSeek` core trait's
+    /// `start_seek`/`poll_complete` are driven directly.)
     async fn reset(&mut self) -> Result<(), Failure> {
+        use tokio::io::AsyncSeek;
         self.f
             .set_len(0)
             .await
             .map_err(|_| failed("reset a capture temp file"))?;
+        std::pin::Pin::new(&mut self.f)
+            .start_seek(io::SeekFrom::Start(0))
+            .map_err(|_| failed("reset a capture temp file"))?;
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut self.f).poll_complete(cx))
+            .await
+            .map_err(|_| failed("reset a capture temp file"))?;
         self.n = 0;
+        self.overflow = false;
         Ok(())
+    }
+
+    /// `finish` — sync the artifact body before it is reported, as
+    /// upstream `finish`'s `f.Sync()`.
+    async fn finish(&mut self) -> Result<u64, Failure> {
+        self.f
+            .sync_all()
+            .await
+            .map_err(|_| failed("sync a capture temp file"))?;
+        Ok(self.n)
     }
 }
 
@@ -167,14 +218,22 @@ struct CaptureCtx {
 impl GitClone {
     /// `initShadow` — a bare repository with Central's config, the
     /// source's objects as its only alternate and the attributes
-    /// neutralizer.
-    async fn init_shadow(&self, dir: &Path, source: &Path) -> Result<(), Failure> {
+    /// neutralizer. `init` ignores `GIT_INDEX_FILE`; upstream still
+    /// names the capture's index for it.
+    async fn init_shadow(
+        &self,
+        deadline: Instant,
+        dir: &Path,
+        source: &Path,
+        index: &Path,
+    ) -> Result<(), Failure> {
         self.git_at(
+            deadline,
             None,
             None,
             false,
             None,
-            Path::new("/dev/null"),
+            index,
             &[
                 OsString::from("init"),
                 OsString::from("--quiet"),
@@ -183,12 +242,14 @@ impl GitClone {
                 dir.as_os_str().to_os_string(),
             ],
         )
-        .await?;
-        let _ = tokio::fs::set_permissions(dir, {
+        .await
+        .map_err(GitAtError::into_failure)?;
+        tokio::fs::set_permissions(dir, {
             use std::os::unix::fs::PermissionsExt;
             std::fs::Permissions::from_mode(0o700)
         })
-        .await;
+        .await
+        .map_err(|_| failed("restrict the shadow repository"))?;
         let info = dir.join("objects").join("info");
         tokio::fs::create_dir_all(&info)
             .await
@@ -214,16 +275,21 @@ impl GitClone {
     /// Central's command-line config, the capture deadline and a wait
     /// delay. `stdout` receives the output; `None` captures at most
     /// 4 KiB for the caller. Neither argv nor git's output reaches an
-    /// error.
+    /// error. The whole command — output drain and reap — is bound by
+    /// `deadline`, upstream's `exec.CommandContext(c.ctx)`; once it
+    /// ends the child is killed and the reap bound by `captureWaitDelay`.
+    /// The wide signature mirrors upstream `gitAt`'s parameter list.
+    #[allow(clippy::too_many_arguments)]
     async fn git_at(
         &self,
+        deadline: Instant,
         git_dir: Option<&Path>,
         mut stdout: Option<&mut CappedFile>,
         worktree: bool,
         repo: Option<&str>,
         index: &Path,
         args: &[OsString],
-    ) -> Result<String, Failure> {
+    ) -> Result<String, GitAtError> {
         let mut cmd = Command::new(&self.git);
         cmd.args(SHADOW_CONFIG.iter().map(|s| OsString::from(*s)));
         if let Some(d) = git_dir {
@@ -246,7 +312,9 @@ impl GitClone {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let mut child = cmd.spawn().map_err(|_| failed("start git"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|_| GitAtError::plain(failed("start git")))?;
         // `capture.start` — bound the child's address space so a zlib
         // bomb in a pack cannot make git exhaust host memory; a child
         // whose limit cannot be set is killed and fails the capture.
@@ -258,61 +326,76 @@ impl GitClone {
         {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(e);
+            return Err(GitAtError::plain(e));
         }
-        let mut captured = Vec::new();
-        let mut overflow = false;
-        let mut pipe = child.stdout.take();
-        let mut buf = [0u8; 8192];
-        if let Some(p) = pipe.as_mut() {
-            loop {
-                match tokio::time::timeout(CAPTURE_WAIT_DELAY * 60, async_read(p, &mut buf)).await {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        if let Some(out) = stdout.as_mut() {
-                            if out.write(&buf[..n]).await.is_err() {
-                                overflow = true;
-                                let _ = child.start_kill();
+        let t_deadline = tokio::time::Instant::from_std(deadline);
+        let run = async {
+            let mut captured = Vec::new();
+            let mut write_err = None;
+            let mut pipe = child.stdout.take();
+            let mut buf = [0u8; 8192];
+            if let Some(p) = pipe.as_mut() {
+                loop {
+                    match async_read(p, &mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Some(out) = stdout.as_mut() {
+                                if let Err(e) = out.write(&buf[..n]).await {
+                                    // The cap overflow or a write
+                                    // failure both end the child; the
+                                    // error is reported once it is
+                                    // reaped (`cappedFile.fail`
+                                    // distinguishes the two).
+                                    let _ = child.start_kill();
+                                    write_err = Some(e);
+                                    break;
+                                }
+                            } else if captured.len() < 4 << 10 {
+                                let room = (4 << 10) - captured.len();
+                                captured.extend_from_slice(&buf[..n.min(room)]);
                             }
-                        } else if captured.len() < 4 << 10 {
-                            let room = (4 << 10) - captured.len();
-                            captured.extend_from_slice(&buf[..n.min(room)]);
                         }
+                        Err(_) => break,
                     }
-                    _ => break,
-                }
-                if overflow {
-                    let _ = child.start_kill();
-                    break;
                 }
             }
-        }
-        let status = match tokio::time::timeout(CAPTURE_WAIT_DELAY * 30, child.wait()).await {
-            Ok(Ok(s)) => s,
-            _ => {
+            let status = child.wait().await.ok();
+            (captured, write_err, status)
+        };
+        let (captured, write_err, status) = match tokio::time::timeout_at(t_deadline, run).await {
+            Ok(v) => v,
+            Err(_) => {
                 let _ = child.start_kill();
-                let _ = child.wait().await;
-                if overflow {
-                    return Err(too_large());
-                }
-                return Err(failed("capture deadline"));
+                let _ = tokio::time::timeout(CAPTURE_WAIT_DELAY, child.wait()).await;
+                return Err(GitAtError::plain(failed("capture deadline")));
             }
         };
-        if overflow {
-            return Err(too_large());
+        // Overflow and write errors win over the induced-kill status:
+        // only the cap maps to `ErrCaptureTooLarge`.
+        if let Some(e) = write_err {
+            return Err(GitAtError::plain(e));
         }
+        let Some(status) = status else {
+            return Err(GitAtError::plain(failed("run git")));
+        };
         if !status.success() {
+            if Instant::now() > deadline {
+                return Err(GitAtError::plain(failed("capture deadline")));
+            }
             let op = args
                 .first()
                 .map(|a| a.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            return Err(Failure::internal(
-                codes::CAPTURE_FAILED,
-                format!(
-                    "git {op} exited with status {}",
-                    status.code().unwrap_or(-1)
+            return Err(GitAtError {
+                failure: Failure::internal(
+                    codes::CAPTURE_FAILED,
+                    format!(
+                        "git {op} exited with status {}",
+                        status.code().unwrap_or(-1)
+                    ),
                 ),
-            ));
+                git_exit: true,
+            });
         }
         Ok(String::from_utf8_lossy(&captured).into_owned())
     }
@@ -324,6 +407,7 @@ impl GitClone {
     /// clone object.
     async fn write_patch(
         &self,
+        deadline: Instant,
         c: &CaptureCtx,
         path: &Path,
         nested: &[Vec<u8>],
@@ -348,6 +432,7 @@ impl GitClone {
         ];
         add_args.extend(pathspecs.iter().cloned());
         self.git_at(
+            deadline,
             Some(&c.shadow),
             None,
             true,
@@ -355,7 +440,8 @@ impl GitClone {
             &c.index,
             &add_args,
         )
-        .await?;
+        .await
+        .map_err(GitAtError::into_failure)?;
         let mut diff_args = [
             "diff",
             "--cached",
@@ -371,6 +457,7 @@ impl GitClone {
         diff_args.push(OsString::from("--"));
         diff_args.extend(pathspecs.iter().cloned());
         self.git_at(
+            deadline,
             Some(&c.shadow),
             Some(&mut out),
             true,
@@ -378,17 +465,19 @@ impl GitClone {
             &c.index,
             &diff_args,
         )
-        .await?;
+        .await
+        .map_err(GitAtError::into_failure)?;
         if out.n == header {
             out.write(PATCH_NO_CHANGES_LINE.as_bytes()).await?;
         }
-        Ok(out.n)
+        out.finish().await
     }
 
     /// `hasCommit` — whether `id` names a commit in the log shadow.
     /// `cat-file -t` reads only the object's header.
-    async fn has_commit(&self, c: &CaptureCtx, id: &str) -> bool {
+    async fn has_commit(&self, deadline: Instant, c: &CaptureCtx, id: &str) -> bool {
         self.git_at(
+            deadline,
             Some(&c.log_shadow),
             None,
             false,
@@ -408,9 +497,13 @@ impl GitClone {
     /// HEAD (the base), the after HEAD or "unavailable", and, when
     /// available, the commits `base..after`, at most `max_commits` with
     /// a truncation note, or [`COMMITS_UNAVAILABLE_LINE`] when git
-    /// cannot walk that history.
+    /// cannot walk that history. Only a git that ran and exited
+    /// non-zero while the deadline holds degrades the artifact —
+    /// upstream's `unavailable` (`errors.As(err, &gitExitError)` with
+    /// `c.ctx.Err() == nil`); every other failure fails the capture.
     async fn write_commits(
         &self,
+        deadline: Instant,
         c: &CaptureCtx,
         path: &Path,
         after: &str,
@@ -419,11 +512,12 @@ impl GitClone {
         if after.is_empty() {
             out.write(format!("before HEAD: {}\nafter HEAD: unavailable\n", c.base).as_bytes())
                 .await?;
-            return Ok(out.n);
+            return out.finish().await;
         }
         let heads = format!("before HEAD: {}\nafter HEAD: {}\n", c.base, after);
         let count = self
             .git_at(
+                deadline,
                 Some(&c.log_shadow),
                 None,
                 false,
@@ -439,14 +533,14 @@ impl GitClone {
             .await;
         let count = match count {
             Ok(c) => c,
-            Err(e) if e.code() == codes::CAPTURE_FAILED => {
-                // gitExitError → the degraded artifact.
+            // gitExitError within the deadline → the degraded artifact.
+            Err(e) if e.git_exit && Instant::now() <= deadline => {
                 out.reset().await?;
                 out.write(format!("{heads}{COMMITS_UNAVAILABLE_LINE}").as_bytes())
                     .await?;
-                return Ok(out.n);
+                return out.finish().await;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.failure),
         };
         let n: i64 = count
             .trim()
@@ -474,6 +568,7 @@ impl GitClone {
             ];
             match self
                 .git_at(
+                    deadline,
                     Some(&c.log_shadow),
                     Some(&mut out),
                     false,
@@ -484,17 +579,17 @@ impl GitClone {
                 .await
             {
                 Ok(_) => {}
-                Err(e) if e.code() == codes::CAPTURE_FAILED => {
+                Err(e) if e.git_exit && Instant::now() <= deadline => {
                     out.reset().await?;
                     out.write(format!("{heads}{COMMITS_UNAVAILABLE_LINE}").as_bytes())
                         .await?;
-                    return Ok(out.n);
+                    return out.finish().await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.failure),
             }
             out.write(b"\n").await?;
         }
-        Ok(out.n)
+        out.finish().await
     }
 
     /// `requireRuntimePrivateDir` — the capture directory must be a
@@ -526,17 +621,27 @@ impl GitClone {
         match tokio::fs::create_dir(&tmp).await {
             Ok(()) => {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).await;
+                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))
+                    .await
+                    .map_err(|_| failed("create the capture temp directory"))?;
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(failed("create the capture temp directory")),
         }
         self.require_runtime_private_dir(&tmp).await?;
         self.release_dirs(run).await?;
-        tokio::fs::create_dir(self.capture_tmp_path(run))
+        let run_tmp = self.capture_tmp_path(run);
+        tokio::fs::create_dir(&run_tmp)
             .await
             .map_err(|_| failed("create the run's capture temp directory"))?;
+        // Upstream `os.Mkdir(captureTmpPath, 0o700)` — a failed mode
+        // fails the capture.
+        tokio::fs::set_permissions(&run_tmp, {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(0o700)
+        })
+        .await
+        .map_err(|_| failed("create the run's capture temp directory"))?;
         Ok(())
     }
 
@@ -632,13 +737,15 @@ impl WorkspaceCapture for GitClone {
                 };
                 // The patch, written whole with the patch shadow before
                 // any clone object is copied anywhere.
-                self.init_shadow(&c.shadow, &source).await?;
+                self.init_shadow(deadline, &c.shadow, &source, &c.index)
+                    .await?;
                 let nested = sealed.nested_repos(deadline, WalkLimits::default()).await?;
                 let patch = c.tmp.join("patch");
-                self.write_patch(&c, &patch, &nested).await?;
+                self.write_patch(deadline, &c, &patch, &nested).await?;
                 // The commits, with the log shadow; the clone's objects
                 // are copied as data.
-                self.init_shadow(&c.log_shadow, &source).await?;
+                self.init_shadow(deadline, &c.log_shadow, &source, &c.index)
+                    .await?;
                 let _ = sealed
                     .copy_objects(
                         c.log_shadow.join("objects"),
@@ -649,11 +756,11 @@ impl WorkspaceCapture for GitClone {
                 check(deadline)?;
                 let mut after = sealed.after_head().unwrap_or_default();
                 check(deadline)?;
-                if !after.is_empty() && !self.has_commit(&c, &after).await {
+                if !after.is_empty() && !self.has_commit(deadline, &c, &after).await {
                     after = String::new();
                 }
                 let commits = c.tmp.join("commits");
-                self.write_commits(&c, &commits, &after).await?;
+                self.write_commits(deadline, &c, &commits, &after).await?;
                 check(deadline)?;
                 Ok(Capture {
                     patch: patch.to_string_lossy().into_owned(),

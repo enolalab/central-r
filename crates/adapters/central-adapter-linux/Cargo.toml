@@ -15,7 +15,6 @@ central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
 rustix.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

@@ -21,7 +21,7 @@ use central_harness::port::PortFuture;
 /// the walkers the Linux sealer runs on descriptors.
 struct TestSealer {
     root: PathBuf,
-    sealed: Mutex<Vec<RunId>>,
+    sealed: std::sync::Arc<Mutex<Vec<RunId>>>,
     free: u64,
     min_free: u64,
 }
@@ -60,6 +60,11 @@ fn walk(
         *n += 1;
         if *n > limits.max_entries {
             return;
+        }
+        // `.git`-named entries are never descended — the clone's own
+        // repository is not a nested one (upstream's name check).
+        if e.file_name().as_encoded_bytes() == b".git" {
+            continue;
         }
         let p = e.path();
         let Ok(ft) = e.file_type() else { continue };
@@ -272,7 +277,7 @@ impl central_harness::app::ports::WorkspaceSealer for TestSealer {
             Ok(Box::new(TestSealed {
                 run_dir,
                 repo,
-                sealed: std::sync::Arc::new(Mutex::new(Vec::new())),
+                sealed: std::sync::Arc::clone(&self.sealed),
                 run,
             })
                 as Box<dyn central_harness::app::ports::SealedClone>)
@@ -312,6 +317,12 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn fixture() -> Option<Fixture> {
+    fixture_at(None)
+}
+
+/// `fixture` with a custom `git_path` — the provisioner still runs it
+/// with its closed environment, so a script can wrap the real binary.
+fn fixture_at(git_path: Option<String>) -> Option<Fixture> {
     if StdCommand::new("git").arg("--version").output().is_err() {
         return None; // no git on this host
     }
@@ -363,13 +374,14 @@ fn fixture() -> Option<Fixture> {
     let uid = libc_uid();
     let cfg = GitCloneConfig {
         data_root: root.clone(),
+        git_path: git_path.unwrap_or_default(),
         operator_uid: uid,
         runtime_uid: uid,
         ..GitCloneConfig::default()
     };
     let sealer = std::sync::Arc::new(TestSealer {
         root: root.clone(),
-        sealed: Mutex::new(Vec::new()),
+        sealed: std::sync::Arc::new(Mutex::new(Vec::new())),
         free: u64::MAX,
         min_free: 0,
     });
@@ -398,6 +410,38 @@ async fn provision_clones_and_records_base() {
     assert!(!ws.base_sha.is_empty());
     assert!(Path::new(&ws.path).join(".git").is_dir());
     assert!(ws.path.ends_with(&format!("{}/repo", run)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_git_runs_past_the_wait_delay() {
+    // A provisioning git command is unbounded: a git binary that
+    // sleeps past `GIT_WAIT_DELAY` on the clone still provisions —
+    // the delay bounds only the post-exit pipe drain.
+    let unique = std::env::temp_dir().join(format!(
+        "central-gitclone-fakegit-{}-{}",
+        std::process::id(),
+        RunId::new()
+    ));
+    std::fs::create_dir_all(&unique).unwrap_or_default();
+    let fake = unique.join("fake-git");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncase \" $*\" in\n*\" clone \"*) sleep 6 ;;\nesac\nexec /usr/bin/git \"$@\"\n",
+    )
+    .unwrap_or_default();
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755));
+    let Some(f) = fixture_at(Some(fake.to_string_lossy().into_owned())) else {
+        return;
+    };
+    let run = RunId::new();
+    let ws = central_harness::app::ports::WorkspaceProvisioner::provision(&f.git, f.ws, run)
+        .await
+        .map_err(|e| e.to_string());
+    let _ = std::fs::remove_dir_all(&unique);
+    let ws = ws.ok().unwrap_or_default();
+    assert!(!ws.base_sha.is_empty());
+    assert!(Path::new(&ws.path).join(".git").is_dir());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -14,12 +14,16 @@ use central_harness::port::PortFuture;
 use tokio::process::Command;
 
 use super::{GIT_WAIT_DELAY, GitClone};
+use crate::process::async_read;
 
 impl GitClone {
     /// Upstream `run` — one provisioning git command with an
     /// environment built from empty: no system or global config, no
     /// hooks, no fsmonitor, no prompts. Neither argv nor git's output
     /// reaches an error: git's stderr may quote repository content.
+    /// The command itself is unbounded — only the caller's cancellation
+    /// (the dropped future's `kill_on_drop`) ends it, as upstream's ctx;
+    /// [`GIT_WAIT_DELAY`] bounds only the post-exit pipe drain.
     async fn run_git(&self, dir: &Path, args: &[&str]) -> Result<String, Failure> {
         let mut cmd = Command::new(&self.git);
         cmd.args([
@@ -49,17 +53,44 @@ impl GitClone {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-        let child = cmd.spawn().map_err(|_| git_failed(args[0]))?;
-        // WaitDelay: give a killed git GIT_WAIT_DELAY to die, then reap
-        // regardless of pipe-holding grandchildren.
-        let out = match tokio::time::timeout(GIT_WAIT_DELAY, child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(_)) | Err(_) => return Err(git_failed(args[0])),
+        let mut child = cmd.spawn().map_err(|_| git_failed(args[0]))?;
+        // WaitDelay: the exit itself is unbounded; once git is dead its
+        // output pipe is drained for at most GIT_WAIT_DELAY, so a
+        // grandchild still holding it open cannot block the reap.
+        let mut pipe = child.stdout.take();
+        let drain = tokio::spawn(async move {
+            let mut out = Vec::new();
+            if let Some(p) = pipe.as_mut() {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match async_read(p, &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => out.extend_from_slice(&buf[..n]),
+                    }
+                }
+            }
+            out
+        });
+        let status = match child.wait().await {
+            Ok(s) => s,
+            Err(_) => {
+                drain.abort();
+                return Err(git_failed(args[0]));
+            }
         };
-        if !out.status.success() {
+        let mut drain = drain;
+        let stdout = match tokio::time::timeout(GIT_WAIT_DELAY, &mut drain).await {
+            Ok(r) => r.unwrap_or_default(),
+            Err(_) => {
+                // A pipe-holding grandchild outlived the drain bound.
+                drain.abort();
+                Vec::new()
+            }
+        };
+        if !status.success() {
             return Err(git_failed(args[0]));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 }
 
@@ -140,9 +171,11 @@ impl WorkspaceProvisioner for GitClone {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    tokio::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o750))
-                        .await;
+                // Upstream `os.Mkdir(runDir, 0o750)` — a failed mode
+                // fails the provision.
+                tokio::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o750))
+                    .await
+                    .map_err(|_| workspace_unavailable("create run directory"))?;
             }
             let repo = run_dir.join("repo");
             let repo_s = repo.to_string_lossy().into_owned();
@@ -207,6 +240,9 @@ impl WorkspaceProvisioner for GitClone {
                     "workspace and run ids are required",
                 ));
             }
+            // Upstream `Reopen` checks free space first (low disk wraps
+            // `ErrInsufficientSpace`, not the refusal).
+            self.check_free_space().await?;
             let repo = self.run_dir(run).join("repo");
             if want.path != repo.to_string_lossy() || !is_object_id(want.base_sha.as_bytes()) {
                 return Err(workspace_unavailable(
