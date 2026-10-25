@@ -27,6 +27,7 @@ mod artifact_cli;
 mod checkpoint_cli;
 mod harness_cli;
 mod node_cli;
+mod run_cli;
 mod serve;
 
 fn main() -> ExitCode {
@@ -52,7 +53,7 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
             // The landed slices own their envelopes end to end:
             // `serve`, `harness resume|rerun|cancel`, `artifact read`
             // (plus its `--stdout` byte ownership), every
-            // `checkpoint *` verb, and `node decide`.
+            // `checkpoint *` verb, `node decide`, and `run submit`.
             if command_id == "serve" {
                 return serve::serve(&verb_tokens(args), stdout, stderr);
             }
@@ -67,6 +68,9 @@ fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 
             }
             if command_id.starts_with("node.") {
                 return node_cli::node(&command_id, &verb_tokens(args), stdout, stderr);
+            }
+            if command_id.starts_with("run.") {
+                return run_cli::run(&command_id, &verb_tokens(args), stdout, stderr);
             }
             let result = LocalResult::unsupported(command_id);
             match result.write_json_line(stdout) {
@@ -410,7 +414,11 @@ mod tests {
             (&["restore", "apply"], "restore.apply"),
             (&["restore", "resume"], "restore.resume"),
             (&["restore", "abandon"], "restore.abandon"),
-            (&["run", "submit"], "run.submit"),
+            // `run submit` is landed (task 10): it routes to
+            // run_cli, which without the composition env reports
+            // RUN_UNAVAILABLE — still exit 5, never the deferred-verb
+            // placeholder. Covered by
+            // `run_submit_without_env_is_unavailable` below.
             // `node decide` is landed (task 9): it routes to
             // node_cli, which without the composition env reports
             // NODE_UNAVAILABLE — still exit 5, never the deferred-verb
@@ -608,6 +616,29 @@ mod tests {
         assert_eq!(parsed["command_id"], "node.decide");
         assert_eq!(parsed["exit_code"], 5);
         assert_eq!(parsed["reason"], "NODE_UNAVAILABLE");
+    }
+
+    #[test]
+    fn run_submit_without_env_is_unavailable_at_exit_5() {
+        // `run submit` is landed: without CENTRAL_NODE_DSN it
+        // reports RUN_UNAVAILABLE (still exit 5), never the
+        // deferred-verb placeholder.
+        let (code, stdout, _) = invoke(&[
+            "run",
+            "submit",
+            "--workspace",
+            "00000000-0000-7000-8000-000000000001",
+            "--title",
+            "t",
+            "--workers",
+            "2",
+        ]);
+        assert_eq!(code, 5);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["schema_version"], "central.local-result/v1");
+        assert_eq!(parsed["command_id"], "run.submit");
+        assert_eq!(parsed["exit_code"], 5);
+        assert_eq!(parsed["reason"], "RUN_UNAVAILABLE");
     }
 
     #[test]

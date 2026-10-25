@@ -12,6 +12,7 @@ central-artifact = { path = "../../capabilities/central-artifact", version = "0.
 central-execution = { path = "../../capabilities/central-execution", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
 central-task = { path = "../../capabilities/central-task", version = "0.1.0" }
+central-runsubmit = { path = "../../capabilities/central-runsubmit", version = "0.1.0" }
 askama.workspace = true
 axum.workspace = true
 prometheus-client.workspace = true
@@ -32,6 +33,8 @@ uuid.workspace = true
 axum.workspace = true
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
+central-runsubmit = { path = "../../capabilities/central-runsubmit", version = "0.1.0" }
+central-workflow = { path = "../../capabilities/central-workflow", version = "0.1.0" }
 rand.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

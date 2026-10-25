@@ -663,6 +663,7 @@ dependencies = [
  "central-foundation",
  "central-harness",
  "central-kernel",
+ "central-runsubmit",
  "central-task",
  "central-transport-http",
  "central-workflow",
@@ -716,6 +717,7 @@ dependencies = [
  "central-foundation",
  "central-harness",
  "central-retry",
+ "central-runsubmit",
  "central-scheduler",
  "central-session",
  "central-task",
@@ -894,6 +896,7 @@ dependencies = [
  "central-execution",
  "central-foundation",
  "central-harness",
+ "central-runsubmit",
  "central-session",
  "central-task",
  "central-transport-http",
@@ -933,6 +936,17 @@ dependencies = [
 [[package]]
 name = "central-runsubmit"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "central-retry",
+ "central-task",
+ "central-workflow",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-runview"
@@ -980,8 +994,10 @@ dependencies = [
  "central-artifact",
  "central-execution",
  "central-foundation",
+ "central-runsubmit",
  "central-session",
  "central-task",
+ "central-workflow",
  "prometheus-client",
  "rand 0.10.3",
  "serde",

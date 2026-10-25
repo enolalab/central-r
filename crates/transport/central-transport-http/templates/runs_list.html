@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Runs</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body class="wide-body">
+<main>
+<h1>Runs</h1>
+<nav><a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/office">Office</a> &middot; <a href="/app/activity">Activity</a></nav>
+{% if can_submit %}
+<section aria-labelledby="run-submit-heading">
+<h2 id="run-submit-heading">Submit a run</h2>
+<p id="run-submit-attest">Submitting creates one leader with worker nodes under the production scheduler. Every node starts a real harness session.</p>
+<form method="post" action="/app/runs/submit">
+  <input type="hidden" name="csrf" value="{{ csrf_field }}">
+  <input type="hidden" name="idempotency_key" value="{{ idempotency_key }}">
+  <label>Title <input name="title" required maxlength="200"></label>
+  <label>Workers <input name="workers" required min="1" max="8" value="2" inputmode="numeric" pattern="[0-9]+"></label>
+  <label>Run key (optional, for resumable submit) <input name="run_key" maxlength="128"></label>
+  <button type="submit" aria-describedby="run-submit-attest">Submit run</button>
+</form>
+</section>
+{% endif %}
+<p class="hint">The workspace run census lands with the R4 run views.</p>
+</main>
+</body>
+</html>

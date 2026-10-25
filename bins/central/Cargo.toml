@@ -29,6 +29,10 @@ central-workflow = { path = "../../crates/capabilities/central-workflow", versio
 # kernel operator the web surface runs — no second authority.
 central-execution = { path = "../../crates/capabilities/central-execution", version = "0.1.0" }
 central-task = { path = "../../crates/capabilities/central-task", version = "0.1.0" }
+# `central run submit` (Phase R4 task 10, issue #122): the verb
+# composes the shared runsubmit saga over CENTRAL_NODE_DSN exactly
+# like `node decide` — one domain path for CLI and HTTP.
+central-runsubmit = { path = "../../crates/capabilities/central-runsubmit", version = "0.1.0" }
 central-harness = { path = "../../crates/capabilities/central-harness", version = "0.1.0" }
 central-transport-http = { path = "../../crates/transport/central-transport-http", version = "0.1.0" }
 central-adapter-postgres = { path = "../../crates/adapters/central-adapter-postgres", version = "0.1.0" }

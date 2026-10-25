@@ -16,7 +16,7 @@ use central_task::domain::{
     CommitResult, NO_EXISTING_VERSION, Run, Task, TaskAggregate, TaskChangeSet, codes,
 };
 use central_task::port::{
-    AggregateLoader, ChangeSetStore, CommitTaskChangeSetRequest, LoadedAggregate,
+    AggregateLoader, ChangeSetStore, CommitTaskChangeSetRequest, LoadedAggregate, RunByKeyReader,
 };
 use central_task::query::{
     ArtifactRef, RunSeekCursor, RunSummary, TaskDetail, TaskDetailProjection, TaskDetailRead,
@@ -222,6 +222,14 @@ impl AggregateLoader for Store {
             task_version,
             run_version,
         })
+    }
+}
+
+impl RunByKeyReader for Store {
+    /// The `central_task::port` shape of [`Store::run_by_key`] — the
+    /// run-submission saga's spec-5 replay-compare read (issue #122).
+    async fn run_by_key(&self, workspace_id: WorkspaceId, run_key: &str) -> Result<Run, Failure> {
+        Store::run_by_key(self, workspace_id, run_key).await
     }
 }
 

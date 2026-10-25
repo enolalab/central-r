@@ -21,6 +21,7 @@ pub mod overview_view;
 pub mod permission_form;
 pub mod permission_view;
 pub mod repository_analysis;
+pub mod run_submit;
 pub mod task_view;
 
 use std::collections::HashMap;
@@ -68,6 +69,11 @@ pub struct WebState {
     /// OPTIONAL harness operator surface; `None` renders no banner and
     /// the resolve/resume/permission routes answer 404.
     pub harness: Option<Arc<dyn harness::HarnessOperator>>,
+    /// OPTIONAL run-submission write port (issue #122). `None` hides
+    /// the `/app/runs` submit form and answers `POST /app/runs/submit`
+    /// the same bare 503 as an unwired read port — upstream's
+    /// nil-tolerant `RunControlPorts.Submitter`.
+    pub run_submitter: Option<Arc<dyn ports::RunSubmitter>>,
     /// The fixed workspace the bootstrap exchange mints sessions for.
     pub workspace: WorkspaceId,
     /// The operator-configured `workspace_root_id` allowlist a
@@ -212,6 +218,27 @@ pub fn routes(state: &Arc<WebState>) -> Vec<RoutedSpec> {
         "/app/tasks/harness/permission",
         serve_harness_permission,
         true
+    );
+    // `/app/runs` — R4 task 10 (issue #122): the list page carries the
+    // submit form while the OPTIONAL submitter is wired; the POST runs
+    // the shared runsubmit saga under the run-control prelude.
+    push(
+        Method::GET,
+        "/app/runs",
+        safe_page(policy::HTML_RESPONSE_CAP),
+        get({
+            let st = Arc::clone(state);
+            move |req: Request| run_submit::serve_run_list(Arc::clone(&st), req)
+        }),
+    );
+    push(
+        Method::POST,
+        "/app/runs/submit",
+        mutation(false),
+        post({
+            let st = Arc::clone(state);
+            move |req: Request| run_submit::serve_run_submit(Arc::clone(&st), req)
+        }),
     );
     page!(
         "/app/tasks/artifact/preview",

@@ -286,6 +286,36 @@ where
     }
 }
 
+/// `web.RunSubmitter` — the OPTIONAL run-submission write port
+/// `ServeRunSubmit` consumes (issue #122); the runsubmit
+/// [`central_runsubmit::app::Service`] satisfies it directly. Like
+/// upstream's `RunControlPorts.Submitter` it is nil-tolerant: an
+/// unwired port hides the runs-list form and answers the POST the same
+/// bare 503 as an unwired read port.
+pub trait RunSubmitter: Send + Sync + 'static {
+    /// `Submit` — one Phase-2 run (leader + flat workers) in the
+    /// session workspace through the shared saga.
+    fn submit(
+        &self,
+        req: central_runsubmit::domain::SubmitRequest,
+    ) -> BoxFuture<'_, Result<central_runsubmit::domain::SubmitResult, DomainFailure>>;
+}
+
+impl<T, L, R, G> RunSubmitter for central_runsubmit::app::Service<T, L, R, G>
+where
+    T: central_runsubmit::app::TaskCommands,
+    L: central_task::port::AggregateLoader,
+    R: central_task::port::RunByKeyReader,
+    G: central_runsubmit::app::GraphStore,
+{
+    fn submit(
+        &self,
+        req: central_runsubmit::domain::SubmitRequest,
+    ) -> BoxFuture<'_, Result<central_runsubmit::domain::SubmitResult, DomainFailure>> {
+        Box::pin(async move { central_runsubmit::app::Service::submit(self, req).await })
+    }
+}
+
 /// `execquery.RunTurnActivityRead` — the OPTIONAL per-run provider-turn
 /// timeline the detail page renders when wired (ADR 0021). A composition
 /// without it simply omits the section.

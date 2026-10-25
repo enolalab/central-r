@@ -35,5 +35,10 @@ uuid.workspace = true
 time.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+# `runsubmit_integration` drives the shared saga end-to-end against a
+# provisioned database (issue #122, `live_test.go` port).
+central-runsubmit = { path = "../../capabilities/central-runsubmit", version = "0.1.0" }
+
 [lints]
 workspace = true

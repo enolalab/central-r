@@ -16,6 +16,10 @@ central-artifact = { path = "../capabilities/central-artifact", version = "0.1.0
 central-execution = { path = "../capabilities/central-execution", version = "0.1.0" }
 central-harness = { path = "../capabilities/central-harness", version = "0.1.0" }
 central-task = { path = "../capabilities/central-task", version = "0.1.0" }
+# R4 task 10 (issue #122): the serve root composes the shared
+# runsubmit saga over the runtime pool for `POST /app/runs/submit` —
+# the same service the `central run submit` CLI composes.
+central-runsubmit = { path = "../capabilities/central-runsubmit", version = "0.1.0" }
 central-adapter-harness = { path = "../adapters/central-adapter-harness", version = "0.1.0" }
 central-adapter-linux = { path = "../adapters/central-adapter-linux", version = "0.1.0" }
 central-adapter-postgres = { path = "../adapters/central-adapter-postgres", version = "0.1.0" }

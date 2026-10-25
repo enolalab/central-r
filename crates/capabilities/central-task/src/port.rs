@@ -26,7 +26,7 @@
 use central_foundation::failure::Failure;
 use central_foundation::identity::{CausationId, CorrelationId, TaskId, WorkspaceId};
 
-use crate::domain::{CommitResult, TaskAggregate, TaskChangeSet};
+use crate::domain::{CommitResult, Run, TaskAggregate, TaskChangeSet};
 
 /// The durable Task change-set plus the command identity fields the
 /// adapter-level idempotency guards consume (`central.command_receipts`).
@@ -87,4 +87,17 @@ pub trait AggregateLoader: Send + Sync + 'static {
         workspace_id: WorkspaceId,
         task_id: TaskId,
     ) -> Result<LoadedAggregate, Failure>;
+}
+
+/// Resolves one run by the spec-5 `(workspace_id, run_key)` submit
+/// coordinate — the replay-compare read the run-submission saga needs
+/// after a keyed submit conflict (upstream `runsubmit.RunByKeyReader`;
+/// placed beside [`AggregateLoader`] because it reads the same
+/// `central.runs` projection this port owns). It never mutates state.
+#[trait_variant::make(Send)]
+pub trait RunByKeyReader: Send + Sync + 'static {
+    /// Reads the run recorded under `run_key` in `workspace_id`. An
+    /// absent row answers `codes::TASK_NOT_FOUND`; an empty key or nil
+    /// workspace is a caller bug and answers `invalid`.
+    async fn run_by_key(&self, workspace_id: WorkspaceId, run_key: &str) -> Result<Run, Failure>;
 }

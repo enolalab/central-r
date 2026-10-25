@@ -159,7 +159,7 @@ pub(crate) async fn serve_logout(state: Arc<WebState>, req: Request) -> Response
 
 /// `activeSessionWithCSRF` — the genuinely CSRF-enforcing session
 /// validation for the raw-body mutation/logout preludes.
-async fn active_session_with_csrf(
+pub(crate) async fn active_session_with_csrf(
     state: &WebState,
     headers: &axum::http::HeaderMap,
     csrf: [u8; 32],

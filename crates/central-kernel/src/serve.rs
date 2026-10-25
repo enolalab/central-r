@@ -66,6 +66,7 @@ use central_adapter_postgres::task::{
     DetailStore as PgTaskDetailStore, EventLogStore as PgTaskEventLogStore,
     ListStore as PgTaskListStore, MilestoneStore as PgMilestoneStore, Store as PgTaskStore,
 };
+use central_adapter_postgres::workflow::Store as PgWorkflowStore;
 use central_adapter_s3::{Config as ObjectConfig, S3ObjectStore};
 use central_artifact::app::Service as ArtifactService;
 use central_artifact::classifier::ReportClassifier;
@@ -2238,6 +2239,30 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         Arc::new(PgTaskStore::new(pool.clone())),
         Arc::new(PgTaskEventLogStore::new(pool.clone())),
     ));
+    // R4 task 10 (issue #122): the shared runsubmit saga — the same
+    // service `central run submit` composes — over the runtime pool.
+    // The graph store's harness-registry seam is the serve-parity
+    // claude-code-only rule; the shared serve store leaves it unset,
+    // so the submit path gets its own instance (a nil seam would
+    // reject every emit).
+    let runsubmit_graph = {
+        let mut graph = PgWorkflowStore::new(pool.clone());
+        graph.harness_registry = Some(Arc::new(|name: &str| {
+            name == central_runsubmit::domain::HARNESS_NAME
+        }));
+        graph
+    };
+    let run_submitter: Arc<dyn tports::RunSubmitter> =
+        Arc::new(central_runsubmit::app::Service::new(
+            central_task::app::TaskService::new(
+                PgTaskStore::new(pool.clone()),
+                PgTaskListStore::new(pool.clone()),
+                PgTaskDetailStore::new(pool.clone()),
+            ),
+            PgTaskStore::new(pool.clone()),
+            PgTaskStore::new(pool.clone()),
+            runsubmit_graph,
+        ));
     let task_events: Arc<dyn ports::TaskEventSink> = Arc::new(ServeTaskEventSink::new(Arc::new(
         PgMilestoneStore::new(pool.clone()),
     )));
@@ -2564,6 +2589,7 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         claimability: exec_store.clone(),
         turn_activity: None,
         harness: Some(operator.clone()),
+        run_submitter: Some(run_submitter),
         workspace: config.workspace,
         allowed_roots: config.allowed_roots.clone(),
         epoch_source: epoch_source.clone(),
