@@ -1,0 +1,295 @@
+//! `SigningService` + `Ed25519Signer` — the port of upstream
+//! `signing.go`: the broker's persistent HMAC-SHA-256 fingerprint key
+//! and the ephemeral Ed25519 signer the journal's committed records
+//! carry.
+//!
+//! The HMAC key is *persistent* — created once under the protected root
+//! as `hmac-fingerprint.key` (`0600`, link count 1, owned by the broker
+//! user) and reloaded across restarts, so issued proofs and records stay
+//! verifiable after a crash. The Ed25519 key is ephemeral by upstream
+//! design: signatures prove "this broker instance signed this record",
+//! never a durable identity.
+
+use std::fs;
+use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
+
+use central_foundation::failure::Failure;
+
+use super::durable::{FINGERPRINT_KEY_FILENAME, PRIVATE_FILE_MODE, ensure_private_root, sync_dir};
+use super::wire::hmac_fingerprint;
+use zeroize::Zeroizing;
+
+/// `fingerprintKeySize` — 32-byte HMAC key.
+const FINGERPRINT_KEY_SIZE: usize = 32;
+
+/// `SigningService` — HMAC-based fingerprinting used by the journal,
+/// proof, payload-epoch, and lifecycle protocols.
+pub struct SigningService {
+    fingerprint_key: Zeroizing<Vec<u8>>,
+}
+
+impl SigningService {
+    /// `NewSigningService` — a fixed-key service for isolated unit tests.
+    /// Broker services must use [`Self::new_persistent`] instead.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            fingerprint_key: Zeroizing::new(b"central-fingerprint-key-v1".to_vec()),
+        }
+    }
+
+    /// A service over an already-validated key — the read-only
+    /// `ActivePayloadEpochSource` composition, which loads the persistent
+    /// key through the strict path rather than creating it.
+    #[must_use]
+    pub(crate) fn from_key(key: Vec<u8>) -> Self {
+        Self {
+            fingerprint_key: Zeroizing::new(key),
+        }
+    }
+
+    /// A copy of the fingerprint key for composing a second service
+    /// over the same identity (the persistent `ProofService` shares the
+    /// key the `Service` HMACs under).
+    pub(crate) fn key_copy(&self) -> Vec<u8> {
+        (*self.fingerprint_key).clone()
+    }
+
+    /// `newPersistentSigningService` — atomically creates or loads the
+    /// broker's HMAC key. The broker normally runs as root; requiring the
+    /// effective user to own the root and key preserves that boundary
+    /// while allowing unprivileged tests.
+    pub fn new_persistent(root: &Path) -> Result<Self, Failure> {
+        ensure_private_root(root)?;
+        let key_path = root.join(FINGERPRINT_KEY_FILENAME);
+        let key = load_or_create_fingerprint_key(root, &key_path)?;
+        Ok(Self {
+            fingerprint_key: Zeroizing::new(key),
+        })
+    }
+
+    /// `HMACFingerprint` — hex HMAC-SHA-256 over `domain|data`.
+    #[must_use]
+    pub fn fingerprint(&self, domain: &str, data: &[u8]) -> String {
+        hmac_fingerprint(&self.fingerprint_key, domain, data)
+    }
+}
+
+impl Default for SigningService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `loadOrCreateFingerprintKey` — open the existing key (strict shape
+/// checks) or create it via a `0600` temp file published by `link(2)`
+/// so a racing creator never overwrites an established key.
+fn load_or_create_fingerprint_key(root: &Path, key_path: &Path) -> Result<Vec<u8>, Failure> {
+    match load_fingerprint_key(key_path) {
+        Ok(key) => return Ok(key),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Failure::internal(
+                "broker_signing_os",
+                format!("broker: load signing key: {e}"),
+            ));
+        }
+    }
+
+    // Create in a unique temp file, then `link` into place — the link
+    // fails with EEXIST when a peer already published, in which case we
+    // re-load and adopt theirs (upstream's `os.ErrExist →
+    // loadFingerprintKey` retry).
+    let tmp = {
+        let mut name = [0u8; 8];
+        rustix::rand::getrandom(&mut name, rustix::rand::GetRandomFlags::empty())
+            .map_err(|e| Failure::internal("broker_signing_os", format!("tmp entropy: {e}")))?;
+        root.join(format!(
+            ".hmac-fingerprint-key-{}",
+            crate::broker::wire::hex_encode(&name)
+        ))
+    };
+    let publish = (|| -> Result<Vec<u8>, Failure> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PRIVATE_FILE_MODE)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&tmp)
+            .map_err(|e| {
+                Failure::internal(
+                    "broker_signing_os",
+                    format!("broker: create signing key: {e}"),
+                )
+            })?;
+        let mut key = vec![0u8; FINGERPRINT_KEY_SIZE];
+        let mut filled = 0usize;
+        while filled < FINGERPRINT_KEY_SIZE {
+            filled +=
+                rustix::rand::getrandom(&mut key[filled..], rustix::rand::GetRandomFlags::empty())
+                    .map_err(|e| {
+                        Failure::internal(
+                            "broker_signing_os",
+                            format!("broker: generate signing key: {e}"),
+                        )
+                    })?;
+        }
+        use std::io::Write as _;
+        file.write_all(&key)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| {
+                Failure::internal(
+                    "broker_signing_os",
+                    format!("broker: write signing key: {e}"),
+                )
+            })?;
+        drop(file);
+        match fs::hard_link(&tmp, key_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A racing creator won — adopt the established key.
+                let _ = fs::remove_file(&tmp);
+                return load_fingerprint_key(key_path).map_err(|e| {
+                    Failure::internal(
+                        "broker_signing_os",
+                        format!("broker: load signing key: {e}"),
+                    )
+                });
+            }
+            Err(e) => {
+                return Err(Failure::internal(
+                    "broker_signing_os",
+                    format!("broker: publish signing key: {e}"),
+                ));
+            }
+        }
+        Ok(key)
+    })();
+    let _ = fs::remove_file(&tmp);
+    let key = publish?;
+    sync_dir(root)?;
+    Ok(key)
+}
+
+/// `loadFingerprintKey` — `lstat` shape checks (regular, not symlink,
+/// exact `0600`, owner-owned, link count 1) then read; 32 bytes or
+/// corrupt.
+fn load_fingerprint_key(key_path: &Path) -> std::io::Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(key_path)?;
+    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker: signing key is not a regular file",
+        ));
+    }
+    if meta.permissions().mode() & 0o777 != PRIVATE_FILE_MODE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "broker: insecure signing key permissions {:04o}",
+                (meta.permissions().mode() & 0o777)
+            ),
+        ));
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker: signing key is not owned by the broker user",
+        ));
+    }
+    if meta.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broker: signing key has an invalid link count",
+        ));
+    }
+    let key = fs::read(key_path)?;
+    if key.len() != FINGERPRINT_KEY_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("broker: corrupt signing key length {}", key.len()),
+        ));
+    }
+    Ok(key)
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519Signer — external verifiability for journal entries
+// ---------------------------------------------------------------------------
+
+/// `Ed25519Signer` — an ephemeral Ed25519 key pair that signs authority
+/// transition payloads (upstream `NewEd25519Signer`). The key never
+/// persists: signatures prove "a broker signed", not "this broker".
+pub struct Ed25519Signer {
+    key: ed25519_dalek::SigningKey,
+}
+
+impl Ed25519Signer {
+    /// `NewEd25519Signer` — a fresh key pair from the OS RNG.
+    ///
+    /// # Errors
+    /// `broker_signing_os` when the entropy source fails.
+    pub fn new() -> Result<Self, Failure> {
+        let mut seed = [0u8; 32];
+        rustix::rand::getrandom(&mut seed, rustix::rand::GetRandomFlags::empty()).map_err(|e| {
+            Failure::internal("broker_signing_os", format!("broker: ed25519 key gen: {e}"))
+        })?;
+        Ok(Self {
+            key: ed25519_dalek::SigningKey::from_bytes(&seed),
+        })
+    }
+
+    /// `Sign` — the hex-encoded Ed25519 signature over `data`.
+    #[must_use]
+    pub fn sign(&self, data: &[u8]) -> String {
+        use ed25519_dalek::Signer as _;
+        super::wire::hex_encode(&self.key.sign(data).to_bytes())
+    }
+
+    /// `PublicKeyHex` — the hex-encoded public half.
+    #[must_use]
+    pub fn public_key_hex(&self) -> String {
+        super::wire::hex_encode(self.key.verifying_key().as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_key_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("central-signing-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let a = SigningService::new_persistent(&dir).unwrap();
+        let fa = a.fingerprint("test", b"abc");
+        let b = SigningService::new_persistent(&dir).unwrap();
+        assert_eq!(fa, b.fingerprint("test", b"abc"));
+        let mode = fs::metadata(dir.join(FINGERPRINT_KEY_FILENAME))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insecure_key_rejected() {
+        let dir = std::env::temp_dir().join(format!("central-signing-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = dir.join(FINGERPRINT_KEY_FILENAME);
+        fs::write(&key, [0u8; 32]).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(SigningService::new_persistent(&dir).is_err());
+        // Wrong length, right mode — still corrupt.
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&key, [0u8; 31]).unwrap();
+        assert!(SigningService::new_persistent(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

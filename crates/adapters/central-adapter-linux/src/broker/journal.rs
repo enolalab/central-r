@@ -1,0 +1,739 @@
+//! `journal.go` — the authority-transition journal: a directory tree of
+//! `prepared.json` / `issued.json` / `committed.json` phase files under
+//! `<root>/authority-records/<stream>/<seq>-<operation>/`, plus the
+//! `lifecycle-records/<op>/<seq>/` tree and `prepare-records/`
+//! operation store.
+//!
+//! Wire and durability parity notes:
+//! - Every phase file is `os.Create`+`fsync`+dir-fsync; the committed
+//!   phase additionally writes `committed.tmp` (`0400`), fsyncs, and
+//!   installs with `RENAME_NOREPLACE` — a committed record can never be
+//!   overwritten by a retried commit.
+//! - `issued.json` HMACs the payload *before* `payload_digest` and
+//!   `payload_bytes` are populated (upstream ordering); the committed
+//!   record is Ed25519-signed when a signer is attached.
+//! - `Recover` settles orphaned chains: an intact `issued.json` is
+//!   committed as-is, a *corrupt* issued file is skipped (never
+//!   reinterpreted as prepared), and a missing issued file falls back
+//!   to `prepared.json` which is re-issued then committed.
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+use central_foundation::failure::Failure;
+use central_infra::authority::{AuthorityTransitionPayload, CommittedReceipt, PrepareOperation};
+use central_infra::domain::{LifecycleOperation, LifecyclePhase};
+use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use super::durable::{PRIVATE_DIRECTORY_MODE, rename_noreplace, sync_dir, sync_file};
+use super::signing::{Ed25519Signer, SigningService};
+use super::wire::{hex_encode, rfc3339};
+
+fn internal(msg: impl Into<String>) -> Failure {
+    Failure::internal("broker_journal", msg.into())
+}
+
+/// `LifecycleRecord` — the on-disk journal entry for one lifecycle
+/// phase transition (snake_case upstream tags).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifecycleRecord {
+    /// `operation_id`.
+    pub operation_id: String,
+    /// `instance_id`.
+    pub instance_id: String,
+    /// `phase` — upstream overwrites this with the protocol phase
+    /// (`prepared`/`issued`/`committed`) during the write sequence.
+    pub phase: String,
+    /// `timestamp`.
+    #[serde(with = "rfc3339")]
+    pub timestamp: OffsetDateTime,
+    /// `hmac,omitempty`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hmac: String,
+    /// `signature,omitempty`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
+}
+
+/// `Journal` — `rootPath` + signing identity + optional Ed25519 signer.
+pub struct Journal {
+    root_path: PathBuf,
+    signing: std::sync::Arc<SigningService>,
+    signer: Option<std::sync::Arc<Ed25519Signer>>,
+    mu: Mutex<()>,
+}
+
+impl Journal {
+    /// `NewJournal`.
+    #[must_use]
+    pub fn new(
+        root_path: PathBuf,
+        signing: std::sync::Arc<SigningService>,
+        signer: Option<std::sync::Arc<Ed25519Signer>>,
+    ) -> Self {
+        Self {
+            root_path,
+            signing,
+            signer,
+            mu: Mutex::new(()),
+        }
+    }
+
+    /// `RootPath` — exported for test inspection.
+    #[must_use]
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, ()>, Failure> {
+        self.mu
+            .lock()
+            .map_err(|_| internal("journal: lock poisoned"))
+    }
+
+    /// `AppendLifecycle` — one `%020d` sequence directory per call under
+    /// `lifecycle-records/<op.id>`; prepared → issued (HMAC under
+    /// `lifecycle`) → committed (`RENAME_NOREPLACE`, signed).
+    ///
+    /// # Errors
+    /// `broker_journal` on any filesystem, marshal, or signing failure.
+    pub fn append_lifecycle(
+        &self,
+        op: &LifecycleOperation,
+        phase: LifecyclePhase,
+    ) -> Result<(), Failure> {
+        let _guard = self.lock()?;
+        let mut record = LifecycleRecord {
+            operation_id: op.id.clone(),
+            instance_id: op.binding.instance_id.clone(),
+            phase: phase.as_str().to_owned(),
+            timestamp: OffsetDateTime::now_utc(),
+            hmac: String::new(),
+            signature: String::new(),
+        };
+
+        let op_dir = self.root_path.join("lifecycle-records").join(&op.id);
+        fs::create_dir_all(&op_dir)
+            .map_err(|e| internal(format!("journal: lifecycle mkdir: {e}")))?;
+        fs::set_permissions(&op_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .map_err(|e| internal(format!("journal: lifecycle mkdir: {e}")))?;
+
+        // Allocate next sequence number within the operation directory.
+        let mut max_seq = 0u64;
+        for entry in fs::read_dir(&op_dir)
+            .map_err(|e| internal(format!("journal: lifecycle readdir: {e}")))?
+        {
+            let entry = entry.map_err(|e| internal(format!("journal: lifecycle readdir: {e}")))?;
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(seq) = parse_seq_name(&entry.file_name().to_string_lossy())
+            {
+                max_seq = max_seq.max(seq);
+            }
+        }
+        let seq_num = max_seq + 1;
+
+        let seq_dir = op_dir.join(format!("{seq_num:020}"));
+        fs::create_dir_all(&seq_dir)
+            .map_err(|e| internal(format!("journal: lifecycle mkdir seq: {e}")))?;
+        fs::set_permissions(&seq_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .map_err(|e| internal(format!("journal: lifecycle mkdir seq: {e}")))?;
+
+        // Phase 1: prepared.
+        record.phase = "prepared".into();
+        write_lifecycle_phase(&seq_dir, "prepared.json", &record).map_err(|e| {
+            internal(format!(
+                "journal: lifecycle write prepared: {}",
+                e.message()
+            ))
+        })?;
+
+        // Phase 2: issued (compute HMAC).
+        record.phase = "issued".into();
+        let canonical = serde_json::to_vec(&record)
+            .map_err(|e| internal(format!("journal: lifecycle marshal: {e}")))?;
+        record.hmac = self.signing.fingerprint("lifecycle", &canonical);
+        write_lifecycle_phase(&seq_dir, "issued.json", &record)
+            .map_err(|e| internal(format!("journal: lifecycle write issued: {}", e.message())))?;
+
+        // Phase 3: committed (atomic install).
+        record.phase = "committed".into();
+        let committed_path = seq_dir.join("committed.json");
+        let tmp_path = seq_dir.join("committed.tmp");
+        let mut canonical = serde_json::to_vec(&record)
+            .map_err(|e| internal(format!("journal: lifecycle marshal: {e}")))?;
+        if let Some(signer) = &self.signer {
+            record.signature = signer.sign(&canonical);
+            canonical = serde_json::to_vec(&record)
+                .map_err(|e| internal(format!("journal: lifecycle re-marshal: {e}")))?;
+        }
+        fs::write(&tmp_path, &canonical)
+            .map_err(|e| internal(format!("journal: lifecycle write tmp: {e}")))?;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400))
+            .map_err(|e| internal(format!("journal: lifecycle write tmp: {e}")))?;
+        sync_file(&tmp_path)
+            .map_err(|e| internal(format!("journal: lifecycle sync tmp: {}", e.message())))?;
+        rename_noreplace(&tmp_path, &committed_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            internal(format!("journal: lifecycle atomic commit: {}", e.message()))
+        })?;
+        sync_dir(&seq_dir)
+    }
+
+    /// `Append` — the unlocked three-phase write (upstream does not
+    /// take `j.mu` here; only `AppendCommitted`/`AppendLifecycle`/
+    /// recovery do).
+    ///
+    /// # Errors
+    /// `broker_journal` on any filesystem, marshal, or signing failure.
+    pub fn append(
+        &self,
+        stream_id: &str,
+        payload: &mut AuthorityTransitionPayload,
+    ) -> Result<(), Failure> {
+        let stream_dir = self.root_path.join("authority-records").join(stream_id);
+        fs::create_dir_all(&stream_dir)
+            .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
+        fs::set_permissions(
+            &stream_dir,
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
+        let seq_dir = stream_dir.join(format!(
+            "{:020}-{}",
+            payload.sequence_num, payload.operation
+        ));
+        fs::create_dir_all(&seq_dir).map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
+        fs::set_permissions(&seq_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
+        self.commit_phases(&seq_dir, payload)
+    }
+
+    /// `AppendCommitted` — allocates the next sequence under the mutex,
+    /// writes all three phases, returns `{id: uuid4, sequence}`.
+    ///
+    /// # Errors
+    /// `broker_journal` on any filesystem, marshal, or signing failure.
+    pub fn append_committed(
+        &self,
+        stream_id: &str,
+        payload: &mut AuthorityTransitionPayload,
+    ) -> Result<CommittedReceipt, Failure> {
+        let _guard = self.lock()?;
+
+        let stream_dir = self.root_path.join("authority-records").join(stream_id);
+        fs::create_dir_all(&stream_dir)
+            .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
+        fs::set_permissions(
+            &stream_dir,
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
+
+        let mut max_seq = 0u64;
+        for entry in fs::read_dir(&stream_dir)
+            .map_err(|e| internal(format!("journal: readdir stream: {e}")))?
+        {
+            let entry = entry.map_err(|e| internal(format!("journal: readdir stream: {e}")))?;
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(seq) = parse_seq_dir_name(&entry.file_name().to_string_lossy())
+            {
+                max_seq = max_seq.max(seq);
+            }
+        }
+        payload.sequence_num = max_seq + 1;
+
+        let seq_dir = stream_dir.join(format!(
+            "{:020}-{}",
+            payload.sequence_num, payload.operation
+        ));
+        fs::create_dir_all(&seq_dir).map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
+        fs::set_permissions(&seq_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
+
+        self.commit_phases(&seq_dir, payload)?;
+
+        Ok(CommittedReceipt {
+            id: Uuid::new_v4().to_string(),
+            sequence: payload.sequence_num,
+        })
+    }
+
+    /// The shared prepared → issued → committed write sequence both
+    /// `Append` and `AppendCommitted` use.
+    fn commit_phases(
+        &self,
+        seq_dir: &Path,
+        payload: &mut AuthorityTransitionPayload,
+    ) -> Result<(), Failure> {
+        payload.phase = "prepared".into();
+        self.write_phase(seq_dir, "prepared.json", payload)?;
+
+        payload.phase = "issued".into();
+        let canonical = serde_json::to_vec(&*payload)
+            .map_err(|e| internal(format!("journal: marshal: {e}")))?;
+        payload.hmac = self.signing.fingerprint("authority-transition", &canonical);
+        let digest = sha2::Sha256::digest(serde_json::to_vec(&payload.payload).unwrap_or_default());
+        payload.payload_digest = hex_encode(&digest);
+        payload.payload_bytes = serde_json::to_vec(&payload.payload).map_or(0, |v| v.len() as u64);
+        self.write_phase(seq_dir, "issued.json", payload)?;
+
+        payload.phase = "committed".into();
+        let committed_path = seq_dir.join("committed.json");
+        let tmp_path = seq_dir.join("committed.tmp");
+        let mut committed = serde_json::to_vec(&*payload)
+            .map_err(|e| internal(format!("journal: marshal: {e}")))?;
+        if let Some(signer) = &self.signer {
+            payload.signature = signer.sign(&committed);
+            committed = serde_json::to_vec(&*payload)
+                .map_err(|e| internal(format!("journal: marshal: {e}")))?;
+        }
+        fs::write(&tmp_path, &committed)
+            .map_err(|e| internal(format!("journal: write tmp: {e}")))?;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400))
+            .map_err(|e| internal(format!("journal: write tmp: {e}")))?;
+        sync_file(&tmp_path)?;
+        rename_noreplace(&tmp_path, &committed_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            internal(format!("journal: atomic commit: {}", e.message()))
+        })?;
+        sync_dir(seq_dir)
+    }
+
+    /// `prepareDir`.
+    fn prepare_dir(&self) -> PathBuf {
+        self.root_path.join("prepare-records")
+    }
+
+    /// `Unsettled` — the first prepare-record entry whose phase is not
+    /// terminal; `None` when the directory is absent or empty.
+    ///
+    /// # Errors
+    /// Infallible by upstream design — unreadable/corrupt entries are
+    /// skipped — but declared `Result`-free to mirror that.
+    #[must_use]
+    pub fn unsettled(&self) -> Option<PrepareOperation> {
+        let _guard = self.mu.lock().ok()?;
+        let dir = self.prepare_dir();
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                || !name.to_string_lossy().ends_with(".json")
+            {
+                continue;
+            }
+            let Ok(data) = fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(op) = serde_json::from_slice::<PrepareOperation>(&data) else {
+                continue;
+            };
+            if !op.phase.is_terminal() {
+                return Some(op);
+            }
+        }
+        None
+    }
+
+    /// `Exact` — load `prepare-records/<id>.json`; absent, corrupt, or
+    /// ID-mismatched records are errors.
+    ///
+    /// # Errors
+    /// `broker_journal` on read, decode, or ID-mismatch failure.
+    pub fn exact(&self, id: &str) -> Result<PrepareOperation, Failure> {
+        let _guard = self.lock()?;
+        let path = self.prepare_dir().join(format!("{id}.json"));
+        let data = fs::read(&path).map_err(|e| internal(format!("journal: exact prepare: {e}")))?;
+        let op: PrepareOperation = serde_json::from_slice(&data)
+            .map_err(|e| internal(format!("journal: exact prepare: {e}")))?;
+        if op.operation_id != id {
+            return Err(internal("journal: exact prepare: ID mismatch"));
+        }
+        Ok(op)
+    }
+
+    /// `Record` — persist a prepare operation result as
+    /// `prepare-records/<operation_id>.json` via tmp+fsync+rename. The
+    /// upstream signature takes `dependencyprepare.Result`; the Rust
+    /// capability callsite owns the `PrepareOperation` mapping, so this
+    /// records the operation record directly.
+    ///
+    /// # Errors
+    /// `broker_journal` on mkdir, marshal, or durable-write failure.
+    pub fn record_operation(&self, op: &PrepareOperation) -> Result<(), Failure> {
+        let _guard = self.lock()?;
+        let dir = self.prepare_dir();
+        fs::create_dir_all(&dir).map_err(|e| internal(format!("journal: record prepare: {e}")))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+            .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
+        let data = serde_json::to_vec(op)
+            .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
+        let path = dir.join(format!("{}.json", op.operation_id));
+        let tmp_path = dir.join(format!("{}.json.tmp", op.operation_id));
+        fs::write(&tmp_path, &data)
+            .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
+        sync_file(&tmp_path)?;
+        fs::rename(&tmp_path, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            internal(format!("journal: record prepare: {e}"))
+        })?;
+        sync_dir(&dir)
+    }
+
+    /// `Recover` — settle every orphaned `<stream>/<seq>` chain under
+    /// `authority-records`: intact `issued.json` commits as-is; a
+    /// *corrupt* issued file skips the chain (never reinterpreted);
+    /// missing issued falls back to `prepared.json`, re-issues, then
+    /// commits. Per-chain failures are logged and skipped, matching
+    /// upstream's continue-on-error recovery.
+    ///
+    /// # Errors
+    /// `broker_journal` only when the records root itself is
+    /// unreadable; per-record failures do not propagate.
+    pub fn recover(&self) -> Result<usize, Failure> {
+        let _guard = self.lock()?;
+        let records_dir = self.root_path.join("authority-records");
+        if !records_dir.exists() {
+            return Ok(0);
+        }
+        let streams = fs::read_dir(&records_dir)
+            .map_err(|e| internal(format!("journal: recover readdir: {e}")))?;
+        let mut recovered = 0usize;
+        for stream in streams.flatten() {
+            if !stream.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let stream_dir = stream.path();
+            let Ok(entries) = fs::read_dir(&stream_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let seq_dir = entry.path();
+                if seq_dir.join("committed.json").exists() {
+                    continue;
+                }
+                let issued_path = seq_dir.join("issued.json");
+                let prepared_path = seq_dir.join("prepared.json");
+
+                let mut payload: AuthorityTransitionPayload;
+                let mut have_issued = false;
+                match fs::read(&issued_path) {
+                    Ok(data) => match serde_json::from_slice(&data) {
+                        Ok(p) => {
+                            payload = p;
+                            have_issued = true;
+                        }
+                        Err(_) => continue, // corrupt issued: never reinterpret
+                    },
+                    Err(_) => match fs::read(&prepared_path) {
+                        Ok(data) => match serde_json::from_slice(&data) {
+                            Ok(p) => payload = p,
+                            Err(_) => continue,
+                        },
+                        Err(_) => continue,
+                    },
+                }
+
+                if !have_issued {
+                    payload.phase = "issued".into();
+                    let Ok(canonical) = serde_json::to_vec(&payload) else {
+                        continue;
+                    };
+                    payload.hmac = self.signing.fingerprint("authority-transition", &canonical);
+                    let digest = sha2::Sha256::digest(
+                        serde_json::to_vec(&payload.payload).unwrap_or_default(),
+                    );
+                    payload.payload_digest = hex_encode(&digest);
+                    payload.payload_bytes =
+                        serde_json::to_vec(&payload.payload).map_or(0, |v| v.len() as u64);
+                    if self.write_phase(&seq_dir, "issued.json", &payload).is_err() {
+                        continue;
+                    }
+                }
+
+                payload.phase = "committed".into();
+                let tmp_path = seq_dir.join("committed.tmp");
+                let committed_path = seq_dir.join("committed.json");
+                let Ok(mut committed) = serde_json::to_vec(&payload) else {
+                    continue;
+                };
+                if let Some(signer) = &self.signer {
+                    payload.signature = signer.sign(&committed);
+                    let Ok(c) = serde_json::to_vec(&payload) else {
+                        continue;
+                    };
+                    committed = c;
+                }
+                if fs::write(&tmp_path, &committed).is_err()
+                    || fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).is_err()
+                    || sync_file(&tmp_path).is_err()
+                {
+                    continue;
+                }
+                if rename_noreplace(&tmp_path, &committed_path).is_err() {
+                    let _ = fs::remove_file(&tmp_path);
+                    continue;
+                }
+                if sync_dir(&seq_dir).is_err() {
+                    continue;
+                }
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// `writePhase` — marshal, create, fsync file, fsync dir.
+    fn write_phase(
+        &self,
+        seq_dir: &Path,
+        filename: &str,
+        payload: &AuthorityTransitionPayload,
+    ) -> Result<(), Failure> {
+        let path = seq_dir.join(filename);
+        let data = serde_json::to_vec(payload).map_err(|e| internal(format!("journal: {e}")))?;
+        fs::write(&path, &data).map_err(|e| internal(format!("journal: {e}")))?;
+        sync_file(&path)?;
+        sync_dir(seq_dir)
+    }
+}
+
+/// `writeLifecyclePhase` — same shape as `writePhase` for lifecycle
+/// records.
+fn write_lifecycle_phase(
+    seq_dir: &Path,
+    filename: &str,
+    record: &LifecycleRecord,
+) -> Result<(), Failure> {
+    let path = seq_dir.join(filename);
+    let data = serde_json::to_vec(record).map_err(|e| internal(format!("journal: {e}")))?;
+    fs::write(&path, &data).map_err(|e| internal(format!("journal: {e}")))?;
+    sync_file(&path)?;
+    sync_dir(seq_dir)
+}
+
+/// `%020d` — the lifecycle sequence-directory name.
+fn parse_seq_name(name: &str) -> Option<u64> {
+    if name.len() != 20 || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    name.parse().ok()
+}
+
+/// `%020d-<operation>` — the authority-record sequence-directory name.
+fn parse_seq_dir_name(name: &str) -> Option<u64> {
+    let (num, _op) = name.split_once('-')?;
+    parse_seq_name(num)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — upstream journal crash/replay coverage, ported.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::testutil::TempDir;
+    use std::sync::Arc;
+
+    fn journal(dir: &Path) -> Journal {
+        Journal::new(
+            dir.to_path_buf(),
+            Arc::new(SigningService::new()),
+            Some(Arc::new(Ed25519Signer::new().unwrap())),
+        )
+    }
+
+    fn payload(op: &str) -> AuthorityTransitionPayload {
+        AuthorityTransitionPayload {
+            schema_version: "central.authority-transition/v1".into(),
+            stream_id: "stream-1".into(),
+            sequence_num: 0,
+            phase: String::new(),
+            operation: op.into(),
+            instance_id: "inst".into(),
+            binding_id: "bind".into(),
+            launch_id: "launch".into(),
+            nonce: "nonce".into(),
+            payload: serde_json::json!({"k": "v"}),
+            payload_digest: String::new(),
+            payload_bytes: 0,
+            prior_digest: String::new(),
+            broker_key_ver: "v1".into(),
+            hmac: String::new(),
+            signature: String::new(),
+            signed_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn append_writes_all_three_phases() {
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        let mut p = payload("bind");
+        p.sequence_num = 7;
+        j.append("stream-1", &mut p).unwrap();
+        let seq_dir = dir
+            .join("authority-records/stream-1")
+            .join("00000000000000000007-bind");
+        let prepared: AuthorityTransitionPayload =
+            serde_json::from_slice(&fs::read(seq_dir.join("prepared.json")).unwrap()).unwrap();
+        let issued: AuthorityTransitionPayload =
+            serde_json::from_slice(&fs::read(seq_dir.join("issued.json")).unwrap()).unwrap();
+        let committed: AuthorityTransitionPayload =
+            serde_json::from_slice(&fs::read(seq_dir.join("committed.json")).unwrap()).unwrap();
+        assert_eq!(prepared.phase, "prepared");
+        assert_eq!(issued.phase, "issued");
+        assert_eq!(committed.phase, "committed");
+        // Upstream ordering: the issued-phase HMAC covers the record
+        // before the payload digest/bytes are populated.
+        assert!(prepared.hmac.is_empty());
+        assert!(!issued.hmac.is_empty());
+        assert!(!issued.payload_digest.is_empty());
+        assert_ne!(issued.payload_bytes, 0);
+        // The committed record carries the Ed25519 signature.
+        assert!(!committed.signature.is_empty());
+    }
+
+    #[test]
+    fn append_committed_allocates_monotonic_sequences() {
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        let r1 = j.append_committed("s", &mut payload("a")).unwrap();
+        let r2 = j.append_committed("s", &mut payload("b")).unwrap();
+        assert_eq!(r1.sequence, 1);
+        assert_eq!(r2.sequence, 2);
+        assert_ne!(r1.id, r2.id);
+    }
+
+    #[test]
+    fn recover_commits_prepared_only_chain() {
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        // Simulate a crash after prepared.json: the record exists
+        // without issued/committed.
+        let seq_dir = dir
+            .join("authority-records/stream-1")
+            .join("00000000000000000003-bind");
+        fs::create_dir_all(&seq_dir).unwrap();
+        let mut p = payload("bind");
+        p.sequence_num = 3;
+        p.phase = "prepared".into();
+        fs::write(
+            seq_dir.join("prepared.json"),
+            serde_json::to_vec(&p).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(j.recover().unwrap(), 1);
+        let committed: AuthorityTransitionPayload =
+            serde_json::from_slice(&fs::read(seq_dir.join("committed.json")).unwrap()).unwrap();
+        assert_eq!(committed.phase, "committed");
+        assert!(!committed.hmac.is_empty());
+        // A settled chain is not recovered twice.
+        assert_eq!(j.recover().unwrap(), 0);
+    }
+
+    #[test]
+    fn recover_commits_intact_issued_chain() {
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        let seq_dir = dir
+            .join("authority-records/stream-1")
+            .join("00000000000000000001-rotate");
+        fs::create_dir_all(&seq_dir).unwrap();
+        let mut p = payload("rotate");
+        p.sequence_num = 1;
+        p.phase = "issued".into();
+        let canonical = serde_json::to_vec(&p).unwrap();
+        p.hmac = j.signing.fingerprint("authority-transition", &canonical);
+        fs::write(seq_dir.join("issued.json"), serde_json::to_vec(&p).unwrap()).unwrap();
+        assert_eq!(j.recover().unwrap(), 1);
+        assert!(seq_dir.join("committed.json").exists());
+    }
+
+    #[test]
+    fn recover_never_reinterprets_corrupt_issued() {
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        let seq_dir = dir
+            .join("authority-records/stream-1")
+            .join("00000000000000000002-bind");
+        fs::create_dir_all(&seq_dir).unwrap();
+        fs::write(seq_dir.join("prepared.json"), b"{\"phase\":\"prepared\"}").unwrap();
+        fs::write(seq_dir.join("issued.json"), b"not-json").unwrap();
+        // The torn tail is skipped: no committed.json is minted from
+        // unreadable bytes and nothing is reinterpreted as prepared.
+        assert_eq!(j.recover().unwrap(), 0);
+        assert!(!seq_dir.join("committed.json").exists());
+    }
+
+    #[test]
+    fn lifecycle_records_round_trip() {
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        let op = LifecycleOperation {
+            id: "life-1".into(),
+            linked_operation_id: String::new(),
+            phase: LifecyclePhase::Started,
+            binding: central_infra::domain::LifecycleBinding {
+                instance_id: "inst".into(),
+                ..Default::default()
+            },
+            observation: Default::default(),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        j.append_lifecycle(&op, LifecyclePhase::Started).unwrap();
+        j.append_lifecycle(&op, LifecyclePhase::Verified).unwrap();
+        let op_dir = dir.join("lifecycle-records/life-1");
+        let mut seqs: Vec<_> = fs::read_dir(&op_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .collect();
+        seqs.sort();
+        assert_eq!(seqs, ["00000000000000000001", "00000000000000000002"]);
+        let committed: LifecycleRecord = serde_json::from_slice(
+            &fs::read(op_dir.join("00000000000000000002/committed.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(committed.phase, "committed");
+        assert!(!committed.hmac.is_empty());
+        assert!(!committed.signature.is_empty());
+    }
+
+    #[test]
+    fn prepare_records_settle() {
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        assert!(j.unsettled().is_none());
+        let mut op = PrepareOperation {
+            operation_id: "op-77".into(),
+            phase: central_infra::authority::PrepareOperationPhase::Acquiring,
+            admission_id: "adm".into(),
+            selector: "sel".into(),
+            deadline: OffsetDateTime::now_utc(),
+            reason: String::new(),
+            reused: 0,
+            acquired: 0,
+            receipt_id: String::new(),
+            created_at: OffsetDateTime::now_utc(),
+        };
+        j.record_operation(&op).unwrap();
+        assert_eq!(j.unsettled().unwrap().operation_id, "op-77");
+        assert_eq!(j.exact("op-77").unwrap().operation_id, "op-77");
+        assert!(j.exact("missing").is_err());
+        op.phase = central_infra::authority::PrepareOperationPhase::Failed;
+        j.record_operation(&op).unwrap();
+        assert!(j.unsettled().is_none());
+    }
+}

@@ -700,15 +700,23 @@ name = "central-adapter-linux"
 version = "0.1.0"
 dependencies = [
  "central-adapter-harness",
+ "central-backup",
  "central-foundation",
  "central-harness",
+ "central-infra",
  "central-scheduler",
  "central-session",
+ "ed25519-dalek",
+ "hmac 0.13.0",
  "libc",
+ "rand 0.10.3",
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "time",
  "tokio",
+ "uuid",
  "zeroize",
 ]
 

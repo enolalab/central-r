@@ -85,6 +85,30 @@ pub(crate) fn unshare(flags: crate::sys::namespace::NamespaceFlags) -> Result<()
     unsafe { rustix::thread::unshare_unsafe(flags) }
 }
 
+/// `LISTEN_FDS` socket activation: fd `3 + index` is handed to this
+/// process by the supervisor — the descriptor is owned exclusively by
+/// this process per the activation contract, so wrapping it in
+/// `OwnedFd` transfers ownership without aliasing. The caller validates
+/// `LISTEN_PID`/`LISTEN_FDS` before reaching here.
+///
+/// # Errors
+/// `EBADF` when the fd is not open.
+pub(crate) fn socket_activation_fd(index: u32) -> Result<std::os::fd::OwnedFd, Errno> {
+    let raw = 3i32 + i32::try_from(index).map_err(|_| Errno::BADF)?;
+    // SAFETY: the socket-activation contract makes `3 + index` an open
+    // descriptor owned solely by this process; `OwnedFd::from_raw_fd`
+    // takes that ownership. `fcntl(F_GETFD)` proves it is open before
+    // we claim it so a bad index cannot alias an unrelated fd number.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: `raw` was just proven open by `F_GETFD` and is owned by
+    // this process under the activation contract.
+    use std::os::fd::FromRawFd as _;
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
 /// Hand-written Linux-PAM FFI (`pam`), R5 task 5 / decision D1.
 ///
 /// This is a byte-exact port of the upstream cgo shim

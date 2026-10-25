@@ -28,6 +28,7 @@
 //!   and sandbox launcher are built from (R5 task 4).
 
 #[forbid(unsafe_code)]
+pub mod broker;
 pub mod dev_bootstrap;
 #[forbid(unsafe_code)]
 pub mod dev_restore_barrier;
