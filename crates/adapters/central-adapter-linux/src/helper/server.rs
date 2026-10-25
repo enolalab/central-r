@@ -2,12 +2,14 @@
 //! policy), the closed matrix gate, the deny-safe transport gate, the
 //! verb dispatch table, and the systemd-activation accept loop.
 //!
-//! Every answered request — admitted or not — produces exactly one
+//! Every request that clears `admit_helper_conn` produces exactly one
 //! [`DecisionRecord`] through the server's optional auditor seam, so a
-//! caller can prove one audit record exists per decision including
-//! denials. That hook is the R5 slice's answer to the task's
-//! audit-per-decision requirement; upstream records these only in its
-//! stderr journal.
+//! caller can prove one audit record exists per post-admission
+//! decision including denials. Requests that fail inside admission —
+//! `SO_PEERCRED` failure, an unreadable frame, an unadmitted peer —
+//! precede the seam and mint no record. That hook is the R5 slice's
+//! answer to the task's audit-per-decision requirement; upstream
+//! records these only in its stderr journal.
 
 use super::PeerIdentity;
 use super::audit::{REASON_DENY_SAFE_ACTIVE, is_deny_safe_active, parse_audit_request};
@@ -135,9 +137,11 @@ impl SocketPolicy {
     }
 }
 
-/// One audit record per helper decision. `peer` carries the
-/// kernel-reported identity; `admitted=false` marks the
-/// closed-unanswered refusals (no response was writable).
+/// One audit record per post-admission helper decision. `peer` carries
+/// the kernel-reported identity; `admitted=false` is the field's shape
+/// for a refusal recorded before a response was writable — admission
+/// failures precede the seam, so every emitted record today carries
+/// `admitted=true`.
 #[derive(Debug, Clone)]
 pub struct DecisionRecord {
     pub operation_id: String,
@@ -151,8 +155,10 @@ pub struct DecisionRecord {
 }
 
 /// The decision-audit seam. `record` is invoked exactly once per
-/// `handle_conn`, including parse errors, unadmitted peers, unsupported
-/// verbs, deny-safe refusals, and handler answers.
+/// `handle_conn` decision that survives `admit_helper_conn` —
+/// unsupported verbs, deny-safe refusals, and handler answers. Parse
+/// errors and unadmitted peers err inside admission before any record
+/// is minted, so the seam sees post-admission decisions only.
 pub trait DecisionAuditor: Send + Sync {
     fn record(&self, decision: &DecisionRecord);
 }

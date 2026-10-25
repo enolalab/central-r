@@ -180,9 +180,9 @@ impl PamConfirmer {
                 format!("pam: generate confirmation nonce: {e}"),
             )
         })?;
-        // Upstream base64url-encodes; this build encodes hex — the token
-        // never leaves the process and the store key is local.
-        let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        // `base64.RawURLEncoding.EncodeToString` — upstream's token form
+        // (pam_linux.go's ConfirmationToken).
+        let token = crate::broker::wire::b64_url_raw_encode(&raw);
         self.used.lock().unwrap_or_else(|e| e.into_inner()).insert(
             token.clone(),
             ConfirmationRecord {
@@ -365,5 +365,31 @@ impl PamConfirmer {
         confirm_backup_prune => (BackupPrune, perform_prune_tty_ceremony, "prune", "prune");
         confirm_security_rescue => (SecurityRescue, perform_rescue_tty_ceremony, "rescue", "rescue");
         confirm_maintenance_apply => (MaintenanceApply, perform_maintenance_apply_tty_ceremony, "maintenance-apply", "maintenance-apply");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The minted confirmation token is upstream's
+    /// `base64.RawURLEncoding` of 32 random bytes — 43 chars, no
+    /// padding, URL-safe alphabet — and it verifies exactly once.
+    #[test]
+    fn confirmation_token_is_base64url_and_single_use() {
+        let confirmer = PamConfirmer::new();
+        let token = confirmer.new_confirmation_token().unwrap();
+        assert_eq!(token.len(), 43);
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+        assert_eq!(
+            crate::broker::wire::b64_url_raw_decode(&token).map(|v| v.len()),
+            Some(32)
+        );
+        assert!(confirmer.verify_and_consume(&token));
+        assert!(!confirmer.verify_and_consume(&token));
     }
 }

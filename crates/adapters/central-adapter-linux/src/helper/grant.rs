@@ -424,7 +424,6 @@ impl GrantStore {
     /// `OpenGrantStore` — dir must exist, be a `0700` directory owned by
     /// owner, and its key loads or mints exclusively.
     pub fn open(dir: &str, owner_uid: u32, owner_gid: u32) -> Result<Self, Failure> {
-        use std::os::unix::fs::MetadataExt;
         let path = std::path::Path::new(dir);
         if !path.is_absolute() || path != std::path::Path::new(dir).components().as_path() {
             return Err(invalid(
@@ -432,19 +431,27 @@ impl GrantStore {
                 "grant: store path must be absolute and clean",
             ));
         }
-        let meta = std::fs::metadata(dir)
-            .map_err(|e| internal("sys_grant_store", format!("grant: store: {e}")))?;
-        if !meta.is_dir()
-            || meta.mode() & 0o777 != 0o700
-            || meta.uid() != owner_uid
-            || meta.gid() != owner_gid
+        // `root.Stat(".")` — upstream opens `os.Root` first, then stats
+        // through it: `fstat` on the opened dirfd lands the mode/owner
+        // check on the directory the store will actually use, with no
+        // check→open window a swapped path could win.
+        let root = ScopedDir::open(dir)?;
+        let info = rustix::fs::fstat(&root.fd).map_err(|_| {
+            denied(
+                "sys_grant_store",
+                "grant: store must be a 0700 directory owned by the instance owner",
+            )
+        })?;
+        if info.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || info.st_mode & 0o777 != 0o700
+            || info.st_uid != owner_uid
+            || info.st_gid != owner_gid
         {
             return Err(denied(
                 "sys_grant_store",
                 "grant: store must be a 0700 directory owned by the instance owner",
             ));
         }
-        let root = ScopedDir::open(dir)?;
         let key = Self::load_or_create_key(&root)?;
         Ok(GrantStore {
             mu: Mutex::new(()),
@@ -572,9 +579,10 @@ impl GrantStore {
         let mut nonce = [0u8; GRANT_NONCE_LENGTH];
         rustix::rand::getrandom(&mut nonce, rustix::rand::GetRandomFlags::empty())
             .map_err(|e| internal("sys_grant_nonce", format!("grant: generate nonce: {e}")))?;
-        // Upstream base64url-encodes the nonce; this build hex-encodes.
-        // The value stays inside the store files only.
-        let nonce_text: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        // `base64.RawURLEncoding.EncodeToString` — upstream's nonce
+        // form (grant.go); the URL alphabet keeps the grant filename
+        // path-safe.
+        let nonce_text = crate::broker::wire::b64_url_raw_encode(&nonce);
         let issued_str = (self.now)();
         let issued = parse_time(&issued_str).unwrap_or_else(time::OffsetDateTime::now_utc);
         let expires = issued + time::Duration::try_from(ttl).unwrap_or(time::Duration::MAX);
@@ -1017,6 +1025,18 @@ mod tests {
         let g = store
             .issue(&scope, "boot-1", "rel-1", Duration::from_secs(60))
             .unwrap();
+        // Upstream's nonce form: `base64.RawURLEncoding` of the
+        // 32 random bytes — 43 chars, no padding, filename-safe.
+        assert_eq!(g.nonce.len(), 43);
+        assert!(
+            g.nonce
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+        assert_eq!(
+            crate::broker::wire::b64_url_raw_decode(&g.nonce).map(|v| v.len()),
+            Some(GRANT_NONCE_LENGTH)
+        );
         assert!(std::path::Path::new(&path).join(g.file_name()).exists());
         let spent = store.consume(&scope, "boot-1", uid, 4242).unwrap();
         assert_eq!(spent.nonce, g.nonce);
@@ -1117,6 +1137,40 @@ mod tests {
         store
             .issue_init("boot-1", "rel-1", Duration::from_secs(60), false)
             .unwrap();
+    }
+
+    /// `OpenGrantStore` refuses anything but a `0700` directory owned
+    /// by the instance owner — the check lands on the opened dirfd, so
+    /// a swapped path cannot win a check→open race: a mode change made
+    /// before open is seen, and a non-directory never passes.
+    #[test]
+    fn store_open_refuses_unfit_dirs() {
+        let (_t, path) = store_dir("open");
+        let (uid, gid) = owner();
+        // Wrong mode refuses.
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            GrantStore::open(&path, uid, gid).err().unwrap().code(),
+            "sys_grant_store"
+        );
+        // A wrong owner refuses — the dir's uid can never be uid+1.
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert_eq!(
+            GrantStore::open(&path, uid.wrapping_add(1), gid)
+                .err()
+                .unwrap()
+                .code(),
+            "sys_grant_store"
+        );
+        // A regular file is not a store.
+        let file = TestDir::new("open-file");
+        let file_path = file.path().join("not-a-dir");
+        std::fs::write(&file_path, b"x").unwrap();
+        assert!(GrantStore::open(file_path.to_str().unwrap(), uid, gid).is_err());
+        // And the still-0700 dir opens.
+        GrantStore::open(&path, uid, gid).unwrap();
     }
 
     /// `ReadCeremonyMode`/`WriteCeremonyMode` — absent is physical_tty;

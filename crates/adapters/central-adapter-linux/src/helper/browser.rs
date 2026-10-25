@@ -6,7 +6,7 @@
 use super::PeerIdentity;
 use central_foundation::failure::Failure;
 use serde::Serialize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn denied() -> Failure {
     super::err_denied()
@@ -103,10 +103,63 @@ impl WaylandSeat for SystemWaylandSeat {
         if !meta.file_type().is_socket() {
             return Err(denied());
         }
-        let conn = std::os::unix::net::UnixStream::connect(&path).map_err(|_| denied())?;
+        let conn = dial_unix_bounded(&path)?;
         drop(conn);
         Ok(())
     }
+}
+
+/// `net.Dialer{Timeout: time.Second}.DialContext(ctx, "unix", path)` —
+/// a nonblocking `connect` bounded to one second: `poll` waits for
+/// writability, `SO_ERROR` surfaces the pending connection's verdict,
+/// and the finished stream goes back to blocking mode like the conn
+/// upstream's dialer returns. Every failure — refused, timed out, or
+/// malformed — collapses to the same `ErrDenied` a dial error produces.
+fn dial_unix_bounded(path: &std::path::Path) -> Result<std::os::unix::net::UnixStream, Failure> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::io::Errno;
+    use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let fd = net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )
+    .map_err(|_| denied())?;
+    let addr = SocketAddrUnix::new(path).map_err(|_| denied())?;
+    match net::connect(&fd, &addr) {
+        Ok(()) => {}
+        Err(Errno::INPROGRESS) | Err(Errno::AGAIN) => {
+            // One second of budget across EINTR retries — upstream's
+            // fixed dialer timeout, not a per-poll slice.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(denied());
+                }
+                let timeout = Timespec::try_from(left).unwrap_or(Timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                });
+                match poll(&mut fds, Some(&timeout)) {
+                    Ok(0) => return Err(denied()),
+                    Ok(_) => break,
+                    Err(Errno::INTR) => continue,
+                    Err(_) => return Err(denied()),
+                }
+            }
+            match net::sockopt::socket_error(&fd) {
+                Ok(Ok(())) => {}
+                _ => return Err(denied()),
+            }
+        }
+        Err(_) => return Err(denied()),
+    }
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    stream.set_nonblocking(false).map_err(|_| denied())?;
+    Ok(stream)
 }
 
 /// `BrowserLauncher`.
@@ -622,5 +675,32 @@ mod tests {
         // A comm containing a paren is skipped by the last-`)` rule.
         let tricky = b"42 (weird)name) S 1 1 1 1024 -1".to_vec();
         assert!(is_controlling_tty("/dev/pts/0", &tricky));
+    }
+
+    /// The bounded dial: a live socket answers inside the deadline
+    /// with a clear `SO_ERROR`; a socket file with nobody listening
+    /// refuses fast rather than hanging the seat check.
+    #[test]
+    fn bounded_unix_dial_answers_or_refuses() {
+        let dir = std::env::temp_dir().join(format!(
+            "helper-browser-dial-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let sock = dir.join("wayland-9");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let conn = dial_unix_bounded(&sock).unwrap();
+        // Connected: no pending SO_ERROR on the finished stream.
+        assert!(conn.take_error().unwrap().is_none());
+        drop(conn);
+        // Nobody accepts; drop the listener and the path is a stale
+        // socket — connect refuses immediately, no 1s wait needed.
+        drop(listener);
+        assert!(dial_unix_bounded(&sock).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
