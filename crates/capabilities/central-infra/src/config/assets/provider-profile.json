@@ -1,0 +1,37 @@
+{
+  "default_budget": {
+    "input_tokens": 100000,
+    "output_tokens": 20000,
+    "request_bytes": 1048576,
+    "response_bytes": 4194304,
+    "spend_micros": 5000000,
+    "tool_calls_per_run": 50,
+    "tool_calls_per_step": 5,
+    "wall_time_seconds": 3600
+  },
+  "destination": "https://api.openai.com:443/v1/responses",
+  "hard_budget": {
+    "input_tokens": 200000,
+    "output_tokens": 40000,
+    "request_bytes": 4194304,
+    "response_bytes": 8388608,
+    "spend_micros": 25000000,
+    "tool_calls_per_run": 100,
+    "tool_calls_per_step": 10,
+    "wall_time_seconds": 7200
+  },
+  "input_token_price_micros": "@genesis:input_token_price_micros",
+  "local_grant_ttl_seconds": 3600,
+  "method": "POST",
+  "model": "gpt-5.6",
+  "output_token_price_micros": "@genesis:output_token_price_micros",
+  "path": "/v1/responses",
+  "policy_revision": "policy-1",
+  "price_data_revision": "@genesis:price_data_revision",
+  "protected_paths": [],
+  "provider": "openai-responses",
+  "purpose": "provider_api_key_v1",
+  "secret_ref": "openai_api_key",
+  "signature": "@genesis:signature",
+  "tool_revision": "tool-1"
+}

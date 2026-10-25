@@ -1,0 +1,198 @@
+{
+  "artifact": {
+    "active_transfers": 2,
+    "admission_wait_ms": 5000,
+    "copy_buffer_bytes": 262144,
+    "stream_idle_ms": 30000,
+    "stream_total_ms": 1800000,
+    "waiters": 8
+  },
+  "bootstrap_session": {
+    "absolute_ms": 43200000,
+    "binding_id": "@genesis:binding",
+    "first_use_ms": 60000,
+    "idle_ms": 1800000,
+    "presentation_ms": 180000,
+    "throttle_failures": 5,
+    "throttle_window_ms": 60000,
+    "token_bits": 256
+  },
+  "http": {
+    "application": {
+      "host": "127.0.0.1",
+      "port": 8080
+    },
+    "graceful_shutdown_ms": 45000,
+    "idle_ms": 60000,
+    "max_header_bytes": 32768,
+    "max_header_value_bytes": 4096,
+    "non_streaming": {
+      "active": 16,
+      "admission_wait_ms": 2000,
+      "api_buffer_bytes": 2097152,
+      "body_read_ms": 30000,
+      "html_buffer_bytes": 1048576,
+      "response_write_ms": 30000,
+      "route_total_ms": 65000,
+      "waiters": 32
+    },
+    "operations": {
+      "host": "127.0.0.1",
+      "port": 9090
+    },
+    "read_header_ms": 5000,
+    "tls": {
+      "binding_id": "@genesis:binding",
+      "ca_fingerprint_sha256": "@genesis:fingerprint",
+      "leaf_fingerprint_sha256": "@genesis:fingerprint"
+    }
+  },
+  "instance_id": "@genesis:instance_id",
+  "object_store": {
+    "bindings": {
+      "backup": "@genesis:binding",
+      "restore": "@genesis:binding",
+      "root": "@genesis:binding",
+      "runtime": "@genesis:binding"
+    },
+    "bucket": "central-artifacts-v1",
+    "host": "127.0.0.1",
+    "path_style": true,
+    "policy_digests": {
+      "backup": "aa5f63fdf5b13e4bc2effd1a972a7c2ed6771faee3b56bc2fca7d822ad7d38b1",
+      "import": "46919b32f24986496167605fb6fb7b859f78aa8b4cd4aa9f36b859e3cc6f18f7",
+      "restore": "79ec56cee096807d98ca968500e2b5bd16ac948c008a2c83ab5cbfc5e338e6dc",
+      "runtime": "b4613cce4c0fe3e7b23cc7212d578919169cb1d64aab9c5b73fc544cf759d72f"
+    },
+    "port": 59000,
+    "region": "us-east-1",
+    "scheme": "http"
+  },
+  "observability": {
+    "log_format": "json",
+    "log_level": "info",
+    "metric_registry": "central_custom_v1"
+  },
+  "operator_modes": {
+    "backup_admission_deadline_fraction_per_mille": 750,
+    "backup_elapsed_ms": 7200000,
+    "backup_min_throughput_bytes_per_second": 16777216,
+    "backup_probe_bytes": 536870912,
+    "backup_probe_elapsed_ms": 300000,
+    "backup_probe_max_age_ms": 604800000,
+    "backup_reference_database_bytes": 5368709120,
+    "backup_reference_object_bytes": 10737418240,
+    "backup_reference_records": 10000,
+    "body_attempts": 3,
+    "body_copy_buffer_bytes": 262144,
+    "body_idle_ms": 30000,
+    "body_total_ms": 1800000,
+    "body_transfer_workers": 1,
+    "browser_clear_elapsed_ms": 300000,
+    "browser_disk_cache_bytes": 268435456,
+    "browser_profile_bytes": 1073741824,
+    "browser_profile_inodes": 50000,
+    "capacity_free_floor_bytes": 1073741824,
+    "capacity_poll_ms": 1000,
+    "capacity_survival_reserve_bytes": 4294967296,
+    "capacity_write_quantum_bytes": 8388608,
+    "export_elapsed_ms": 7200000,
+    "import_elapsed_ms": 7200000,
+    "inventory_chunk_records": 1000,
+    "inventory_record_bytes": 4096,
+    "inventory_slice_ms": 300000,
+    "inventory_slice_pages": 100,
+    "inventory_spool_bytes_per_worker": 8388608,
+    "inventory_workers": 1,
+    "maintenance_elapsed_ms": 7200000,
+    "migration_lock_ms": 15000,
+    "multipart_part_bytes": 16777216,
+    "prepare_elapsed_ms": 1200000,
+    "restore_elapsed_ms": 14400000,
+    "restore_ticket_ms": 900000,
+    "security_rescue_elapsed_ms": 14400000,
+    "target_lock_ms": 30000,
+    "total_lock_ms": 45000
+  },
+  "paths": {
+    "authoritative_state_root": "@genesis:state_root",
+    "backup_repository_root": "@genesis:backup_root",
+    "instance_data_root": "@genesis:data_root",
+    "workspace_roots": []
+  },
+  "postgres": {
+    "bindings": {
+      "migration": "@genesis:binding",
+      "outbox": "@genesis:binding",
+      "runtime": "@genesis:binding",
+      "server_admin": "@genesis:binding"
+    },
+    "database": "central",
+    "host": "127.0.0.1",
+    "pools": {
+      "cleanup": 1,
+      "coexisting_read_only": 2,
+      "offline_mutation": 2,
+      "outbox": 3,
+      "runtime_general": 6,
+      "runtime_settlement": 2,
+      "serve_lock_control": 1
+    },
+    "port": 55432,
+    "schema": "central",
+    "timeouts": {
+      "connection_lifetime_ms": 1800000,
+      "idle_in_transaction_ms": 30000,
+      "lock_ms": 5000,
+      "pool_acquire_ms": 2000,
+      "statement_ms": 30000,
+      "transaction_ms": 30000
+    }
+  },
+  "protected_store": {
+    "backend": "protected_file_v1",
+    "binding_root_id": "@genesis:binding",
+    "candidate_cleanup_age_ms": 86400000,
+    "max_secret_bytes": 65536,
+    "resolve_ms": 5000,
+    "retired_cleanup_age_ms": 604800000
+  },
+  "provider": "@genesis:provider",
+  "runtime": {
+    "central_rss_ceiling_bytes": 805306368,
+    "dependency_retry_ms": 60000,
+    "enabled_components": [
+      "artifact_reconciliation",
+      "cleanup",
+      "execution",
+      "http",
+      "outbox",
+      "session_recovery",
+      "task_reconciliation"
+    ],
+    "go_memory_limit_bytes": 671088640,
+    "health_interval_ms": 5000,
+    "health_timeout_ms": 2000,
+    "host_memory_headroom_bytes": 536870912,
+    "host_memory_reserve_bytes": 2147483648,
+    "operator_tool_rss_ceiling_bytes": 536870912,
+    "preflight_ms": 5000,
+    "preflight_page": 100,
+    "retry_initial_ms": 250,
+    "retry_max_ms": 5000,
+    "settlement_ms": 30000,
+    "startup_dependency_ms": 30000,
+    "total_shutdown_ms": 45000
+  },
+  "schema_version": "central.config/v1",
+  "tools": {
+    "pg_dump": {
+      "path": "/usr/lib/postgresql/16/bin/pg_dump",
+      "version": "16.14"
+    },
+    "pg_restore": {
+      "path": "/usr/lib/postgresql/16/bin/pg_restore",
+      "version": "16.14"
+    }
+  }
+}
