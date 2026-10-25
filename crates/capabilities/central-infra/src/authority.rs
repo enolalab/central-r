@@ -1226,26 +1226,37 @@ pub struct B04IssueProofRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct B04MaterializeRequest {
     /// The binding being materialized.
+    #[serde(default)]
     pub binding_id: String,
     /// The requesting operation.
+    #[serde(default)]
     pub operation_id: String,
     /// The consumed one-use receipt.
+    #[serde(default)]
     pub receipt_id: String,
     /// Receipt HMAC.
+    #[serde(default)]
     pub receipt_hmac: String,
     /// Lifecycle fencing token.
+    #[serde(default)]
     pub fencing_token: u64,
     /// Calling peer's UID.
+    #[serde(default)]
     pub peer_uid: u32,
     /// Calling peer's PID.
+    #[serde(default)]
     pub peer_pid: i32,
     /// Dependency service (`minio`).
+    #[serde(default)]
     pub service: String,
     /// Authorized materialization target.
+    #[serde(default)]
     pub target: String,
     /// Target file owner UID.
+    #[serde(default)]
     pub uid: u32,
     /// Target file owner GID.
+    #[serde(default)]
     pub gid: u32,
 }
 

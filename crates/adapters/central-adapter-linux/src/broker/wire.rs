@@ -170,9 +170,70 @@ pub(crate) fn b64_encode(bytes: &[u8]) -> String {
 
 /// `base64.RawStdEncoding` — no padding (the bootstrap presentation
 /// value's wire form, consumed by the Task-7 custody path).
-#[allow(dead_code)]
 pub(crate) fn b64_raw_encode(bytes: &[u8]) -> String {
     b64_encode(bytes).trim_end_matches('=').to_owned()
+}
+
+/// `base64.RawStdEncoding.DecodeString` — the strict no-padding decode
+/// upstream applies to the persisted bootstrap candidate digest and the
+/// `present_bootstrap` presentation value. Rejects any `=` byte, wrong
+/// residual length (`len % 4 == 1`), and non-alphabet bytes.
+pub(crate) fn b64_raw_decode(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if bytes.contains(&b'=') {
+        return None;
+    }
+    match bytes.len() % 4 {
+        0 => b64_decode(text),
+        1 => None,
+        // Re-pad to the next quad boundary, then run the strict padded
+        // decoder — the recovered bytes are identical to what Go's raw
+        // decoder produces.
+        rem => {
+            let mut padded = String::with_capacity(bytes.len() + (4 - rem));
+            padded.push_str(text);
+            padded.push_str(&"=".repeat(4 - rem));
+            b64_decode(&padded)
+        }
+    }
+}
+
+const B64_URL_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// `base64.RawURLEncoding.EncodeToString` — the BX1 export token's
+/// `nonce_b64` form (no padding, `-`/`_` alphabet).
+pub(crate) fn b64_url_raw_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(B64_URL_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(B64_URL_ALPHABET[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(B64_URL_ALPHABET[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(B64_URL_ALPHABET[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// `base64.RawURLEncoding.DecodeString` — strict no-padding URL-safe
+/// decode; same residual-length refusal as [`b64_raw_decode`].
+pub(crate) fn b64_url_raw_decode(text: &str) -> Option<Vec<u8>> {
+    let mut mapped = String::with_capacity(text.len() + 3);
+    for c in text.chars() {
+        match c {
+            '-' => mapped.push('+'),
+            '_' => mapped.push('/'),
+            '=' => return None,
+            _ => mapped.push(c),
+        }
+    }
+    b64_raw_decode(&mapped)
 }
 
 /// Strict `StdEncoding` decode: rejects non-alphabet bytes, bad length,
@@ -346,6 +407,31 @@ mod tests {
         assert_eq!(b64_decode("aGVsbG8="), Some(b"hello".to_vec()));
         assert_eq!(b64_decode("aGVsbG8"), None);
         assert_eq!(b64_raw_encode(b"hello"), "aGVsbG8");
+    }
+
+    #[test]
+    fn b64_raw_decode_matches_go_raw_std() {
+        // RawStdEncoding: "aGVsbG8" and "aGVsbG9sb3c" round-trip without
+        // padding; "aGVsbG8=" is refused (padding in a raw decoder).
+        assert_eq!(b64_raw_decode("aGVsbG8"), Some(b"hello".to_vec()));
+        assert_eq!(b64_raw_decode("aGVsbG9sb3c"), Some(b"hellolow".to_vec()));
+        assert_eq!(b64_raw_decode("aGVsbG8="), None);
+        assert_eq!(b64_raw_decode("a"), None); // len % 4 == 1 is invalid
+        assert_eq!(b64_raw_decode(""), Some(Vec::new()));
+    }
+
+    #[test]
+    fn b64_url_raw_round_trip() {
+        let bytes: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let encoded = b64_url_raw_encode(&bytes);
+        assert!(!encoded.contains('='));
+        assert_eq!(b64_url_raw_decode(&encoded), Some(bytes.to_vec()));
+        // URL alphabet exercised: bytes producing '+'/'/' in std b64.
+        let tricky = [0xfb, 0xff, 0xbf];
+        let enc = b64_url_raw_encode(&tricky);
+        assert_eq!(enc, "-_-_");
+        assert_eq!(b64_url_raw_decode("-_-_"), Some(tricky.to_vec()));
+        assert_eq!(b64_url_raw_decode("abcd="), None);
     }
 
     #[test]

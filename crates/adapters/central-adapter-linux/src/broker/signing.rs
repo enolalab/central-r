@@ -254,6 +254,89 @@ impl Ed25519Signer {
     pub fn public_key_hex(&self) -> String {
         super::wire::hex_encode(self.key.verifying_key().as_bytes())
     }
+
+    /// The raw signing key for composed signing sites (the BX1 export
+    /// token's JCS payload). Key material stays inside the broker
+    /// boundary — this hands out a borrow, never a copy into ordinary
+    /// storage.
+    pub(crate) fn signing_key(&self) -> &ed25519_dalek::SigningKey {
+        &self.key
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical-JSON signing + verification — the projection/export-token
+// signature vocabulary shared by `xdg.rs` and `export_token.rs`
+// ---------------------------------------------------------------------------
+
+/// Sign the JCS-canonical form of `value` and return the hex Ed25519
+/// signature — the single call sites that must produce "signature over
+/// canonical JSON bytes" (XDG projections sign the canonical *view*;
+/// BX1 signs the canonical unsigned token object).
+pub(crate) fn sign_canonical_json(
+    key: &ed25519_dalek::SigningKey,
+    value: &serde_json::Value,
+) -> Result<String, Failure> {
+    use ed25519_dalek::Signer as _;
+    let canonical = central_foundation::jcs::canonicalize(value).map_err(|e| {
+        Failure::invalid(
+            "broker_signing",
+            format!("broker: canonicalize signed payload: {e}"),
+        )
+    })?;
+    Ok(super::wire::hex_encode(&key.sign(&canonical).to_bytes()))
+}
+
+/// Verify an Ed25519 signature given hex-encoded public key and
+/// signature — upstream's `ed25519.Verify` + strict decode ladder
+/// (each malformed input is denied, not silently skipped).
+pub(crate) fn verify_ed25519_hex(
+    public_key_hex: &str,
+    signature_hex: &str,
+    data: &[u8],
+) -> Result<(), Failure> {
+    let invalid =
+        |what: &str| Failure::invalid("broker_signing", format!("broker: invalid ed25519 {what}"));
+    let public_raw =
+        super::wire::hex_decode(public_key_hex).ok_or_else(|| invalid("public key encoding"))?;
+    let public_array: [u8; 32] = public_raw
+        .try_into()
+        .map_err(|_| invalid("public key length"))?;
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&public_array)
+        .map_err(|_| invalid("public key"))?;
+    let signature_raw =
+        super::wire::hex_decode(signature_hex).ok_or_else(|| invalid("signature encoding"))?;
+    let signature_array: [u8; 64] = signature_raw
+        .try_into()
+        .map_err(|_| invalid("signature length"))?;
+    use ed25519_dalek::Verifier as _;
+    verifying
+        .verify(
+            data,
+            &ed25519_dalek::Signature::from_bytes(&signature_array),
+        )
+        .map_err(|_| {
+            Failure::denied(
+                "broker_signing",
+                "broker: ed25519 signature verification failed",
+            )
+        })
+}
+
+/// Verify an Ed25519 signature over the JCS-canonical form of `value` —
+/// the consumer-side counterpart of [`sign_canonical_json`].
+pub(crate) fn verify_canonical_json_hex(
+    public_key_hex: &str,
+    signature_hex: &str,
+    value: &serde_json::Value,
+) -> Result<(), Failure> {
+    let canonical = central_foundation::jcs::canonicalize(value).map_err(|e| {
+        Failure::invalid(
+            "broker_signing",
+            format!("broker: canonicalize signed payload: {e}"),
+        )
+    })?;
+    verify_ed25519_hex(public_key_hex, signature_hex, &canonical)
 }
 
 #[cfg(test)]
@@ -291,5 +374,42 @@ mod tests {
         fs::write(&key, [0u8; 31]).unwrap();
         assert!(SigningService::new_persistent(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canonical_json_sign_and_verify() {
+        let signer = Ed25519Signer::new().unwrap();
+        let value = serde_json::json!({"b": 2, "a": [1, {"x": true}]});
+        let signature = sign_canonical_json(signer.signing_key(), &value).unwrap();
+        assert_eq!(signature.len(), 128);
+        // The same object with different key order canonicalizes
+        // identically — the signature verifies across serializations.
+        let reordered = serde_json::json!({"a": [1, {"x": true}], "b": 2});
+        verify_canonical_json_hex(signer.public_key_hex().as_str(), &signature, &reordered)
+            .unwrap();
+        // Tampered payload refuses.
+        let tampered = serde_json::json!({"a": [1, {"x": false}], "b": 2});
+        assert!(
+            verify_canonical_json_hex(signer.public_key_hex().as_str(), &signature, &tampered)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_rejects_malformed_inputs() {
+        let signer = Ed25519Signer::new().unwrap();
+        let signature =
+            sign_canonical_json(signer.signing_key(), &serde_json::json!({"k": "v"})).unwrap();
+        assert!(verify_ed25519_hex("zz", &signature, b"x").is_err());
+        assert!(verify_ed25519_hex("abcd", &signature, b"x").is_err());
+        assert!(
+            verify_ed25519_hex(
+                &signer.public_key_hex(),
+                &signature[..signature.len() - 2],
+                b"x"
+            )
+            .is_err()
+        );
+        assert!(verify_ed25519_hex(&signer.public_key_hex(), &signature, b"other").is_err());
     }
 }

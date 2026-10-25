@@ -275,7 +275,6 @@ pub fn is_r6_purpose(purpose: &str) -> bool {
         || is_postgres_service_role_authority_purpose(purpose)
         || is_advisory_evaluation_authority_purpose(purpose)
         || is_recovery_authority_purpose(purpose)
-        || is_bootstrap_authority_purpose(purpose)
         || matches!(
             purpose,
             RESTORE_APPLY_AUTHORIZATION_RPC
@@ -285,7 +284,6 @@ pub fn is_r6_purpose(purpose: &str) -> bool {
                 | RESTORE_BARRIER_INSPECT_RPC
                 | RESTORE_TICKET_BARRIER_INSPECT_RPC
                 | MIGRATION_REPORT_OUTCOME_RPC
-                | SIGN_LEAF_RPC
         )
 }
 
@@ -897,10 +895,6 @@ mod tests {
             "bind_postgres_service_role",
             "append_advisory_evaluation",
             "migration_report_launch_outcome",
-            "sign_leaf",
-            "present_bootstrap",
-            "register_bootstrap_candidate",
-            "activate_bootstrap_candidate",
         ] {
             assert!(is_r6_purpose(purpose), "unregistered R6 purpose {purpose}");
         }
@@ -911,6 +905,10 @@ mod tests {
             MIGRATION_READ_RECORD_RPC,
             AUTHORIZE_LIFECYCLE_RPC,
             HMAC_FINGERPRINT_RPC,
+            SIGN_LEAF_RPC,
+            PRESENT_BOOTSTRAP_RPC,
+            REGISTER_BOOTSTRAP_CANDIDATE_RPC,
+            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
             "migration_read_launch_outcome",
             "issue_migration_launch",
             "adopt_b03_minio_bootstrap",

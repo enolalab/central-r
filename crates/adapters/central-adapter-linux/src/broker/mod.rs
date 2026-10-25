@@ -17,7 +17,10 @@
 //! registers those purposes as closed denials so the wire contract is
 //! complete before the machinery lands.
 
+pub mod bootstrap_session;
 pub(crate) mod durable;
+pub mod export_token;
+pub mod handoff;
 pub mod journal;
 pub mod lifecycle;
 pub mod lifecycle_client;
@@ -26,9 +29,12 @@ pub mod proof;
 pub mod protected_file;
 pub mod protocol;
 pub mod provisioning;
+pub mod secret_bootstrap;
 pub mod server;
 pub mod signing;
+pub mod tls;
 pub(crate) mod wire;
+pub mod xdg;
 
 #[cfg(test)]
 pub(crate) mod testutil {

@@ -39,6 +39,14 @@ sha2.workspace = true
 hmac.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
+# Broker custody additions (R5 task 7): `rcgen` mints the broker's
+# Ed25519 TLS authority (upstream `tls_authority.go`); `x509-parser`
+# re-validates the persisted CA/leaf chain on restart
+# (`tls_persistent.go`'s `authorityFromState` checks). Both are pinned
+# in `[workspace.dependencies]`.
+rcgen.workspace = true
+x509-parser.workspace = true
+rustls-pki-types.workspace = true
 # This crate is one of the two places audited `unsafe` may live
 # (workflow §5.2): libc carries the one call site rustix has no safe
 # wrapper for in `sys` — the `seccomp(2)` `SECCOMP_SET_MODE_FILTER`

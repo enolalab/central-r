@@ -145,4 +145,11 @@ skip = [
     { name = "hmac", version = "0.12.1" },
     { name = "md-5", version = "0.11.0" },
     { name = "sha1", version = "0.11.0" },
+    # Recorded duplicate introduced by `central-adapter-linux` (the
+    # first x509-parser consumer): x509-parser's `asn1-rs` DER stack
+    # pins asn1-rs-derive → synstructure 0.13, while the sqlx/ICU4X
+    # tree keeps synstructure 0.14 via yoke-derive. Neither side can
+    # move — both are upstream requirement pins; the skipped version is
+    # the non-canonical lineage.
+    { name = "synstructure", version = "0.13.2" },
 ]

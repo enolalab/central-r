@@ -113,6 +113,15 @@ ed25519-dalek = "=3.0.0"
 hmac = "=0.13.0"
 rand = "=0.10.3"
 zeroize = "=1.9.1"
+# Broker TLS authority (R5 task 7): rcgen mints the Ed25519 CA and
+# leaves; `x509-parser` re-validates persisted certificates on reload
+# (upstream `tls_persistent.go`'s load-time chain check).
+rcgen = { version = "=0.14.10", features = ["pem", "x509-parser"] }
+x509-parser = "=0.18.0"
+# rcgen 0.14's `KeyPair::from_der_and_sign_algo` takes
+# `PrivateKeyDer`/`PrivatePkcs8KeyDer`; the version matches the rustls
+# 0.23 pin already in the lockfile.
+rustls-pki-types = "=1.15.1"
 
 # Observability — kernel, observability rendering, operational endpoints
 tracing = "=0.1.44"

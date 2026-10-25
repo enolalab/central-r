@@ -79,6 +79,7 @@ pub struct Generation {
 
 /// `ProtectedFileBackend` — stores protected generations on the local
 /// filesystem inside the instance state root.
+#[derive(Debug, Clone)]
 pub struct ProtectedFileBackend {
     root: PathBuf,
 }

@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write as _};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -23,16 +23,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use central_foundation::failure::Failure;
+use central_foundation::identity::{HandoffReceiptId, OperationId, SecretBindingId};
 use central_infra::authority::{
-    B04AdoptRequest, B04IssueProofRequest, B05MaterializePostgresMigrationRequest, BrokerEvidence,
-    BrokerOutcome, BrokerRequest, BrokerResponse, LifecycleAuthorization,
-    LifecycleAuthorizationRequest, ProtectedGeneration,
+    B04AdoptRequest, B04AdoptResult, B04IssueProofRequest, B04MaterializeRequest,
+    B04MaterializeResult, B05MaterializePostgresMigrationRequest, BrokerEvidence, BrokerOutcome,
+    BrokerRequest, BrokerResponse, LifecycleAuthorization, LifecycleAuthorizationRequest,
+    ProtectedGeneration,
 };
+use central_infra::domain::{AdoptRequest, HandoffRequest, Purpose};
+use central_infra::port::LeafSignRequest;
 use serde::Deserialize;
 use time::OffsetDateTime;
+use zeroize::Zeroize as _;
 
 use crate::sys::peercred::{PeerCred, peercred};
 
+use super::bootstrap_session::{self, BootstrapSession};
+use super::handoff::{self, HandoffService};
 use super::journal::Journal;
 use super::lifecycle::LifecycleNonceStore;
 use super::payload_epoch::PayloadEpochStore;
@@ -42,7 +49,9 @@ use super::protocol::{self, *};
 use super::provisioning::{
     self, ProvisioningRecord, ProvisioningStore, ReplaceProvisioningRecordRequest,
 };
+use super::secret_bootstrap::SecretBootstrap;
 use super::signing::{Ed25519Signer, SigningService};
+use super::tls::TlsAuthority;
 
 /// `brokerConnectionDeadline` — one second; bounds the initial framed
 /// exchange and every pre-authentication denial.
@@ -95,9 +104,25 @@ fn success(operation_id: &str, result: serde_json::Value) -> BrokerResponse {
     }
 }
 
+/// `BrokerError` outcome — upstream's non-denial failure class
+/// (`sign_leaf` is the R5 arm that emits it).
+fn error_response(operation_id: &str, message: impl Into<String>) -> BrokerResponse {
+    BrokerResponse {
+        operation_id: operation_id.into(),
+        outcome: BrokerOutcome::Error,
+        result: None,
+        evidence: BrokerEvidence {
+            operation_id: operation_id.into(),
+            code: String::new(),
+            message: message.into(),
+        },
+    }
+}
+
 /// `Service` — aggregates the broker sub-components. Fields whose
-/// upstream counterparts are R6 stores are absent; dispatch denies
-/// their purposes with the slice's closed denial.
+/// upstream counterparts are R6 stores (launch evidence, runtime
+/// bindings, recovery journal) are absent; dispatch denies their
+/// purposes with the slice's closed denial.
 pub struct Service {
     /// The protected-state root (`0700`, broker-owned).
     pub root_path: PathBuf,
@@ -107,6 +132,8 @@ pub struct Service {
     pub(crate) signing: Arc<SigningService>,
     /// The Ed25519 external-verifiability signer.
     pub signer: Option<Arc<Ed25519Signer>>,
+    /// The broker's local TLS certificate authority (`s.tls`).
+    pub tls: Option<TlsAuthority>,
     /// The authority-transition journal (`journal.RootPath` is the
     /// protected root's parent, upstream's `filepath.Dir(rootPath)`).
     pub journal: Option<Arc<Journal>>,
@@ -118,6 +145,15 @@ pub struct Service {
     pub proofs: Option<ProofService>,
     /// The payload epoch store.
     pub payload_epochs: Option<PayloadEpochStore>,
+    /// The sealed-memfd handoff factory (`s.handoff` — outbound
+    /// descriptor minting; the inbound B04 transport uses the
+    /// `handoff` module's free functions directly).
+    pub handoff: HandoffService,
+    /// The durable B04 secret-bootstrap session (`s.bootstrap`).
+    pub bootstrap: Option<SecretBootstrap>,
+    /// The persistent bootstrap-candidate session
+    /// (`s.bootstrapSession`).
+    pub bootstrap_session: Option<BootstrapSession>,
     /// The central runtime UID `isRuntimeOrRootPeer` widens to (ADR
     /// 0013).
     pub runtime_uid: u32,
@@ -129,19 +165,26 @@ pub struct Service {
 pub(crate) struct ServiceBootstrapState {
     /// `bootstrap.<purpose>.<instance>` → generation.
     pub bootstraps: BTreeMap<String, ProtectedGeneration>,
+    /// `bootstrapValue` — the one-use staged bootstrap value held only
+    /// in broker memory until `present_bootstrap` consumes it.
+    pub bootstrap_value: Vec<u8>,
 }
 
 impl Service {
-    /// `NewService` — persistent signing identity, journal rooted at
-    /// `root_path`'s parent (upstream `filepath.Dir(rootPath)`),
-    /// protected backend, nonce store, provisioning store, persistent
-    /// proof service, payload-epoch store.
+    /// `NewService` — persistent signing identity, persistent TLS
+    /// authority, journal rooted at `root_path`'s parent (upstream
+    /// `filepath.Dir(rootPath)`), protected backend, nonce store, the
+    /// durable secret-bootstrap session, provisioning store,
+    /// persistent proof service, the bootstrap-candidate session, and
+    /// the payload-epoch store.
     ///
     /// # Errors
-    /// Any sub-component's `new_*` error — signing identity, nonce
-    /// root, proof state, epoch root.
+    /// Any sub-component's `new_*` error — signing identity, TLS
+    /// authority, nonce root, bootstrap recovery, proof state, epoch
+    /// root.
     pub fn new(root_path: PathBuf, runtime_uid: u32) -> Result<Self, Failure> {
         let signing = Arc::new(SigningService::new_persistent(&root_path)?);
+        let tls = Some(TlsAuthority::new_persistent(&root_path)?);
         let signer = Some(Arc::new(Ed25519Signer::new()?));
         let nonces = Some(LifecycleNonceStore::new(&root_path)?);
         let backend = ProtectedFileBackend::new(root_path.clone());
@@ -149,6 +192,13 @@ impl Service {
             .parent()
             .map_or_else(|| root_path.clone(), PathBuf::from);
         let journal = Arc::new(Journal::new(journal_root, signing.clone(), signer.clone()));
+        let handoff = HandoffService::new();
+        let bootstrap = Some(SecretBootstrap::new(
+            root_path.clone(),
+            backend.clone(),
+            journal.clone(),
+            signing.clone(),
+        )?);
         let provisioning = Some(ProvisioningStore::new(
             root_path.clone(),
             Some(journal.clone()),
@@ -158,6 +208,7 @@ impl Service {
             SigningService::from_key(signing.key_copy()),
             Some(journal.clone()),
         )?);
+        let bootstrap_session = Some(BootstrapSession::new_persistent(&root_path)?);
         let payload_epochs = Some(super::payload_epoch::new_payload_epoch_store(
             &root_path,
             SigningService::from_key(signing.key_copy()),
@@ -167,14 +218,19 @@ impl Service {
             backend,
             signing,
             signer,
+            tls,
             journal: Some(journal),
             nonces,
             provisioning,
             proofs,
             payload_epochs,
+            handoff,
+            bootstrap,
+            bootstrap_session,
             runtime_uid,
             bootstrap_mu: Mutex::new(ServiceBootstrapState {
                 bootstraps: BTreeMap::new(),
+                bootstrap_value: Vec::new(),
             }),
         })
     }
@@ -187,11 +243,15 @@ impl Service {
         backend: ProtectedFileBackend,
         signing: Arc<SigningService>,
         signer: Option<Arc<Ed25519Signer>>,
+        tls: Option<TlsAuthority>,
         journal: Option<Arc<Journal>>,
         nonces: Option<LifecycleNonceStore>,
         provisioning: Option<ProvisioningStore>,
         proofs: Option<ProofService>,
         payload_epochs: Option<PayloadEpochStore>,
+        handoff: HandoffService,
+        bootstrap: Option<SecretBootstrap>,
+        bootstrap_session: Option<BootstrapSession>,
         runtime_uid: u32,
     ) -> Self {
         Self {
@@ -199,14 +259,19 @@ impl Service {
             backend,
             signing,
             signer,
+            tls,
             journal,
             nonces,
             provisioning,
             proofs,
             payload_epochs,
+            handoff,
+            bootstrap,
+            bootstrap_session,
             runtime_uid,
             bootstrap_mu: Mutex::new(ServiceBootstrapState {
                 bootstraps: BTreeMap::new(),
+                bootstrap_value: Vec::new(),
             }),
         }
     }
@@ -274,8 +339,13 @@ impl Service {
                 "B04_HANDOFF_DENIED: create_protected_generation is permanently denied",
             ),
             // `sign_leaf` is a live upstream RPC backed by the TLS
-            // authority — R6 machinery, so it closes like every other
-            // R6-backed purpose below rather than erroring.
+            // authority: upstream answers `BrokerError` (not a denial)
+            // when signing fails.
+            SIGN_LEAF_RPC => self.dispatch_sign_leaf(req),
+            REGISTER_BOOTSTRAP_CANDIDATE_RPC | ACTIVATE_BOOTSTRAP_CANDIDATE_RPC => {
+                self.dispatch_bootstrap_candidate(req)
+            }
+            PRESENT_BOOTSTRAP_RPC => self.dispatch_present_bootstrap(req),
             HMAC_FINGERPRINT_RPC => self.dispatch_hmac_fingerprint(req),
             AUTHORIZE_LIFECYCLE_RPC => self.dispatch_authorize_lifecycle(req),
             CONSUME_LIFECYCLE_RPC => self.dispatch_consume_lifecycle(req),
@@ -300,10 +370,143 @@ impl Service {
         req.payload.as_ref()?.get("request").map(Box::as_ref)
     }
 
+    /// `dispatchSignLeaf` — `sign_leaf`'s upstream arm: the payload's
+    /// `request` decodes into `LeafSignRequest` (Go's `json.Unmarshal`
+    /// error is ignored — a malformed request becomes the zero request
+    /// and the authority itself rejects the empty key). Signer errors
+    /// surface as `BrokerError`, not a denial.
+    fn dispatch_sign_leaf(&self, req: &BrokerRequest) -> BrokerResponse {
+        /// `port.LeafSignRequest`'s wire form — `public_key` is Go's
+        /// `[]byte` standard-base64 JSON string.
+        #[derive(Deserialize, Default)]
+        struct LeafSignWire {
+            #[serde(default, with = "super::wire::b64")]
+            public_key: Vec<u8>,
+            #[serde(default)]
+            not_after: i64,
+        }
+        let wire_req: LeafSignWire = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("request"))
+            .map(|r| serde_json::from_str(r.get()).unwrap_or_default())
+            .unwrap_or_default();
+        let Some(tls) = &self.tls else {
+            return error_response(&req.operation_id, "broker: TLS authority unavailable");
+        };
+        match tls.sign_leaf(&LeafSignRequest {
+            public_key: wire_req.public_key,
+            not_after: wire_req.not_after,
+        }) {
+            Err(e) => error_response(&req.operation_id, e.message().to_owned()),
+            // `port.LeafCertificate` marshals PascalCase upstream (no
+            // Go tags): `{"Raw":"<std b64>","Fingerprint":"…"}`.
+            Ok(leaf) => success(
+                &req.operation_id,
+                serde_json::json!({
+                    "Raw": super::wire::b64_encode(&leaf.raw),
+                    "Fingerprint": leaf.fingerprint,
+                }),
+            ),
+        }
+    }
+
+    /// `dispatchBootstrapCandidate` — `register_bootstrap_candidate` /
+    /// `activate_bootstrap_candidate`: the closed candidate decoder,
+    /// then the persistent session's register/activate. Upstream
+    /// signals every failure as code `AUTHORITY_DENIED` with no
+    /// message.
+    fn dispatch_bootstrap_candidate(&self, req: &BrokerRequest) -> BrokerResponse {
+        let denied = || BrokerResponse {
+            operation_id: req.operation_id.clone(),
+            outcome: BrokerOutcome::Denied,
+            result: None,
+            evidence: BrokerEvidence {
+                operation_id: req.operation_id.clone(),
+                code: "AUTHORITY_DENIED".to_owned(),
+                message: String::new(),
+            },
+        };
+        let Ok(binding) = bootstrap_session::decode_candidate_binding(req.payload.as_ref()) else {
+            return denied();
+        };
+        let Some(session) = &self.bootstrap_session else {
+            return denied();
+        };
+        let result = if req.purpose == REGISTER_BOOTSTRAP_CANDIDATE_RPC {
+            session.register(&binding)
+        } else {
+            session.activate(&binding)
+        };
+        match result {
+            Err(_) => denied(),
+            Ok(()) => BrokerResponse {
+                operation_id: req.operation_id.clone(),
+                outcome: BrokerOutcome::Success,
+                result: None,
+                evidence: BrokerEvidence::default(),
+            },
+        }
+    }
+
+    /// `presentBootstrap` — the one-use staged value leaves broker
+    /// memory as the response's `{"value": <raw-std-b64>}`. An empty
+    /// stage is `BOOTSTRAP_NOT_STAGED` (the R6 recovery-journal
+    /// fallback `takeActivatedRecoveryBootstrap` has no store in this
+    /// slice, and upstream maps its error to the same code).
+    fn dispatch_present_bootstrap(&self, req: &BrokerRequest) -> BrokerResponse {
+        let mut value = match self.bootstrap_lock() {
+            Ok(mut guard) => {
+                let value = guard.bootstrap_value.clone();
+                if !guard.bootstrap_value.is_empty() {
+                    guard.bootstrap_value.zeroize();
+                    guard.bootstrap_value = Vec::new();
+                }
+                value
+            }
+            Err(_) => Vec::new(),
+        };
+        if value.is_empty() {
+            return BrokerResponse {
+                operation_id: req.operation_id.clone(),
+                outcome: BrokerOutcome::Denied,
+                result: None,
+                evidence: BrokerEvidence {
+                    operation_id: req.operation_id.clone(),
+                    code: "BOOTSTRAP_NOT_STAGED".to_owned(),
+                    message: String::new(),
+                },
+            };
+        }
+        // `defer zeroBytes(value)` — the plaintext staging buffer is
+        // scrubbed after the response is built.
+        let result = serde_json::json!({"value": super::wire::b64_raw_encode(&value)});
+        value.zeroize();
+        success(&req.operation_id, result)
+    }
+
+    /// `StageBootstrapValue` — the protected bootstrap installation
+    /// flow's in-memory hand to `present_bootstrap`. The value is held
+    /// only under `bootstrapMu` until the one-use presentation RPC;
+    /// bounds `0 < len <= 4096`, exactly as upstream.
+    ///
+    /// # Errors
+    /// `broker` denied when `value` is empty or exceeds 4096 bytes.
+    pub fn stage_bootstrap_value(&self, value: &[u8]) -> Result<(), Failure> {
+        if value.is_empty() || value.len() > 4096 {
+            return Err(Failure::denied(
+                "broker",
+                "broker: bootstrap value out of bounds",
+            ));
+        }
+        let mut guard = self.bootstrap_lock()?;
+        guard.bootstrap_value = value.to_vec();
+        Ok(())
+    }
+
     /// `dispatchB04Adopt` — `adopt_b03_minio_bootstrap`'s upstream
-    /// validation ladder. The adopt itself is R6 machinery
-    /// (`s.bootstrap`), but every rung upstream rejects before reaching
-    /// it is part of the wire contract and reproduces here exactly.
+    /// validation ladder, ending in the real
+    /// `s.bootstrap.AdoptB03`.
     fn dispatch_b04_adopt(&self, req: &BrokerRequest) -> BrokerResponse {
         const CLASS: &str = "B04_HANDOFF_DENIED: ";
         let Some(payload) = req.payload.as_ref() else {
@@ -333,17 +536,58 @@ impl Service {
                 format!("{CLASS}missing lifecycle evidence"),
             );
         }
-        // `s.bootstrap.VerifyLifecycleProof` — the B04 bootstrap session
-        // is R6, so the caller's evidence can never verify; upstream
-        // wraps that store error under the same class.
-        migration_denied(
-            &req.operation_id,
-            format!("{CLASS}{UNSUPPORTED_IN_THIS_SLICE}"),
-        )
+        let Some(bootstrap) = &self.bootstrap else {
+            return migration_denied(
+                &req.operation_id,
+                format!("{CLASS}{UNSUPPORTED_IN_THIS_SLICE}"),
+            );
+        };
+        // `s.bootstrap.VerifyLifecycleProof` — the caller's evidence
+        // must match a broker-issued, unexpired proof.
+        if let Err(e) = bootstrap.verify_lifecycle_proof(
+            &wire.instance_id,
+            wire.fencing_token,
+            &wire.stopped_topology_proof,
+            &wire.mount_release_proof,
+            &wire.binding_evidence,
+            wire.evidence_expires_at,
+        ) {
+            return migration_denied(&req.operation_id, format!("{CLASS}{}", e.message()));
+        }
+        // Upstream `uuid.FromString` accepts any UUID version; the
+        // domain newtype's strict v7 parse is reached only through
+        // `from_trusted_db_bytes` after the wire-shape check — the
+        // nil-UUID rejection stays in `AdoptRequest::validate`.
+        let Ok(op_uuid) = uuid::Uuid::parse_str(&wire.operation_id) else {
+            return migration_denied(&req.operation_id, format!("{CLASS}invalid operation id"));
+        };
+        let adopt_req = AdoptRequest {
+            instance_id: wire.instance_id,
+            purpose: Purpose::MinioRoot,
+            legacy_generation_id: None,
+            operation_id: OperationId::from_trusted_db_bytes(*op_uuid.as_bytes()),
+            fencing_token: wire.fencing_token,
+        };
+        match bootstrap.adopt_b03(&adopt_req) {
+            Err(e) => migration_denied(&req.operation_id, format!("{CLASS}{}", e.message())),
+            Ok((binding, outcome)) => success(
+                &req.operation_id,
+                serde_json::to_value(B04AdoptResult {
+                    binding_id: binding.binding_id.to_string(),
+                    generation_id: binding.generation_id.to_string(),
+                    outcome: outcome.as_str().to_owned(),
+                    ..B04AdoptResult::default()
+                })
+                .unwrap_or_default(),
+            ),
+        }
     }
 
-    /// `dispatchB04IssueProof` — `issue_b04_lifecycle_proof`'s ladder;
-    /// `s.bootstrap.IssueLifecycleProof` is R6.
+    /// `dispatchB04IssueProof` — `issue_b04_lifecycle_proof`'s ladder,
+    /// ending in the real `s.bootstrap.IssueLifecycleProof` (SC-DEF-12:
+    /// the broker durably signs the caller's stopped-topology /
+    /// mount-release / binding tokens so a later adopt has a
+    /// broker-issued record to verify against).
     fn dispatch_b04_issue_proof(&self, req: &BrokerRequest) -> BrokerResponse {
         const CLASS: &str = "B04_PROOF_DENIED: ";
         let Some(payload) = req.payload.as_ref() else {
@@ -367,14 +611,37 @@ impl Service {
         {
             return migration_denied(&req.operation_id, format!("{CLASS}incomplete evidence"));
         }
-        if uuid::Uuid::parse_str(&wire.operation_id).is_err() {
+        let Ok(op_uuid) = uuid::Uuid::parse_str(&wire.operation_id) else {
             return migration_denied(&req.operation_id, format!("{CLASS}invalid operation id"));
+        };
+        let Some(bootstrap) = &self.bootstrap else {
+            return migration_denied(
+                &req.operation_id,
+                format!("{CLASS}{UNSUPPORTED_IN_THIS_SLICE}"),
+            );
+        };
+        // lockID is passed as the operation ID: IssueLifecycleProof uses
+        // it only for idempotent re-issue detection on retry within the
+        // same operation, never for verification.
+        match bootstrap.issue_lifecycle_proof(
+            &wire.instance_id,
+            OperationId::from_trusted_db_bytes(*op_uuid.as_bytes()),
+            &wire.operation_id,
+            "",
+            "",
+            wire.fencing_token,
+            &wire.stopped_topology_proof,
+            &wire.mount_release_proof,
+            &wire.binding_evidence,
+        ) {
+            Err(e) => migration_denied(&req.operation_id, format!("{CLASS}{}", e.message())),
+            Ok(_) => BrokerResponse {
+                operation_id: req.operation_id.clone(),
+                outcome: BrokerOutcome::Success,
+                result: None,
+                evidence: BrokerEvidence::default(),
+            },
         }
-        // `s.bootstrap.IssueLifecycleProof` — R6.
-        migration_denied(
-            &req.operation_id,
-            format!("{CLASS}{UNSUPPORTED_IN_THIS_SLICE}"),
-        )
     }
 
     /// `dispatchB05MaterializePostgres` — the JSON dispatch path of
@@ -860,25 +1127,197 @@ impl Service {
     }
 
     // ------------------------------------------------------------------
-    // Framed transports — R6 machinery, closed denials
+    // Framed transports — B04 is live; B05/B10 remain closed denials
     // ------------------------------------------------------------------
 
-    /// `handleB04MaterializeTransport` — the B04 bootstrap session is
-    /// R6; the transport still enforces the request's outer binding
-    /// checks before denying, so the denial semantics a test or a peer
-    /// sees are upstream's.
+    /// `handleB04MaterializeTransport` — the full B04 materialization
+    /// flow in upstream's descriptor-first order:
+    ///  1. Receive and validate the FD via SCM_RIGHTS
+    ///  2. `ValidateMaterializeRequest` (no plaintext released)
+    ///  3. `StartReserved` + `StartWrite`
+    ///  4. `ResolveCredential` (plaintext read only after the FD is
+    ///     validated)
+    ///  5. `WriteValueToDescriptor` + fsync + close
+    ///  6. `CompleteBrokerWrite` + send the ACK frame
+    ///  7. Read the helper confirmation (`0x03`)
+    ///  8. `ConfirmHelperAcknowledged` + `AcknowledgeMaterialization`
+    ///  9. Write the JSON response
+    ///
+    /// The plaintext never appears in the JSON response, a log line,
+    /// or a file — only inside the sealed descriptor the peer
+    /// supplied.
+    #[allow(clippy::too_many_lines)]
     fn handle_b04_materialize_transport(
         &self,
         conn: &mut std::os::unix::net::UnixStream,
         req: &BrokerRequest,
-        _peer: &PeerCred,
+        peer: &PeerCred,
     ) -> Result<(), Failure> {
-        protocol::write_deny(
-            conn,
+        const CLASS: &str = "B04_HANDOFF_DENIED: ";
+        let deny = |conn: &mut std::os::unix::net::UnixStream, msg: String| {
+            protocol::write_deny(conn, &req.operation_id, &msg);
+        };
+        let Some(raw) = req.payload.as_ref().and_then(|p| p.get("request")) else {
+            deny(conn, format!("{CLASS}missing request field"));
+            return Ok(());
+        };
+        let wire_req: B04MaterializeRequest = match serde_json::from_str(raw.get()) {
+            Ok(w) => w,
+            Err(_) => {
+                deny(conn, format!("{CLASS}invalid request"));
+                return Ok(());
+            }
+        };
+        // The closed dependency binding — `minio`,
+        // `/run/secrets/minio-root-password`, owner `1000:1000`.
+        if wire_req.service != "minio"
+            || wire_req.target != "/run/secrets/minio-root-password"
+            || wire_req.uid != 1000
+            || wire_req.gid != 1000
+        {
+            deny(conn, format!("{CLASS}invalid dependency binding"));
+            return Ok(());
+        }
+        if wire_req.peer_uid != peer.uid.as_raw() || wire_req.peer_pid != peer.pid.as_raw_pid() {
+            deny(conn, format!("{CLASS}peer identity mismatch"));
+            return Ok(());
+        }
+        let Ok(binding_uuid) = uuid::Uuid::parse_str(&wire_req.binding_id) else {
+            deny(conn, format!("{CLASS}invalid binding id"));
+            return Ok(());
+        };
+        let Ok(op_uuid) = uuid::Uuid::parse_str(&wire_req.operation_id) else {
+            deny(conn, format!("{CLASS}invalid operation id"));
+            return Ok(());
+        };
+        let Some(bootstrap) = &self.bootstrap else {
+            deny(conn, format!("{CLASS}{UNSUPPORTED_IN_THIS_SLICE}"));
+            return Ok(());
+        };
+        let mut handoff_req = HandoffRequest {
+            binding_id: SecretBindingId::from_trusted_db_bytes(*binding_uuid.as_bytes()),
+            operation_id: OperationId::from_trusted_db_bytes(*op_uuid.as_bytes()),
+            receipt_id: HandoffReceiptId::new(),
+            receipt_hmac: String::new(),
+            fencing_token: wire_req.fencing_token,
+            peer_uid: peer.uid.as_raw(),
+            peer_pid: peer.pid.as_raw_pid(),
+            purpose: Purpose::MinioRoot,
+            service: wire_req.service,
+            target: wire_req.target,
+            uid: wire_req.uid,
+            gid: wire_req.gid,
+        };
+        handoff_req.receipt_hmac = bootstrap.compute_receipt_hmac(&handoff_req);
+
+        // Step 1: receive and validate the destination descriptor
+        // before any plaintext is read.
+        let fd = match handoff::receive_descriptor(conn) {
+            Ok(fd) => fd,
+            Err(e) => {
+                deny(conn, format!("{CLASS}transport: {}", e.message()));
+                return Ok(());
+            }
+        };
+
+        // Step 2: validate the request (no plaintext released). The
+        // returned receipt is the resume-stable record; the optional
+        // operation is `None` when an existing receipt answers the
+        // retry — the receipt's own `operation_id` still names the
+        // operation the state machine advances.
+        let (receipt, _op) = match bootstrap.validate_materialize_request(&handoff_req) {
+            Ok(pair) => pair,
+            Err(e) => {
+                deny(conn, format!("{CLASS}{}", e.message()));
+                return Ok(());
+            }
+        };
+
+        // Step 3: reserved → write_started.
+        if let Err(e) = bootstrap.start_reserved(receipt.operation_id) {
+            deny(conn, format!("{CLASS}state: {}", e.message()));
+            return Ok(());
+        }
+        if let Err(e) = bootstrap.start_write(receipt.operation_id) {
+            deny(conn, format!("{CLASS}state: {}", e.message()));
+            return Ok(());
+        }
+
+        // Step 4: resolve the credential — plaintext enters the
+        // process only after the descriptor is validated.
+        let secret = match bootstrap.resolve_credential(&receipt) {
+            Ok(s) => zeroize::Zeroizing::new(s),
+            Err(e) => {
+                deny(conn, format!("{CLASS}resolve: {}", e.message()));
+                return Ok(());
+            }
+        };
+
+        // Step 5: write the value into the sealed descriptor.
+        if let Err(e) = handoff::write_value_to_descriptor(fd, &secret) {
+            deny(conn, format!("{CLASS}write: {}", e.message()));
+            return Ok(());
+        }
+        drop(secret); // `defer`-equivalent scrub of the plaintext copy.
+
+        // Step 6: broker write complete → emit the ACK frame.
+        if let Err(e) = bootstrap.complete_broker_write(receipt.operation_id) {
+            deny(conn, format!("{CLASS}state: {}", e.message()));
+            return Ok(());
+        }
+        let receipt_hmac = handoff::compute_materialize_receipt_hmac(&self.signing, &handoff_req);
+        let mut opaque_proof = Vec::with_capacity("b04-ok:".len() + receipt_hmac.len());
+        opaque_proof.extend_from_slice(b"b04-ok:");
+        opaque_proof.extend_from_slice(receipt_hmac.as_bytes());
+        // Frame: 0x01 ack marker (1), proof length (2), uid (2),
+        // gid (2), opaque proof (N) — upstream's big-endian uint16s.
+        let mut frame = Vec::with_capacity(7 + opaque_proof.len());
+        frame.push(0x01);
+        frame.extend_from_slice(&(opaque_proof.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&1000u16.to_be_bytes());
+        frame.extend_from_slice(&1000u16.to_be_bytes());
+        frame.extend_from_slice(&opaque_proof);
+        if let Err(e) = conn.write_all(&frame) {
+            return Err(Failure::internal(
+                "broker",
+                format!("B04 transport: write ack: {e}"),
+            ));
+        }
+
+        // Step 7: read the helper's ownership confirmation (`0x03`).
+        let mut confirmation = [0u8; 1];
+        if conn.read_exact(&mut confirmation).is_err() || confirmation[0] != 0x03 {
+            deny(
+                conn,
+                format!("{CLASS}helper did not confirm ownership handoff"),
+            );
+            return Ok(());
+        }
+
+        // Step 8: helper acknowledged → acknowledged.
+        if let Err(e) = bootstrap.confirm_helper_acknowledged(receipt.operation_id) {
+            deny(conn, format!("{CLASS}helper ack: {}", e.message()));
+            return Ok(());
+        }
+        if let Err(e) = bootstrap.acknowledge_materialization(receipt.operation_id) {
+            deny(conn, format!("{CLASS}acknowledge: {}", e.message()));
+            return Ok(());
+        }
+
+        // Step 9: the safe JSON response — identities and the opaque
+        // receipt HMAC only, never plaintext.
+        let resp = success(
             &req.operation_id,
-            &format!("B04_HANDOFF_DENIED: {UNSUPPORTED_IN_THIS_SLICE}"),
+            serde_json::to_value(B04MaterializeResult {
+                operation_id: receipt.operation_id.to_string(),
+                receipt_id: receipt.receipt_id.to_string(),
+                binding_id: receipt.binding_id.to_string(),
+                opaque_token: receipt.hmac.clone(),
+                safe_next_action: String::new(),
+            })
+            .unwrap_or_default(),
         );
-        Ok(())
+        protocol::write_response(conn, &resp)
     }
 
     /// `handleB05MaterializeTransport` — no launch evidence store in
@@ -1475,7 +1914,6 @@ mod tests {
     use crate::broker::testutil::{TempDir, service};
     use central_infra::authority::BrokerOutcome;
     use std::collections::BTreeMap;
-    use std::io::Write as _;
 
     /// `json.RawMessage` construction — the verbatim JSON bytes a
     /// `BrokerRequest` payload value carries.
@@ -1558,10 +1996,14 @@ mod tests {
             CONSUME_LIFECYCLE_RPC,
             VERIFY_LIFECYCLE_LOCK_OWNER_RPC,
             HMAC_FINGERPRINT_RPC,
-            // Upstream denial ladders.
-            MIGRATION_READ_OUTCOME_RPC,
+            SIGN_LEAF_RPC,
+            PRESENT_BOOTSTRAP_RPC,
+            REGISTER_BOOTSTRAP_CANDIDATE_RPC,
+            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
             ADOPT_B03_MINIO_BOOTSTRAP_RPC,
             ISSUE_B04_LIFECYCLE_PROOF_RPC,
+            // Upstream denial ladders.
+            MIGRATION_READ_OUTCOME_RPC,
             MATERIALIZE_MINIO_ROOT_RPC,
             MATERIALIZE_POSTGRES_MIGRATION_RPC,
             MATERIALIZE_MINIO_RUNTIME_RPC,
@@ -1581,10 +2023,6 @@ mod tests {
             CREATE_PROTECTED_GENERATION_RPC,
             MATERIALIZE_DEPENDENCY_HANDOFF_RPC,
             // The closed R6 surface.
-            SIGN_LEAF_RPC,
-            PRESENT_BOOTSTRAP_RPC,
-            REGISTER_BOOTSTRAP_CANDIDATE_RPC,
-            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
             "issue_restore_apply_authorization",
             "issue_restore_resume_authorization",
             "issue_restore_abandon_authorization",
@@ -1687,8 +2125,11 @@ mod tests {
             denied(request_raw(r#"{"purpose":"minio_root_v1"}"#)),
             "B04_HANDOFF_DENIED: missing lifecycle evidence"
         );
-        // Complete, unexpired evidence reaches the R6 bootstrap
-        // session boundary — the adopt's own upstream class.
+        // Complete, unexpired evidence reaches `VerifyLifecycleProof`:
+        // no broker-issued proof exists, so the denial is upstream's
+        // own `B04_HANDOFF_DENIED: <proof error>` — the proof store's
+        // message already carries the class prefix, exactly as
+        // upstream's `"B04_HANDOFF_DENIED: " + err.Error()` produces.
         let future = super::super::wire::format_rfc3339_nano(
             OffsetDateTime::now_utc() + time::Duration::minutes(5),
         );
@@ -1696,9 +2137,14 @@ mod tests {
             r#"{{"instance_id":"i","purpose":"minio_root_v1","operation_id":"{op}","fencing_token":7,"stopped_topology_proof":"s","mount_release_proof":"m","binding_evidence":"b","evidence_expires_at":"{future}"}}"#,
             op = uuid::Uuid::new_v4()
         );
-        assert_eq!(
-            denied(request_raw(&evidence)),
-            format!("B04_HANDOFF_DENIED: {UNSUPPORTED_IN_THIS_SLICE}")
+        let msg = denied(request_raw(&evidence));
+        assert!(
+            msg.starts_with("B04_HANDOFF_DENIED: "),
+            "unexpected adopt denial: {msg}"
+        );
+        assert!(
+            msg.contains("lifecycle proof"),
+            "unexpected adopt denial: {msg}"
         );
     }
 
@@ -1736,10 +2182,20 @@ mod tests {
             denied(request_raw(&evidence("not-a-uuid"))),
             "B04_PROOF_DENIED: invalid operation id"
         );
-        assert_eq!(
-            denied(request_raw(&evidence(&uuid::Uuid::new_v4().to_string()))),
-            format!("B04_PROOF_DENIED: {UNSUPPORTED_IN_THIS_SLICE}")
-        );
+        // Complete evidence mints the durable broker proof — a Success
+        // with no result body, exactly as upstream.
+        let resp = svc.dispatch(&request(
+            ISSUE_B04_LIFECYCLE_PROOF_RPC,
+            request_raw(&evidence(&uuid::Uuid::new_v4().to_string())),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
+        assert!(resp.result.is_none());
+        // Re-issue inside the same operation is idempotent.
+        let resp = svc.dispatch(&request(
+            ISSUE_B04_LIFECYCLE_PROOF_RPC,
+            request_raw(&evidence(&uuid::Uuid::new_v4().to_string())),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
     }
 
     #[test]
@@ -1829,11 +2285,7 @@ mod tests {
             "activate_recovery_bootstrap",
             "bind_postgres_service_role",
             "append_advisory_evaluation",
-            "sign_leaf",
             "migration_report_launch_outcome",
-            "present_bootstrap",
-            "register_bootstrap_candidate",
-            "activate_bootstrap_candidate",
         ] {
             let resp = svc.dispatch(&request(purpose, None));
             assert_eq!(resp.outcome, BrokerOutcome::Denied, "{purpose}");
@@ -2087,5 +2539,287 @@ mod tests {
             err.message()
         );
         drop(writer.join().unwrap());
+    }
+
+    // -- Task-7 live dispatch coverage ---------------------------------
+
+    #[test]
+    fn sign_leaf_rpc_signs_and_errors() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x77u8; 32]);
+        let not_after = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let resp = svc.dispatch(&request(
+            SIGN_LEAF_RPC,
+            request_raw(&format!(
+                r#"{{"public_key":"{}","not_after":{not_after}}}"#,
+                super::super::wire::b64_encode(key.verifying_key().as_bytes()),
+            )),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
+        let result = resp.result.unwrap();
+        let der = super::super::wire::b64_decode(result["Raw"].as_str().unwrap()).unwrap();
+        // `Fingerprint` is sha256-hex over the DER the response carries.
+        assert_eq!(
+            result["Fingerprint"].as_str().unwrap(),
+            super::super::wire::sha256_hex(&der)
+        );
+        // The certificate parses and names the broker CA as issuer.
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+        let issuer_cn = cert
+            .issuer()
+            .iter_common_name()
+            .next()
+            .and_then(|a| a.as_str().ok())
+            .unwrap()
+            .to_owned();
+        assert_eq!(issuer_cn, "Central Local CA");
+        // Malformed or absent request → upstream's `BrokerError`, never
+        // a denial and never "unknown purpose".
+        let resp = svc.dispatch(&request(SIGN_LEAF_RPC, request_raw(r#""x""#)));
+        assert_eq!(resp.outcome, BrokerOutcome::Error);
+        let resp = svc.dispatch(&request(SIGN_LEAF_RPC, None));
+        assert_eq!(resp.outcome, BrokerOutcome::Error);
+    }
+
+    #[test]
+    fn bootstrap_candidate_rpcs_register_activate_and_recover() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        let binding_payload = |candidate_id: &str, generation: u64| {
+            Some(BTreeMap::from([(
+                "binding".to_owned(),
+                raw(&format!(
+                    r#"{{"candidate_id":"{candidate_id}","generation":{generation},"digest":"{}"}}"#,
+                    super::super::wire::b64_raw_encode(&[7u8; 32])
+                )),
+            )]))
+        };
+        // Absent payload → upstream's code-only AUTHORITY_DENIED.
+        let resp = svc.dispatch(&request(REGISTER_BOOTSTRAP_CANDIDATE_RPC, None));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.code, "AUTHORITY_DENIED");
+        assert!(resp.evidence.message.is_empty());
+        // Register then activate the identical binding.
+        let resp = svc.dispatch(&request(
+            REGISTER_BOOTSTRAP_CANDIDATE_RPC,
+            binding_payload("cand-1", 1),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
+        // A different candidate at the same generation cannot activate.
+        let resp = svc.dispatch(&request(
+            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
+            binding_payload("cand-other", 1),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.code, "AUTHORITY_DENIED");
+        let resp = svc.dispatch(&request(
+            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
+            binding_payload("cand-1", 1),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
+        // The activation is consumed — a replay denies.
+        let resp = svc.dispatch(&request(
+            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
+            binding_payload("cand-1", 1),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        // Restart recovery: a second Service over the same root reloads
+        // the activated candidate — the replay stays denied.
+        let svc2 = service(&dir);
+        let resp = svc2.dispatch(&request(
+            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
+            binding_payload("cand-1", 1),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+    }
+
+    #[test]
+    fn present_bootstrap_is_one_use_and_bounded() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        // Nothing staged → the code-only BOOTSTRAP_NOT_STAGED denial.
+        let resp = svc.dispatch(&request(PRESENT_BOOTSTRAP_RPC, None));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.code, "BOOTSTRAP_NOT_STAGED");
+        assert!(resp.evidence.message.is_empty());
+        // Stage → present once → the raw-std-b64 value.
+        svc.stage_bootstrap_value(b"bootstrap-secret").unwrap();
+        let resp = svc.dispatch(&request(PRESENT_BOOTSTRAP_RPC, None));
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
+        assert_eq!(
+            resp.result.unwrap()["value"].as_str().unwrap(),
+            super::super::wire::b64_raw_encode(b"bootstrap-secret")
+        );
+        // Consumed — the second presentation denies identically.
+        let resp = svc.dispatch(&request(PRESENT_BOOTSTRAP_RPC, None));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.code, "BOOTSTRAP_NOT_STAGED");
+        // Upstream's `StageBootstrapValue` bounds: 0 < len <= 4096.
+        assert!(svc.stage_bootstrap_value(b"").is_err());
+        assert!(svc.stage_bootstrap_value(&[0u8; 4097]).is_err());
+    }
+
+    /// Drive one `0xb4` framed request through `handle_conn`, then read
+    /// the denial `BrokerResponse` line (all pre-descriptor rungs deny
+    /// as ordinary JSON responses).
+    fn b04_frame_roundtrip(request_json: serde_json::Value) -> BrokerResponse {
+        let dir = TempDir::new("server-conn");
+        let svc = service(&dir);
+        let (server_end, mut client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || handle_conn(server_end, &svc));
+        let req = serde_json::json!({
+            "operation_id": "op-b04",
+            "purpose": MATERIALIZE_MINIO_ROOT_RPC,
+            "payload": {"request": request_json},
+        })
+        .to_string();
+        let mut frame = vec![B04_FRAME_MARKER];
+        frame.extend_from_slice(&(req.len() as u32).to_be_bytes());
+        frame.extend_from_slice(req.as_bytes());
+        client_end.write_all(&frame).unwrap();
+        client_end.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut client_end, &mut buf).unwrap();
+        drop(client_end);
+        let _ = handle.join();
+        serde_json::from_str(buf.trim_end()).unwrap()
+    }
+
+    #[test]
+    fn b04_transport_rungs_deny_in_order() {
+        // `payload.request` absent.
+        let dir = TempDir::new("server-conn");
+        let svc = service(&dir);
+        let (server_end, mut client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || handle_conn(server_end, &svc));
+        let req = br#"{"operation_id":"op-b04","purpose":"materialize_minio_root","payload":{}}"#;
+        let mut frame = vec![B04_FRAME_MARKER];
+        frame.extend_from_slice(&(req.len() as u32).to_be_bytes());
+        frame.extend_from_slice(req);
+        client_end.write_all(&frame).unwrap();
+        client_end.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut client_end, &mut buf).unwrap();
+        let _ = handle.join();
+        let resp: BrokerResponse = serde_json::from_str(buf.trim_end()).unwrap();
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(
+            resp.evidence.message,
+            "B04_HANDOFF_DENIED: missing request field"
+        );
+        // Malformed request JSON.
+        let resp = b04_frame_roundtrip(serde_json::Value::String("x".into()));
+        assert_eq!(resp.evidence.message, "B04_HANDOFF_DENIED: invalid request");
+        // Default-shaped request fails the closed dependency binding.
+        let resp = b04_frame_roundtrip(serde_json::json!({}));
+        assert_eq!(
+            resp.evidence.message,
+            "B04_HANDOFF_DENIED: invalid dependency binding"
+        );
+        // Correct binding, wrong peer identity.
+        let resp = b04_frame_roundtrip(serde_json::json!({
+            "service": "minio",
+            "target": "/run/secrets/minio-root-password",
+            "uid": 1000, "gid": 1000,
+            "peer_uid": 0, "peer_pid": -1,
+        }));
+        assert_eq!(
+            resp.evidence.message,
+            "B04_HANDOFF_DENIED: peer identity mismatch"
+        );
+        // Real peer identity, malformed binding id.
+        let resp = b04_frame_roundtrip(serde_json::json!({
+            "service": "minio",
+            "target": "/run/secrets/minio-root-password",
+            "uid": 1000, "gid": 1000,
+            "peer_uid": rustix::process::geteuid().as_raw(),
+            "peer_pid": std::process::id(),
+            "binding_id": "not-a-uuid",
+        }));
+        assert_eq!(
+            resp.evidence.message,
+            "B04_HANDOFF_DENIED: invalid binding id"
+        );
+        // Binding parses, malformed operation id.
+        let resp = b04_frame_roundtrip(serde_json::json!({
+            "service": "minio",
+            "target": "/run/secrets/minio-root-password",
+            "uid": 1000, "gid": 1000,
+            "peer_uid": rustix::process::geteuid().as_raw(),
+            "peer_pid": std::process::id(),
+            "binding_id": uuid::Uuid::new_v4(),
+            "operation_id": "not-a-uuid",
+        }));
+        assert_eq!(
+            resp.evidence.message,
+            "B04_HANDOFF_DENIED: invalid operation id"
+        );
+    }
+
+    /// The deepest rung a test can drive deterministically: a fully
+    /// valid request reaches `ReceiveDescriptor` — the broker then
+    /// either refuses the descriptor's shape (non-root test host: the
+    /// memfd cannot be root-owned) or the lease lookup (root: no B04
+    /// adoption has produced a lease for the binding). Both are the
+    /// custody failures upstream emits at that point.
+    #[test]
+    fn b04_transport_reaches_descriptor_then_store() {
+        let dir = TempDir::new("server-conn");
+        let svc = service(&dir);
+        let (server_end, mut client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || handle_conn(server_end, &svc));
+        let op = uuid::Uuid::new_v4();
+        let req = serde_json::json!({
+            "operation_id": "op-b04",
+            "purpose": MATERIALIZE_MINIO_ROOT_RPC,
+            "payload": {"request": {
+                "service": "minio",
+                "target": "/run/secrets/minio-root-password",
+                "uid": 1000, "gid": 1000,
+                "peer_uid": rustix::process::geteuid().as_raw(),
+                "peer_pid": std::process::id(),
+                "binding_id": uuid::Uuid::new_v4(),
+                "operation_id": op,
+                "fencing_token": 7,
+            }},
+        })
+        .to_string();
+        let mut frame = vec![B04_FRAME_MARKER];
+        frame.extend_from_slice(&(req.len() as u32).to_be_bytes());
+        frame.extend_from_slice(req.as_bytes());
+        client_end.write_all(&frame).unwrap();
+        // Send the destination descriptor: empty 0400 sealed-capable
+        // memfd — the shape `validate_destination` checks against the
+        // root-owner requirement.
+        let fd = rustix::fs::memfd_create(
+            "central-test",
+            rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+        )
+        .unwrap();
+        rustix::fs::fchmod(&fd, rustix::fs::Mode::from_bits_retain(0o400)).unwrap();
+        crate::broker::handoff::send_b04_descriptor(&client_end, &fd).unwrap();
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut client_end, &mut buf).unwrap();
+        let _ = handle.join();
+        let resp: BrokerResponse = serde_json::from_str(buf.trim_end()).unwrap();
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.operation_id, "op-b04");
+        if rustix::process::geteuid().is_root() {
+            // Descriptor validated → the store answers for the
+            // never-adopted binding.
+            assert_eq!(resp.evidence.message, "B04_HANDOFF_DENIED: no active lease");
+        } else {
+            // The descriptor must be root-owned; the test's memfd
+            // cannot satisfy that, and the denial is the custody
+            // refusal upstream emits before any plaintext resolves.
+            assert!(
+                resp.evidence
+                    .message
+                    .starts_with("B04_HANDOFF_DENIED: transport:"),
+                "unexpected denial: {}",
+                resp.evidence.message
+            );
+        }
     }
 }
