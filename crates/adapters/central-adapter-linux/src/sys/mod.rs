@@ -33,6 +33,17 @@
 //!   `launcher_linux.go`)
 //! - [`namespace`] — `unshare`/`setns` (`launcher_linux.go`'s clone and
 //!   unshare flag sets)
+//! - [`pam`] — the PAM authentication boundary (R5 task 5, decision
+//!   D1): the safe front door over the hand-written `libpam` FFI in
+//!   [`audited::pam_ffi`] — upstream `pam_linux.go`'s
+//!   `authenticatePAM` and conversation contract
+//! - [`tty`] — the physical-console boundary the ceremonies are built
+//!   on: `openPhysicalTTY`'s D-1 seat check and `O_NONBLOCK` open,
+//!   `TIOCEXCL`/`TCIFLUSH`, the `poll(2)`-bounded ceremony reads with
+//!   echo suppression, the confirmation-phrase vocabulary, and the
+//!   init confirmation dialog (`tty_ceremony_read_linux.go`,
+//!   `pam_linux.go`, `confirmation_phrase.go`,
+//!   `init_ceremony_prompt.go`)
 
 /// The one audited `unsafe` site — `unsafe` is permitted inside this
 /// module only (`#![allow(unsafe_code)]` at its top; the crate's
@@ -52,6 +63,8 @@ pub mod namespace;
 #[forbid(unsafe_code)]
 pub mod openat2;
 #[forbid(unsafe_code)]
+pub mod pam;
+#[forbid(unsafe_code)]
 pub mod peercred;
 #[forbid(unsafe_code)]
 pub mod pidfd;
@@ -59,6 +72,8 @@ pub mod pidfd;
 pub mod scm_rights;
 #[forbid(unsafe_code)]
 pub mod seccomp;
+#[forbid(unsafe_code)]
+pub mod tty;
 
 /// Re-exec probe harness for the stateful-boundary tests
 /// (seccomp/namespace/hardening): a `#[test]` that mutates the

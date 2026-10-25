@@ -12,11 +12,15 @@ central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
 central-scheduler = { path = "../../capabilities/central-scheduler", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
-# `event` (pidfd liveness via `poll`) and `thread` (`PR_SET_NO_NEW_PRIVS`,
-# `PR_CAPBSET_*`, `unshare`/`setns`) are the `sys` boundary's extra API
-# surface — the same additive-per-crate feature pattern
+# `event` (pidfd liveness via `poll`, the TTY ceremony's bounded
+# read/write), `thread` (`PR_SET_NO_NEW_PRIVS`, `PR_CAPBSET_*`,
+# `unshare`/`setns`), `termios` (`TIOCEXCL`, `TCGETS`/`TCSETS` echo
+# suppression, `TCFLSH` — the R5-task-5 PAM/TTY boundary), `pty`
+# (the pty test fixture), and `rand` (`getrandom` for ceremony
+# confirmation codes) are the `sys` boundary's extra API surface —
+# the same additive-per-crate feature pattern
 # `central-harness-launcherd` uses.
-rustix = { workspace = true, features = ["event", "thread"] }
+rustix = { workspace = true, features = ["event", "pty", "rand", "termios", "thread"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

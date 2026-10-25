@@ -38,17 +38,19 @@ pub(crate) fn run_on_with(test_name: &'static str, mode: &str, env: &[(&str, &st
     // probe must fail the suite, never hang it.
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
+        match child.try_wait().expect("probe child wait failed") {
+            Some(_) => break,
+            None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Ok(None) => {
+            None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("probe child for {test_name} exceeded {PROBE_TIMEOUT:?}");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "probe child for {test_name} exceeded {PROBE_TIMEOUT:?}"
+                );
             }
-            Err(e) => panic!("probe child for {test_name} wait failed: {e}"),
         }
     }
     let out = child.wait_with_output().expect("collect probe output");
