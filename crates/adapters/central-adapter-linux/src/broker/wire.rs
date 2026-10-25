@@ -65,6 +65,16 @@ pub(crate) fn format_rfc3339_nano(t: OffsetDateTime) -> String {
     out
 }
 
+/// Go `time.RFC3339` formatting — whole seconds, never a fractional
+/// field. Upstream's `revoked_at` lease tombstones are written with
+/// `time.Now().UTC().Format(time.RFC3339)` (secret_bootstrap.go), so
+/// the durable record's byte shape truncates sub-second precision.
+pub(crate) fn format_rfc3339_seconds(t: OffsetDateTime) -> String {
+    // `0` is always a valid nanosecond.
+    let whole = t.replace_nanosecond(0).unwrap_or(t);
+    format_rfc3339_nano(whole)
+}
+
 /// Serde adapter for `time.Time` fields tagged `json:"x"`: serializes
 /// the RFC 3339 / RFC 3339Nano text Go emits, parses what Go's
 /// `time.Time.UnmarshalJSON` accepts.

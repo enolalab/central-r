@@ -1517,9 +1517,11 @@ impl SecretBootstrap {
             fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
         )
         .map_err(|e| internal(format!("broker: secure lease dir: {e}")))?;
+        // Upstream writes the tombstone with `time.RFC3339` — whole
+        // seconds, no fractional field.
         let tombstone = format!(
             "{{\"revoked_at\":\"{}\"}}",
-            wire::format_rfc3339_nano(now())
+            wire::format_rfc3339_seconds(now())
         );
         if let Err(e) = write_private(
             &lease_dir.join(format!("{binding_id}.revoked")),

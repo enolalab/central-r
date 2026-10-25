@@ -34,7 +34,12 @@ pub mod server;
 pub mod signing;
 pub mod tls;
 pub(crate) mod wire;
-pub mod xdg;
+// No `xdg` module: the signed XDG-view surface is upstream's
+// `central.view-signature/v1` envelope (`internal/config/view.go`),
+// already ported at `central_infra::config::view` (R5 Task 2). The
+// broker emits no projections in this slice — a custom schema here
+// would be dead code carrying an unverified authority claim, so the
+// surface stays closed until a consumer needs it.
 
 #[cfg(test)]
 pub(crate) mod testutil {

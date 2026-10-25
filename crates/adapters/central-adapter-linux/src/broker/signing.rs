@@ -258,21 +258,23 @@ impl Ed25519Signer {
     /// The raw signing key for composed signing sites (the BX1 export
     /// token's JCS payload). Key material stays inside the broker
     /// boundary — this hands out a borrow, never a copy into ordinary
-    /// storage.
+    /// storage. Only the tests and the R6 export-issuing call site use
+    /// it today.
+    #[allow(dead_code)]
     pub(crate) fn signing_key(&self) -> &ed25519_dalek::SigningKey {
         &self.key
     }
 }
 
 // ---------------------------------------------------------------------------
-// Canonical-JSON signing + verification — the projection/export-token
-// signature vocabulary shared by `xdg.rs` and `export_token.rs`
+// Canonical-JSON signing + verification — the signed-record signature
+// vocabulary (the BX1 export token's JCS unsigned form)
 // ---------------------------------------------------------------------------
 
 /// Sign the JCS-canonical form of `value` and return the hex Ed25519
 /// signature — the single call sites that must produce "signature over
-/// canonical JSON bytes" (XDG projections sign the canonical *view*;
-/// BX1 signs the canonical unsigned token object).
+/// canonical JSON bytes" (BX1 signs the canonical unsigned token
+/// object).
 pub(crate) fn sign_canonical_json(
     key: &ed25519_dalek::SigningKey,
     value: &serde_json::Value,

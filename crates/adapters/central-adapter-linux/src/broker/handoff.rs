@@ -28,7 +28,7 @@ use central_foundation::failure::Failure;
 use rustix::io::Errno;
 use rustix::process::Uid;
 
-use central_infra::domain::HandoffRequest;
+use central_infra::domain::{HandoffReceipt, HandoffRequest};
 
 use super::signing::SigningService;
 use crate::sys::{memfd, scm_rights};
@@ -172,6 +172,34 @@ pub fn compute_materialize_receipt_hmac(signing: &SigningService, req: &HandoffR
         req.target,
         req.uid,
         req.gid
+    );
+    signing.fingerprint("b04-materialize", payload.as_bytes())
+}
+
+/// `handleB04MaterializeTransport` step 7 — the same `b04-materialize`
+/// fingerprint as [`compute_materialize_receipt_hmac`], but over the
+/// *returned receipt* (upstream `service.go` recomputes it inline over
+/// `receipt` fields, never the request). On a resume the durable
+/// receipt's `receipt_id` predates the one freshly minted into the
+/// request, so hashing the request would prove a receipt that was
+/// never persisted while `opaque_token` carries the persisted record's
+/// HMAC — the ACK frame must name the durable identity.
+pub fn compute_materialize_receipt_hmac_for_receipt(
+    signing: &SigningService,
+    receipt: &HandoffReceipt,
+) -> String {
+    let payload = format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        receipt.binding_id,
+        receipt.operation_id,
+        receipt.receipt_id,
+        receipt.purpose.as_str(),
+        receipt.peer_uid,
+        receipt.peer_pid,
+        receipt.service,
+        receipt.target,
+        receipt.uid,
+        receipt.gid
     );
     signing.fingerprint("b04-materialize", payload.as_bytes())
 }

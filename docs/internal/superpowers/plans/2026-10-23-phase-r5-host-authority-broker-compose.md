@@ -64,7 +64,9 @@ central-rust/
 │           ├── lib.rs
 │           ├── sys/{memfd,scm_rights,peercred,openat2,pidfd,hardening,seccomp,tty,pam,cgroup,namespace}.rs
 │           ├── broker/{protocol,server,journal,protected_file,signing,tls,secret_bootstrap,
-│           │          bootstrap_session,handoff,xdg,export_token,payload_epoch,provisioning,proof}.rs
+│           │          bootstrap_session,handoff,export_token,payload_epoch,provisioning,proof}.rs
+│           │          # no xdg.rs — signed views are central-infra::config::view
+│           │          # (central.view-signature/v1), not a broker-side schema
 │           ├── helper/{protocol,server,client,matrix,init,prepare,grant,pam_ceremony,tty_ceremony,
 │           │          browser,audit,lifecycle}.rs
 │           ├── sandbox/{envelope,launcher,daemon,path_resolve}.rs

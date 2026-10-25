@@ -30,7 +30,7 @@ use central_infra::authority::{
     BrokerRequest, BrokerResponse, LifecycleAuthorization, LifecycleAuthorizationRequest,
     ProtectedGeneration,
 };
-use central_infra::domain::{AdoptRequest, HandoffRequest, Purpose};
+use central_infra::domain::{AdoptRequest, HandoffReceipt, HandoffRequest, Purpose};
 use central_infra::port::LeafSignRequest;
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -451,9 +451,18 @@ impl Service {
 
     /// `presentBootstrap` — the one-use staged value leaves broker
     /// memory as the response's `{"value": <raw-std-b64>}`. An empty
-    /// stage is `BOOTSTRAP_NOT_STAGED` (the R6 recovery-journal
-    /// fallback `takeActivatedRecoveryBootstrap` has no store in this
-    /// slice, and upstream maps its error to the same code).
+    /// stage is `BOOTSTRAP_NOT_STAGED`.
+    ///
+    /// **Hard R6 requirement:** upstream `service.go:1006-1025` does
+    /// not deny on an empty in-memory stage — it first falls back to
+    /// `s.recoveryJournal.takeActivatedRecoveryBootstrap(ctx)` and
+    /// denies `BOOTSTRAP_NOT_STAGED` only when that journal take also
+    /// fails. `Service` has no `recovery_journal` field in this slice
+    /// (the store is R6), so the fallback path cannot exist here; when
+    /// the recovery journal lands this arm MUST consult it before
+    /// returning the empty-stage denial, preserving the one-use take
+    /// and the same code on its error. See the T7 report's R6
+    /// requirements.
     fn dispatch_present_bootstrap(&self, req: &BrokerRequest) -> BrokerResponse {
         let mut value = match self.bootstrap_lock() {
             Ok(mut guard) => {
@@ -1126,6 +1135,25 @@ impl Service {
         success(&req.operation_id, serde_json::json!({"fingerprint": fp}))
     }
 
+    /// The B04 ACK frame's opaque proof — `b04-ok:` + the
+    /// `b04-materialize` fingerprint over the *returned receipt*
+    /// (upstream `service.go`'s inline recompute over `receipt`
+    /// fields), never over `handoff_req`: the request's `receipt_id`
+    /// is minted fresh on every presentation, so on a resume it names
+    /// a receipt that was never persisted while the durable record —
+    /// and the JSON result's `opaque_token` — carries the persisted
+    /// receipt's HMAC. Hashing the receipt keeps the ACK and the
+    /// durable record the same identity on first issue and on resume
+    /// alike.
+    fn materialize_ack_proof(&self, receipt: &HandoffReceipt) -> Vec<u8> {
+        let receipt_hmac =
+            handoff::compute_materialize_receipt_hmac_for_receipt(&self.signing, receipt);
+        let mut opaque_proof = Vec::with_capacity("b04-ok:".len() + receipt_hmac.len());
+        opaque_proof.extend_from_slice(b"b04-ok:");
+        opaque_proof.extend_from_slice(receipt_hmac.as_bytes());
+        opaque_proof
+    }
+
     // ------------------------------------------------------------------
     // Framed transports — B04 is live; B05/B10 remain closed denials
     // ------------------------------------------------------------------
@@ -1224,14 +1252,25 @@ impl Service {
         // returned receipt is the resume-stable record; the optional
         // operation is `None` when an existing receipt answers the
         // retry — the receipt's own `operation_id` still names the
-        // operation the state machine advances.
-        let (receipt, _op) = match bootstrap.validate_materialize_request(&handoff_req) {
+        // operation the state machine advances (upstream binds
+        // `op.OperationID`; where `op` is present the two must agree —
+        // a divergence would mean the durable binding was forged
+        // upstream of this point).
+        let (receipt, op) = match bootstrap.validate_materialize_request(&handoff_req) {
             Ok(pair) => pair,
             Err(e) => {
                 deny(conn, format!("{CLASS}{}", e.message()));
                 return Ok(());
             }
         };
+        if let Some(op) = &op {
+            debug_assert!(
+                op.operation_id == receipt.operation_id,
+                "receipt {} names a different operation than op {}",
+                receipt.receipt_id,
+                op.operation_id
+            );
+        }
 
         // Step 3: reserved → write_started.
         if let Err(e) = bootstrap.start_reserved(receipt.operation_id) {
@@ -1265,10 +1304,7 @@ impl Service {
             deny(conn, format!("{CLASS}state: {}", e.message()));
             return Ok(());
         }
-        let receipt_hmac = handoff::compute_materialize_receipt_hmac(&self.signing, &handoff_req);
-        let mut opaque_proof = Vec::with_capacity("b04-ok:".len() + receipt_hmac.len());
-        opaque_proof.extend_from_slice(b"b04-ok:");
-        opaque_proof.extend_from_slice(receipt_hmac.as_bytes());
+        let opaque_proof = self.materialize_ack_proof(&receipt);
         // Frame: 0x01 ack marker (1), proof length (2), uid (2),
         // gid (2), opaque proof (N) — upstream's big-endian uint16s.
         let mut frame = Vec::with_capacity(7 + opaque_proof.len());
@@ -2821,5 +2857,72 @@ mod tests {
                 resp.evidence.message
             );
         }
+    }
+
+    /// R5-T7-F1 — the ACK frame's `b04-ok:<hmac>` proves the
+    /// *persisted* receipt. First presentation mints the durable
+    /// receipt + operation (`issued`); the retry — the flow dying
+    /// after validate, then re-presenting the same `operation_id`
+    /// with the fresh `receipt_id` every transport pass mints — hits
+    /// the `operations.get` resume branch and returns the *persisted*
+    /// receipt, whose `receipt_id` differs from the request's. The
+    /// proof must equal that record's `hmac` — the same value
+    /// `opaque_token` returns — never a recompute over the ephemeral
+    /// request.
+    #[test]
+    fn b04_ack_proof_binds_persisted_receipt_on_resume() {
+        let dir = TempDir::new("server-ack");
+        let svc = service(&dir);
+        let sb = svc.bootstrap.as_ref().unwrap();
+        // Stage: one adopted binding → an active lease under fence 5.
+        let (binding, _) = sb
+            .adopt_b03(&AdoptRequest {
+                instance_id: "inst-ack".to_owned(),
+                purpose: Purpose::MinioRoot,
+                legacy_generation_id: None,
+                operation_id: OperationId::new(),
+                fencing_token: 5,
+            })
+            .unwrap();
+        let operation_id = OperationId::new();
+        let handoff_req = |receipt_id: HandoffReceiptId| {
+            let mut req = HandoffRequest {
+                binding_id: binding.binding_id,
+                peer_uid: rustix::process::geteuid().as_raw(),
+                peer_pid: std::process::id() as i32,
+                operation_id,
+                receipt_id,
+                receipt_hmac: String::new(),
+                fencing_token: 5,
+                purpose: Purpose::MinioRoot,
+                service: "minio".to_owned(),
+                target: "/run/secrets/minio-root-password".to_owned(),
+                uid: 1000,
+                gid: 1000,
+            };
+            req.receipt_hmac = sb.compute_receipt_hmac(&req);
+            req
+        };
+        // First presentation — mints the durable pair.
+        let req1 = handoff_req(HandoffReceiptId::new());
+        let (issued_receipt, _) = sb.validate_materialize_request(&req1).unwrap();
+        // Re-present the same operation with a fresh receipt id — the
+        // resume branch returns the persisted receipt.
+        let req2 = handoff_req(HandoffReceiptId::new());
+        assert_ne!(req2.receipt_id, issued_receipt.receipt_id);
+        let (receipt, op) = sb.validate_materialize_request(&req2).unwrap();
+        assert_eq!(receipt.receipt_id, issued_receipt.receipt_id);
+        assert_eq!(receipt.hmac, issued_receipt.hmac);
+        assert!(op.is_some());
+        // The ACK opaque proof equals the persisted receipt HMAC —
+        // byte-for-byte the `b04-ok:` body the frame embeds.
+        let proof = svc.materialize_ack_proof(&receipt);
+        let mut expected = b"b04-ok:".to_vec();
+        expected.extend_from_slice(receipt.hmac.as_bytes());
+        assert_eq!(proof, expected);
+        // A recompute over the ephemeral request names a different
+        // identity — the divergence this fix removes.
+        let request_hmac = handoff::compute_materialize_receipt_hmac(&svc.signing, &req2);
+        assert_ne!(request_hmac, receipt.hmac);
     }
 }
