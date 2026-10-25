@@ -92,7 +92,9 @@ impl AttemptWorkspaceRead for PgSchedulerStore {
 
 /// `workspaceFreer` — the narrow provisioner seam the executor needs:
 /// `free(path)`. A composition-level interface keeps the executor
-/// testable without a scratch root.
+/// testable without a scratch root. Implementations may block on git
+/// and filesystem work; [`SchedulerCompensation`] calls it through
+/// `tokio::task::spawn_blocking`.
 pub trait WorkspaceFreer: Send + Sync {
     /// Removes the workspace at `path`; idempotent.
     ///
@@ -173,12 +175,27 @@ impl CompensationExecutor for SchedulerCompensation {
         else {
             return Ok(());
         };
-        self.prov.free(&path).map_err(|f| {
-            Failure::internal(
-                "scheduler_compensation",
-                format!("scheduler compensation: free workspace: {}", f.message()),
-            )
-        })
+        // `Provisioner::free` runs `git worktree remove` and
+        // `remove_dir_all` synchronously — its port signature carries
+        // no ctx and stays sync. Inside `sweep_timeouts` it must not
+        // pin a runtime worker, so the call moves to the blocking
+        // pool; a join failure is a panic, mapped internal like the
+        // free refusal it replaces.
+        let prov = self.prov.clone();
+        tokio::task::spawn_blocking(move || prov.free(&path))
+            .await
+            .map_err(|e| {
+                Failure::internal(
+                    "scheduler_compensation",
+                    format!("scheduler compensation: free workspace join: {e}"),
+                )
+            })?
+            .map_err(|f| {
+                Failure::internal(
+                    "scheduler_compensation",
+                    format!("scheduler compensation: free workspace: {}", f.message()),
+                )
+            })
     }
 
     /// `RetainArtifacts` — marks the node's declared artifacts kept for

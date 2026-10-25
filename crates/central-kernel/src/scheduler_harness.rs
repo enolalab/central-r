@@ -366,8 +366,16 @@ pub fn compose_scheduler_harness(
     hc: &HarnessConfig,
     sc: &SchedulerConfig,
 ) -> Result<(SchedulerNodeLauncher, SchedulerKiller), Failure> {
-    let root = hc.worktree_root();
-    let scratch = std::path::PathBuf::from(&sc.scratch_root);
+    // Upstream `filepath.Clean`s both sides before the prefix test:
+    // collect the components back so `.` segments and doubled or
+    // trailing separators cannot slip the containment check.
+    let root = hc
+        .worktree_root()
+        .components()
+        .collect::<std::path::PathBuf>();
+    let scratch = std::path::Path::new(&sc.scratch_root)
+        .components()
+        .collect::<std::path::PathBuf>();
     if scratch != root && !scratch.starts_with(&root) {
         return Err(Failure::denied(
             CODE_SCRATCH_ESCAPES,

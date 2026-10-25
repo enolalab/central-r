@@ -56,8 +56,13 @@ const KIND_MARKER: &str = ".central-workspace-kind";
 /// The in-workspace marker recording the workspace's disk byte cap.
 const BUDGET_MARKER: &str = ".central-workspace-budget";
 /// Bounds the `git worktree remove` inside [`Provisioner::free`] and
-/// the partial-leftover cleanup, whose port signature carries no
-/// cancellation (upstream `freeTimeout`).
+/// the partial-leftover cleanup in `provision_worktree` — the only
+/// sites upstream's `freeTimeout` covers. `worktree prune`/`add`
+/// carry no internal bound: upstream ran them under the caller ctx
+/// alone, and Rust has no ctx — a dropped `spawn_blocking` task
+/// cannot be interrupted, so the blocking task running to completion
+/// is the bound (a Rust-shape divergence from ctx-cancel, not an
+/// invented timeout).
 const GIT_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `workflow.WorkspaceKindWorktree`'s wire spelling.
@@ -73,6 +78,20 @@ const CODE_PROVISION_FAILED: &str = "workspace_provision_failed";
 
 fn invalid(message: impl Into<String>) -> Failure {
     Failure::invalid(CODE_INVALID_CONFIG, message)
+}
+
+/// `filepath.IsAbs(p) && filepath.Clean(p) == p` — the shape rule
+/// `NewProvisioner` applies to every configured path: no `..`
+/// segments, and the path's components must collect back to the
+/// supplied spelling, so a trailing or doubled separator or a `.`
+/// segment fails it (the same test the kernel's `is_clean_absolute`
+/// makes).
+fn is_clean_absolute(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
 }
 
 fn provision_failed(message: impl Into<String>) -> Failure {
@@ -100,20 +119,11 @@ impl DispatchProvisioner {
     ///
     /// # Errors
     /// `provision_invalid_config` when a path fails its shape rule —
-    /// the same refusals upstream's constructor makes.
+    /// the same `filepath.IsAbs` + `filepath.Clean(p) == p` refusals
+    /// upstream's constructor makes.
     pub fn new(scratch_root: &str, source_repo: &str) -> Result<Self, Failure> {
-        // Upstream `filepath.Clean(p) == p`: the Rust shape is "no
-        // CurDir/ParentDir components" on an absolute, non-root path.
         let scratch = Path::new(scratch_root);
-        if !scratch.is_absolute()
-            || scratch.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::CurDir | std::path::Component::ParentDir
-                )
-            })
-            || scratch == Path::new("/")
-        {
+        if !is_clean_absolute(scratch) || scratch == Path::new("/") {
             return Err(invalid(format!(
                 "scratch root must be an absolute, clean, non-root path: {scratch_root}"
             )));
@@ -122,14 +132,7 @@ impl DispatchProvisioner {
             None
         } else {
             let repo = Path::new(source_repo);
-            if !repo.is_absolute()
-                || repo.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::CurDir | std::path::Component::ParentDir
-                    )
-                })
-            {
+            if !is_clean_absolute(repo) {
                 return Err(invalid(format!(
                     "source repo must be an absolute, clean path: {source_repo}"
                 )));
@@ -229,10 +232,12 @@ impl DispatchProvisioner {
         }
         // A leftover without a marker is a partial provision: drop any
         // worktree registration it left, then the directory itself.
+        // Upstream wraps this remove in `context.WithTimeout(ctx,
+        // freeTimeout)` — one of the two sites `GIT_OP_TIMEOUT` covers.
         if dir.symlink_metadata().is_ok() {
             let _ = self.git_run(
                 source_repo,
-                GIT_OP_TIMEOUT,
+                Some(GIT_OP_TIMEOUT),
                 &["worktree", "remove", "--force", &dir.to_string_lossy()],
             );
             std::fs::remove_dir_all(dir)
@@ -240,8 +245,11 @@ impl DispatchProvisioner {
         }
         // Prune clears administrative entries whose directories vanished
         // out from under git (e.g. a crash between worktree add and
-        // marker write followed by manual cleanup).
-        self.git_run(source_repo, GIT_OP_TIMEOUT, &["worktree", "prune"])
+        // marker write followed by manual cleanup). Upstream runs this
+        // and `add` under the caller ctx alone; Rust's spawn_blocking
+        // carries no ctx-cancel — the abandoned blocking task is the
+        // bound, so no internal timeout (see GIT_OP_TIMEOUT's doc).
+        self.git_run(source_repo, None, &["worktree", "prune"])
             .map_err(|e| provision_failed(format!("git worktree prune: {}", e.message())))?;
         let parent = dir.parent().unwrap_or_else(|| Path::new("/"));
         std::fs::create_dir_all(parent)
@@ -249,7 +257,7 @@ impl DispatchProvisioner {
         set_private(parent)?;
         self.git_run(
             source_repo,
-            GIT_OP_TIMEOUT,
+            None,
             &[
                 "worktree",
                 "add",
@@ -266,8 +274,22 @@ impl DispatchProvisioner {
     /// `gitRun` — executes git in `dir` with an environment built from
     /// empty: no system or global config, no hooks, no fsmonitor, no
     /// prompts. git's stderr is not echoed into errors — it may quote
-    /// repository content.
-    fn git_run(&self, dir: &Path, timeout: Duration, args: &[&str]) -> Result<String, Failure> {
+    /// repository content. `timeout` is `Some` only where upstream's
+    /// `freeTimeout` applied (see [`GIT_OP_TIMEOUT`]); `None` runs the
+    /// child to completion — the [`Provisioner::provision`] caller's
+    /// `spawn_blocking` abandonment is the bound, matching upstream's
+    /// unbounded-under-ctx `prune`/`add`.
+    ///
+    /// This runs on a blocking thread (spawned from `provision` via
+    /// `spawn_blocking`, or from the sync `free`); the
+    /// `try_wait`/`sleep` poll loop is upstream's `cmd.Run` +
+    /// `WaitDelay` shape and must never occupy a runtime worker.
+    fn git_run(
+        &self,
+        dir: &Path,
+        timeout: Option<Duration>,
+        args: &[&str],
+    ) -> Result<String, Failure> {
         let mut full: Vec<String> = vec![
             "-c".into(),
             "core.hooksPath=/dev/null".into(),
@@ -297,7 +319,7 @@ impl DispatchProvisioner {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| provision_failed(format!("run git {}: {e}", args[0])))?;
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -316,12 +338,15 @@ impl DispatchProvisioner {
                     )));
                 }
                 Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
+                    if let Some(deadline) = deadline
+                        && std::time::Instant::now() >= deadline
+                    {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(provision_failed(format!(
-                            "git {} timed out after {timeout:?}",
-                            args[0]
+                            "git {} timed out after {:?}",
+                            args[0],
+                            timeout.unwrap_or_default()
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -375,13 +400,29 @@ fn read_marker(dir: &Path, name: &str) -> Result<String, Failure> {
     }
 }
 
+/// `os.WriteFile(path, bytes, 0o600)` — create/truncate with the
+/// private mode upstream pins on marker files. The mode applies at
+/// creation only (matching `os.WriteFile`'s chmod-on-open semantics);
+/// an existing marker keeps its mode.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    opts.open(path)?.write_all(bytes)
+}
+
 /// `writeMarkers` — records the workspace's budget bound first and its
 /// kind marker last — the kind marker's presence is what a re-prepare
 /// treats as a complete provision.
 fn write_markers(dir: &Path, kind: &str, budget: u64) -> Result<(), Failure> {
-    std::fs::write(dir.join(BUDGET_MARKER), format!("{budget}\n"))
+    write_private(&dir.join(BUDGET_MARKER), format!("{budget}\n").as_bytes())
         .map_err(|e| provision_failed(format!("write budget marker: {e}")))?;
-    std::fs::write(dir.join(KIND_MARKER), format!("{kind}\n"))
+    write_private(&dir.join(KIND_MARKER), format!("{kind}\n").as_bytes())
         .map_err(|e| provision_failed(format!("write kind marker: {e}")))?;
     Ok(())
 }
@@ -408,18 +449,32 @@ impl Provisioner for DispatchProvisioner {
         if run_id.is_nil() || node_id.is_nil() || attempt_id.is_nil() {
             return Err(invalid("run, node and attempt ids must be non-nil"));
         }
-        // Rust has no `ctx`: a dropped future abandons the work — the
-        // port's `Cancelled` arm — so the body runs synchronously like
-        // upstream's blocking exec calls did.
         let dir = self.workspace_path(run_id, node_id)?;
-        match kind {
-            KIND_WORKTREE => self.provision_worktree(&dir, base_ref),
-            KIND_DIRECTORY => self.provision_directory(&dir),
+        // The body is blocking work (git spawn + filesystem) and runs
+        // inside the dispatcher's `JoinSet`: on a runtime worker it
+        // would pin the worker for the whole op and still could not
+        // be cancelled — a dropped future is the port's `Cancelled`
+        // arm. It therefore runs on the blocking pool: the abandoned
+        // `spawn_blocking` task is the Rust shape of upstream's ctx
+        // cancellation — the work runs to completion detached, the
+        // same end state an idempotent re-prepare already handles.
+        let this = Self {
+            scratch_root: self.scratch_root.clone(),
+            source_repo: self.source_repo.clone(),
+            git: self.git.clone(),
+        };
+        let kind = kind.to_string();
+        let base_ref = base_ref.to_string();
+        tokio::task::spawn_blocking(move || match kind.as_str() {
+            KIND_WORKTREE => this.provision_worktree(&dir, &base_ref),
+            KIND_DIRECTORY => this.provision_directory(&dir),
             other => Err(Failure::invalid(
                 CODE_UNKNOWN_KIND,
                 format!("unknown workspace_kind: {other}"),
             )),
-        }
+        })
+        .await
+        .map_err(|e| provision_failed(format!("provision task join: {e}")))?
     }
 
     /// `Free` — releases a workspace previously returned by
@@ -429,6 +484,11 @@ impl Provisioner for DispatchProvisioner {
     /// whose marker is missing but that still looks like a worktree (a
     /// `.git` gitfile) is treated as a worktree. Free is idempotent and
     /// refuses paths outside `<scratch_root>/workspaces`.
+    ///
+    /// The port signature is sync (upstream `Free` carries no ctx), so
+    /// async callers must run it on `tokio::task::spawn_blocking` —
+    /// the retry sweep's compensation hook is one (see
+    /// `central-kernel/src/retry_compose.rs`).
     fn free(&self, path: &str) -> Result<(), Failure> {
         let clean = PathBuf::from(path);
         let root = self.scratch_root.join(WORKSPACES_DIR);
@@ -465,7 +525,7 @@ impl Provisioner for DispatchProvisioner {
             // idempotent.
             let _ = self.git_run(
                 source_repo,
-                GIT_OP_TIMEOUT,
+                Some(GIT_OP_TIMEOUT),
                 &["worktree", "remove", "--force", &clean.to_string_lossy()],
             );
         }
@@ -575,7 +635,18 @@ mod tests {
 
     #[test]
     fn new_provisioner_rejects_bad_roots() {
-        for root in ["", "relative/dir", "/", "a/../b"] {
+        // `filepath.Clean(p) != p` spellings join the shape refusals:
+        // trailing and doubled separators, `.`/`..` segments.
+        for root in [
+            "",
+            "relative/dir",
+            "/",
+            "a/../b",
+            "/scratch/../x",
+            "/scratch/",
+            "/scratch//dir",
+            "/scratch/./dir",
+        ] {
             let err = DispatchProvisioner::new(root, "")
                 .err()
                 .unwrap_or_else(|| unreachable!("NewProvisioner({root:?}) accepted"));
@@ -613,6 +684,17 @@ mod tests {
                 0o700,
                 "workspace dir mode"
             );
+            for name in [KIND_MARKER, BUDGET_MARKER] {
+                assert_eq!(
+                    std::fs::metadata(want.join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600,
+                    "marker {name} mode"
+                );
+            }
         }
         assert_eq!(marker(&want, KIND_MARKER), "directory");
         assert_eq!(marker(&want, BUDGET_MARKER), "4294967296");

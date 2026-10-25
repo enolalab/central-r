@@ -3957,10 +3957,42 @@ mod tests {
         }
     }
 
+    /// Records the harness reconciler's first store read as the
+    /// "harness" gate step; an empty candidate page makes the real
+    /// [`HarnessReconciler`] pass a no-op so the test drives upstream's
+    /// injected `harnessReconcile` seam through production code.
+    struct RecordingRecoveryStore {
+        order: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl central_harness::port::RecoveryStore for RecordingRecoveryStore {
+        fn list_recovery_candidates<'a>(
+            &'a self,
+            _after: central_harness::port::RecoveryCursor,
+            _limit: usize,
+        ) -> central_harness::port::PortFuture<
+            'a,
+            Result<Vec<central_harness::port::RecoveryCandidate>, Failure>,
+        > {
+            self.order.lock().unwrap().push("harness");
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn recover_attempt<'a>(
+            &'a self,
+            _expected: &'a central_harness::attempt::Attempt,
+            _next: &'a central_harness::attempt::Attempt,
+        ) -> central_harness::port::PortFuture<'a, Result<central_harness::attempt::Attempt, Failure>>
+        {
+            Box::pin(async { Err(Failure::internal("unused", "unused")) })
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn scheduler_reconcile_runs_inside_the_startup_gate() {
-        // Ordering: b08 (claim/complete), then scheduler, then the
-        // fenced artifact pass — upstream's exact gate order.
+        // Ordering: b08 (claim/complete), then harness reconcile, then
+        // scheduler, then the fenced artifact pass — upstream's exact
+        // gate order [b08, harness, scheduler, artifact].
         let order = Arc::new(StdMutex::new(Vec::new()));
         let (mut preflight, _recovery) = test_gate(
             Arc::new(ScriptedCoordinator {
@@ -3974,6 +4006,13 @@ mod tests {
             })),
             Arc::new(StdMutex::new(None)),
         );
+        preflight.harness_reconcile = Some(Arc::new(HarnessReconciler::new(
+            Arc::new(RecordingRecoveryStore {
+                order: order.clone(),
+            }),
+            Arc::new(TokioClock),
+            None,
+        )));
         preflight.scheduler_reconcile = Some(Arc::new(RecordingSchedulerReconcile {
             order: order.clone(),
             err: None,
@@ -3982,13 +4021,17 @@ mod tests {
             .run_for_serve(CancellationToken::new(), far_startup())
             .await
             .expect("runGateSteps");
-        let steps = order.lock().unwrap().clone();
-        let scheduler_at = steps.iter().position(|s| *s == "scheduler");
-        let complete_at = steps.iter().rposition(|s| *s == "complete");
-        let artifact_at = steps.iter().position(|s| *s == "artifact");
-        assert!(
-            complete_at < scheduler_at && scheduler_at < artifact_at,
-            "gate order = {steps:?}, want complete < scheduler < artifact"
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            [
+                "epoch",
+                "claim",
+                "harness",
+                "scheduler",
+                "artifact_fence",
+                "artifact"
+            ],
+            "gate order = b08 → harness reconcile → scheduler reconcile → fenced artifact recovery"
         );
 
         // A failed reconcile fails the gate before artifact recovery.
