@@ -810,8 +810,10 @@ pub struct Candidate {
     pub operation_id: String,
     /// The prepared selector.
     pub selector: String,
-    /// The candidate phase.
-    pub phase: PreparePhase,
+    /// The candidate phase. `None` is the unset phase — upstream's
+    /// `Phase` is a `string` whose zero value `""` is distinct from
+    /// every named phase, and `Candidate::is_zero` checks for it.
+    pub phase: Option<PreparePhase>,
     /// Bytes of source the acquisition actually read — the only byte
     /// figure a progress event may carry.
     pub source_bytes: i64,
@@ -828,10 +830,11 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// `IsZero` — the unset candidate.
+    /// `IsZero` — the unset candidate: empty identity, empty
+    /// selector, and an unset (upstream `Phase == ""`) phase.
     #[must_use]
     pub fn is_zero(&self) -> bool {
-        self.id.is_empty() && self.selector.is_empty()
+        self.id.is_empty() && self.selector.is_empty() && self.phase.is_none()
     }
 }
 
@@ -845,7 +848,7 @@ pub fn new_candidate(selector: &str) -> Result<Candidate, Failure> {
     }
     Ok(Candidate {
         selector: selector.to_string(),
-        phase: PreparePhase::Pending,
+        phase: Some(PreparePhase::Pending),
         ..Candidate::default()
     })
 }
@@ -1107,7 +1110,9 @@ pub struct B04LifecycleEvidence {
     pub mount_release_proof: String,
     /// The binding evidence.
     pub binding_evidence: String,
-    /// Evidence expiry.
+    /// Evidence expiry. `None` is upstream's zero `time.Time`;
+    /// `validate` rejects `None` and `Some` of the Go zero instant
+    /// exactly as `ExpiresAt.IsZero()` does upstream.
     pub expires_at: Option<OffsetDateTime>,
 }
 
@@ -1121,7 +1126,7 @@ impl B04LifecycleEvidence {
             || self.stopped_topology_proof.is_empty()
             || self.mount_release_proof.is_empty()
             || self.binding_evidence.is_empty()
-            || self.expires_at.is_none()
+            || self.expires_at.is_none_or(is_go_zero_time)
         {
             return Err(Failure::invalid(
                 codes::LIFECYCLE_INVALID,
@@ -3551,7 +3556,7 @@ mod tests {
         // Receipt derivation: a valid candidate produces its receipt.
         let mut candidate = new_candidate("minio").unwrap();
         assert!(!candidate.is_zero());
-        assert_eq!(candidate.phase, PreparePhase::Pending);
+        assert_eq!(candidate.phase, Some(PreparePhase::Pending));
         candidate.id = "candidate-1".to_string();
         candidate.dependency_set = complete_prepared_set();
         let receipt = receipt_for_candidate(&candidate).unwrap();
@@ -3804,6 +3809,12 @@ mod tests {
             },
             B04LifecycleEvidence {
                 expires_at: None,
+                ..valid.clone()
+            },
+            // `Some` of the Go zero instant is the same reject
+            // upstream's `time.Time.IsZero()` produces.
+            B04LifecycleEvidence {
+                expires_at: Some(datetime!(1-01-01 0:00:00 UTC)),
                 ..valid.clone()
             },
         ] {

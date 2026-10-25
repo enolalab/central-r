@@ -304,6 +304,12 @@ pub(crate) mod wire {
         *v == 0
     }
 
+    /// `serde(skip_serializing_if)` for `,omitempty` `u64` fields —
+    /// Go's `uint64` omits the zero value.
+    pub(crate) fn u64_is_zero(v: &u64) -> bool {
+        *v == 0
+    }
+
     /// `serde(skip_serializing_if)` for `,omitempty` `bool` fields.
     pub(crate) fn bool_is_false(v: &bool) -> bool {
         !*v
@@ -758,9 +764,11 @@ pub struct BrokerRequest {
     /// Session token; empty when the transport does not require one.
     pub session_token: String,
     /// Named arguments — upstream `map[string]json.RawMessage`.
-    /// A nil map arrives as `null`; decoded as empty.
-    #[serde(default, deserialize_with = "wire::null_to_default")]
-    pub payload: BTreeMap<String, serde_json::Value>,
+    /// Upstream's tag has no `omitempty`, so a nil map marshals as
+    /// `null`: `None` ↔ nil (`"payload":null`), `Some` ↔ non-nil —
+    /// including `Some(empty)` ↔ `"{}"`, the distinction Go keeps.
+    /// `null` and an absent key both decode to `None`.
+    pub payload: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// The broker's signed reply to a broker operation (upstream

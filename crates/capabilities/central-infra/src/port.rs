@@ -44,6 +44,15 @@ use crate::domain::{
 /// (upstream `helper/protocol.go Request`). `verb` is the closed
 /// [`HelperVerb`] matrix — the helper denies anything it does not
 /// implement with `UNSUPPORTED_IN_THIS_SLICE`.
+///
+/// Upstream `Request.Verb` is a raw `string`, so the Go server can
+/// *decode* an unknown verb and still answer `denied` through its
+/// matrix lookup. This typed field cannot represent an unknown verb —
+/// envelope decode fails before any deny decision. The T4–T8
+/// socket-server task needs a raw-string decode view (e.g. a
+/// transport-side `verb: String` twin resolved to [`HelperVerb`]
+/// only after the deny-unknown check) to preserve upstream's
+/// deny-not-reject behavior for out-of-matrix verbs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelperRequest {
     /// The operation identity echoed in the response.
@@ -57,7 +66,8 @@ pub struct HelperRequest {
 
 /// The helper's newline-delimited JSON reply (upstream
 /// `helper/protocol.go Response`). `outcome` is the closed
-/// `success`/`denied`/`error` trio the server writes.
+/// `success`/`denied`/`error`/`deferred` vocabulary the server
+/// writes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelperResponse {
     /// Echoed operation identity.
@@ -75,17 +85,23 @@ pub struct HelperResponse {
 }
 
 /// The closed outcome set the helper writes (upstream's literal
-/// `"success"`, `"denied"`, and `"error"` strings).
+/// `"success"`, `"denied"`, `"error"`, and `"deferred"` strings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HelperOutcome {
     /// The operation succeeded.
     Success,
     /// The helper refused the operation (the authority boundary
-    /// denied it, or the verb is `UNSUPPORTED_IN_THIS_SLICE`).
+    /// denied it).
     Denied,
     /// The operation errored inside the helper.
     Error,
+    /// The verb is registered in the matrix but not implemented in
+    /// this slice — upstream answers `deferred` with
+    /// `UNSUPPORTED_IN_THIS_SLICE` (or a verb-specific
+    /// `*_UNAVAILABLE` reason) for every `!Implemented` verb and
+    /// for dispatch arms whose handler is not wired.
+    Deferred,
 }
 
 /// The client side of the helper Unix socket: one
@@ -133,6 +149,14 @@ impl<B: BrokerClient + ?Sized> BrokerClient for Arc<B> {
         (**self).call(request).await
     }
 }
+
+// Tracking note — upstream `authority/port/protected_port.go`'s
+// `ProtectedDescriptorUse` is intentionally not ported in T3. It is
+// an fd-carrying boundary: `Use(ctx, fn(ctx, fd int) error)` hands a
+// borrowed SCM_RIGHTS descriptor to an in-process callback, so its
+// natural Rust shape belongs to the socket adapter (fds plus
+// `rustix`/`OwnedFd`), not to this capability's domain-value port
+// surface. It lands with the T4+ adapter task.
 
 // ---------------------------------------------------------------------------
 // TlsAuthority — the local CA (upstream authority/port/tls_port.go)
@@ -542,12 +566,15 @@ pub struct BootstrapHandoff {
     /// Target owner GID.
     #[serde(rename = "GID")]
     pub gid: u32,
+    /// The validity window the materialization must complete inside.
+    /// Declared before `container_id` so serde emits upstream's Go
+    /// declaration order (`Lifetime` then `ContainerID`) —
+    /// [`MountProof::handoff_digest`] covers these exact bytes.
+    #[serde(rename = "Lifetime")]
+    pub lifetime: HandoffLifetime,
     /// The container performing materialization.
     #[serde(rename = "ContainerID")]
     pub container_id: String,
-    /// The validity window the materialization must complete inside.
-    #[serde(rename = "Lifetime")]
-    pub lifetime: HandoffLifetime,
     /// B04 opaque evidence (never plaintext or raw paths).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub b04_operation_id: String,
@@ -558,7 +585,7 @@ pub struct BootstrapHandoff {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub b04_receipt_id: String,
     /// See [`Self::b04_operation_id`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "crate::authority::wire::u64_is_zero")]
     pub b04_fencing_token: u64,
     /// See [`Self::b04_operation_id`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1175,6 +1202,74 @@ mod tests {
             serde_json::from_str::<HelperOutcome>("\"error\"").unwrap(),
             HelperOutcome::Error
         );
+
+        // The fourth outcome word: upstream answers `deferred` for
+        // registered-but-`!Implemented` verbs
+        // (helper/server.go — `UNSUPPORTED_IN_THIS_SLICE` and the
+        // verb-specific `*_UNAVAILABLE` arms).
+        let deferred: HelperResponse = serde_json::from_str(
+            "{\"operation_id\":\"op-4\",\"outcome\":\"deferred\",\"exit_code\":5,\"reason\":\"UNSUPPORTED_IN_THIS_SLICE\"}",
+        )
+        .unwrap();
+        assert_eq!(deferred.outcome, HelperOutcome::Deferred);
+        assert_eq!(
+            serde_json::to_string(&deferred).unwrap(),
+            "{\"operation_id\":\"op-4\",\"outcome\":\"deferred\",\"exit_code\":5,\"reason\":\"UNSUPPORTED_IN_THIS_SLICE\"}"
+        );
+    }
+
+    /// Pins `BootstrapHandoff`'s serialized bytes to upstream's Go
+    /// declaration order — `InstanceID … GID, Lifetime, ContainerID,
+    /// b04_*` — because [`MountProof::handoff_digest`] digests this
+    /// exact encoding. `b04_fencing_token` is `,omitempty` upstream:
+    /// zero is not emitted.
+    #[test]
+    fn bootstrap_handoff_wire_shape_matches_upstream() {
+        let handoff = BootstrapHandoff {
+            instance_id: "i-1".to_string(),
+            purpose: BootstrapPurpose::FirstSetup,
+            service: ServiceMode::Minio,
+            target: "/run/central/bootstrap".to_string(),
+            uid: 501,
+            gid: 502,
+            lifetime: HandoffLifetime {
+                duration: Duration::seconds(90),
+                expires: datetime!(2026-03-04 06:30:00 UTC),
+            },
+            container_id: "container-9".to_string(),
+            b04_operation_id: String::new(),
+            b04_binding_id: String::new(),
+            b04_receipt_id: String::new(),
+            b04_fencing_token: 0,
+            b04_stopped_topology_proof: String::new(),
+            b04_mount_release_proof: String::new(),
+            b04_binding_evidence: String::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&handoff).unwrap(),
+            "{\"InstanceID\":\"i-1\",\"Purpose\":\"first-setup\",\"Service\":\"minio\",\"Target\":\"/run/central/bootstrap\",\"UID\":501,\"GID\":502,\"Lifetime\":{\"Duration\":90000000000,\"Expires\":\"2026-03-04T06:30:00Z\"},\"ContainerID\":\"container-9\"}"
+        );
+
+        // B04 evidence emits in tag order; a non-zero fencing token
+        // appears where upstream's `,omitempty` places it.
+        let adopted = BootstrapHandoff {
+            b04_operation_id: "op-7".to_string(),
+            b04_binding_id: "bind-3".to_string(),
+            b04_receipt_id: "rcpt-2".to_string(),
+            b04_fencing_token: 42,
+            b04_stopped_topology_proof: "stop".to_string(),
+            b04_mount_release_proof: "rel".to_string(),
+            b04_binding_evidence: "ev".to_string(),
+            ..handoff.clone()
+        };
+        assert_eq!(
+            serde_json::to_string(&adopted).unwrap(),
+            "{\"InstanceID\":\"i-1\",\"Purpose\":\"first-setup\",\"Service\":\"minio\",\"Target\":\"/run/central/bootstrap\",\"UID\":501,\"GID\":502,\"Lifetime\":{\"Duration\":90000000000,\"Expires\":\"2026-03-04T06:30:00Z\"},\"ContainerID\":\"container-9\",\"b04_operation_id\":\"op-7\",\"b04_binding_id\":\"bind-3\",\"b04_receipt_id\":\"rcpt-2\",\"b04_fencing_token\":42,\"b04_stopped_topology_proof\":\"stop\",\"b04_mount_release_proof\":\"rel\",\"b04_binding_evidence\":\"ev\"}"
+        );
+        // The zero token round-trips through `default`.
+        let decoded: BootstrapHandoff =
+            serde_json::from_str(&serde_json::to_string(&handoff).unwrap()).unwrap();
+        assert_eq!(decoded, handoff);
     }
 
     // ---------------------------------------------------------------
