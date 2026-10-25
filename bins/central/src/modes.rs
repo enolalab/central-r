@@ -219,44 +219,100 @@ fn helper_daemon(genesis_absent: bool, policy: Result<(), String>, stderr: &mut 
     ExitClass::Terminal.code()
 }
 
-/// The two instance roots genesis distinguishes: state and protected
-/// (`genesisRoots.instancesRoot()`/`protectedInstancesRoot()`).
-const GENESIS_STATE_INSTANCES: &str = "/var/lib/central-state/v1/instances";
-const GENESIS_PROTECTED_INSTANCES: &str = "/var/lib/central-protected/v1/instances";
+/// The genesis host-root layout (`genesisRoots`): the two instance
+/// roots `state()` distinguishes plus the ancestor set and the
+/// protected root it gates on first.
+pub(crate) const GENESIS_STATE_INSTANCES: &str = "/var/lib/central-state/v1/instances";
+pub(crate) const GENESIS_PROTECTED_INSTANCES: &str = "/var/lib/central-protected/v1/instances";
+pub(crate) const GENESIS_PROTECTED_ROOT: &str = "/var/lib/central-protected/v1";
+pub(crate) const GENESIS_ANCESTORS: [&str; 3] = [
+    "/var/lib/central-state",
+    "/var/lib/central-state/v1",
+    "/var/lib/central-protected",
+];
 
-/// Minimal stand-in for genesis `state()`: absent means both instance
-/// roots are missing or empty. An unreadable root counts as present —
-/// the helper then follows the instance composition branch, which
-/// still fails closed this slice.
-fn genesis_roots_absent() -> bool {
-    for root in [GENESIS_STATE_INSTANCES, GENESIS_PROTECTED_INSTANCES] {
-        match std::fs::read_dir(root) {
-            Ok(mut entries) => {
-                if entries.next().is_some() {
-                    return false;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return false,
-        }
+/// `genesisAncestorMissingOrRootOwned(path, 0)`: missing, or a real
+/// directory owned by root that is neither group- nor
+/// other-writable. A symlink fails upstream's `O_NOFOLLOW` open the
+/// same way it fails `is_dir` on `symlink_metadata` here.
+pub(crate) fn genesis_ancestor_ok(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0,
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
     }
-    true
 }
 
-/// Ports `helperPeerPolicyFromEnvironment`: both operator ids must be
-/// set, numeric, and nonzero.
-fn helper_peer_policy(uid: Option<String>, gid: Option<String>) -> Result<(), String> {
-    for (name, value) in [("CENTRAL_OPERATOR_UID", uid), ("CENTRAL_OPERATOR_GID", gid)] {
-        let raw = value
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("{name} is not set"))?;
-        let parsed: u32 = raw
-            .trim()
-            .parse()
-            .map_err(|_| format!("{name} is not a number: {raw:?}"))?;
-        if parsed == 0 {
-            return Err(format!("{name} must be a valid nonzero uid/gid: {raw:?}"));
+/// `protectedGenesisRootMissingOrExact` (`exactOwnedDirectory`):
+/// missing, or a real root:root directory with mode exactly 0700.
+pub(crate) fn genesis_dir_missing_or_root_0700(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            meta.is_dir() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o7777 == 0o700
         }
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// `emptyGenesisRootOrMissing`: `Some(empty)` when the path is missing
+/// or a root:root 0700 directory (`empty` = no entries); `None` for
+/// every upstream error case — a non-directory, wrong owner or mode,
+/// or a directory that cannot be listed.
+pub(crate) fn empty_genesis_root_or_missing(path: &str) -> Option<bool> {
+    if !genesis_dir_missing_or_root_0700(path) {
+        return None;
+    }
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => Some(entries.next().is_none()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// Whether upstream `genesisEnv.state()` would call this host absent,
+/// at the fidelity reachable without the instance loader: ancestors
+/// and the protected root pass verbatim, then each instances root
+/// must be missing or an empty root:root 0700 dir. Everything else —
+/// including upstream's protected-without-state inconsistency — is
+/// not absent, which is all `helperModeFor` needs to pick the
+/// instance branch.
+fn genesis_roots_absent() -> bool {
+    for path in GENESIS_ANCESTORS {
+        if !genesis_ancestor_ok(path) {
+            return false;
+        }
+    }
+    if !genesis_dir_missing_or_root_0700(GENESIS_PROTECTED_ROOT) {
+        return false;
+    }
+    matches!(
+        (
+            empty_genesis_root_or_missing(GENESIS_STATE_INSTANCES),
+            empty_genesis_root_or_missing(GENESIS_PROTECTED_INSTANCES),
+        ),
+        (Some(true), Some(true))
+    )
+}
+
+/// Ports `helperPeerPolicyFromEnvironment`: both operator ids must
+/// satisfy `strconv.ParseUint(_, 10, 32)` — nonempty, ASCII digits
+/// only (no sign, no whitespace, no underscores) — and be nonzero.
+/// Upstream collapses unset/invalid/zero into its two
+/// provisioned-policy errors and deliberately never echoes the env
+/// value.
+fn helper_peer_policy(uid: Option<String>, gid: Option<String>) -> Result<(), String> {
+    let provisioned = |value: Option<String>| {
+        value
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse::<u32>().ok())
+            .is_some_and(|n| n != 0)
+    };
+    if !provisioned(uid) {
+        return Err("operator UID policy is not provisioned".to_string());
+    }
+    if !provisioned(gid) {
+        return Err("operator GID policy is not provisioned".to_string());
     }
     Ok(())
 }
@@ -280,12 +336,13 @@ pub(crate) fn run_broker_daemon(stderr: &mut impl Write) -> u8 {
 }
 
 /// `central --sandbox-launcher` after the gates — upstream
-/// `runSandboxDaemon`. The launcher itself is T9 work; the portable
-/// failure keeps upstream's `sandbox: <serve-error>` exit-3 shape.
+/// `runSandboxDaemon`: on a non-reference host the portable
+/// `sandbox.ServeLauncher` stub is what answers, verbatim at exit 3
+/// (`internal/sandbox/daemon.go`, printed as `sandbox: %v`).
 pub(crate) fn run_sandbox_daemon(stderr: &mut impl Write) -> u8 {
     let _ = writeln!(
         stderr,
-        "sandbox: sandbox-daemon: not implemented in this slice"
+        "sandbox: sandbox-daemon: not available in portable mode; recompile on reference host"
     );
     ExitClass::Unavailable.code()
 }
@@ -497,15 +554,29 @@ pub(crate) fn run_attest(args: &[String], stdout: &mut impl Write, stderr: &mut 
 fn attest_keygen(
     args: &[String],
     _stdout: &mut impl Write,
-    _stderr: &mut impl Write,
+    stderr: &mut impl Write,
 ) -> Result<(), AttestError> {
     let (flags, _positionals) = parse_go_flags(
         args,
+        "attest keygen",
         &[
-            ("key-id", GoFlag::Value),
-            ("out", GoFlag::Value),
-            ("label", GoFlag::Value),
+            (
+                "key-id",
+                GoFlag::Value,
+                "the lock's attestation_trust key_id this key will be trusted under",
+            ),
+            (
+                "out",
+                GoFlag::Value,
+                "absolute path to write the key file to",
+            ),
+            (
+                "label",
+                GoFlag::Value,
+                "a human-readable label carried in the key file, never trusted",
+            ),
         ],
+        stderr,
     )
     .map_err(AttestError::Usage)?;
     if flags.get("key-id").is_none_or(String::is_empty)
@@ -537,9 +608,19 @@ pub(crate) enum GoFlag {
 /// scanning stops at the first non-flag token or `--`; `-` alone is a
 /// positional; at most two leading dashes; bool flags accept only
 /// `=v`. Error strings mirror Go's messages.
+///
+/// Each spec entry is `(name, kind, usage)` — the usage text the
+/// FlagSet was declared with upstream. Like `flag.ContinueOnError`,
+/// every parse failure is `failf`: the error line followed by the
+/// `Usage of <flag_set_name>:` defaults block on `err_out`, with the
+/// bare message returned for the caller's `usage:` wrapper. `-h` and
+/// `--help` print only the usage block and return Go's `ErrHelp`
+/// text, `flag: help requested`.
 pub(crate) fn parse_go_flags(
     tokens: &[String],
-    specs: &[(&str, GoFlag)],
+    flag_set_name: &str,
+    specs: &[(&str, GoFlag, &str)],
+    err_out: &mut impl Write,
 ) -> Result<(BTreeMap<String, String>, Vec<String>), String> {
     let mut values = BTreeMap::new();
     let mut positionals = Vec::new();
@@ -556,20 +637,41 @@ pub(crate) fn parse_go_flags(
         }
         let name_and_value = token.trim_start_matches('-').to_string();
         if token.len() - name_and_value.len() > 2 {
-            return Err(format!("bad flag syntax: {token}"));
+            return Err(failf(
+                err_out,
+                flag_set_name,
+                specs,
+                format!("bad flag syntax: {token}"),
+            ));
         }
         if name_and_value.is_empty()
             || name_and_value.starts_with('-')
             || name_and_value.starts_with('=')
         {
-            return Err(format!("bad flag syntax: {token}"));
+            return Err(failf(
+                err_out,
+                flag_set_name,
+                specs,
+                format!("bad flag syntax: {token}"),
+            ));
         }
         let (name, inline_value) = match name_and_value.split_once('=') {
             Some((n, v)) => (n.to_string(), Some(v.to_string())),
             None => (name_and_value, None),
         };
-        let Some((_, spec)) = specs.iter().find(|(n, _)| *n == name) else {
-            return Err(format!("flag provided but not defined: -{name}"));
+        let Some((_, spec, _)) = specs.iter().find(|(n, _, _)| *n == name) else {
+            // Go's special case: an undefined -h/--help prints the
+            // usage block (no error line) and returns ErrHelp.
+            if name == "help" || name == "h" {
+                write_go_flag_usage(err_out, flag_set_name, specs);
+                return Err("flag: help requested".to_string());
+            }
+            return Err(failf(
+                err_out,
+                flag_set_name,
+                specs,
+                format!("flag provided but not defined: -{name}"),
+            ));
         };
         match spec {
             GoFlag::Bool => {
@@ -579,8 +681,11 @@ pub(crate) fn parse_go_flags(
                         "1" | "t" | "T" | "TRUE" | "true" | "True" => "true".to_string(),
                         "0" | "f" | "F" | "FALSE" | "false" | "False" => "false".to_string(),
                         _ => {
-                            return Err(format!(
-                                "invalid boolean value {v:?} for -{name}: parse error"
+                            return Err(failf(
+                                err_out,
+                                flag_set_name,
+                                specs,
+                                format!("invalid boolean value {v:?} for -{name}: parse error"),
                             ));
                         }
                     },
@@ -593,14 +698,24 @@ pub(crate) fn parse_go_flags(
                     None => {
                         index += 1;
                         if index >= tokens.len() {
-                            return Err(format!("flag needs an argument: -{name}"));
+                            return Err(failf(
+                                err_out,
+                                flag_set_name,
+                                specs,
+                                format!("flag needs an argument: -{name}"),
+                            ));
                         }
                         tokens[index].clone()
                     }
                 };
                 if matches!(spec, GoFlag::Duration) && parse_go_duration(&value).is_none() {
-                    return Err(format!(
-                        "invalid value {value:?} for flag -{name}: time: invalid duration {value:?}"
+                    return Err(failf(
+                        err_out,
+                        flag_set_name,
+                        specs,
+                        format!(
+                            "invalid value {value:?} for flag -{name}: time: invalid duration {value:?}"
+                        ),
                     ));
                 }
                 values.insert(name, value);
@@ -611,9 +726,59 @@ pub(crate) fn parse_go_flags(
     Ok((values, positionals))
 }
 
+/// Go `failf`: the error line then `f.usage()` on the FlagSet output;
+/// the message returns so the caller can wrap it (`%w: %v`).
+fn failf(
+    err_out: &mut impl Write,
+    flag_set_name: &str,
+    specs: &[(&str, GoFlag, &str)],
+    msg: String,
+) -> String {
+    let _ = writeln!(err_out, "{msg}");
+    write_go_flag_usage(err_out, flag_set_name, specs);
+    msg
+}
+
+/// Go `defaultUsage` + `PrintDefaults`: `Usage of <name>:` then one
+/// entry per flag, sorted by name — `  -name <type>` and the usage
+/// text on a `    \t`-indented continuation (a single-line `\t` only
+/// fits a one-letter flag). `fs.String` prints `string`, `fs.Bool`
+/// prints no type name, and `fs.Func` prints `value` — which is what
+/// upstream's `--ttl` is. No spec in this port has a non-zero
+/// default, so the ` (default …)` suffix never renders.
+fn write_go_flag_usage(out: &mut impl Write, flag_set_name: &str, specs: &[(&str, GoFlag, &str)]) {
+    let _ = writeln!(out, "Usage of {flag_set_name}:");
+    let mut sorted: Vec<&(&str, GoFlag, &str)> = specs.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, kind, usage) in sorted {
+        let type_name = match kind {
+            GoFlag::Bool => "",
+            GoFlag::Value => "string",
+            GoFlag::Duration => "value",
+        };
+        let mut line = format!("  -{name}");
+        if !type_name.is_empty() {
+            line.push(' ');
+            line.push_str(type_name);
+        }
+        if line.len() <= 4 {
+            line.push('\t');
+        } else {
+            line.push_str("\n    \t");
+        }
+        line.push_str(&usage.replace('\n', "\n    \t"));
+        let _ = writeln!(out, "{line}");
+    }
+}
+
 /// Go `time.ParseDuration` validity port: `[+-]` then one or more
 /// `number+unit` runs (`ns|us|µs|μs|ms|s|m|h`); bare `0` is valid.
 /// Returns nanoseconds so callers can compare ranges.
+///
+/// A `.` immediately after digits with an empty fraction is legal in
+/// Go (`"1.h"` → 1h, verified against go1.26 — the fraction may be
+/// empty when the integer part is nonempty), and the f64 scan here
+/// accepts it identically.
 pub(crate) fn parse_go_duration(raw: &str) -> Option<i64> {
     let mut rest = raw;
     let neg = rest.starts_with('-');
@@ -839,26 +1004,26 @@ mod tests {
         let mut stderr = Vec::new();
         let code = helper_daemon(
             true,
-            Err("CENTRAL_OPERATOR_UID is not set".into()),
+            Err("operator UID policy is not provisioned".into()),
             &mut stderr,
         );
         assert_eq!(code, 6);
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "helper: genesis composition: CENTRAL_OPERATOR_UID is not set\n"
+            "helper: genesis composition: operator UID policy is not provisioned\n"
         );
 
         let mut stderr = Vec::new();
         let code = helper_daemon(
             false,
-            Err("CENTRAL_OPERATOR_UID is not set".into()),
+            Err("operator UID policy is not provisioned".into()),
             &mut stderr,
         );
         assert_eq!(code, 6);
         assert!(
             String::from_utf8(stderr)
                 .unwrap()
-                .starts_with("helper: composition: CENTRAL_OPERATOR_UID is not set")
+                .starts_with("helper: composition: operator UID policy is not provisioned")
         );
 
         // Composed policy still cannot serve this slice.
@@ -873,22 +1038,30 @@ mod tests {
 
     #[test]
     fn peer_policy_ported_messages() {
-        assert_eq!(
-            helper_peer_policy(None, Some("1".into())).unwrap_err(),
-            "CENTRAL_OPERATOR_UID is not set"
-        );
-        assert_eq!(
-            helper_peer_policy(Some("".into()), Some("1".into())).unwrap_err(),
-            "CENTRAL_OPERATOR_UID is not set"
-        );
-        assert_eq!(
-            helper_peer_policy(Some("abc".into()), Some("1".into())).unwrap_err(),
-            "CENTRAL_OPERATOR_UID is not a number: \"abc\""
-        );
-        assert_eq!(
-            helper_peer_policy(Some("0".into()), Some("1".into())).unwrap_err(),
-            "CENTRAL_OPERATOR_UID must be a valid nonzero uid/gid: \"0\""
-        );
+        // Every uid failure — unset, empty, non-numeric, signed,
+        // whitespace-padded, zero — collapses to upstream's single
+        // provisioned-policy string (no env value echoed).
+        for uid in [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("+1"),
+            Some(" 1"),
+            Some("0"),
+        ] {
+            assert_eq!(
+                helper_peer_policy(uid.map(str::to_string), Some("1".into())).unwrap_err(),
+                "operator UID policy is not provisioned",
+                "uid {uid:?}"
+            );
+        }
+        for gid in [None, Some(""), Some("x"), Some("0")] {
+            assert_eq!(
+                helper_peer_policy(Some("1".into()), gid.map(str::to_string)).unwrap_err(),
+                "operator GID policy is not provisioned",
+                "gid {gid:?}"
+            );
+        }
         assert!(helper_peer_policy(Some("1".into()), Some("2".into())).is_ok());
     }
 
@@ -912,7 +1085,7 @@ mod tests {
         assert_eq!(code, 3);
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "sandbox: sandbox-daemon: not implemented in this slice\n"
+            "sandbox: sandbox-daemon: not available in portable mode; recompile on reference host\n"
         );
     }
 
@@ -1020,11 +1193,24 @@ mod tests {
         assert_eq!(code, 2);
         assert_eq!(stderr, "attest: usage: --key-id and --out are required\n");
 
+        // Go `flag.ContinueOnError` writes the failf line plus the
+        // `Usage of attest keygen:` defaults block before the
+        // dispatcher's `attest: usage:` line.
         let (code, _, stderr) = attest(&["keygen", "--bogus"]);
         assert_eq!(code, 2);
         assert_eq!(
             stderr,
-            "attest: usage: flag provided but not defined: -bogus\n"
+            concat!(
+                "flag provided but not defined: -bogus\n",
+                "Usage of attest keygen:\n",
+                "  -key-id string\n",
+                "    \tthe lock's attestation_trust key_id this key will be trusted under\n",
+                "  -label string\n",
+                "    \ta human-readable label carried in the key file, never trusted\n",
+                "  -out string\n",
+                "    \tabsolute path to write the key file to\n",
+                "attest: usage: flag provided but not defined: -bogus\n",
+            )
         );
 
         // Fully flagged still fails closed — the key generator is not
@@ -1046,55 +1232,116 @@ mod tests {
 
     // -- Go flag / duration ports ---------------------------------------
 
+    const SCAN_SPECS: &[(&str, GoFlag, &str)] = &[
+        ("kind", GoFlag::Value, "ceremony kind: lifecycle, prepare"),
+        ("operation", GoFlag::Value, "exact operation id"),
+        (
+            "ttl",
+            GoFlag::Duration,
+            "how long the grant stays spendable",
+        ),
+        ("replace", GoFlag::Bool, "revoke the pending init grant"),
+    ];
+
+    const SCAN_USAGE: &str = concat!(
+        "Usage of grant issue:\n",
+        "  -kind string\n",
+        "    \tceremony kind: lifecycle, prepare\n",
+        "  -operation string\n",
+        "    \texact operation id\n",
+        "  -replace\n",
+        "    \trevoke the pending init grant\n",
+        "  -ttl value\n",
+        "    \thow long the grant stays spendable\n",
+    );
+
+    type ScanResult = Result<(BTreeMap<String, String>, Vec<String>), String>;
+
+    fn scan(tokens: &[&str]) -> (ScanResult, String) {
+        let mut errbuf = Vec::new();
+        let result = parse_go_flags(&argv(tokens), "grant issue", SCAN_SPECS, &mut errbuf);
+        (result, String::from_utf8(errbuf).unwrap())
+    }
+
     #[test]
     fn go_flag_scan() {
-        let (values, pos) = parse_go_flags(
-            &argv(&["--kind", "init", "-replace", "--operation=x", "extra"]),
-            &[
-                ("kind", GoFlag::Value),
-                ("operation", GoFlag::Value),
-                ("replace", GoFlag::Bool),
-            ],
-        )
-        .unwrap();
+        let (result, errout) = scan(&["--kind", "init", "-replace", "--operation=x", "extra"]);
+        let (values, pos) = result.unwrap();
+        assert_eq!(errout, "");
         assert_eq!(values["kind"], "init");
         assert_eq!(values["operation"], "x");
         assert_eq!(values["replace"], "true");
         assert_eq!(pos, vec!["extra"]);
 
-        assert_eq!(
-            parse_go_flags(&argv(&["--bogus"]), &[("kind", GoFlag::Value)]).unwrap_err(),
-            "flag provided but not defined: -bogus"
-        );
-        assert_eq!(
-            parse_go_flags(&argv(&["--kind"]), &[("kind", GoFlag::Value)]).unwrap_err(),
-            "flag needs an argument: -kind"
-        );
         // A value flag consumes the next token verbatim — `--operation
         // --kind init` treats `--kind` as the operation value.
-        let (values, pos) = parse_go_flags(
-            &argv(&["--operation", "--kind", "init"]),
-            &[("operation", GoFlag::Value), ("kind", GoFlag::Value)],
-        )
-        .unwrap();
+        let (result, _) = scan(&["--operation", "--kind", "init"]);
+        let (values, pos) = result.unwrap();
         assert_eq!(values["operation"], "--kind");
         assert_eq!(pos, vec!["init"]);
-        assert_eq!(
-            parse_go_flags(&argv(&["---x"]), &[("x", GoFlag::Bool)]).unwrap_err(),
-            "bad flag syntax: ---x"
-        );
-        assert_eq!(
-            parse_go_flags(&argv(&["-replace=wat"]), &[("replace", GoFlag::Bool)]).unwrap_err(),
-            "invalid boolean value \"wat\" for -replace: parse error"
-        );
+
         // `--` terminates flags.
-        let (values, pos) = parse_go_flags(
-            &argv(&["--kind", "x", "--", "--bogus"]),
-            &[("kind", GoFlag::Value)],
-        )
-        .unwrap();
+        let (result, _) = scan(&["--kind", "x", "--", "--bogus"]);
+        let (values, pos) = result.unwrap();
         assert_eq!(values["kind"], "x");
         assert_eq!(pos, vec!["--bogus"]);
+    }
+
+    #[test]
+    fn go_flag_failf_writes_error_then_usage_block() {
+        // failf prints the error line, then `Usage of <ctx>:` plus
+        // the sorted PrintDefaults entries, and returns the bare
+        // message for the caller's `usage:` wrapper.
+        let (result, errout) = scan(&["--bogus"]);
+        assert_eq!(result.unwrap_err(), "flag provided but not defined: -bogus");
+        assert_eq!(
+            errout,
+            format!("flag provided but not defined: -bogus\n{SCAN_USAGE}")
+        );
+
+        let (result, errout) = scan(&["--kind"]);
+        assert_eq!(result.unwrap_err(), "flag needs an argument: -kind");
+        assert_eq!(
+            errout,
+            format!("flag needs an argument: -kind\n{SCAN_USAGE}")
+        );
+
+        let (result, errout) = scan(&["---x"]);
+        assert_eq!(result.unwrap_err(), "bad flag syntax: ---x");
+        assert_eq!(errout, format!("bad flag syntax: ---x\n{SCAN_USAGE}"));
+
+        let (result, errout) = scan(&["-replace=wat"]);
+        assert_eq!(
+            result.unwrap_err(),
+            "invalid boolean value \"wat\" for -replace: parse error"
+        );
+        assert_eq!(
+            errout,
+            format!("invalid boolean value \"wat\" for -replace: parse error\n{SCAN_USAGE}")
+        );
+
+        let (result, errout) = scan(&["--ttl", "bogus"]);
+        assert_eq!(
+            result.unwrap_err(),
+            "invalid value \"bogus\" for flag -ttl: time: invalid duration \"bogus\""
+        );
+        assert_eq!(
+            errout,
+            format!(
+                "invalid value \"bogus\" for flag -ttl: time: invalid duration \"bogus\"\n{SCAN_USAGE}"
+            )
+        );
+    }
+
+    #[test]
+    fn go_flag_help_prints_usage_only() {
+        // `-h`/`--help` when undefined: Go prints the usage block
+        // (no error line) and returns ErrHelp's text.
+        for flag in ["-h", "--help"] {
+            let (result, errout) = scan(&[flag]);
+            assert_eq!(result.unwrap_err(), "flag: help requested", "flag {flag}");
+            assert_eq!(errout, SCAN_USAGE, "flag {flag}");
+        }
     }
 
     #[test]
@@ -1112,6 +1359,10 @@ mod tests {
             ("5x", None),
             ("1..2h", None),
             ("-0", Some(0)),
+            // Go accepts a bare `.` after digits (go1.26 verifies
+            // `time.ParseDuration("1.h") == 1h`); the f64 scan matches.
+            ("1.h", Some(3_600_000_000_000)),
+            (".5h", Some(1_800_000_000_000)),
         ] {
             assert_eq!(parse_go_duration(raw), want, "raw {raw:?}");
         }

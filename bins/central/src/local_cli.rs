@@ -3,8 +3,9 @@
 //! `doctor` (the host-prerequisite check runs for real — it owns no
 //! backend), `init` (grammar only; the helper side is T6), `prepare`
 //! (flag grammar only; the helper call fails closed), and the
-//! `up`/`down`/`status` lifecycle trio (no lifecycle client is
-//! installed yet — upstream's nil-client branch).
+//! `up`/`down`/`status` lifecycle trio — the real binary always
+//! installs a lifecycle client, so a helper-less host is upstream's
+//! `helper: dial:` failure branch.
 //!
 //! Every other registered `local` id — `local.browser.open`,
 //! `local.trust.install`, `local.security-update`, `local.wipe`,
@@ -38,7 +39,7 @@ pub(crate) fn local(
         "local.doctor.prerequisites" => run_doctor(stdout, stderr),
         "local.init" => run_init(tokens, stdout, stderr),
         "local.up" | "local.down" | "local.status" => {
-            run_lifecycle_unavailable(command_id, stdout, stderr)
+            run_lifecycle_dial_failure(command_id, stdout, stderr)
         }
         "local.prepare" => run_prepare(command_id, tokens, stdout, stderr),
         _ => emit(
@@ -215,10 +216,18 @@ fn run_init(tokens: &[String], stdout: &mut impl Write, stderr: &mut impl Write)
 
 // -- `local up|down|status` ----------------------------------------------
 
-/// Ports the nil-`lifecycleClient` branch of `runLifecycle`: the
-/// lifecycle service is owned by the helper side (T6/T14), so every
-/// lifecycle verb fails closed identically.
-fn run_lifecycle_unavailable(
+/// Ports the observable `runLifecycle` outcome on a helper-less host
+/// (`internal/command/lifecycle.go`). Upstream's real binary installs
+/// a lifecycle client unconditionally (`deferredModeComposition`), so
+/// the nil-client `LIFECYCLE_SERVICE_UNAVAILABLE` branch is
+/// unreachable there: the helper socket dial fails with
+/// `helper: dial: …`, which `lifecycleSafeNextAction` maps to
+/// `START_CENTRAL_HELPER` under `LIFECYCLE_EXECUTION_FAILED` at exit
+/// 5 — the pair `cli_exit_status_test.go` pins for "local status
+/// without a helper". The failed call's zero-valued result fields
+/// (operation/receipt/phase/state/reason_code) stay omitted, exactly
+/// like upstream's `omitempty` details.
+fn run_lifecycle_dial_failure(
     command_id: &str,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
@@ -228,9 +237,9 @@ fn run_lifecycle_unavailable(
         stdout,
         stderr,
         ExitClass::Incompatible,
-        Some("LIFECYCLE_SERVICE_UNAVAILABLE"),
+        Some("LIFECYCLE_EXECUTION_FAILED"),
         Some(serde_json::json!({
-            "safe_next_action": "INSTALL_LIFECYCLE_SERVICE",
+            "safe_next_action": "START_CENTRAL_HELPER",
         })),
     )
 }
@@ -519,17 +528,34 @@ mod tests {
     // -- lifecycle --------------------------------------------------------
 
     #[test]
-    fn lifecycle_verbs_fail_closed_exit_5() {
+    fn lifecycle_verbs_report_the_helper_dial_failure_exit_5() {
+        // The pair the real binary emits on a helper-less host:
+        // LIFECYCLE_EXECUTION_FAILED + START_CENTRAL_HELPER (upstream
+        // cli_exit_status_test.go, "local status without a helper").
         for id in ["local.up", "local.down", "local.status"] {
             let (code, stdout, _) = invoke(id, &[]);
             assert_eq!(code, 5, "id {id}");
             let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
             assert_eq!(parsed["command_id"], id);
-            assert_eq!(parsed["reason"], "LIFECYCLE_SERVICE_UNAVAILABLE");
+            assert_eq!(parsed["reason"], "LIFECYCLE_EXECUTION_FAILED");
             assert_eq!(
                 parsed["details"]["safe_next_action"],
-                "INSTALL_LIFECYCLE_SERVICE"
+                "START_CENTRAL_HELPER"
             );
+            // Zero-valued result fields stay omitted (upstream's
+            // LifecycleDetails are all omitempty).
+            for field in [
+                "operation_id",
+                "receipt_id",
+                "phase",
+                "state",
+                "reason_code",
+            ] {
+                assert!(
+                    parsed["details"].get(field).is_none(),
+                    "id {id} leaks {field}"
+                );
+            }
         }
     }
 

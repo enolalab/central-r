@@ -14,8 +14,8 @@
 //! resume|rerun|cancel` (R3 task 13) are the landed verbs. R5 owns
 //! the `local` census: `doctor` runs the real host check, `init`
 //! parses the four grammar forms, `prepare` parses its flag grammar,
-//! and `up`/`down`/`status` fail closed at the not-installed
-//! lifecycle-service branch — while `grant`, `attest`, `broker serve`,
+//! and `up`/`down`/`status` report upstream's helper-dial failure —
+//! while `grant`, `attest`, `broker serve`,
 //! and the three protected modes reach argv-exact skeletons that fail
 //! closed at upstream's not-ready exits until T6/T8/T9/T13 land.
 //! Every remaining registered command emits the schema-valid
@@ -172,9 +172,9 @@ fn dispatch(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -
     let command_id = resolve_command_id(args);
     // Tokens after the `<verb> <sub>` pair — upstream `args[3:]`.
     let tokens = if args.len() > 2 { &args[2..] } else { &[][..] };
-    if command_id == "serve" {
-        return serve::serve(tokens, stdout, stderr);
-    }
+    // `serve` resolves Mode::Serve before dispatch runs, so its
+    // registry row is upstream-census documentation only — there is
+    // no dispatch arm for it.
     if command_id.starts_with("harness.") {
         return harness_cli::harness(command_id, tokens, stdout, stderr);
     }
@@ -380,10 +380,10 @@ mod tests {
             let (code, stdout, _) = invoke(argv);
             assert_eq!(code, 5, "argv {argv:?}");
             let parsed = parse_envelope(&stdout);
-            assert_eq!(parsed["reason"], "LIFECYCLE_SERVICE_UNAVAILABLE");
+            assert_eq!(parsed["reason"], "LIFECYCLE_EXECUTION_FAILED");
             assert_eq!(
                 parsed["details"]["safe_next_action"],
-                "INSTALL_LIFECYCLE_SERVICE"
+                "START_CENTRAL_HELPER"
             );
         }
 

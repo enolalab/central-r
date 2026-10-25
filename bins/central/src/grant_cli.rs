@@ -122,7 +122,11 @@ fn pre_instance_issue_kind(args: &[String]) -> Option<String> {
     if args.first().map(String::as_str) != Some("issue") {
         return None;
     }
-    parse_grant_issue_flags(&args[1..]).ok().map(|f| f.kind)
+    // Upstream passes io.Discard here — the probe must not spray flag
+    // errors or the usage block at the operator during env resolution.
+    parse_grant_issue_flags(&args[1..], &mut std::io::sink())
+        .ok()
+        .map(|f| f.kind)
 }
 
 /// Ports `grantDispatch`: usage/unknown-subcommand at exit 2, the
@@ -139,7 +143,7 @@ fn grant_dispatch(
         return ExitClass::Usage.code();
     }
     let result = match args[0].as_str() {
-        "issue" => grant_issue(env, &args[1..], stdout),
+        "issue" => grant_issue(env, &args[1..], stdout, stderr),
         "mode" => grant_mode(env, &args[1..]),
         "list" => grant_list(env, stdout),
         other => {
@@ -165,17 +169,41 @@ struct GrantIssueFlags {
     replace: bool,
 }
 
-fn parse_grant_issue_flags(args: &[String]) -> Result<GrantIssueFlags, String> {
+fn parse_grant_issue_flags(
+    args: &[String],
+    err_out: &mut impl Write,
+) -> Result<GrantIssueFlags, String> {
     // Upstream ignores leftover positionals — `fs.Parse` leaves them
-    // in `fs.Args()` and `grantIssue` never inspects it.
+    // in `fs.Args()` and `grantIssue` never inspects it. `err_out` is
+    // the FlagSet output: flag.ContinueOnError writes the failf line
+    // plus the `Usage of grant issue:` defaults block there before
+    // the caller's `grant: usage:` line.
     let (values, _positionals) = modes::parse_go_flags(
         args,
+        "grant issue",
         &[
-            ("kind", modes::GoFlag::Value),
-            ("operation", modes::GoFlag::Value),
-            ("ttl", modes::GoFlag::Duration),
-            ("replace", modes::GoFlag::Bool),
+            (
+                "kind",
+                modes::GoFlag::Value,
+                "ceremony kind: lifecycle, prepare, migration_reset, restore_apply, restore_abandon, wipe, backup_export, backup_import, backup_delete, backup_prune, security_rescue, init",
+            ),
+            (
+                "operation",
+                modes::GoFlag::Value,
+                "exact operation id the grant is for (required for migration_reset, restore_* and backup_prune)",
+            ),
+            (
+                "ttl",
+                modes::GoFlag::Duration,
+                "how long the grant stays spendable (default 1h, 15m for init; max 24h)",
+            ),
+            (
+                "replace",
+                modes::GoFlag::Bool,
+                "revoke the pending init grant and issue a new one (init only)",
+            ),
         ],
+        err_out,
     )?;
     Ok(GrantIssueFlags {
         kind: values.get("kind").cloned().unwrap_or_default(),
@@ -197,8 +225,9 @@ fn grant_issue(
     env: &GrantEnv,
     args: &[String],
     _stdout: &mut impl Write,
+    stderr: &mut impl Write,
 ) -> Result<(), GrantError> {
-    let flags = parse_grant_issue_flags(args).map_err(GrantError::Usage)?;
+    let flags = parse_grant_issue_flags(args, stderr).map_err(GrantError::Usage)?;
     // Upstream ParseGrantKind trims before matching and quotes the
     // untrimmed raw value in the error.
     if !GRANT_KINDS.contains(&flags.kind.trim()) {
@@ -252,10 +281,23 @@ fn grant_issue_init(env: &GrantEnv, flags: &GrantIssueFlags) -> Result<(), Grant
     }
 }
 
-/// Light stand-in for genesis `state()`: absent when both instance
-/// roots are missing or empty; broken when either exists but cannot
-/// be read; present otherwise. Full ownership/mode classification is
-/// T8's real `genesisEnv.state`.
+/// Stand-in for genesis `state()` (`local_init_genesis_linux.go`)
+/// classified like upstream's `genesisState`: absent/present/broken.
+/// Every pre-instance check that needs no instance loader runs
+/// verbatim through the shared `modes` probes — ancestors
+/// missing-or-root-owned-not-writable, the protected root
+/// missing-or-exactly-root:root-0700, each instances root
+/// missing-or-root:root-0700 — plus upstream's consistency rules:
+/// protected-without-state is broken, and a state instance with no
+/// protected counterpart is broken (its `productionBrokerRootAt`
+/// check could never pass).
+///
+/// Residual: a non-empty state root AND a non-empty protected root is
+/// reported `present` where upstream still runs `presentRecord` — the
+/// composition loader, the active dependency receipt, and the genesis
+/// record are T8/T13 machinery. A non-empty-but-unresolvable pair
+/// reads `present` here where upstream says `broken`; both refuse at
+/// exit 6 either way, so only the adjective in the refusal differs.
 enum GenesisProbe {
     Absent,
     Present,
@@ -273,25 +315,34 @@ impl std::fmt::Display for GenesisProbe {
 }
 
 fn probe_genesis_state() -> GenesisProbe {
-    let mut saw_entry = false;
-    for root in [
-        "/var/lib/central-state/v1/instances",
-        "/var/lib/central-protected/v1/instances",
-    ] {
-        match std::fs::read_dir(root) {
-            Ok(mut entries) => {
-                if entries.next().is_some() {
-                    saw_entry = true;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return GenesisProbe::Broken,
+    use modes::{
+        GENESIS_ANCESTORS, GENESIS_PROTECTED_INSTANCES, GENESIS_PROTECTED_ROOT,
+        GENESIS_STATE_INSTANCES, empty_genesis_root_or_missing, genesis_ancestor_ok,
+        genesis_dir_missing_or_root_0700,
+    };
+    for path in GENESIS_ANCESTORS {
+        if !genesis_ancestor_ok(path) {
+            return GenesisProbe::Broken;
         }
     }
-    if saw_entry {
-        GenesisProbe::Present
-    } else {
-        GenesisProbe::Absent
+    if !genesis_dir_missing_or_root_0700(GENESIS_PROTECTED_ROOT) {
+        return GenesisProbe::Broken;
+    }
+    let state_empty = match empty_genesis_root_or_missing(GENESIS_STATE_INSTANCES) {
+        Some(empty) => empty,
+        None => return GenesisProbe::Broken,
+    };
+    let protected_empty = match empty_genesis_root_or_missing(GENESIS_PROTECTED_INSTANCES) {
+        Some(empty) => empty,
+        None => return GenesisProbe::Broken,
+    };
+    match (state_empty, protected_empty) {
+        (true, true) => GenesisProbe::Absent,
+        // "protected state … has no state instance" and the converse
+        // (the instance's protected root could not resolve) are both
+        // upstream's broken branch.
+        (true, false) | (false, true) => GenesisProbe::Broken,
+        (false, false) => GenesisProbe::Present,
     }
 }
 
@@ -511,38 +562,81 @@ mod tests {
         }
     }
 
+    /// The `Usage of grant issue:` block Go's `flag.ContinueOnError`
+    /// FlagSet writes (failf + PrintDefaults) before `grantDispatch`'s
+    /// `grant: usage:` line — verbatim upstream spec order sorted by
+    /// flag name.
+    const ISSUE_USAGE: &str = concat!(
+        "Usage of grant issue:\n",
+        "  -kind string\n",
+        "    \tceremony kind: lifecycle, prepare, migration_reset, restore_apply, restore_abandon, wipe, backup_export, backup_import, backup_delete, backup_prune, security_rescue, init\n",
+        "  -operation string\n",
+        "    \texact operation id the grant is for (required for migration_reset, restore_* and backup_prune)\n",
+        "  -replace\n",
+        "    \trevoke the pending init grant and issue a new one (init only)\n",
+        "  -ttl value\n",
+        "    \thow long the grant stays spendable (default 1h, 15m for init; max 24h)\n",
+    );
+
     #[test]
     fn issue_flag_parse_errors_are_usage() {
-        for (args, want) in [
+        // flag_err entries additionally expect the failf line plus the
+        // usage block before the dispatcher's `grant: usage:` line.
+        for (args, flag_err, tail) in [
             (
                 vec!["issue", "--bogus"],
+                Some("flag provided but not defined: -bogus"),
                 "grant: usage: flag provided but not defined: -bogus\n",
             ),
             (
                 vec!["issue", "--ttl", "bogus"],
+                Some("invalid value \"bogus\" for flag -ttl: time: invalid duration \"bogus\""),
                 "grant: usage: invalid value \"bogus\" for flag -ttl: time: invalid duration \"bogus\"\n",
             ),
             (
                 vec!["issue", "--kind"],
+                Some("flag needs an argument: -kind"),
                 "grant: usage: flag needs an argument: -kind\n",
             ),
             // Positionals are ignored upstream — `issue positional`
             // fails the empty kind check instead.
             (
                 vec!["issue", "positional"],
+                None,
                 "grant: usage: grant: unknown kind \"\"\n",
             ),
             (
                 vec!["issue", "--kind", "bogus"],
+                None,
                 "grant: usage: grant: unknown kind \"bogus\"\n",
             ),
             // Missing --kind parses fine but fails the kind check.
-            (vec!["issue"], "grant: usage: grant: unknown kind \"\"\n"),
+            (
+                vec!["issue"],
+                None,
+                "grant: usage: grant: unknown kind \"\"\n",
+            ),
         ] {
             let (code, _, stderr) = dispatch(GrantEnv::Production, &args);
             assert_eq!(code, 2, "args {args:?}");
+            let want = match flag_err {
+                Some(err) => format!("{err}\n{ISSUE_USAGE}{tail}"),
+                None => tail.to_string(),
+            };
             assert_eq!(stderr, want, "args {args:?}");
         }
+    }
+
+    #[test]
+    fn issue_help_prints_usage_and_help_requested() {
+        // `-h`/`--help` undefined: Go prints the usage block with no
+        // error line, then ErrHelp reaches the `grant: usage:` wrap.
+        let (code, _, stderr) = dispatch(GrantEnv::Production, &["issue", "--help"]);
+        assert_eq!(code, 2);
+        assert_eq!(
+            stderr,
+            format!("{ISSUE_USAGE}grant: usage: flag: help requested\n")
+        );
     }
 
     #[test]

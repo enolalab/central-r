@@ -96,7 +96,9 @@ aws-config = { version = "=1.13.0", default-features = false }
 sha2 = "=0.11.1"
 sha1 = "=0.10.7"
 
-# central-adapter-linux + launcher/protected-execution-mode binaries only
+# central-adapter-linux + launcher/protected-execution-mode binaries,
+# including bins/central (which hosts the --helper/--broker/
+# --sandbox-launcher protected modes and their uid/os probes)
 rustix = { version = "=1.1.5", features = ["fs", "net", "process", "shm", "mm"] }
 
 # Cryptography — broker, advisory verification, CSRF/session/approval binding
