@@ -671,6 +671,7 @@ dependencies = [
  "central-task",
  "central-transport-http",
  "central-workflow",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.1",

@@ -1,20 +1,28 @@
 //! `central` — the main CLI and serving binary (rust-application-
 //! boundaries.md §2.1/§3.2).
 //!
+//! Mode resolution ports `cmd/central/modes.go`: the daemon flags
+//! (`--helper`, `--broker`, `--sandbox-launcher`, `--archguard`,
+//! `--slice-a-verify`) win anywhere in argv, then the `verb`/`sub`
+//! grammar selects Doctor/Init/Migrate/Serve/Bootstrap/BrokerServe/
+//! Grant/Attest/Version, and everything else is a registry dispatch.
+//! Privilege and `LISTEN_FDS` gates run before any handler.
+//!
 //! `central artifact read` (Phase R4 task 7), `central checkpoint *`
-//! (Phase R4 task 8), and `central node decide` (Phase R4 task 9) are
-//! the landed verbs — `artifact_cli` owns its envelope and the
-//! `--stdout` byte plane end to end, `checkpoint_cli` owns the
-//! checkpoint verb surface end to end, `node_cli` owns the
-//! operator-decision verb end to end. Every command owned by
-//! a not-yet-landed R-slice — `serve`, `local *`, `migrate *`,
-//! `backup *`, `restore *`, `run *`, `node *`, `maintenance *`,
-//! `bootstrap *`, `grant`, `attest`, `broker *`, and the protected
-//! execution modes — resolves to a schema-valid
-//! `UNSUPPORTED_IN_THIS_SLICE` result at exit `5` with no mutation
-//! (local-development-environment.md §11). A command that ends without
-//! a written result fails closed at exit `6`, matching upstream
-//! `cli.ResultExitCode`.
+//! (Phase R4 task 8), `central node decide` (Phase R4 task 9),
+//! `central run submit` (task 10), `central serve` and `harness
+//! resume|rerun|cancel` (R3 task 13) are the landed verbs. R5 owns
+//! the `local` census: `doctor` runs the real host check, `init`
+//! parses the four grammar forms, `prepare` parses its flag grammar,
+//! and `up`/`down`/`status` fail closed at the not-installed
+//! lifecycle-service branch — while `grant`, `attest`, `broker serve`,
+//! and the three protected modes reach argv-exact skeletons that fail
+//! closed at upstream's not-ready exits until T6/T8/T9/T13 land.
+//! Every remaining registered command emits the schema-valid
+//! `UNSUPPORTED_IN_THIS_SLICE` envelope at exit `5` with no mutation;
+//! anything outside the closed grammar is `unknown`. A command that
+//! ends without a written result fails closed at exit `6`, matching
+//! upstream `cli.ResultExitCode`.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -25,7 +33,10 @@ use central_kernel::lifecycle;
 
 mod artifact_cli;
 mod checkpoint_cli;
+mod grant_cli;
 mod harness_cli;
+mod local_cli;
+mod modes;
 mod node_cli;
 mod run_cli;
 mod serve;
@@ -38,72 +49,155 @@ fn main() -> ExitCode {
 }
 
 /// Dispatches one operator invocation and returns the process exit
-/// status. Every result path writes exactly one envelope; a write
-/// failure collapses to [`ExitClass::Terminal`] so the exit status never
-/// looks like a success the envelope did not record.
+/// status. Mode gates run first — upstream `main()` checks privilege
+/// then socket activation before any handler runs — and mode-owned
+/// surfaces (`--helper`, `grant`, `broker serve`, …) bypass the
+/// command registry entirely. Everything else resolves through the
+/// closed command table; unregistered grammar is the `unknown`
+/// envelope.
 fn run(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
-    match resolve(args) {
-        Resolution::Version => {
+    let mode = modes::resolve_mode(args);
+    if let Err(msg) = modes::check_privilege_for_uid(mode, modes::current_uid()) {
+        let _ = writeln!(stderr, "authority denied: {msg}");
+        return ExitClass::Denied.code();
+    }
+    let listen_fds = std::env::var("LISTEN_FDS").ok().filter(|v| !v.is_empty());
+    if let Err(msg) = modes::check_socket_activation(mode, listen_fds.as_deref()) {
+        let _ = writeln!(stderr, "dependency unavailable: {msg}");
+        return ExitClass::Unavailable.code();
+    }
+    match mode {
+        modes::Mode::Version => {
             match writeln!(stdout, "{{\"version\":{:?}}}", env!("CARGO_PKG_VERSION")) {
                 Ok(()) => ExitClass::Success.code(),
                 Err(err) => write_io_failure(stderr, &err),
             }
         }
-        Resolution::Command(command_id) => {
-            // The landed slices own their envelopes end to end:
-            // `serve`, `harness resume|rerun|cancel`, `artifact read`
-            // (plus its `--stdout` byte ownership), every
-            // `checkpoint *` verb, `node decide`, and `run submit`.
-            if command_id == "serve" {
-                return serve::serve(&verb_tokens(args), stdout, stderr);
-            }
-            if command_id.starts_with("harness.") {
-                return harness_cli::harness(&command_id, &verb_tokens(args), stdout, stderr);
-            }
-            if command_id == "artifact.read" {
-                return artifact_cli::artifact_read(&verb_tokens(args), stdout, stderr);
-            }
-            if command_id.starts_with("checkpoint.") {
-                return checkpoint_cli::checkpoint(&command_id, &verb_tokens(args), stdout, stderr);
-            }
-            if command_id.starts_with("node.") {
-                return node_cli::node(&command_id, &verb_tokens(args), stdout, stderr);
-            }
-            if command_id.starts_with("run.") {
-                return run_cli::run(&command_id, &verb_tokens(args), stdout, stderr);
-            }
-            let result = LocalResult::unsupported(command_id);
-            match result.write_json_line(stdout) {
-                Ok(()) => result.exit_code,
-                Err(err) => write_io_failure(stderr, &err),
-            }
-        }
+        modes::Mode::Helper => modes::run_helper_daemon(stderr),
+        modes::Mode::Broker => modes::run_broker_daemon(stderr),
+        modes::Mode::BrokerServe => modes::run_broker_serve(&args[2..], stderr),
+        modes::Mode::SandboxLauncher => modes::run_sandbox_daemon(stderr),
+        modes::Mode::ArchGuard => modes::run_archguard(stdout, stderr),
+        modes::Mode::Verify => modes::run_slice_a_verify(stderr),
+        modes::Mode::Grant => grant_cli::grant(&args[1..], stdout, stderr),
+        modes::Mode::Attest => modes::run_attest(&args[1..], stdout, stderr),
+        // Upstream `runCentralServe` bypasses Dispatch — `central
+        // serve <anything>` runs the server entry point.
+        modes::Mode::Serve => serve::serve(&args[1..], stdout, stderr),
+        modes::Mode::Doctor
+        | modes::Mode::Init
+        | modes::Mode::Migrate
+        | modes::Mode::Bootstrap
+        | modes::Mode::Deferred
+        | modes::Mode::Unknown => dispatch(args, stdout, stderr),
     }
 }
 
-/// Returns the raw argv tokens following the `<noun> <verb>` pair —
-/// flags included, in original order (upstream `args[3:]`). Global
-/// `--config <value>` pairs are consumed without becoming tokens.
-fn verb_tokens(args: &[String]) -> Vec<String> {
-    let mut skip_value = false;
-    let mut positional_seen = 0usize;
-    for (index, arg) in args.iter().enumerate() {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        match arg.as_str() {
-            "--config" => skip_value = true,
-            _ if arg.starts_with('-') => {}
-            _ => {
-                positional_seen += 1;
-                if positional_seen == 2 {
-                    return args[index + 1..].to_vec();
-                }
-            }
-        }
+/// The closed command grammar — the `(verb, subcommand)` pairs of
+/// upstream `internal/command/registry.go` resolved by
+/// `internal/command/dispatch.go`'s first-match `resolve` (entries
+/// sharing a pair collapse onto the first registry id, e.g.
+/// `local security rescue cleanup` → `local.security-update` and
+/// `local init --status` → `local.init`, whose flag form is then
+/// re-derived inside `runInit`). `checkpoint show` and the `harness`
+/// verbs are the Rust side's deliberate additions — they landed in
+/// earlier slices and stay registered so the census covers them.
+/// Anything outside the table resolves `unknown`, upstream's
+/// Dispatch fallback.
+const COMMAND_REGISTRY: &[(&str, &str, &str)] = &[
+    ("local", "doctor", "local.doctor.prerequisites"),
+    ("local", "init", "local.init"),
+    ("local", "security", "local.security-update"),
+    ("local", "prepare", "local.prepare"),
+    ("local", "up", "local.up"),
+    ("local", "down", "local.down"),
+    ("local", "status", "local.status"),
+    ("local", "browser", "local.browser.open"),
+    ("local", "trust", "local.trust.install"),
+    ("migrate", "up", "migrate-up"),
+    ("migrate", "verify", "migrate-verify"),
+    ("migrate", "status", "migrate-status"),
+    ("migrate", "resume", "migrate-resume"),
+    ("migrate", "reset", "migrate-reset"),
+    ("serve", "", "serve"),
+    ("bootstrap", "show", "bootstrap.show"),
+    ("backup", "create", "backup.create"),
+    ("backup", "verify", "backup.verify"),
+    ("backup", "status", "backup.status"),
+    ("restore", "verify", "restore.verify"),
+    ("restore", "apply", "restore.apply"),
+    ("restore", "resume", "restore.resume"),
+    ("restore", "abandon", "restore.abandon"),
+    ("local", "wipe", "local.wipe"),
+    ("backup", "export", "backup.export"),
+    ("backup", "import", "backup.import"),
+    ("backup", "delete", "backup.delete"),
+    ("backup", "prune", "backup.prune.plan"),
+    ("local", "audit", "local.audit"),
+    ("local", "dependency", "local.dependency-upgrade-plan"),
+    ("maintenance", "plan", "maintenance.plan"),
+    ("maintenance", "apply", "maintenance.apply"),
+    ("artifact", "read", "artifact.read"),
+    ("checkpoint", "create", "checkpoint.create"),
+    ("checkpoint", "resume", "checkpoint.resume"),
+    ("checkpoint", "gc", "checkpoint.gc"),
+    ("checkpoint", "pin", "checkpoint.pin"),
+    ("checkpoint", "unpin", "checkpoint.unpin"),
+    ("checkpoint", "list", "checkpoint.list"),
+    ("node", "decide", "node.decide"),
+    ("run", "submit", "run.submit"),
+    ("checkpoint", "show", "checkpoint.show"),
+    ("harness", "resume", "harness.resume"),
+    ("harness", "rerun", "harness.rerun"),
+    ("harness", "cancel", "harness.cancel"),
+];
+
+/// First-match `(verb, subcommand)` resolution — upstream
+/// `resolve(verb, subcmd)` over the registry table. `sub` is exactly
+/// the one token after the verb (`args[2]` upstream).
+fn resolve_command_id(args: &[String]) -> &'static str {
+    let verb = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.get(1).map(String::as_str).unwrap_or("");
+    COMMAND_REGISTRY
+        .iter()
+        .find(|(v, s, _)| *v == verb && *s == sub)
+        .map(|(_, _, id)| *id)
+        .unwrap_or("unknown")
+}
+
+/// Registry dispatch — upstream `Dispatch`: the landed slices own
+/// their envelopes end to end; every other registered command id
+/// emits the deferred envelope.
+fn dispatch(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
+    let command_id = resolve_command_id(args);
+    // Tokens after the `<verb> <sub>` pair — upstream `args[3:]`.
+    let tokens = if args.len() > 2 { &args[2..] } else { &[][..] };
+    if command_id == "serve" {
+        return serve::serve(tokens, stdout, stderr);
     }
-    Vec::new()
+    if command_id.starts_with("harness.") {
+        return harness_cli::harness(command_id, tokens, stdout, stderr);
+    }
+    if command_id == "artifact.read" {
+        return artifact_cli::artifact_read(tokens, stdout, stderr);
+    }
+    if command_id.starts_with("checkpoint.") {
+        return checkpoint_cli::checkpoint(command_id, tokens, stdout, stderr);
+    }
+    if command_id.starts_with("node.") {
+        return node_cli::node(command_id, tokens, stdout, stderr);
+    }
+    if command_id.starts_with("run.") {
+        return run_cli::run(command_id, tokens, stdout, stderr);
+    }
+    if command_id.starts_with("local.") {
+        return local_cli::local(command_id, tokens, stdout, stderr);
+    }
+    let result = LocalResult::unsupported(command_id);
+    match result.write_json_line(stdout) {
+        Ok(()) => result.exit_code,
+        Err(err) => write_io_failure(stderr, &err),
+    }
 }
 
 /// Fails closed on a result that could not be written: upstream's rule
@@ -114,173 +208,6 @@ fn write_io_failure(stderr: &mut impl Write, err: &std::io::Error) -> u8 {
         "central_result_write_failed",
         err.to_string(),
     )))
-}
-
-enum Resolution {
-    Version,
-    Command(String),
-}
-
-/// Resolves argv (minus argv[0]) to a version print or the canonical
-/// `command_id` for the deferred envelope.
-fn resolve(args: &[String]) -> Resolution {
-    // `--version`/`-V` wins only as the sole argument or while it still
-    // precedes the first positional verb — `central serve --version`
-    // must reach the deferred `serve` command, not print the version.
-    // `--config` consumes its value before the scan continues.
-    let mut skip_value = false;
-    for arg in args {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        match arg.as_str() {
-            "--config" => skip_value = true,
-            "--version" | "-V" => return Resolution::Version,
-            _ if !arg.starts_with('-') => break,
-            _ => {}
-        }
-    }
-
-    // Global flags are consumed without affecting command identity; the
-    // daemon-mode flags resolve to fixed mode command ids.
-    let mut positional: Vec<&str> = Vec::new();
-    let mut flags: Vec<&str> = Vec::new();
-    let mut skip_value = false;
-    for arg in args {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        match arg.as_str() {
-            "--config" => skip_value = true,
-            "--helper" => return Resolution::Command("helper".to_string()),
-            "--broker" => return Resolution::Command("broker".to_string()),
-            "--sandbox-launcher" => {
-                return Resolution::Command("sandbox-launcher".to_string());
-            }
-            "--archguard" => return Resolution::Command("archguard".to_string()),
-            "--slice-a-verify" => return Resolution::Command("slice-a-verify".to_string()),
-            _ => {
-                if let Some(flag) = arg.strip_prefix("--") {
-                    flags.push(flag);
-                } else {
-                    positional.push(arg.as_str());
-                }
-            }
-        }
-    }
-
-    let Some(&verb) = positional.first() else {
-        return Resolution::Command("unknown".to_string());
-    };
-    if verb == "version" {
-        return Resolution::Version;
-    }
-    Resolution::Command(command_id(verb, &positional[1..], &flags))
-}
-
-/// True when `flag` was passed either bare (`--status`) or with a value
-/// (`--resume=<id>`), mirroring the upstream flag-sensitive command ids.
-fn has_flag(flags: &[&str], flag: &str) -> bool {
-    flags
-        .iter()
-        .any(|f| *f == flag || f.starts_with(&format!("{flag}=")))
-}
-
-/// The canonical `command_id` for a deferred command, matching the
-/// upstream command registry ids where they exist (`internal/command/
-/// registry.go`) and a deterministic `<verb>[.<sub>]` derivation
-/// otherwise.
-fn command_id(verb: &str, rest: &[&str], flags: &[&str]) -> String {
-    let sub = rest.first().copied();
-    match (verb, sub) {
-        ("serve", _) => "serve".to_string(),
-        ("local", Some("init")) => {
-            if has_flag(flags, "status") {
-                "local.init.status".to_string()
-            } else if has_flag(flags, "resume") {
-                "local.init.resume".to_string()
-            } else if has_flag(flags, "abandon") {
-                "local.init.abandon".to_string()
-            } else {
-                "local.init".to_string()
-            }
-        }
-        ("local", Some("doctor")) => {
-            if has_flag(flags, "host-prerequisites") {
-                "local.doctor.prerequisites".to_string()
-            } else {
-                "local.doctor".to_string()
-            }
-        }
-        ("local", Some("security")) => match rest.get(1).copied() {
-            Some("update") => "local.security-update".to_string(),
-            Some("rescue") => {
-                if rest.get(2).copied() == Some("cleanup") {
-                    "local.security-rescue-cleanup".to_string()
-                } else {
-                    "local.security-rescue".to_string()
-                }
-            }
-            other => format!("local.security.{}", other.unwrap_or("status")),
-        },
-        ("local", Some("dependency")) => match (rest.get(1).copied(), rest.get(2).copied()) {
-            (Some("upgrade"), Some("plan")) => "local.dependency-upgrade-plan".to_string(),
-            (Some("upgrade"), Some("apply")) => "local.dependency-upgrade-apply".to_string(),
-            _ => "local.dependency".to_string(),
-        },
-        ("local", Some("browser")) => match rest.get(1).copied() {
-            Some(action) => format!("local.browser.{action}"),
-            None => "local.browser".to_string(),
-        },
-        ("local", Some("trust")) => match rest.get(1).copied() {
-            Some(action) => format!("local.trust.{action}"),
-            None => "local.trust".to_string(),
-        },
-        ("local", Some("tls")) => match rest.get(1).copied() {
-            Some(action) => format!("local.tls.{action}"),
-            None => "local.tls".to_string(),
-        },
-        ("local", Some(sub)) => format!("local.{sub}"),
-        ("local", None) => "local".to_string(),
-        ("migrate", Some(sub)) => format!("migrate-{sub}"),
-        ("migrate", None) => "migrate".to_string(),
-        ("backup", Some("prune")) => match rest.get(1).copied() {
-            Some("plan") => "backup.prune.plan".to_string(),
-            Some("apply") => "backup.prune.apply".to_string(),
-            _ => "backup.prune".to_string(),
-        },
-        ("backup", Some(sub)) => format!("backup.{sub}"),
-        ("backup", None) => "backup".to_string(),
-        ("restore", Some(sub)) => format!("restore.{sub}"),
-        ("restore", None) => "restore".to_string(),
-        ("run", Some(sub)) => format!("run.{sub}"),
-        ("run", None) => "run".to_string(),
-        ("node", Some(sub)) => format!("node.{sub}"),
-        ("node", None) => "node".to_string(),
-        ("checkpoint", Some(sub)) => format!("checkpoint.{sub}"),
-        ("checkpoint", None) => "checkpoint".to_string(),
-        ("artifact", Some(sub)) => format!("artifact.{sub}"),
-        ("artifact", None) => "artifact".to_string(),
-        // R3 task 13: `harness resume|rerun|cancel` are the landed
-        // verb ids; anything else under `harness` keeps the
-        // deterministic derivation and stays fail-closed.
-        ("harness", Some(sub)) => format!("harness.{sub}"),
-        ("harness", None) => "harness".to_string(),
-        ("maintenance", Some(sub)) => format!("maintenance.{sub}"),
-        ("maintenance", None) => "maintenance".to_string(),
-        ("bootstrap", Some(sub)) => format!("bootstrap.{sub}"),
-        ("bootstrap", None) => "bootstrap".to_string(),
-        ("grant", _) => "grant".to_string(),
-        ("attest", _) => "attest".to_string(),
-        ("broker", Some(sub)) => format!("broker.{sub}"),
-        ("broker", None) => "broker".to_string(),
-        ("helper", _) => "helper".to_string(),
-        ("central-protected-broker", _) => "central-protected-broker".to_string(),
-        ("central-sandbox-launcher", _) => "central-sandbox-launcher".to_string(),
-        _ => "unknown".to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -304,92 +231,91 @@ mod tests {
         )
     }
 
+    /// Non-root assumption for the operator-mode assertions — the
+    /// privilege gate is exercised directly through
+    /// `modes::check_privilege_for_uid`; a root test run sees the
+    /// denied branch instead and these cases skip like upstream's
+    /// `os.Getuid() == 0` skips.
+    fn non_root() -> bool {
+        modes::current_uid() != 0
+    }
+
+    fn parse_envelope(stdout: &str) -> serde_json::Value {
+        serde_json::from_str(stdout.trim_end()).unwrap()
+    }
+
     #[test]
     fn version_prints_one_json_line_and_exits_0() {
+        // Upstream has only the `version` verb — `--version`/`-V` were
+        // never registered and resolve `unknown` like any other flag.
+        let (code, stdout, _) = invoke(&["version"]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            stdout,
+            format!("{{\"version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"))
+        );
         for argv in [
             &["--version"][..],
             &["-V"][..],
-            &["version"][..],
-            &["--config", "/abs/central.json", "--version"][..],
+            &["--version", "serve"][..],
+            &["--config", "/abs/central.json", "version"][..],
         ] {
             let (code, stdout, _) = invoke(argv);
-            assert_eq!(code, 0, "argv {argv:?}");
+            assert_eq!(code, 5, "argv {argv:?}");
             assert_eq!(
-                stdout,
-                format!("{{\"version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"))
+                parse_envelope(&stdout)["command_id"],
+                "unknown",
+                "argv {argv:?}"
             );
         }
     }
 
     #[test]
-    fn version_flag_after_a_positional_verb_reaches_the_command() {
-        // `central serve --version` is a `serve` invocation, not a
-        // version print — the flag belongs to the command (upstream
-        // `runCentralServe` takes no flags). Without the runtime env
-        // serve refuses at exit 3, never a version print and never
-        // the deferred-verb placeholder.
-        for argv in [&["serve", "--version"][..], &["serve", "-V"][..]] {
+    fn serve_mode_owns_any_argv_after_the_verb() {
+        // `central serve --version`/`central serve extra` reach the
+        // server composition (upstream `runCentralServe` ignores
+        // trailing args) — never a version print, never `unknown`.
+        if !non_root() {
+            return;
+        }
+        for argv in [
+            &["serve", "--version"][..],
+            &["serve", "-V"][..],
+            &["serve", "extra"][..],
+        ] {
             let (code, stdout, _) = invoke(argv);
-            let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+            let parsed = parse_envelope(&stdout);
             assert_eq!(parsed["command_id"], "serve", "argv {argv:?}");
             assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE", "argv {argv:?}");
             assert_eq!(code, 3, "argv {argv:?}");
         }
-        let (code, stdout, _) = invoke(&["local", "up", "--version"]);
-        assert_eq!(code, 5);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
-        assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
     }
 
+    /// The complete registered census: every `(verb, sub)` pair in
+    /// COMMAND_REGISTRY must route — landed verbs to their modules,
+    /// the R5 `local` skeletons to their not-ready outcomes, and the
+    /// still-deferred commands to the exact exit-5 envelope.
     #[test]
-    fn version_flag_before_any_positional_verb_still_prints() {
-        for argv in [
-            &["--version", "serve"][..],
-            &["-V", "serve"][..],
-            &["--config", "/abs/central.json", "--version", "serve"][..],
-        ] {
-            let (code, stdout, _) = invoke(argv);
-            assert_eq!(code, 0, "argv {argv:?}");
-            assert_eq!(
-                stdout,
-                format!("{{\"version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION"))
-            );
+    fn every_registered_verb_is_reachable() {
+        if !non_root() {
+            return;
         }
-    }
-
-    #[test]
-    fn every_deferred_verb_fails_closed_at_exit_5() {
-        // The R2–R6-owned command surface plus representative flag-
-        // sensitive ids — all UNSUPPORTED_IN_THIS_SLICE until the owning
-        // slice lands (local-development-environment.md §11).
-        let cases: &[(&[&str], &str)] = &[
-            // `serve` and `harness resume|rerun|cancel` are landed
-            // (task 13): they route to their own composition and
-            // report their own unavailable reasons — covered by
-            // `serve_without_env_is_unavailable` and
-            // `harness_verbs_without_env_are_unavailable` below.
-            (&["local", "init"], "local.init"),
+        // Deferred commands: exact upstream envelope, no details.
+        let deferred: &[(&[&str], &str)] = &[
             (&["local", "init", "--status"], "local.init.status"),
             (&["local", "init", "--resume=abc"], "local.init.resume"),
-            (&["local", "init", "--abandon", "abc"], "local.init.abandon"),
-            (&["local", "doctor"], "local.doctor"),
-            (
-                &["local", "doctor", "--host-prerequisites"],
-                "local.doctor.prerequisites",
-            ),
-            (&["local", "prepare"], "local.prepare"),
-            (&["local", "up"], "local.up"),
-            (&["local", "down"], "local.down"),
-            (&["local", "status"], "local.status"),
+            (&["local", "init", "--abandon=abc"], "local.init.abandon"),
             (&["local", "wipe", "--target", "/x"], "local.wipe"),
             (&["local", "audit"], "local.audit"),
             (&["local", "browser", "open"], "local.browser.open"),
             (&["local", "trust", "install"], "local.trust.install"),
             (&["local", "security", "update"], "local.security-update"),
-            (&["local", "security", "rescue"], "local.security-rescue"),
+            // First-match collapse: every `local security *` form
+            // resolves to the first `local security` registry id.
+            (&["local", "security", "rescue"], "local.security-update"),
             (
                 &["local", "security", "rescue", "cleanup"],
-                "local.security-rescue-cleanup",
+                "local.security-update",
             ),
             (
                 &["local", "dependency", "upgrade", "plan"],
@@ -397,69 +323,34 @@ mod tests {
             ),
             (
                 &["local", "dependency", "upgrade", "apply"],
-                "local.dependency-upgrade-apply",
+                "local.dependency-upgrade-plan",
             ),
             (&["migrate", "up"], "migrate-up"),
             (&["migrate", "verify"], "migrate-verify"),
             (&["migrate", "status"], "migrate-status"),
             (&["migrate", "resume", "--operation=x"], "migrate-resume"),
+            (&["migrate", "reset"], "migrate-reset"),
             (&["backup", "create"], "backup.create"),
             (&["backup", "verify", "id"], "backup.verify"),
+            (&["backup", "status"], "backup.status"),
             (&["backup", "export"], "backup.export"),
             (&["backup", "import"], "backup.import"),
             (&["backup", "delete"], "backup.delete"),
             (&["backup", "prune", "plan"], "backup.prune.plan"),
-            (&["backup", "prune", "apply"], "backup.prune.apply"),
+            // First-match: `backup.prune.apply` is the shadowed entry.
+            (&["backup", "prune", "apply"], "backup.prune.plan"),
             (&["restore", "verify"], "restore.verify"),
             (&["restore", "apply"], "restore.apply"),
             (&["restore", "resume"], "restore.resume"),
             (&["restore", "abandon"], "restore.abandon"),
-            // `run submit` is landed (task 10): it routes to
-            // run_cli, which without the composition env reports
-            // RUN_UNAVAILABLE — still exit 5, never the deferred-verb
-            // placeholder. Covered by
-            // `run_submit_without_env_is_unavailable` below.
-            // `node decide` is landed (task 9): it routes to
-            // node_cli, which without the composition env reports
-            // NODE_UNAVAILABLE — still exit 5, never the deferred-verb
-            // placeholder. Covered by
-            // `node_decide_without_env_is_unavailable` below.
-            (&["node"], "node"),
-            // `checkpoint *` is landed (task 8): the verbs route to
-            // checkpoint_cli, which without the composition env
-            // reports CHECKPOINT_UNAVAILABLE — still exit 5, never the
-            // deferred-verb placeholder. Covered by
-            // `checkpoint_verbs_without_env_are_unavailable` below.
-            (&["checkpoint"], "checkpoint"),
             (&["maintenance", "plan"], "maintenance.plan"),
             (&["maintenance", "apply"], "maintenance.apply"),
             (&["bootstrap", "show"], "bootstrap.show"),
-            (&["grant", "admin"], "grant"),
-            (&["attest"], "attest"),
-            (&["broker", "serve"], "broker.serve"),
-            (&["helper"], "helper"),
-            (&["central-protected-broker"], "central-protected-broker"),
-            (&["central-sandbox-launcher"], "central-sandbox-launcher"),
-            (&["--helper"], "helper"),
-            (&["--broker"], "broker"),
-            (&["--sandbox-launcher"], "sandbox-launcher"),
-            (&["--archguard"], "archguard"),
-            (&["--slice-a-verify"], "slice-a-verify"),
-            (&[], "unknown"),
-            (&["frobnicate"], "unknown"),
-            (
-                &["--config", "/abs/central.json", "local", "up"],
-                "local.up",
-            ),
-            // `serve` is landed (task 13): it no longer sits in the
-            // deferred-verb table — the dedicated
-            // `serve_without_env_is_unavailable_at_exit_3` test below
-            // covers its exit-3 dependency refusal.
         ];
-        for (argv, want_id) in cases {
+        for (argv, want_id) in deferred {
             let (code, stdout, _) = invoke(argv);
             assert_eq!(code, 5, "argv {argv:?} must exit 5");
-            let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+            let parsed = parse_envelope(&stdout);
             assert_eq!(parsed["schema_version"], "central.local-result/v1");
             assert_eq!(parsed["command_id"], *want_id, "argv {argv:?}");
             assert_eq!(parsed["exit_code"], 5);
@@ -467,15 +358,206 @@ mod tests {
             assert!(parsed["timestamp"].is_string());
             assert!(parsed.get("details").is_none());
         }
+
+        // R5 local skeletons.
+        let (code, stdout, _) = invoke(&["local", "doctor"]);
+        assert_eq!(code, 0);
+        assert_eq!(
+            parse_envelope(&stdout)["command_id"],
+            "local.doctor.prerequisites"
+        );
+
+        let (code, stdout, stderr) = invoke(&["local", "init"]);
+        assert_eq!(code, 3);
+        assert_eq!(parse_envelope(&stdout)["reason"], "HELPER_UNAVAILABLE");
+        assert!(stderr.contains("systemctl start central-helper.socket"));
+
+        for argv in [
+            &["local", "up"][..],
+            &["local", "down"][..],
+            &["local", "status"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, 5, "argv {argv:?}");
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(parsed["reason"], "LIFECYCLE_SERVICE_UNAVAILABLE");
+            assert_eq!(
+                parsed["details"]["safe_next_action"],
+                "INSTALL_LIFECYCLE_SERVICE"
+            );
+        }
+
+        let (code, stdout, _) = invoke(&["local", "prepare"]);
+        assert_eq!(code, 7);
+        assert_eq!(parse_envelope(&stdout)["reason"], "PREPARE_FAILED");
+
+        // Landed commands route to their own modules (covered in
+        // detail by the dedicated tests below).
+        let (code, stdout, _) = invoke(&["serve"]);
+        assert_eq!(code, 3);
+        assert_eq!(parse_envelope(&stdout)["reason"], "DEPENDENCY_UNAVAILABLE");
+        let (code, stdout, _) = invoke(&["artifact", "read", "id"]);
+        assert_eq!(code, 5);
+        assert_eq!(
+            parse_envelope(&stdout)["reason"],
+            "ARTIFACT_READ_UNAVAILABLE"
+        );
+        let (code, stdout, _) = invoke(&["checkpoint", "list", "--run", "r"]);
+        assert_eq!(code, 5);
+        assert_eq!(parse_envelope(&stdout)["reason"], "CHECKPOINT_UNAVAILABLE");
+        let (code, stdout, _) = invoke(&["run", "submit"]);
+        assert_eq!(code, 5);
+        assert_eq!(parse_envelope(&stdout)["reason"], "RUN_UNAVAILABLE");
+        let (code, _, _) = invoke(&["harness", "resume"]);
+        assert_eq!(code, 2);
+    }
+
+    /// Grammar closure: anything the registry does not contain is the
+    /// `unknown` envelope at exit 5 — including bare nouns, unknown
+    /// subverbs under known nouns, and leading global flags upstream
+    /// never had (`--config`, `--version`).
+    #[test]
+    fn unregistered_grammar_is_unknown_at_exit_5() {
+        if !non_root() {
+            return;
+        }
+        for argv in [
+            &[][..],
+            &["frobnicate"][..],
+            &["local"][..],
+            &["local", "bogus"][..],
+            &["local", "tls", "inspect"][..],
+            &["migrate"][..],
+            &["migrate", "bogus"][..],
+            &["backup"][..],
+            &["backup", "bogus"][..],
+            &["restore"][..],
+            &["node"][..],
+            &["node", "bogus"][..],
+            &["run"][..],
+            &["run", "list"][..],
+            &["artifact"][..],
+            &["artifact", "bogus"][..],
+            &["checkpoint"][..],
+            &["checkpoint", "bogus"][..],
+            &["harness"][..],
+            &["harness", "status"][..],
+            &["maintenance"][..],
+            &["bootstrap"][..],
+            &["bootstrap", "bogus"][..],
+            &["broker"][..],
+            &["broker", "bogus"][..],
+            &["helper"][..],
+            &["central-protected-broker"][..],
+            &["central-sandbox-launcher"][..],
+            &["--config", "/abs/central.json", "local", "up"][..],
+            &["--bogus-flag"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, 5, "argv {argv:?}");
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(parsed["schema_version"], "central.local-result/v1");
+            assert_eq!(parsed["command_id"], "unknown", "argv {argv:?}");
+            assert_eq!(parsed["exit_code"], 5);
+            assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
+            assert!(parsed["timestamp"].is_string());
+            assert!(parsed.get("details").is_none());
+        }
+    }
+
+    /// The protected modes are reachable only through their exact
+    /// flag argv; as a non-root operator they deny at exit 7 before
+    /// any body runs, matching upstream `checkPrivilege`.
+    #[test]
+    fn protected_modes_require_exact_flag_and_root() {
+        if !non_root() {
+            return;
+        }
+        for (argv, uid_msg) in [
+            (&["--helper"][..], "--helper"),
+            (&["--broker"][..], "--broker"),
+            (&["--sandbox-launcher"][..], "--sandbox-launcher"),
+            (&["--slice-a-verify"][..], "--slice-a-verify"),
+            (&["grant", "issue", "--kind", "init"][..], "grant"),
+            (
+                &["broker", "serve", "--state-root", "/x", "--socket", "/y"][..],
+                "broker serve",
+            ),
+            // Flag precedence: the daemon flag anywhere selects the mode.
+            (&["local", "up", "--helper"][..], "--helper precedence"),
+        ] {
+            let (code, stdout, stderr) = invoke(argv);
+            assert_eq!(code, 7, "argv {argv:?} ({uid_msg})");
+            assert_eq!(stdout, "", "argv {argv:?} writes no envelope");
+            assert!(
+                stderr.contains("authority denied: mode requires root (UID 0)"),
+                "argv {argv:?} stderr {stderr:?}"
+            );
+        }
+        // Positional lookalikes never reach the modes.
+        for argv in [
+            &["helper"][..],
+            &["central-protected-broker"][..],
+            &["central-sandbox-launcher"][..],
+            &["broker", "bogus"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, 5, "argv {argv:?}");
+            assert_eq!(parse_envelope(&stdout)["command_id"], "unknown");
+        }
+    }
+
+    /// `attest` carries no privilege gate upstream — a non-root
+    /// invocation reaches the dispatch skeleton (usage at exit 2),
+    /// while `grant`/`broker serve` deny first.
+    #[test]
+    fn attest_reaches_dispatch_without_root() {
+        if !non_root() {
+            return;
+        }
+        let (code, stdout, stderr) = invoke(&["attest"]);
+        assert_eq!(code, 2);
+        assert_eq!(stdout, "");
+        assert_eq!(stderr, "usage: central attest keygen ...\n");
+        let (code, _, stderr) = invoke(&["attest", "bogus"]);
+        assert_eq!(code, 2);
+        assert_eq!(stderr, "attest: unknown subcommand \"bogus\"\n");
+    }
+
+    /// `--archguard` is a non-root mode: it passes the gate and fails
+    /// closed through the deferred envelope (the Go-source guard has
+    /// no Rust counterpart).
+    #[test]
+    fn archguard_mode_is_closed_unsupported() {
+        if !non_root() {
+            return;
+        }
+        let (code, stdout, _) = invoke(&["--archguard"]);
+        assert_eq!(code, 5);
+        let parsed = parse_envelope(&stdout);
+        assert_eq!(parsed["command_id"], "archguard");
+        assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
     }
 
     #[test]
-    fn no_args_emits_unknown_envelope_at_exit_5() {
-        let (code, stdout, _) = invoke(&[]);
-        assert_eq!(code, 5);
-        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        assert_eq!(parsed["command_id"], "unknown");
-        assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
+    fn local_init_grammar_is_closed() {
+        if !non_root() {
+            return;
+        }
+        // Usage errors are exit 2 under the `local.init` id.
+        for argv in [
+            &["local", "init", "--abandon", "abc"][..],
+            &["local", "init", "--resume", "abc"][..],
+            &["local", "init", "--config", "/x"][..],
+            &["local", "init", "extra"][..],
+        ] {
+            let (code, stdout, stderr) = invoke(argv);
+            assert_eq!(code, 2, "argv {argv:?}");
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(parsed["command_id"], "local.init", "argv {argv:?}");
+            assert_eq!(parsed["reason"], "INVALID_INVOCATION");
+            assert!(stderr.starts_with("central local init: "), "argv {argv:?}");
+        }
     }
 
     #[test]
@@ -483,9 +565,12 @@ mod tests {
         // `artifact.read` is landed: without the composition env it
         // reports ARTIFACT_READ_UNAVAILABLE (still exit 5), never the
         // deferred-verb placeholder.
+        if !non_root() {
+            return;
+        }
         let (code, stdout, _) = invoke(&["artifact", "read", "id"]);
         assert_eq!(code, 5);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        let parsed = parse_envelope(&stdout);
         assert_eq!(parsed["schema_version"], "central.local-result/v1");
         assert_eq!(parsed["command_id"], "artifact.read");
         assert_eq!(parsed["exit_code"], 5);
@@ -497,9 +582,12 @@ mod tests {
         // `serve` is landed (task 13): without the runtime credential
         // env it reports DEPENDENCY_UNAVAILABLE at exit 3, never the
         // deferred-verb placeholder.
+        if !non_root() {
+            return;
+        }
         let (code, stdout, _) = invoke(&["serve"]);
         assert_eq!(code, 3);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        let parsed = parse_envelope(&stdout);
         assert_eq!(parsed["schema_version"], "central.local-result/v1");
         assert_eq!(parsed["command_id"], "serve");
         assert_eq!(parsed["exit_code"], 3);
@@ -511,9 +599,12 @@ mod tests {
         // `harness resume|rerun|cancel` are landed (task 13): a
         // missing flag is a usage refusal at exit 2; fully flagged
         // but without a DSN they report HARNESS_UNAVAILABLE at exit 3.
+        if !non_root() {
+            return;
+        }
         let (code, stdout, _) = invoke(&["harness", "resume"]);
         assert_eq!(code, 2);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        let parsed = parse_envelope(&stdout);
         assert_eq!(parsed["command_id"], "harness.resume");
         assert_eq!(parsed["reason"], "HARNESS_USAGE");
 
@@ -528,11 +619,12 @@ mod tests {
             "00000000-0000-7000-8000-000000000003",
         ]);
         assert_eq!(code, 3);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        let parsed = parse_envelope(&stdout);
         assert_eq!(parsed["command_id"], "harness.cancel");
         assert_eq!(parsed["reason"], "HARNESS_UNAVAILABLE");
 
-        // Every other harness verb stays fail-closed (R4–R6 slices).
+        // Every other harness verb is outside the closed grammar and
+        // resolves `unknown` (upstream has no harness registry).
         for argv in [
             &["harness", "status"][..],
             &["harness", "launch", "--x"][..],
@@ -540,36 +632,21 @@ mod tests {
         ] {
             let (code, stdout, _) = invoke(argv);
             assert_eq!(code, 5, "argv {argv:?}");
-            let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(parsed["command_id"], "unknown");
             assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
         }
     }
 
     #[test]
-    fn verb_tokens_skip_global_config_pairs() {
-        let argv = [
-            "--config",
-            "/abs/central.json",
-            "artifact",
-            "read",
-            "id",
-            "--stdout",
-        ]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect::<Vec<_>>();
-        assert_eq!(verb_tokens(&argv), vec!["id", "--stdout"]);
-        let argv = ["artifact", "read"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect::<Vec<_>>();
-        assert!(verb_tokens(&argv).is_empty());
-        // Same walk for the checkpoint verb pair.
-        let argv = ["checkpoint", "list", "--run", "r"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(verb_tokens(&argv), vec!["--run", "r"]);
+    fn tokens_after_the_verb_pair_reach_the_landed_module() {
+        // upstream `args[3:]`: everything after `<verb> <sub>`.
+        let argv = args(&["artifact", "read", "id", "--stdout"]);
+        assert_eq!(&argv[2..], &["id", "--stdout"]);
+        let argv = args(&["checkpoint", "list", "--run", "r"]);
+        assert_eq!(&argv[2..], &["--run", "r"]);
+        let argv = args(&["local", "init", "--status"]);
+        assert_eq!(&argv[2..], &["--status"]);
     }
 
     #[test]
@@ -577,6 +654,9 @@ mod tests {
         // `checkpoint *` is landed: without CENTRAL_CHECKPOINT_DSN the
         // verbs report CHECKPOINT_UNAVAILABLE (still exit 5), never
         // the deferred-verb placeholder.
+        if !non_root() {
+            return;
+        }
         for argv in [
             &["checkpoint", "create"][..],
             &["checkpoint", "resume", "--token", "t"][..],
@@ -588,7 +668,7 @@ mod tests {
         ] {
             let (code, stdout, _) = invoke(argv);
             assert_eq!(code, 5, "argv {argv:?}");
-            let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+            let parsed = parse_envelope(&stdout);
             assert_eq!(parsed["schema_version"], "central.local-result/v1");
             assert_eq!(parsed["reason"], "CHECKPOINT_UNAVAILABLE", "argv {argv:?}");
             assert_eq!(parsed["exit_code"], 5);
@@ -600,6 +680,9 @@ mod tests {
         // `node decide` is landed: without CENTRAL_NODE_DSN it
         // reports NODE_UNAVAILABLE (still exit 5), never the
         // deferred-verb placeholder.
+        if !non_root() {
+            return;
+        }
         let (code, stdout, _) = invoke(&[
             "node",
             "decide",
@@ -611,7 +694,7 @@ mod tests {
             "rerun",
         ]);
         assert_eq!(code, 5);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        let parsed = parse_envelope(&stdout);
         assert_eq!(parsed["schema_version"], "central.local-result/v1");
         assert_eq!(parsed["command_id"], "node.decide");
         assert_eq!(parsed["exit_code"], 5);
@@ -623,6 +706,9 @@ mod tests {
         // `run submit` is landed: without CENTRAL_NODE_DSN it
         // reports RUN_UNAVAILABLE (still exit 5), never the
         // deferred-verb placeholder.
+        if !non_root() {
+            return;
+        }
         let (code, stdout, _) = invoke(&[
             "run",
             "submit",
@@ -634,7 +720,7 @@ mod tests {
             "2",
         ]);
         assert_eq!(code, 5);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        let parsed = parse_envelope(&stdout);
         assert_eq!(parsed["schema_version"], "central.local-result/v1");
         assert_eq!(parsed["command_id"], "run.submit");
         assert_eq!(parsed["exit_code"], 5);
@@ -645,8 +731,11 @@ mod tests {
     fn envelope_exit_code_equals_process_status() {
         // The §7.2 contract: exit_code must equal the process exit
         // status — `run` returns exactly the emitted code.
+        if !non_root() {
+            return;
+        }
         let (code, stdout, _) = invoke(&["local", "up"]);
-        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let parsed = parse_envelope(&stdout);
         assert_eq!(parsed["exit_code"].as_u64().unwrap(), u64::from(code));
     }
 }

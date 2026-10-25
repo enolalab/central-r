@@ -37,6 +37,11 @@ central-harness = { path = "../../crates/capabilities/central-harness", version 
 central-transport-http = { path = "../../crates/transport/central-transport-http", version = "0.1.0" }
 central-adapter-postgres = { path = "../../crates/adapters/central-adapter-postgres", version = "0.1.0" }
 central-adapter-s3 = { path = "../../crates/adapters/central-adapter-s3", version = "0.1.0" }
+# `central --helper`/`--broker`/`--sandbox-launcher` mode gates (Phase
+# R5 task 1): the privilege check needs `rustix::process::getuid` —
+# the same pinned workspace dep the kernel and launcher bins already
+# use.
+rustix.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
