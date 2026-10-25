@@ -11,8 +11,9 @@
 //!
 //! Upstream's order is load-bearing: `prctl` (157) is on the seccomp
 //! allow-list precisely because the capability drops run *after* the
-//! filter installs, and `no_new_privs` lands last because an earlier
-//! `nnp` would break the install under a privileged caller differently.
+//! filter installs (the broker is root/CAP_SYS_ADMIN at that point, so
+//! the prctl+prctl-capbset calls must still reach the kernel), and
+//! `no_new_privs` lands last as the final, irreversible demotion.
 //!
 //! All steps fail closed: any error aborts the sequence and the broker
 //! refuses to start unhardened.

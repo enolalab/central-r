@@ -24,17 +24,18 @@ zeroize.workspace = true
 # This crate is one of the two places audited `unsafe` may live
 # (workflow §5.2): libc carries the one call site rustix has no safe
 # wrapper for in `sys` — the `seccomp(2)` `SECCOMP_SET_MODE_FILTER`
-# install (R5 decision D2). Every use sits inside `sys::audited`,
-# behind a named safe wrapper with a `// SAFETY:` proof, like the
-# launcher binaries' `sys.rs`.
+# install (R5 decision D2). Every use sits inside `sys/` — the call
+# site in `sys::audited`, the filter built in `sys::seccomp` from libc
+# ABI types/constants — behind a named safe wrapper with a `// SAFETY:`
+# proof, like the launcher binaries' `sys.rs`.
 libc.workspace = true
 
 # This crate is one of the two audited `unsafe` sites (workflow §5.2):
 # `sys::audited` opts back in per module, so this crate lists the
 # workspace lints by hand (it cannot both inherit and override
 # `unsafe_code`) with `unsafe_code` at "deny" instead of "forbid".
-# Every `pub mod` in `lib.rs`/`sys/mod.rs` re-pins `forbid`, leaving
-# `sys::audited` the only compilable unsafe site — the same shape as
+# Every production `pub mod` in `lib.rs`/`sys/mod.rs` re-pins `forbid`,
+# with the crate-level "deny" as the backstop — the same shape as
 # `central-harness-launcherd`'s `sys.rs`.
 [lints.rust]
 unsafe_code = "deny"

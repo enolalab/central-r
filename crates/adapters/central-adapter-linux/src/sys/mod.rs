@@ -10,8 +10,10 @@
 //! install, plus the `unshare(2)` wrapper rustix only exposes as an
 //! `unsafe fn` — lives in [`audited`], the single module this subtree
 //! permits `unsafe` in; each `unsafe` block there carries a `// SAFETY:`
-//! proof. Every other submodule is `forbid(unsafe_code)`, so a raw
-//! syscall can only ever compile inside `audited`.
+//! proof. Every other production submodule is `forbid(unsafe_code)` —
+//! the crate-level `deny` (lowered by an explicit `#[allow]` inside
+//! `audited` only) is the backstop if a future module forgets the pin.
+//! `probe` is test-only.
 //!
 //! Module map (upstream provenance):
 //!

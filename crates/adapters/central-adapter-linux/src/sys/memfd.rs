@@ -119,6 +119,11 @@ pub fn validate_sealed(fd: impl AsFd, expected_uid: Uid) -> Result<(), Failure> 
             st.st_uid
         )));
     }
+    // Upstream rejects only `Size <= 0`; the `MAX_VALUE_BYTES` ceiling
+    // is a deliberate strictness addition — a sealed descriptor
+    // carrying more than `MaxSecretBytes` can never be a legitimate
+    // payload, so refusing it here fail-closes a class of oversized
+    // handoffs upstream leaves to the later payload-size check.
     if st.st_size <= 0 || st.st_size as u64 > MAX_VALUE_BYTES {
         return Err(denied("fd size is out of bounds"));
     }

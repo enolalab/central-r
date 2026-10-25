@@ -25,16 +25,47 @@ pub(crate) fn run_on(test_name: &'static str, mode: &str) -> ExitStatus {
 /// [`run_on`] plus extra `NAME=value` environment pairs.
 pub(crate) fn run_on_with(test_name: &'static str, mode: &str, env: &[(&str, &str)]) -> ExitStatus {
     let exe = std::env::current_exe().expect("current test binary path");
-    std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(PROBE_ENV, mode)
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .status()
-        .expect("spawn probe child")
+        .spawn()
+        .expect("spawn probe child");
+    // Upstream bounds probe children at `testProbeTimeout` (10s): a hung
+    // probe must fail the suite, never hang it.
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("probe child for {test_name} exceeded {PROBE_TIMEOUT:?}");
+            }
+            Err(e) => panic!("probe child for {test_name} wait failed: {e}"),
+        }
+    }
+    let out = child.wait_with_output().expect("collect probe output");
+    // A mistyped `--exact` name selects zero tests and exits 0 — the
+    // parent would assert a success that never probed anything. Assert
+    // the harness actually selected exactly one test so a rename cannot
+    // silently green the suite.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("running 1 test"),
+        "probe child for {test_name} selected no test — stdout: {stdout}"
+    );
+    out.status
 }
+
+/// Bound on a probe child's lifetime — upstream `testProbeTimeout`.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// [`run_on`] for probes whose child takes its mode from the test
 /// name's own fixed value — the common case, where one `#[test]` is

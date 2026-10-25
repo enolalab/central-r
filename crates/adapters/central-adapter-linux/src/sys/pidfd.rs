@@ -60,8 +60,11 @@ pub fn is_pidfd<Fd: AsFd>(fd: Fd) -> Result<(), Failure> {
 /// (the kernel's "exit happened" edge stays level-triggered), a live
 /// one does not. Zero-timeout `poll`.
 ///
-/// This is upstream's `isAlive` — polling the descriptor, never
-/// `kill(pid, 0)`, so PID reuse can never make a stale pid look alive.
+/// Upstream checks liveness via `PidfdSendSignal(fd, 0)` /
+/// `waitid(P_PIDFD)` (`protocol_linux.go`, `client_linux.go`,
+/// `settle.go`) — this poll form is equivalent-or-stronger: it polls
+/// the descriptor, never `kill(pid, 0)`, so PID reuse can never make a
+/// stale pid look alive.
 ///
 /// # Errors
 /// `sys_pidfd_os` on the `poll` failure.
