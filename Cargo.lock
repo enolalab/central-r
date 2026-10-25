@@ -703,6 +703,7 @@ dependencies = [
 name = "central"
 version = "0.1.0"
 dependencies = [
+ "central-adapter-linux",
  "central-adapter-postgres",
  "central-adapter-s3",
  "central-artifact",

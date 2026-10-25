@@ -36,6 +36,7 @@ pub mod dev_restore_barrier;
 pub mod dispatch_provision;
 #[forbid(unsafe_code)]
 pub mod group_signals;
+pub mod helper;
 #[forbid(unsafe_code)]
 pub mod launcher_client;
 #[forbid(unsafe_code)]

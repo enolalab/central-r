@@ -37,6 +37,11 @@ central-harness = { path = "../../crates/capabilities/central-harness", version 
 central-transport-http = { path = "../../crates/transport/central-transport-http", version = "0.1.0" }
 central-adapter-postgres = { path = "../../crates/adapters/central-adapter-postgres", version = "0.1.0" }
 central-adapter-s3 = { path = "../../crates/adapters/central-adapter-s3", version = "0.1.0" }
+# `central --helper` (Phase R5 task 8): upstream `cmd/central` imports
+# `internal/adapter/authority/helper` directly — the bin composes the
+# helper daemon the same way, over the workspace-pinned adapter the
+# kernel already pulls in.
+central-adapter-linux = { path = "../../crates/adapters/central-adapter-linux", version = "0.1.0" }
 # `central --helper`/`--broker`/`--sandbox-launcher` mode gates (Phase
 # R5 task 1): the privilege check needs `rustix::process::getuid` —
 # the same pinned workspace dep the kernel and launcher bins already

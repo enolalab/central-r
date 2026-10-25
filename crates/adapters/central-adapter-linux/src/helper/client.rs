@@ -1,0 +1,238 @@
+//! `client_linux.go` + `socket_path.go` — the operator-side clients
+//! that dial the helper's Unix socket. The R5 slice carries the
+//! lifecycle and prepare clients plus the raw write/read helpers every
+//! other client (init.rs already carries `InitClient`) is built on.
+//! The R6 clients — wipe, backup, restore, export/import, delete,
+//! prune, state-audit, rescue, maintenance, security-update — are
+//! deferred with their verbs: a client for a verb the matrix answers
+//! `UNSUPPORTED_IN_THIS_SLICE` would only add untested surface.
+
+use super::protocol::*;
+use std::time::Duration;
+
+/// `ProductionSocketPath` — where
+/// `packaging/systemd/central-helper.socket` listens. Its directory is
+/// 0711; the socket itself is 0660 root:<operator primary group>,
+/// which `SocketPolicy::validate` enforces at startup.
+pub const PRODUCTION_SOCKET_PATH: &str = "/run/central-operator/helper.sock";
+
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `LifecycleResult` — the typed result the lifecycle client returns.
+#[derive(Debug, Clone, Default)]
+pub struct LifecycleResult {
+    pub operation_id: String,
+    pub phase: String,
+    pub state: String,
+    pub reason_code: String,
+    pub receipt_id: String,
+}
+
+/// `LifecycleClient` — `linuxLifecycleClient`: up/down/status against
+/// the helper socket.
+pub struct LifecycleClient {
+    socket_path: String,
+}
+
+impl LifecycleClient {
+    /// `NewLifecycleClient`.
+    pub fn new(socket_path: impl Into<String>) -> Self {
+        LifecycleClient {
+            socket_path: socket_path.into(),
+        }
+    }
+
+    fn lifecycle_op(&self, verb: &str, req: &LifecycleRequest) -> Result<LifecycleResult, String> {
+        let mut conn = std::os::unix::net::UnixStream::connect(&self.socket_path)
+            .map_err(|e| format!("helper: dial: {e}"))?;
+        let _ = conn.set_read_timeout(Some(
+            DIAL_TIMEOUT + super::server::helper_verb_deadline(verb),
+        ));
+        let _ = conn.set_write_timeout(Some(DIAL_TIMEOUT));
+        let payload = serde_json::to_vec(req)
+            .map_err(|e| format!("helper: marshal lifecycle request: {e}"))?;
+        let msg = Request {
+            operation_id: format!("client-lifecycle-{}", now_nanos()),
+            verb: verb.to_owned(),
+            payload: serde_json::value::RawValue::from_string(
+                String::from_utf8(payload).unwrap_or_default(),
+            )
+            .ok(),
+        };
+        write_request(&mut conn, &msg).map_err(|e| format!("helper: write request: {e}"))?;
+        let resp = read_response(&mut conn).map_err(|e| format!("helper: read response: {e}"))?;
+        let mut details = LifecycleResultDetails::default();
+        if let Some(raw) = &resp.result {
+            details = serde_json::from_str(raw.get())
+                .map_err(|e| format!("helper: parse result: {e}"))?;
+        }
+        let mut result = LifecycleResult {
+            operation_id: details.operation_id,
+            phase: details.phase,
+            state: details.state,
+            reason_code: details.reason_code,
+            receipt_id: details.receipt_id,
+        };
+        if resp.outcome != "success" {
+            if result.reason_code.is_empty() {
+                // A denial before the service ran — a failed ceremony,
+                // a refused authorization — carries its code on the
+                // envelope alone.
+                result.reason_code = resp.reason.clone();
+            }
+            return Err(format!(
+                "helper: lifecycle {verb} denied: {} (reason: {})",
+                resp.outcome, resp.reason
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn up(&self, req: &LifecycleRequest) -> Result<LifecycleResult, String> {
+        self.lifecycle_op(super::verb::UP, req)
+    }
+
+    pub fn down(&self, req: &LifecycleRequest) -> Result<LifecycleResult, String> {
+        self.lifecycle_op(super::verb::DOWN, req)
+    }
+
+    pub fn status(&self, req: &LifecycleRequest) -> Result<LifecycleResult, String> {
+        self.lifecycle_op(super::verb::STATUS, req)
+    }
+}
+
+/// `PrepareResult` — the operator's summary; the client carries the
+/// helper's safe projection through unchanged rather than re-deriving
+/// a next action from a phase string.
+#[derive(Debug, Clone, Default)]
+pub struct PrepareResult {
+    pub state: String,
+    pub code: String,
+    pub operation_id: String,
+    pub receipt_id: String,
+    pub remediation: String,
+    pub phase: String,
+    pub selector: String,
+    pub resume_required: bool,
+    pub reused: i64,
+    pub acquired: i64,
+    pub advisory_id: String,
+    pub safe_next_action: String,
+    pub operation_elapsed_ms: i64,
+    pub stage_timings: Vec<StageTiming>,
+    pub resource_counters: Option<ResourceCounters>,
+}
+
+/// `prepareResultFrom` — both of `Prepare`'s return paths use it, so
+/// a denied result carries the same summary a successful one does.
+fn prepare_result_from(details: PrepareResultDetails) -> PrepareResult {
+    PrepareResult {
+        state: details.authority_state,
+        code: details.reason_code,
+        operation_id: details.operation_id,
+        remediation: details.remediation,
+        receipt_id: details.receipt_id,
+        phase: details.phase,
+        selector: details.selector,
+        resume_required: details.resume_required,
+        reused: details.reused,
+        acquired: details.acquired,
+        advisory_id: details.advisory_id,
+        safe_next_action: details.safe_next_action,
+        operation_elapsed_ms: details.operation_elapsed_ms,
+        stage_timings: details.stage_timings,
+        resource_counters: details.resource_counters,
+    }
+}
+
+/// `Client` — `linuxClient`: the prepare verb's operator client.
+pub struct PrepareClient {
+    socket_path: String,
+}
+
+impl PrepareClient {
+    /// `NewClient`.
+    pub fn new(socket_path: impl Into<String>) -> Self {
+        PrepareClient {
+            socket_path: socket_path.into(),
+        }
+    }
+
+    /// `Prepare` — dial, one prepare request, the wire projection back.
+    pub fn prepare(&self, req: &PrepareRequest) -> Result<PrepareResult, String> {
+        let mut conn = std::os::unix::net::UnixStream::connect(&self.socket_path)
+            .map_err(|e| format!("helper: dial: {e}"))?;
+        let _ = conn.set_read_timeout(Some(super::server::PREPARE_BUDGET));
+        let _ = conn.set_write_timeout(Some(DIAL_TIMEOUT));
+        let payload =
+            serde_json::to_vec(req).map_err(|e| format!("helper: marshal prepare request: {e}"))?;
+        let msg = Request {
+            operation_id: format!("client-prepare-{}", now_nanos()),
+            verb: super::verb::PREPARE.to_owned(),
+            payload: serde_json::value::RawValue::from_string(
+                String::from_utf8(payload).unwrap_or_default(),
+            )
+            .ok(),
+        };
+        write_request(&mut conn, &msg).map_err(|e| format!("helper: write request: {e}"))?;
+        let resp = read_response(&mut conn).map_err(|e| format!("helper: read response: {e}"))?;
+        let mut details = PrepareResultDetails::default();
+        if let Some(raw) = &resp.result {
+            details = serde_json::from_str(raw.get())
+                .map_err(|e| format!("helper: parse result: {e}"))?;
+        }
+        if resp.outcome != "success" {
+            let mut result = prepare_result_from(details);
+            if result.code.is_empty() {
+                // A denial's code lives on the envelope when no result
+                // details came back — which is most of them.
+                result.code = resp.reason.clone();
+            }
+            return Err(format!(
+                "helper: prepare denied: {} (reason: {})",
+                resp.outcome, resp.reason
+            ));
+        }
+        Ok(prepare_result_from(details))
+    }
+}
+
+/// `time.Now().UnixNano()` for the client-minted operation ids.
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lifecycle client round-trips the helper's own wire shapes:
+    /// a closed-matrix server answers `status` with the deferred
+    /// service-unavailable response, and the client folds the envelope
+    /// reason into `reason_code`.
+    #[test]
+    fn lifecycle_client_folds_envelope_reason() {
+        let dir = std::env::temp_dir().join(format!("helper-client-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let req = read_request(&mut conn).unwrap();
+            assert_eq!(req.verb, super::super::verb::STATUS);
+            write_response(
+                &mut conn,
+                &Response::deferred(&req.operation_id, "LIFECYCLE_SERVICE_UNAVAILABLE"),
+            )
+            .unwrap();
+        });
+        let client = LifecycleClient::new(path.to_string_lossy());
+        let err = client.status(&LifecycleRequest::default()).unwrap_err();
+        assert!(err.contains("LIFECYCLE_SERVICE_UNAVAILABLE"), "{err}");
+        server_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

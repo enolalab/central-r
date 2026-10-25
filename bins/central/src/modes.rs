@@ -196,27 +196,25 @@ fn is_reference_host() -> bool {
 
 // -- mode entry points (skeletons until their R5 tasks land) -----------
 
-/// `central --helper` after the gates — upstream `runHelperDaemon`.
-/// The genesis branch composes from `CENTRAL_OPERATOR_UID`/`GID`
-/// alone; the instance branch needs the production instance. Either
-/// way the real server lands in T6, so composition failures report
-/// upstream's `helper: [genesis] composition:` class at exit 6.
+/// `central --helper` after the gates — upstream `runHelperDaemon`,
+/// now the adapter's real daemon: `LISTEN_FDS` admission, the
+/// genesis/instance branch, `helperPeerPolicyFromEnvironment`, and
+/// `Serve`/`ServeGenesis` on the activated socket (`fd 3`). The env
+/// seam keeps the failure arms testable without systemd.
 pub(crate) fn run_helper_daemon(stderr: &mut impl Write) -> u8 {
-    helper_daemon(genesis_roots_absent(), helper_policy_from_env(), stderr)
+    helper_daemon(
+        genesis_roots_absent(),
+        |key| std::env::var(key).ok(),
+        stderr,
+    )
 }
 
-fn helper_daemon(genesis_absent: bool, policy: Result<(), String>, stderr: &mut impl Write) -> u8 {
-    let which = if genesis_absent {
-        "genesis composition"
-    } else {
-        "composition"
-    };
-    let msg = match policy {
-        Err(err) => err,
-        Ok(()) => "helper server is not implemented in this slice".to_string(),
-    };
-    let _ = writeln!(stderr, "helper: {which}: {msg}");
-    ExitClass::Terminal.code()
+fn helper_daemon(
+    genesis_absent: bool,
+    env: impl Fn(&str) -> Option<String>,
+    stderr: &mut impl Write,
+) -> u8 {
+    central_adapter_linux::helper::daemon::run_helper_daemon(genesis_absent, &env, stderr)
 }
 
 /// The genesis host-root layout (`genesisRoots`): the two instance
@@ -292,35 +290,6 @@ fn genesis_roots_absent() -> bool {
             empty_genesis_root_or_missing(GENESIS_PROTECTED_INSTANCES),
         ),
         (Some(true), Some(true))
-    )
-}
-
-/// Ports `helperPeerPolicyFromEnvironment`: both operator ids must
-/// satisfy `strconv.ParseUint(_, 10, 32)` — nonempty, ASCII digits
-/// only (no sign, no whitespace, no underscores) — and be nonzero.
-/// Upstream collapses unset/invalid/zero into its two
-/// provisioned-policy errors and deliberately never echoes the env
-/// value.
-fn helper_peer_policy(uid: Option<String>, gid: Option<String>) -> Result<(), String> {
-    let provisioned = |value: Option<String>| {
-        value
-            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|v| v.parse::<u32>().ok())
-            .is_some_and(|n| n != 0)
-    };
-    if !provisioned(uid) {
-        return Err("operator UID policy is not provisioned".to_string());
-    }
-    if !provisioned(gid) {
-        return Err("operator GID policy is not provisioned".to_string());
-    }
-    Ok(())
-}
-
-fn helper_policy_from_env() -> Result<(), String> {
-    helper_peer_policy(
-        std::env::var("CENTRAL_OPERATOR_UID").ok(),
-        std::env::var("CENTRAL_OPERATOR_GID").ok(),
     )
 }
 
@@ -997,72 +966,49 @@ mod tests {
         }
     }
 
-    // -- helper daemon skeleton ---------------------------------------
+    // -- helper daemon -------------------------------------------------
 
+    /// `runHelperDaemon` at the bin seam: the env closure feeds the
+    /// adapter daemon, which owns upstream's `LISTEN_FDS` gate
+    /// (exit 3) and the `[genesis] composition:` failures (exit 6).
     #[test]
-    fn helper_genesis_needs_operator_ids_then_fails_closed() {
+    fn helper_daemon_env_seam() {
+        use std::collections::HashMap;
+        let env = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| map.get(k).cloned()
+        };
+
+        // No LISTEN_FDS: exit 3 with upstream's `no socket fd` line.
         let mut stderr = Vec::new();
-        let code = helper_daemon(
-            true,
-            Err("operator UID policy is not provisioned".into()),
-            &mut stderr,
+        assert_eq!(helper_daemon(true, env(&[]), &mut stderr), 3);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "helper: no socket fd (LISTEN_FDS=\"\")\n"
         );
-        assert_eq!(code, 6);
+
+        // Activated but unprovisioned: exit 6 on each branch name.
+        let mut stderr = Vec::new();
+        assert_eq!(
+            helper_daemon(true, env(&[("LISTEN_FDS", "1")]), &mut stderr),
+            6
+        );
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             "helper: genesis composition: operator UID policy is not provisioned\n"
         );
-
         let mut stderr = Vec::new();
-        let code = helper_daemon(
-            false,
-            Err("operator UID policy is not provisioned".into()),
-            &mut stderr,
+        assert_eq!(
+            helper_daemon(false, env(&[("LISTEN_FDS", "1")]), &mut stderr),
+            6
         );
-        assert_eq!(code, 6);
-        assert!(
-            String::from_utf8(stderr)
-                .unwrap()
-                .starts_with("helper: composition: operator UID policy is not provisioned")
-        );
-
-        // Composed policy still cannot serve this slice.
-        let mut stderr = Vec::new();
-        let code = helper_daemon(true, Ok(()), &mut stderr);
-        assert_eq!(code, 6);
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "helper: genesis composition: helper server is not implemented in this slice\n"
+            "helper: composition: operator UID policy is not provisioned\n"
         );
-    }
-
-    #[test]
-    fn peer_policy_ported_messages() {
-        // Every uid failure — unset, empty, non-numeric, signed,
-        // whitespace-padded, zero — collapses to upstream's single
-        // provisioned-policy string (no env value echoed).
-        for uid in [
-            None,
-            Some(""),
-            Some("abc"),
-            Some("+1"),
-            Some(" 1"),
-            Some("0"),
-        ] {
-            assert_eq!(
-                helper_peer_policy(uid.map(str::to_string), Some("1".into())).unwrap_err(),
-                "operator UID policy is not provisioned",
-                "uid {uid:?}"
-            );
-        }
-        for gid in [None, Some(""), Some("x"), Some("0")] {
-            assert_eq!(
-                helper_peer_policy(Some("1".into()), gid.map(str::to_string)).unwrap_err(),
-                "operator GID policy is not provisioned",
-                "gid {gid:?}"
-            );
-        }
-        assert!(helper_peer_policy(Some("1".into()), Some("2".into())).is_ok());
     }
 
     // -- broker / sandbox skeletons ------------------------------------
