@@ -1,0 +1,417 @@
+{
+  "schema": "phase-2-recovery-matrix/v1",
+  "generated_at": "2026-10-25T06:51:14.799431493Z",
+  "central_revision": "0.1.0",
+  "scenarios": [
+    {
+      "scenario_id": "RTM-01",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "parallel + dependent children → correct final result",
+      "observed": "dependency ordering held; c ready only after a+b succeeded",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-11",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "idempotent emission replay dedupes; divergent payload refuses",
+      "observed": "idempotent replay deduped; divergent key refused",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-12",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "depth over max_depth rejects atomically with SPEC_VALIDATION_FAILED",
+      "observed": "over-depth batch rejected atomically",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-14",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "artifact ordering evidence + authorized read journaled per scope",
+      "observed": "produce + read edges journaled; scopes enforced",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-03",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S2",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "kill mid-attempt: started attempts park ambiguous, siblings survive",
+      "observed": "started attempt parked ambiguous on lease expiry",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-05",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S2",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "unconfirmed launch parks ambiguous; never auto-relaunch",
+      "observed": "unconfirmed launch parked ambiguous; single launch call",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-06",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S2",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "never-started lease expiry fails LEASE_EXPIRED_NOT_STARTED and requeues",
+      "observed": "never-started expiry failed + requeued",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-07",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S2",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "worker lost ladder: suspect at 2 missed beats, lost at 5",
+      "observed": "suspect→lost ladder parked the live attempt",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-15",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "outbox backlog past the stall threshold reports OUTBOX_PUBLISH_STALLED",
+      "observed": "aged unpublished backlog flagged stalled",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-17",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "restart reconcile rebuilds readiness from durable state",
+      "observed": "reconcile + operator decision converged the run",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-02",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S2",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "transient failure schedules a bounded-delay retry",
+      "observed": "transient failure scheduled bounded retry",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-04",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "retry budget exhaustion lands failed_terminal RETRY_BUDGET_EXHAUSTED",
+      "observed": "budget exhaustion landed terminal",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-08",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "capacity admission defers dispatch without consuming an attempt",
+      "observed": "admission deferred without consuming an attempt",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-13",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "node timeout kills the live attempt and lands failed_terminal",
+      "observed": "node timeout killed confirmed and terminated",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-16",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S2",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "worker deregistration releases leases and requeues nodes",
+      "observed": "deregister released leases and requeued",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-19-session",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S2",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "session wall-clock breach kills confirmed SESSION_WALL_CLOCK_REACHED",
+      "observed": "wall-clock breach kill-confirmed, outcome recorded",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-19-deadlines",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "workflow deadline cancels live attempts and lands failed_terminal",
+      "observed": "workflow deadline cascaded cancellations",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-09",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "checkpoint → resume happy path; digest drift refuses WORKSPACE_DIGEST_MISMATCH",
+      "observed": "checkpoint round-trip + digest-drift refusal",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-10",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "stale/incompatible resume tokens refuse RESUME_TOKEN_STALE",
+      "observed": "stale + garbled tokens refused",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-18",
+      "tier": "machine",
+      "status": "passed",
+      "owning_specs": [
+        "S3",
+        "S1"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "journal fold consistency: artifacts + events reconstruct run truth",
+      "observed": "fold reconstructed the journaled truth",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-P1",
+      "tier": "physical",
+      "status": "deferred-physical",
+      "owning_specs": [
+        "S2"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "RTM-03 expectations at production tier under a real daemon kill",
+      "observed": "deferred to the physical-tier acceptance track",
+      "journal_receipt_ids": [],
+      "physical_pointer": "docs/operations/runbooks/phase-2-physical-acceptance.md#rtm-p1"
+    },
+    {
+      "scenario_id": "RTM-P2",
+      "tier": "physical",
+      "status": "deferred-physical",
+      "owning_specs": [
+        "S8"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "host resource exhaustion under real load — machine tier is a scripted analogue",
+      "observed": "deferred to the physical-tier acceptance track",
+      "journal_receipt_ids": [],
+      "physical_pointer": "docs/operations/runbooks/phase-2-physical-acceptance.md#rtm-p2"
+    },
+    {
+      "scenario_id": "RTM-P3",
+      "tier": "physical",
+      "status": "deferred-physical",
+      "owning_specs": [
+        "S6"
+      ],
+      "reason_codes_asserted": [],
+      "event_kinds_asserted": [],
+      "expected": "network partition mid-dispatch — machine tier is a scripted analogue",
+      "observed": "deferred to the physical-tier acceptance track",
+      "journal_receipt_ids": [],
+      "physical_pointer": "docs/operations/runbooks/phase-2-physical-acceptance.md#rtm-p3"
+    }
+  ],
+  "coverage": {
+    "phases_md_scenarios": {
+      "S1": [
+        "RTM-01",
+        "RTM-11",
+        "RTM-12",
+        "RTM-14",
+        "RTM-03",
+        "RTM-05",
+        "RTM-06",
+        "RTM-07",
+        "RTM-15",
+        "RTM-17",
+        "RTM-02",
+        "RTM-04",
+        "RTM-08",
+        "RTM-13",
+        "RTM-16",
+        "RTM-19-session",
+        "RTM-19-deadlines",
+        "RTM-09",
+        "RTM-10",
+        "RTM-18"
+      ],
+      "S2": [
+        "RTM-03",
+        "RTM-05",
+        "RTM-06",
+        "RTM-07",
+        "RTM-02",
+        "RTM-16",
+        "RTM-19-session",
+        "RTM-P1"
+      ],
+      "S3": [
+        "RTM-01",
+        "RTM-11",
+        "RTM-12",
+        "RTM-14",
+        "RTM-15",
+        "RTM-17",
+        "RTM-04",
+        "RTM-08",
+        "RTM-13",
+        "RTM-19-deadlines",
+        "RTM-09",
+        "RTM-10",
+        "RTM-18"
+      ],
+      "S6": [
+        "RTM-P3"
+      ],
+      "S8": [
+        "RTM-P2"
+      ]
+    },
+    "specs_consumed": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6",
+      "S7",
+      "S8"
+    ],
+    "asserted_codes_all_cataloged": true
+  }
+}

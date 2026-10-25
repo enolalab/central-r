@@ -43,5 +43,20 @@ sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# Phase-2 recovery test matrix (`tests/phase2_acceptance/`): composes the
+# real scheduler/retry/eventjournal capability seams the `central` binary
+# only reaches through `central-kernel`, so the test target names them
+# directly.
+central-scheduler = { path = "../../crates/capabilities/central-scheduler", version = "0.1.0" }
+central-retry = { path = "../../crates/capabilities/central-retry", version = "0.1.0" }
+central-eventjournal = { path = "../../crates/capabilities/central-eventjournal", version = "0.1.0" }
+serde.workspace = true
+uuid.workspace = true
+
+[[test]]
+name = "phase2_acceptance"
+path = "tests/phase2_acceptance/mod.rs"
+
 [lints]
 workspace = true
