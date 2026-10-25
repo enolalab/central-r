@@ -8,6 +8,7 @@
 //! narrowed the candidate key — the message is the canonical unsigned
 //! envelope, a single `\x00` separator, then the raw config payload.
 
+#[cfg(test)]
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -378,12 +379,22 @@ pub(crate) enum VerificationEvent {
     Ed25519Verify,
 }
 
+// The verification-event record — test builds only, matching
+// upstream's `verificationObserver` (nil in production; only
+// package-internal tests install a record). Without the gate every
+// `verify_view` call would grow a per-thread vector nothing drains.
+#[cfg(test)]
 thread_local! {
     static VERIFICATION_EVENTS: RefCell<Vec<VerificationEvent>> = const { RefCell::new(Vec::new()) };
 }
 
-fn observe_verification_event(event: VerificationEvent) {
-    VERIFICATION_EVENTS.with(|events| events.borrow_mut().push(event));
+/// Upstream `observeVerificationEvent`. Production installs no
+/// observer, so the body is a no-op outside test builds — the
+/// thread-local record does not exist there.
+#[inline]
+fn observe_verification_event(_event: VerificationEvent) {
+    #[cfg(test)]
+    VERIFICATION_EVENTS.with(|events| events.borrow_mut().push(_event));
 }
 
 /// Drains the thread-local verification-event record — the Rust port of
@@ -502,8 +513,26 @@ pub fn verify_view(
     message.extend_from_slice(config_raw);
 
     observe_verification_event(VerificationEvent::Ed25519Verify);
+    // Go `crypto/ed25519.Verify` parity checks (Go 1.26
+    // `crypto/internal/fips140/ed25519.verifyWithDom` plus the
+    // `NewPublicKey` decode): the signature scalar's top three bits must
+    // be clear — Go's early `sig[63]&224` check, bounding S below 2^253
+    // before the full S < L `SetCanonicalBytes` rejection that `verify`
+    // itself applies — and both the public key `A` and the signature's
+    // `R` half must decode to curve points, as Go's `Point.SetBytes`
+    // requires. With inputs narrowed to the encodings Go accepts, the
+    // recomputed-R equation inside `verify` converges to Go's
+    // acceptance. Small-order `A` remains accepted, exactly as Go
+    // accepts it — `verify_strict` would reject weak keys and diverge.
+    if (signature_bytes[63] & 0xE0) != 0 {
+        return Err(Error::redacted(ErrorKind::Signature));
+    }
+    // `VerifyingKey::from_bytes` performs the `A` point decode itself.
     let verifying_key =
         VerifyingKey::from_bytes(&key.public).map_err(|_| Error::redacted(ErrorKind::Signature))?;
+    if !decodes_to_curve_point(signature.r_bytes()) {
+        return Err(Error::redacted(ErrorKind::Signature));
+    }
     if verifying_key.verify(&message, &signature).is_err() {
         return Err(Error::redacted(ErrorKind::Signature));
     }
@@ -597,6 +626,17 @@ fn parse_signed_at(value: &str) -> Result<UtcDateTime, Error> {
         return Err(Error::redacted(ErrorKind::Timestamp));
     }
     Ok(parsed.into())
+}
+
+/// Whether `encoding` decodes to a valid Ed25519 curve point — Go
+/// `crypto/internal/fips140/edwards25519.Point.SetBytes`, reached
+/// through dalek's `CompressedEdwardsY::decompress` (exposed by
+/// `VerifyingKey::from_bytes`). Both decoders accept the non-canonical
+/// encodings of valid points — unreduced field elements and x = 0 with
+/// the sign bit set — and reject everything else, so this is an exact
+/// Go-parity decode check.
+fn decodes_to_curve_point(encoding: &[u8; 32]) -> bool {
+    VerifyingKey::from_bytes(encoding).is_ok()
 }
 
 /// Upstream `decodeRawSignature`: base64 RawStdEncoding decode, exactly
@@ -700,7 +740,7 @@ mod tests {
     use super::*;
     use crate::config::testutil::{
         COMPLETE_CONFIG_FIXTURE, INSTRUMENTATION_ENVELOPE, SIGNED_NONCANONICAL_ENVELOPE,
-        VIEW_VECTOR_KEY_ID, VIEW_VECTOR_PUBLIC, valid_config,
+        VIEW_VECTOR_KEY_ID, VIEW_VECTOR_PUBLIC, canonical, signed_benchmark_envelope, valid_config,
     };
     use crate::config::{ErrorKind, VerificationKey, VerificationKeyring};
 
@@ -780,6 +820,83 @@ mod tests {
             ],
             "verification event order"
         );
+    }
+
+    /// The Ed25519 group order in little-endian — `S = L` is a
+    /// non-canonical scalar both Go `Scalar.SetCanonicalBytes` and
+    /// dalek's `Scalar::from_canonical_bytes` reject.
+    const GROUP_ORDER_LE: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x10,
+    ];
+
+    /// Re-encodes `envelope` with its signature bytes mutated — the
+    /// envelope stays JCS-canonical and every field remains correctly
+    /// signed for, except the tampered signature itself.
+    fn malleate_signature(envelope: &[u8], mutate: impl Fn(&mut [u8; SIGNATURE_BYTES])) -> Vec<u8> {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(envelope).expect("envelope decodes");
+        let mut signature =
+            decode_raw_signature(document["signature"].as_str().expect("signature string"))
+                .expect("signature decodes");
+        mutate(&mut signature);
+        document["signature"] = serde_json::Value::String(base64_raw_std_encode(&signature));
+        canonical(&serde_json::to_vec(&document).expect("encode envelope"))
+    }
+
+    /// Go `crypto/ed25519.Verify` rejects non-canonical signature and
+    /// point encodings a lax (ZIP-215-only) verifier accepts; the
+    /// pre-checks in `verify_view` must reject the same malleations.
+    #[test]
+    fn verify_view_rejects_noncanonical_signature_encodings() {
+        let raw = valid_config();
+        let envelope = signed_benchmark_envelope(&raw);
+        let keys = vector_keyring();
+        verify_view(&raw, &envelope, &keys).expect("baseline envelope verifies");
+
+        // An `R` encoding that does not decode to a curve point —
+        // found deterministically (roughly half of all 32-byte
+        // encodings fail to decompress).
+        let mut non_point_r = [0u8; 32];
+        for candidate in u8::MIN..=u8::MAX {
+            non_point_r[0] = candidate;
+            if VerifyingKey::from_bytes(&non_point_r).is_err() {
+                break;
+            }
+        }
+        assert!(
+            VerifyingKey::from_bytes(&non_point_r).is_err(),
+            "no non-decoding R encoding found"
+        );
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "non-canonical S (top bits set)",
+                malleate_signature(&envelope, |sig| sig[63] |= 0xE0),
+            ),
+            (
+                "non-canonical S (S = L)",
+                malleate_signature(&envelope, |sig| {
+                    sig[32..].copy_from_slice(&GROUP_ORDER_LE);
+                }),
+            ),
+            (
+                "R not a curve point",
+                malleate_signature(&envelope, |sig| {
+                    sig[..32].copy_from_slice(&non_point_r);
+                }),
+            ),
+        ];
+        for (name, malleated) in cases {
+            let result = verify_view(&raw, &malleated, &keys);
+            assert!(result.is_err(), "{name}: malleated signature accepted");
+            assert_eq!(
+                result.err().map(|e| e.kind()),
+                Some(ErrorKind::Signature),
+                "{name}: error kind"
+            );
+        }
     }
 
     #[test]

@@ -260,6 +260,18 @@ mod tests {
             want_path,
             "provider_policy exposed mutable state"
         );
+
+        // Upstream: the serialized policy must not leak secret fields
+        // or values — catches a future `RuntimeProviderPolicy` field
+        // addition. ("ProfileSignature" is PascalCase and does not
+        // match "signature", same as upstream's byte search.)
+        let policy_json = serde_json::to_string(&policy).expect("marshal policy");
+        for forbidden in ["secret_ref", "purpose", "signature", "openai_api_key"] {
+            assert!(
+                !policy_json.contains(forbidden),
+                "ProviderPolicy serialization contains forbidden field/value {forbidden:?}: {policy_json}"
+            );
+        }
     }
 
     // ---------- schema_test.go ----------
@@ -1874,9 +1886,20 @@ mod tests {
                 "{name}: keyring accepted invalid input"
             );
         }
-        let ring = VerificationKeyring::new(vec![key.clone()]).expect("keyring");
+        // Upstream also mutates the input slice and the looked-up key —
+        // stored copies must be unaffected. `new` consumes the vector
+        // in Rust, so the "input slice" is a clone the caller keeps and
+        // mutates after construction.
+        let mut input = vec![key.clone()];
+        let ring = VerificationKeyring::new(input.clone()).expect("keyring");
+        input[0].id = "changed".to_owned();
+        input[0].public[0] ^= 0xff;
         let got = ring.lookup(VIEW_VECTOR_KEY_ID).expect("lookup");
         assert_eq!(got, key, "ring did not copy input key");
+        let mut got = got;
+        got.public[0] ^= 0xff;
+        let again = ring.lookup(VIEW_VECTOR_KEY_ID).expect("lookup");
+        assert_eq!(again, key, "Lookup exposed mutable key state");
     }
 
     #[test]
