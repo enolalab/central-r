@@ -229,7 +229,7 @@ impl LifecycleClient {
             session_token: String::new(),
             payload: Some(BTreeMap::from([(
                 "request".to_owned(),
-                serde_json::from_slice(&payload_bytes)
+                serde_json::from_slice::<Box<serde_json::value::RawValue>>(&payload_bytes)
                     .map_err(|e| internal(format!("broker lifecycle: marshal: {e}")))?,
             )])),
         })
@@ -432,7 +432,7 @@ impl LifecycleClient {
             .map_err(|e| internal(format!("broker lifecycle: dial: {e}")))?;
         conn.set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| internal(format!("broker lifecycle: dial timeout: {e}")))?;
-        let value: serde_json::Value = serde_json::from_slice(&data)
+        let value: Box<serde_json::value::RawValue> = serde_json::from_slice(&data)
             .map_err(|e| internal(format!("broker lifecycle: marshal: {e}")))?;
         let req = BrokerRequest {
             operation_id: operation_id.to_owned(),

@@ -259,20 +259,25 @@ impl ProtectedFileBackend {
     }
 
     /// `Delete` — removes one exact protected generation by id; never
-    /// accepts a caller-supplied path or purpose.
+    /// accepts a caller-supplied path or purpose. Go's `os.RemoveAll`
+    /// is idempotent — an absent directory is a successful delete —
+    /// and upstream relies on that for crash-recovery cleanups.
     ///
     /// # Errors
-    /// `broker_protected_file` when the id is nil or removal fails.
+    /// `broker_protected_file` when the id is nil or removal fails for
+    /// a reason other than absence.
     pub fn delete(&self, gen_id: Uuid) -> Result<(), Failure> {
         if gen_id.is_nil() {
             return Err(invalid("protected_file: empty generation id"));
         }
-        fs::remove_dir_all(self.generation_dir(&gen_id)).map_err(|e| {
-            Failure::internal(
+        match fs::remove_dir_all(self.generation_dir(&gen_id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Failure::internal(
                 "broker_protected_file",
                 format!("protected_file: delete generation {gen_id}: {e}"),
-            )
-        })
+            )),
+        }
     }
 
     /// `Activate` — marks `gen_id` active via a same-directory
@@ -457,9 +462,13 @@ mod tests {
         assert!(backend.current().is_err());
         backend.activate(generation.generation_id).unwrap();
         assert_eq!(backend.current().unwrap(), generation);
-        // Delete removes the generation directory outright.
+        // Delete removes the generation directory outright, and like
+        // upstream `os.RemoveAll` is idempotent — deleting the same
+        // generation again (or one that never existed) succeeds.
         backend.delete(generation.generation_id).unwrap();
         assert!(backend.get_by_id(generation.generation_id).is_err());
+        backend.delete(generation.generation_id).unwrap();
+        backend.delete(Uuid::now_v7()).unwrap();
     }
 
     #[test]

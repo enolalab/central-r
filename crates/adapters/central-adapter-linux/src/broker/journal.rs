@@ -277,9 +277,13 @@ impl Journal {
         let canonical = serde_json::to_vec(&*payload)
             .map_err(|e| internal(format!("journal: marshal: {e}")))?;
         payload.hmac = self.signing.fingerprint("authority-transition", &canonical);
-        let digest = sha2::Sha256::digest(serde_json::to_vec(&payload.payload).unwrap_or_default());
+        // Upstream `sha256.Sum256(payload.Payload)` + `len(payload.Payload)`:
+        // the digest and byte count are over the verbatim RawMessage, never
+        // a serde re-encoding (which sorts keys and would digest different
+        // bytes than the durable record carries).
+        let digest = sha2::Sha256::digest(raw_payload_bytes(payload));
         payload.payload_digest = hex_encode(&digest);
-        payload.payload_bytes = serde_json::to_vec(&payload.payload).map_or(0, |v| v.len() as u64);
+        payload.payload_bytes = raw_payload_bytes(payload).len() as u64;
         self.write_phase(seq_dir, "issued.json", payload)?;
 
         payload.phase = "committed".into();
@@ -450,12 +454,9 @@ impl Journal {
                         continue;
                     };
                     payload.hmac = self.signing.fingerprint("authority-transition", &canonical);
-                    let digest = sha2::Sha256::digest(
-                        serde_json::to_vec(&payload.payload).unwrap_or_default(),
-                    );
+                    let digest = sha2::Sha256::digest(raw_payload_bytes(&payload));
                     payload.payload_digest = hex_encode(&digest);
-                    payload.payload_bytes =
-                        serde_json::to_vec(&payload.payload).map_or(0, |v| v.len() as u64);
+                    payload.payload_bytes = raw_payload_bytes(&payload).len() as u64;
                     if self.write_phase(&seq_dir, "issued.json", &payload).is_err() {
                         continue;
                     }
@@ -536,6 +537,17 @@ fn parse_seq_dir_name(name: &str) -> Option<u64> {
     parse_seq_name(num)
 }
 
+/// `payload.Payload` as the byte slice upstream's
+/// `sha256.Sum256(payload.Payload)` and `len(payload.Payload)` operate
+/// on: `None` (Go nil `RawMessage`) is the empty slice — digest of `""`
+/// and `payload_bytes` 0 — while `Some` is the verbatim captured JSON.
+fn raw_payload_bytes(record: &AuthorityTransitionPayload) -> &[u8] {
+    record
+        .payload
+        .as_ref()
+        .map_or(&[][..], |raw| raw.get().as_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // Tests — upstream journal crash/replay coverage, ported.
 // ---------------------------------------------------------------------------
@@ -554,6 +566,12 @@ mod tests {
         )
     }
 
+    /// `json.RawMessage` construction — the verbatim bytes the journal
+    /// both hashes and persists.
+    fn raw_value(json: &str) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(json.to_owned()).unwrap()
+    }
+
     fn payload(op: &str) -> AuthorityTransitionPayload {
         AuthorityTransitionPayload {
             schema_version: "central.authority-transition/v1".into(),
@@ -565,7 +583,7 @@ mod tests {
             binding_id: "bind".into(),
             launch_id: "launch".into(),
             nonce: "nonce".into(),
-            payload: serde_json::json!({"k": "v"}),
+            payload: Some(raw_value(r#"{"k":"v"}"#)),
             payload_digest: String::new(),
             payload_bytes: 0,
             prior_digest: String::new(),
@@ -603,6 +621,65 @@ mod tests {
         assert_ne!(issued.payload_bytes, 0);
         // The committed record carries the Ed25519 signature.
         assert!(!committed.signature.is_empty());
+    }
+
+    #[test]
+    fn issued_digest_hashes_verbatim_payload_bytes() {
+        // Regression for the Value-reserialization bug: a payload whose
+        // object keys are NOT in sorted order must hash the raw bytes —
+        // upstream `sha256.Sum256(json.RawMessage)` — not the
+        // BTreeMap-sorted `serde_json::to_vec` re-encoding the digest
+        // used to produce.
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        let mut p = payload("bind");
+        p.sequence_num = 9;
+        p.payload = Some(raw_value(r#"{"b":1,"a":2}"#));
+        j.append("stream-1", &mut p).unwrap();
+        let seq_dir = dir
+            .join("authority-records/stream-1")
+            .join("00000000000000000009-bind");
+        let issued_raw = fs::read(seq_dir.join("issued.json")).unwrap();
+        let issued: AuthorityTransitionPayload = serde_json::from_slice(&issued_raw).unwrap();
+        let expected = hex_encode(&sha2::Sha256::digest(br#"{"b":1,"a":2}"#));
+        assert_eq!(issued.payload_digest, expected);
+        assert_eq!(issued.payload_bytes, 13);
+        // The durable record embeds the same raw bytes that were hashed.
+        let text = String::from_utf8(issued_raw).unwrap();
+        assert!(
+            text.contains(r#""payload":{"b":1,"a":2}"#),
+            "verbatim payload lost: {text}"
+        );
+        // A recovered re-issue computes the same digest — recovery
+        // shares the append path's raw-byte hashing.
+        let committed_raw = fs::read(seq_dir.join("committed.json")).unwrap();
+        let committed: AuthorityTransitionPayload = serde_json::from_slice(&committed_raw).unwrap();
+        assert_eq!(committed.payload_digest, expected);
+        assert_eq!(committed.payload.unwrap().get(), r#"{"b":1,"a":2}"#);
+    }
+
+    #[test]
+    fn nil_payload_digests_empty_bytes_and_emits_null() {
+        // Go nil `json.RawMessage`: `sha256.Sum256(nil)`, `len(nil)`,
+        // and `"payload":null` on output — never `"{}"`.
+        let dir = TempDir::new("journal");
+        let j = journal(&dir);
+        let mut p = payload("bind");
+        p.sequence_num = 11;
+        p.payload = None;
+        j.append("stream-1", &mut p).unwrap();
+        let seq_dir = dir
+            .join("authority-records/stream-1")
+            .join("00000000000000000011-bind");
+        let issued_raw = fs::read(seq_dir.join("issued.json")).unwrap();
+        let issued: AuthorityTransitionPayload = serde_json::from_slice(&issued_raw).unwrap();
+        assert_eq!(
+            issued.payload_digest,
+            hex_encode(&sha2::Sha256::digest(b""))
+        );
+        assert_eq!(issued.payload_bytes, 0);
+        let text = String::from_utf8(issued_raw).unwrap();
+        assert!(text.contains(r#""payload":null"#), "nil payload: {text}");
     }
 
     #[test]

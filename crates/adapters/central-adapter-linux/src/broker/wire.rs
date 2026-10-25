@@ -24,6 +24,13 @@ pub(crate) fn is_go_zero_time(t: OffsetDateTime) -> bool {
     t == GO_ZERO_TIME
 }
 
+/// `#[serde(default)]` for `time.Time` fields: Go's `json.Unmarshal`
+/// leaves an absent timestamp at the zero value rather than failing
+/// the decode.
+pub(crate) fn go_zero_time() -> OffsetDateTime {
+    GO_ZERO_TIME
+}
+
 /// Go `time.RFC3339Nano` formatting: `hh:mm:ss` plus a fractional second
 /// field that appears only when the nanosecond part is non-zero, then
 /// with trailing zeros trimmed (`.999999999` semantics) — never a fixed

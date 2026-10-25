@@ -85,6 +85,13 @@ pub(crate) mod wire {
         t == GO_ZERO_TIME
     }
 
+    /// `#[serde(default)]` for `time.Time` fields: Go's `json.Unmarshal`
+    /// leaves an absent timestamp at the zero value rather than
+    /// failing the decode.
+    pub(crate) fn go_zero_time() -> OffsetDateTime {
+        GO_ZERO_TIME
+    }
+
     /// Go `time.RFC3339Nano` formatting: `hh:mm:ss` plus a fractional
     /// second field that appears only when the nanosecond part is
     /// non-zero, then with trailing zeros trimmed (`.999999999`
@@ -754,7 +761,9 @@ pub struct BrokerEvidence {
 /// helper via the broker protocol (upstream `authority.BrokerRequest`).
 /// `payload` is the named argument map — in the upstream client the
 /// typed request rides under the `"request"` key.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// (`RawValue` has no `PartialEq`; compare `.get()` bytes in tests,
+/// matching Go's `bytes.Equal` on `json.RawMessage`.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerRequest {
     /// The operation identity downstream authority records bind.
     pub operation_id: String,
@@ -767,8 +776,11 @@ pub struct BrokerRequest {
     /// Upstream's tag has no `omitempty`, so a nil map marshals as
     /// `null`: `None` ↔ nil (`"payload":null`), `Some` ↔ non-nil —
     /// including `Some(empty)` ↔ `"{}"`, the distinction Go keeps.
-    /// `null` and an absent key both decode to `None`.
-    pub payload: Option<BTreeMap<String, serde_json::Value>>,
+    /// `null` and an absent key both decode to `None`. Each value is
+    /// the verbatim JSON the peer sent (`RawValue` passthrough), so a
+    /// dispatch that hashes or re-emits it sees the exact bytes, never
+    /// a normalized `Value` re-encoding.
+    pub payload: Option<BTreeMap<String, Box<serde_json::value::RawValue>>>,
 }
 
 /// The broker's signed reply to a broker operation (upstream
@@ -853,7 +865,9 @@ pub struct AdvisoryHostFacts {
 /// transition (init, bind, rotate, revoke). It carries 17 fields
 /// covering identity, payload integrity, and cryptographic proof.
 /// Port of `authority.AuthorityTransitionPayload`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// (`RawValue` has no `PartialEq`; compare `.get()` bytes in tests,
+/// matching Go's `bytes.Equal` on `json.RawMessage`.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityTransitionPayload {
     /// `central.authority-transition/v1`.
     pub schema_version: String,
@@ -873,8 +887,13 @@ pub struct AuthorityTransitionPayload {
     pub launch_id: String,
     /// Replay-protection nonce.
     pub nonce: String,
-    /// Transition payload (upstream `json.RawMessage`).
-    pub payload: serde_json::Value,
+    /// Transition payload (upstream `json.RawMessage`): the verbatim
+    /// bytes `payload_digest` hashes and `payload_bytes` counts.
+    /// `None` ↔ Go nil (`"payload":null` on output, digest of the
+    /// empty slice, `payload_bytes` 0); `Some` serializes the raw
+    /// bytes back unchanged, so the durable record is byte-identical
+    /// to what was hashed.
+    pub payload: Option<Box<serde_json::value::RawValue>>,
     /// Digest of `payload`.
     pub payload_digest: String,
     /// `payload` size in bytes.
@@ -1140,25 +1159,35 @@ impl FromStr for BrokerWireCommand {
 }
 
 /// The closed wire payload for `adopt_b03_minio_bootstrap` (upstream
-/// `authority.B04AdoptRequest`).
+/// `authority.B04AdoptRequest`). Every field defaults: Go's
+/// `json.Unmarshal` leaves absent fields at their zero value and the
+/// dispatch ladder's semantic checks — not the decoder — assign the
+/// denial reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct B04AdoptRequest {
     /// The instance adopting the bootstrap.
+    #[serde(default)]
     pub instance_id: String,
     /// The adopted purpose (`minio_root_v1`).
+    #[serde(default)]
     pub purpose: String,
     /// The adopting operation.
+    #[serde(default)]
     pub operation_id: String,
     /// Lifecycle fencing token.
+    #[serde(default)]
     pub fencing_token: u64,
     /// Proof the topology was stopped.
+    #[serde(default)]
     pub stopped_topology_proof: String,
     /// Proof the mount was released.
+    #[serde(default)]
     pub mount_release_proof: String,
     /// The binding evidence.
+    #[serde(default)]
     pub binding_evidence: String,
     /// Evidence expiry.
-    #[serde(with = "wire::rfc3339")]
+    #[serde(default = "wire::go_zero_time", with = "wire::rfc3339")]
     pub evidence_expires_at: OffsetDateTime,
 }
 
@@ -1170,19 +1199,25 @@ pub struct B04AdoptRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct B04IssueProofRequest {
     /// The requesting instance.
+    #[serde(default)]
     pub instance_id: String,
     /// The requesting operation.
+    #[serde(default)]
     pub operation_id: String,
     /// Lifecycle fencing token.
+    #[serde(default)]
     pub fencing_token: u64,
     /// Proof the topology was stopped.
+    #[serde(default)]
     pub stopped_topology_proof: String,
     /// Proof the mount was released.
+    #[serde(default)]
     pub mount_release_proof: String,
     /// The binding evidence.
+    #[serde(default)]
     pub binding_evidence: String,
     /// Evidence expiry.
-    #[serde(with = "wire::rfc3339")]
+    #[serde(default = "wire::go_zero_time", with = "wire::rfc3339")]
     pub evidence_expires_at: OffsetDateTime,
 }
 
@@ -1248,32 +1283,47 @@ pub struct B04AdoptResult {
 }
 
 /// The closed wire payload for `materialize_postgres_migration`
-/// (upstream `authority.B05MaterializePostgresMigrationRequest`).
+/// (upstream `authority.B05MaterializePostgresMigrationRequest`). Every
+/// field defaults, Go `json.Unmarshal`-style: the JSON dispatch
+/// ladder's own checks produce `invalid dependency binding`/`invalid
+/// binding id`/`invalid operation id`, not decode failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct B05MaterializePostgresMigrationRequest {
     /// Broker-issued launch evidence for the migrate worker.
+    #[serde(default)]
     pub launch_evidence_id: String,
     /// The binding being materialized.
+    #[serde(default)]
     pub binding_id: String,
     /// The requesting operation.
+    #[serde(default)]
     pub operation_id: String,
     /// The consumed one-use receipt.
+    #[serde(default)]
     pub receipt_id: String,
     /// Receipt HMAC.
+    #[serde(default)]
     pub receipt_hmac: String,
     /// Lifecycle fencing token.
+    #[serde(default)]
     pub fencing_token: u64,
     /// Calling peer's UID.
+    #[serde(default)]
     pub peer_uid: u32,
     /// Calling peer's PID.
+    #[serde(default)]
     pub peer_pid: i32,
     /// Dependency service (`central-migrate`).
+    #[serde(default)]
     pub service: String,
     /// Delivery mechanism (`scm_rights`).
+    #[serde(default)]
     pub target: String,
     /// Target credential owner UID.
+    #[serde(default)]
     pub uid: u32,
     /// Target credential owner GID.
+    #[serde(default)]
     pub gid: u32,
 }
 

@@ -507,6 +507,13 @@ impl ProvisioningStore {
         let raw = serde_json::to_vec(&payload).map_err(|e| {
             Failure::internal("broker_provisioning", format!("marshal journal entry: {e}"))
         })?;
+        // `json.RawMessage` passthrough: the journal hashes and persists
+        // exactly these marshaled bytes — capture them, don't re-parse
+        // into a canonicalizing `Value`.
+        let raw_payload: Box<serde_json::value::RawValue> =
+            serde_json::from_slice(&raw).map_err(|e| {
+                Failure::internal("broker_provisioning", format!("marshal journal entry: {e}"))
+            })?;
         let mut journal_payload = central_infra::authority::AuthorityTransitionPayload {
             schema_version: "central.authority-transition/v1".into(),
             stream_id: stream_id.clone(),
@@ -517,7 +524,7 @@ impl ProvisioningStore {
             binding_id: String::new(),
             launch_id: String::new(),
             nonce: String::new(),
-            payload: serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+            payload: Some(raw_payload),
             payload_digest: String::new(),
             payload_bytes: 0,
             prior_digest: String::new(),

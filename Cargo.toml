@@ -63,7 +63,9 @@ publish = false
 uuid = { version = "=1.28.0", features = ["v4", "v7", "serde"] }
 time = { version = "=0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.154"
+# `raw_value`: Box<RawValue> carries verbatim JSON bytes — the upstream
+# json.RawMessage semantics the broker payload digests hash over.
+serde_json = { version = "=1.0.154", features = ["raw_value"] }
 # NFC validation for repository_analysis/v1 task inputs (the same
 # upstream contract `agent.ParseRepositoryAnalysisInput` enforces);
 # already pinned transitively via `stringprep`.

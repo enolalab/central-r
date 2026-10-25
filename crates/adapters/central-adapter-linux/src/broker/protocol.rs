@@ -15,6 +15,7 @@
 //! fields, no trailing data — Go's `decodeBrokerRequest` verbatim,
 //! including the `null`/`{}` payload distinction `BrokerRequest` keeps.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -108,6 +109,8 @@ pub const SIGN_LEAF_RPC: &str = "sign_leaf";
 pub const MATERIALIZE_MINIO_ROOT_RPC: &str = "materialize_minio_root";
 pub const MATERIALIZE_POSTGRES_MIGRATION_RPC: &str = "materialize_postgres_migration";
 pub const MATERIALIZE_MINIO_RUNTIME_RPC: &str = "materialize_minio_runtime";
+pub const ADOPT_B03_MINIO_BOOTSTRAP_RPC: &str = "adopt_b03_minio_bootstrap";
+pub const ISSUE_B04_LIFECYCLE_PROOF_RPC: &str = "issue_b04_lifecycle_proof";
 
 // R6 surface — registered so they deny with the slice's exact closed
 // outcome, never "unknown purpose".
@@ -256,9 +259,14 @@ pub fn is_advisory_evaluation_authority_purpose(purpose: &str) -> bool {
     purpose == ADVISORY_EVALUATION_JOURNAL_RPC
 }
 
-/// Every purpose the R6 surface registers — used by [`super::server`]'s
-/// dispatch so an R6 name returns [`UNSUPPORTED_IN_THIS_SLICE`] rather
-/// than `"unknown purpose"`.
+/// Every purpose the R6 surface registers *without* a concrete
+/// `Dispatch` handler in this slice — used by [`super::server`]'s
+/// dispatch so such a name returns [`UNSUPPORTED_IN_THIS_SLICE`]
+/// rather than `"unknown purpose"`. Purposes with a real dispatch arm
+/// (live RPCs, the B04/B05 denial ladders, the backup
+/// transport-required set, `migration_read_launch_outcome`) are NOT
+/// here — the match arm owns them, and the server-side completeness
+/// test keeps this table from drifting.
 #[must_use]
 pub fn is_r6_purpose(purpose: &str) -> bool {
     is_backup_worker_authority_purpose(purpose)
@@ -276,9 +284,8 @@ pub fn is_r6_purpose(purpose: &str) -> bool {
                 | RESTORE_ABANDON_RPC
                 | RESTORE_BARRIER_INSPECT_RPC
                 | RESTORE_TICKET_BARRIER_INSPECT_RPC
-                | MIGRATION_READ_OUTCOME_RPC
                 | MIGRATION_REPORT_OUTCOME_RPC
-                | ISSUE_MIGRATION_LAUNCH_RPC
+                | SIGN_LEAF_RPC
         )
 }
 
@@ -370,6 +377,79 @@ pub fn read_request_frame(
     Ok(req)
 }
 
+/// `backupWorkerCredentialFrameSize` — marker + kind + two UUIDs.
+pub const BACKUP_WORKER_CREDENTIAL_FRAME_SIZE: usize = 1 + 1 + 16 + 16;
+
+/// `backupWorkerPostgresCredential` — the 0xc1 credential kinds.
+pub const BACKUP_WORKER_POSTGRES_CREDENTIAL: u8 = 1;
+/// `backupWorkerMinioCredential`.
+pub const BACKUP_WORKER_MINIO_CREDENTIAL: u8 = 2;
+/// `backupThroughputPostgresTargetCredential`.
+pub const BACKUP_THROUGHPUT_POSTGRES_TARGET_CREDENTIAL: u8 = 3;
+/// `backupThroughputPostgresProbeCredential`.
+pub const BACKUP_THROUGHPUT_POSTGRES_PROBE_CREDENTIAL: u8 = 4;
+/// `backupThroughputMinioCredential`.
+pub const BACKUP_THROUGHPUT_MINIO_CREDENTIAL: u8 = 5;
+
+/// `validBackupWorkerCredentialKind` — the closed `1..=5` kind set.
+#[must_use]
+pub fn valid_backup_worker_credential_kind(kind: u8) -> bool {
+    kind == BACKUP_WORKER_POSTGRES_CREDENTIAL
+        || kind == BACKUP_WORKER_MINIO_CREDENTIAL
+        || kind == BACKUP_THROUGHPUT_POSTGRES_TARGET_CREDENTIAL
+        || kind == BACKUP_THROUGHPUT_POSTGRES_PROBE_CREDENTIAL
+        || kind == BACKUP_THROUGHPUT_MINIO_CREDENTIAL
+}
+
+/// `backupWorkerCredentialRequest` — the parsed 0xc1 frame body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupWorkerCredentialRequest {
+    /// The credential `kind` byte (`1..=5`).
+    pub kind: u8,
+    /// The worker launch evidence this credential rides on.
+    pub launch_evidence_id: uuid::Uuid,
+    /// The operation the denial echoes.
+    pub operation_id: uuid::Uuid,
+}
+
+/// `readBackupWorkerCredentialRequest` — the fixed 33-byte body after
+/// the `0xc1` marker: `kind` byte, `launch_evidence_id`, then
+/// `operation_id`. Upstream reads it before the worker peer check so
+/// the denial can echo the operation id; nil UUIDs and an unknown kind
+/// are invalid.
+///
+/// # Errors
+/// `broker_protocol` on a short read or an invalid request.
+pub fn read_backup_worker_credential_request(
+    r: &mut impl Read,
+) -> Result<BackupWorkerCredentialRequest, Failure> {
+    let mut payload = [0u8; BACKUP_WORKER_CREDENTIAL_FRAME_SIZE - 1];
+    r.read_exact(&mut payload).map_err(|e| {
+        Failure::internal(
+            "broker_protocol",
+            format!("broker: read backup credential frame: {e}"),
+        )
+    })?;
+    let kind = payload[0];
+    let mut launch_bytes = [0u8; 16];
+    launch_bytes.copy_from_slice(&payload[1..17]);
+    let launch_evidence_id = uuid::Uuid::from_bytes(launch_bytes);
+    let mut operation_bytes = [0u8; 16];
+    operation_bytes.copy_from_slice(&payload[17..33]);
+    let operation_id = uuid::Uuid::from_bytes(operation_bytes);
+    if launch_evidence_id.is_nil()
+        || operation_id.is_nil()
+        || !valid_backup_worker_credential_kind(kind)
+    {
+        return Err(invalid("broker: invalid backup credential request"));
+    }
+    Ok(BackupWorkerCredentialRequest {
+        kind,
+        launch_evidence_id,
+        operation_id,
+    })
+}
+
 /// `decodeB10ProvisionedDescriptor` — `size == len(data)-4` (exactly,
 /// never a prefix), then the JSON `MinioProvisionedDescriptor`.
 ///
@@ -409,7 +489,9 @@ pub fn decode_broker_request(data: &[u8]) -> Result<BrokerRequest, Failure> {
         operation_id: Option<String>,
         purpose: Option<String>,
         session_token: Option<String>,
-        payload: Option<serde_json::Value>,
+        /// Outer `Option` — the key's presence (duplicate detection
+        /// needs it); inner — `None` for an explicit `null`.
+        payload: Option<Option<BTreeMap<String, Box<serde_json::value::RawValue>>>>,
     }
     impl<'de> serde::de::Visitor<'de> for RequestVisitor {
         type Value = Fields;
@@ -480,15 +562,10 @@ pub fn decode_broker_request(data: &[u8]) -> Result<BrokerRequest, Failure> {
 
     // `payload`: Go's `map[string]json.RawMessage` — `null` and absent
     // both mean nil; an object means a map (possibly empty). Any other
-    // JSON shape fails Go's unmarshal, so it fails here.
+    // JSON shape fails Go's unmarshal, so `next_value` refused it above.
     let payload = match fields.payload {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::Object(map)) => Some(map.into_iter().collect()),
-        Some(_) => {
-            return Err(invalid(
-                "broker: invalid request: payload must be an object or null",
-            ));
-        }
+        None | Some(None) => None,
+        Some(Some(map)) => Some(map),
     };
     Ok(BrokerRequest {
         operation_id: fields.operation_id.unwrap_or_default(),
@@ -605,7 +682,9 @@ mod tests {
         assert_eq!(req.operation_id, "op-1");
         assert_eq!(req.purpose, "hmac_fingerprint");
         assert_eq!(req.session_token, "t");
-        assert_eq!(req.payload.unwrap()["request"], serde_json::json!({"x": 1}));
+        // RawValue passthrough — the captured bytes are the verbatim
+        // wire text, whitespace and key order included.
+        assert_eq!(req.payload.unwrap()["request"].get(), r#"{"x":1}"#);
     }
 
     #[test]
@@ -817,22 +896,35 @@ mod tests {
             "activate_recovery_bootstrap",
             "bind_postgres_service_role",
             "append_advisory_evaluation",
-            "migration_read_launch_outcome",
             "migration_report_launch_outcome",
-            "issue_migration_launch",
+            "sign_leaf",
             "present_bootstrap",
             "register_bootstrap_candidate",
             "activate_bootstrap_candidate",
         ] {
             assert!(is_r6_purpose(purpose), "unregistered R6 purpose {purpose}");
         }
-        for live in [
+        for handled in [
+            // Live RPCs and the purposes with a real Dispatch arm are
+            // never R6-classified — the arm owns them.
             MIGRATION_ISSUE_EMPTY_PROOF_RPC,
             MIGRATION_READ_RECORD_RPC,
             AUTHORIZE_LIFECYCLE_RPC,
             HMAC_FINGERPRINT_RPC,
+            "migration_read_launch_outcome",
+            "issue_migration_launch",
+            "adopt_b03_minio_bootstrap",
+            "issue_b04_lifecycle_proof",
+            "materialize_postgres_migration",
+            "materialize_minio_root",
+            "materialize_minio_runtime",
+            "create_protected_generation",
+            "materialize_dependency_handoff",
         ] {
-            assert!(!is_r6_purpose(live), "live purpose {live} misclassified");
+            assert!(
+                !is_r6_purpose(handled),
+                "handled purpose {handled} misclassified"
+            );
         }
         assert!(!is_r6_purpose("genuinely_unknown"));
     }

@@ -332,6 +332,10 @@ impl ProofService {
                 "kind": kind,
             }))
             .map_err(|e| internal(format!("marshal proof journal payload: {e}")))?;
+            // `json.RawMessage` passthrough — hash and persist the same
+            // bytes that were marshaled, never a `Value` re-encoding.
+            let raw_payload: Box<serde_json::value::RawValue> = serde_json::from_slice(&payload)
+                .map_err(|e| internal(format!("marshal proof journal payload: {e}")))?;
             let mut record = central_infra::authority::AuthorityTransitionPayload {
                 schema_version: "central.authority-transition/v1".into(),
                 stream_id: String::new(),
@@ -342,7 +346,7 @@ impl ProofService {
                 binding_id: String::new(),
                 launch_id: String::new(),
                 nonce: String::new(),
-                payload: serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null),
+                payload: Some(raw_payload),
                 payload_digest: String::new(),
                 payload_bytes: 0,
                 prior_digest: String::new(),
