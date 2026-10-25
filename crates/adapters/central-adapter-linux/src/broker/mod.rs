@@ -18,6 +18,7 @@
 //! complete before the machinery lands.
 
 pub mod bootstrap_session;
+pub mod daemon;
 pub(crate) mod durable;
 pub mod export_token;
 pub mod handoff;

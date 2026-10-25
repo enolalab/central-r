@@ -26,6 +26,9 @@
 //!
 //! - [`sys`] — the audited OS boundary primitives the protected broker
 //!   and sandbox launcher are built from (R5 task 4).
+//! - [`sandbox`] — the descriptor-bound sandbox launcher: the
+//!   `central-agent` namespaced envelope, cgroup resource bounds, and
+//!   the protected daemon's denial matrix (R5 task 9 / A06).
 
 #[forbid(unsafe_code)]
 pub mod broker;
@@ -41,6 +44,8 @@ pub mod helper;
 pub mod launcher_client;
 #[forbid(unsafe_code)]
 pub mod lifecycle_watch;
+#[forbid(unsafe_code)]
+pub mod sandbox;
 pub mod sys;
 #[forbid(unsafe_code)]
 pub mod workspace_seal;

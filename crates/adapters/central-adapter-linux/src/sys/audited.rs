@@ -518,3 +518,245 @@ pub(crate) mod pam_ffi {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `clone3` + child trampoline — the one place a namespaced,
+// credential-dropped child process is created (R5 task 9 / A06). The
+// safe front door is `sys::spawn::spawn_namespaced`; everything here
+// is POD so nothing but plain C values crosses the clone.
+// ---------------------------------------------------------------------------
+
+/// Everything the child trampoline needs. Pointer fields carry the
+/// `execve` contract: they must name NUL-terminated strings and
+/// NUL-terminated pointer vectors that outlive the `clone3_exec` call
+/// (they do — `sys::spawn` builds them from `CString`s on the parent
+/// stack, which the child reads through shared copy-on-write pages).
+pub(crate) struct CloneExecSpec {
+    /// `clone_args.flags` — the `CLONE_NEW*` create set, plus
+    /// `CLONE_INTO_CGROUP` when `cgroup_fd` is not `-1` (the caller
+    /// ORs the flag itself).
+    pub clone_flags: u64,
+    /// The cgroup-v2 directory descriptor the child is born into, or -1.
+    pub cgroup_fd: i32,
+    /// Extra `CLONE_NEW*` bits the child `unshare`s itself pre-exec —
+    /// upstream `SysProcAttr.Unshareflags`. `0` skips the call.
+    pub unshare_flags: u64,
+    /// `setuid`/`setgid` target — the `central-agent` identity.
+    pub uid: u32,
+    /// `setgid` target.
+    pub gid: u32,
+    /// `PR_SET_PDEATHSIG` value — upstream's `SIGKILL`; `0` disables
+    /// the prctl and its liveness check.
+    pub pdeathsig: i32,
+    /// The parent's pid at clone time — the post-`prctl` `getppid`
+    /// compare that closes the parent-died-before-prctl race.
+    pub parent_pid: i32,
+    /// `RLIMIT_NOFILE` soft+hard to install; `0` keeps the inherited
+    /// limit.
+    pub nofile: u64,
+    /// `execve` program path — NUL-terminated, live past the call.
+    pub program: *const libc::c_char,
+    /// NUL-terminated argv/envp pointer vectors — `execve`'s own
+    /// contract.
+    pub argv: *const *const libc::c_char,
+    /// NUL-terminated envp pointer vector.
+    pub envp: *const *const libc::c_char,
+    /// The error-report pipe's write end (`O_CLOEXEC`) — the one
+    /// descriptor the `close_range` sweep spares; `execve` closes it.
+    pub err_fd: i32,
+}
+
+/// Report `errno` on the error pipe and `_exit` — the child's only
+/// channel back to the parent when a setup step or `execve` itself
+/// fails. Called in the child only.
+fn child_fail(err_fd: i32, error: i32) -> ! {
+    // SAFETY: `err_fd` is this child's own descriptor; `error` names a
+    // 4-byte int for `write`. `write` and `_exit` are async-signal-safe;
+    // a short or failed write is unrecoverable — the exit happens either
+    // way, which is the fail-closed property the parent relies on (its
+    // read then sees a short frame or EOF, never a false success).
+    unsafe {
+        let _ = libc::write(err_fd, std::ptr::from_ref(&error).cast::<libc::c_void>(), 4);
+        libc::_exit(127);
+    }
+}
+
+/// `close_range(first, last, 0)` — via `SYS_close_range` directly so no
+/// glibc-version symbol is needed. Fails the child on a real error —
+/// a descriptor that survives the sweep is a containment breach.
+fn close_range_or_fail(err_fd: i32) {
+    let sweep = |first: u32, last: u32| -> Result<(), i32> {
+        if first > last {
+            return Ok(());
+        }
+        // SAFETY: closes only this child's own descriptors; no borrowed
+        // memory, no shared state.
+        let rc = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(last_errno().raw_os_error())
+        }
+    };
+    // `err_fd` is the one fd kept until execve's CLOEXEC clears it; the
+    // sweep brackets it on both sides.
+    let kept = err_fd.max(0) as u32;
+    if kept > 3
+        && let Err(e) = sweep(3, kept - 1)
+    {
+        child_fail(err_fd, e);
+    }
+    if let Err(e) = sweep(kept.saturating_add(1), u32::MAX) {
+        child_fail(err_fd, e);
+    }
+}
+
+/// The post-clone child half — upstream `SysProcAttr` realized as the
+/// exact sequence Go's `forkAndExecInChild1` runs:
+///
+/// `unshare(Unshareflags)` → `setgroups(0)` (the credential drop must
+/// not keep root's supplementary groups) → `setgid`/`setuid`
+/// (`Credential`) → `PR_SET_PDEATHSIG` + `getppid` liveness check
+/// (`Pdeathsig`, with the died-before-prctl race closed) → `setpgid`
+/// (`Setpgid`) → `TIOCNOTTY` on the inherited stdin (`Noctty`, result
+/// ignored exactly as Go ignores it) → stdin `/dev/null`, stdout ←
+/// stderr (`cmd.Stdin = nil`, `Stdout = Stderr = os.Stderr`) →
+/// `RLIMIT_NOFILE` → `close_range` fd sweep → `execve`.
+///
+/// Only async-signal-safe libc entry points run in the child — no
+/// allocation, no locks, no Rust runtime — on the child's own
+/// copy-on-write pages. Every failure reports its errno on `err_fd`
+/// and `_exit(127)`s: a partial sandbox can never exec.
+fn child_exec(spec: &CloneExecSpec) -> ! {
+    macro_rules! step {
+        ($call:expr) => {
+            // SAFETY: each call takes only POD/spec fields or string
+            // literals; the child runs alone on its own address space
+            // until execve replaces it.
+            if unsafe { $call } != 0 {
+                child_fail(spec.err_fd, last_errno().raw_os_error());
+            }
+        };
+    }
+
+    if spec.unshare_flags != 0 {
+        // Truncating a u64 that only ever holds 32-bit CLONE_NEW* bits
+        // is lossless — `NamespaceFlags` cannot carry anything else.
+        step!(libc::unshare(spec.unshare_flags as libc::c_int));
+    }
+    // Root's supplementary groups must not survive the identity drop.
+    // The `setgroups`/`setgid`/`setuid` triplet requires CAP_SETGID/
+    // CAP_SETUID, so it runs only when the target identity actually
+    // differs — the launcher's contract (root daemon → uid 502)
+    // always enters here; a same-identity spawn (tests, a future
+    // same-uid launcher) skips it because the drop is already a
+    // no-op and an unprivileged caller could not satisfy it.
+    // SAFETY: `getuid`/`getgid` cannot fail.
+    if spec.uid != unsafe { libc::getuid() } || spec.gid != unsafe { libc::getgid() } {
+        step!(libc::setgroups(0, std::ptr::null()));
+        step!(libc::setgid(spec.gid));
+        step!(libc::setuid(spec.uid));
+    }
+    if spec.pdeathsig != 0 {
+        step!(libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            spec.pdeathsig as libc::c_ulong,
+            0,
+            0,
+            0
+        ));
+        // The Pdeathsig race: the parent exited between clone and this
+        // prctl, so the kernel never armed a death signal — `getppid`
+        // would now report a reparent. Go's forkExec performs the same
+        // check and aborts the child; ESRCH names the cause to the
+        // parent's error-pipe reader.
+        // SAFETY: `getppid` has no failure mode.
+        if unsafe { libc::getppid() } != spec.parent_pid {
+            child_fail(spec.err_fd, libc::ESRCH);
+        }
+    }
+    step!(libc::setpgid(0, 0));
+    // `Noctty` — disassociate the controlling terminal. Go ignores the
+    // ioctl's result (a ctty-less daemon yields ENOTTY, which is fine);
+    // we do the same, on the inherited stdin as upstream does.
+    // SAFETY: fd 0 is the child's own; TIOCNOTTY takes no memory.
+    unsafe {
+        libc::syscall(libc::SYS_ioctl, 0i32, libc::TIOCNOTTY, 0i32);
+    }
+    // `cmd.Stdin = nil` → stdin is /dev/null; `Stdout = os.Stderr`,
+    // `Stderr = os.Stderr` → both point at the inherited stderr.
+    // SAFETY: `open`/`dup2`/`close` take literals only.
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if devnull < 0 {
+        child_fail(spec.err_fd, last_errno().raw_os_error());
+    }
+    // SAFETY: `devnull` was just proven open.
+    if unsafe { libc::dup2(devnull, 0) } < 0 {
+        child_fail(spec.err_fd, last_errno().raw_os_error());
+    }
+    if devnull != 0 {
+        // SAFETY: `devnull` is open and no longer needed at its own slot.
+        unsafe { libc::close(devnull) };
+    }
+    // SAFETY: fds 1 and 2 are the child's own standard streams.
+    if unsafe { libc::dup2(2, 1) } < 0 {
+        child_fail(spec.err_fd, last_errno().raw_os_error());
+    }
+    if spec.nofile > 0 {
+        let lim = libc::rlimit {
+            rlim_cur: spec.nofile,
+            rlim_max: spec.nofile,
+        };
+        // SAFETY: `lim` is a live rlimit for the duration of the call.
+        step!(libc::setrlimit(libc::RLIMIT_NOFILE, &lim));
+    }
+    close_range_or_fail(spec.err_fd);
+    // SAFETY: `program`/`argv`/`envp` satisfy execve's contract — the
+    // caller guaranteed NUL-terminated strings and NULL-terminated
+    // vectors that outlive the clone.
+    unsafe { libc::execve(spec.program, spec.argv, spec.envp) };
+    child_fail(spec.err_fd, last_errno().raw_os_error());
+}
+
+/// `clone3` with `exit_signal = SIGCHLD`, then run [`child_exec`] in
+/// the child. Returns the child's pid to the parent.
+///
+/// # Errors
+/// `Errno` of the `clone3` failure — `EPERM` without `CAP_SYS_ADMIN`
+/// for the namespace set, `EINVAL` for a flag combination the kernel
+/// rejects (`sys::spawn` maps the `CLONE_INTO_CGROUP`-unknown case to
+/// its `cgroup.procs` fallback).
+pub(crate) fn clone3_exec(spec: &CloneExecSpec) -> Result<libc::pid_t, Errno> {
+    // SAFETY: a zeroed clone_args — every field the kernel does not
+    // read stays zero, per clone3(2)'s contract.
+    let mut args: libc::clone_args = unsafe { std::mem::zeroed() };
+    args.flags = spec.clone_flags;
+    // SIGCHLD keeps the child waitpid-able exactly like a fork/exec —
+    // upstream's `cmd.Wait` shape.
+    args.exit_signal = u64::from(libc::SIGCHLD as u32);
+    if spec.cgroup_fd >= 0 {
+        args.cgroup = spec.cgroup_fd as u64;
+    }
+    // SAFETY: `args` names a live clone_args for the syscall's
+    // duration. clone3 with no `stack`/`pidfd`/`set_tid` fields is the
+    // fork form — the child returns from the call on a private copy of
+    // this stack and reads `spec` through shared COW pages (the same
+    // contract raw clone + child-fn carries; every pointer `spec`
+    // holds was caller-proven live). No parent memory is mutated after
+    // clone by either side except through spec reads.
+    let pid = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            std::ptr::from_ref(&args),
+            size_of::<libc::clone_args>(),
+        )
+    };
+    if pid < 0 {
+        return Err(last_errno());
+    }
+    if pid == 0 {
+        child_exec(spec);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(pid as libc::pid_t)
+}

@@ -293,27 +293,30 @@ fn genesis_roots_absent() -> bool {
     )
 }
 
-/// `central --broker` after the gates — upstream `runBrokerDaemon`.
-/// Production-instance resolution is `central-infra` work (T9), so
-/// the skeleton reports upstream's resolution failure verbatim.
+/// `central --broker` after the gates — upstream `runBrokerDaemon`,
+/// now the adapter's real composition: `resolveProductionInstance-
+/// Composition` → `resolveProductionBrokerRoot` → `NewService` →
+/// `LISTEN_FDS` → `Harden` → `Serve` on fd 3. The env seam keeps the
+/// `LISTEN_FDS` arm testable without systemd; every earlier arm is
+/// the adapter's own fail-closed refusal.
 pub(crate) fn run_broker_daemon(stderr: &mut impl Write) -> u8 {
-    let _ = writeln!(
-        stderr,
-        "broker: production instance: production instance authority unavailable"
-    );
-    ExitClass::Terminal.code()
+    broker_daemon(|key| std::env::var(key).ok(), stderr)
+}
+
+fn broker_daemon(env: impl Fn(&str) -> Option<String>, stderr: &mut impl Write) -> u8 {
+    central_adapter_linux::broker::daemon::run_broker_daemon(&env, stderr)
 }
 
 /// `central --sandbox-launcher` after the gates — upstream
-/// `runSandboxDaemon`: on a non-reference host the portable
-/// `sandbox.ServeLauncher` stub is what answers, verbatim at exit 3
-/// (`internal/sandbox/daemon.go`, printed as `sandbox: %v`).
+/// `runSandboxDaemon`: `LISTEN_FDS` admission, then `ServeLauncher`
+/// on the activated fd 3. The env seam keeps the admission arm
+/// testable without systemd.
 pub(crate) fn run_sandbox_daemon(stderr: &mut impl Write) -> u8 {
-    let _ = writeln!(
-        stderr,
-        "sandbox: sandbox-daemon: not available in portable mode; recompile on reference host"
-    );
-    ExitClass::Unavailable.code()
+    sandbox_daemon(|key| std::env::var(key).ok(), stderr)
+}
+
+fn sandbox_daemon(env: impl Fn(&str) -> Option<String>, stderr: &mut impl Write) -> u8 {
+    central_adapter_linux::sandbox::daemon::run_sandbox_daemon(&env, stderr)
 }
 
 /// `central --slice-a-verify` after the gates — upstream
@@ -458,8 +461,9 @@ pub(crate) fn check_broker_serve_socket_for_uid(path: &str, uid: u32) -> Result<
 }
 
 /// `central broker serve` — the composition-root entry point,
-/// upstream `runBrokerServe`. Arg/path checks run verbatim; the real
-/// `broker.NewService` is T9 work and fails closed in its slot.
+/// upstream `runBrokerServe`. Arg/path checks run verbatim, then the
+/// adapter composes the identical `Service` the activated daemon
+/// uses and serves it on the operator socket until SIGINT/SIGTERM.
 pub(crate) fn run_broker_serve(args: &[String], stderr: &mut impl Write) -> u8 {
     let cfg = match parse_broker_serve_args(args) {
         Ok(cfg) => cfg,
@@ -476,11 +480,11 @@ pub(crate) fn run_broker_serve(args: &[String], stderr: &mut impl Write) -> u8 {
         let _ = writeln!(stderr, "broker serve: {err}");
         return ExitClass::Terminal.code();
     }
-    let _ = writeln!(
+    central_adapter_linux::broker::daemon::run_broker_serve(
+        &cfg.state_root,
+        &cfg.socket_path,
         stderr,
-        "broker serve: new service: broker service is not implemented in this slice"
-    );
-    ExitClass::Terminal.code()
+    )
 }
 
 // -- `central attest` ---------------------------------------------------
@@ -1024,14 +1028,45 @@ mod tests {
         );
     }
 
+    /// `runSandboxDaemon` at the bin seam: the env closure feeds the
+    /// adapter daemon, which owns upstream's `LISTEN_FDS` gate —
+    /// `strconv.Atoi` failing (absent or malformed) prints `no socket
+    /// fd`, exit 3; a present-but-unclaimed fd 3 fails the same way.
     #[test]
-    fn sandbox_daemon_fails_closed_exit_3() {
+    fn sandbox_daemon_env_seam() {
+        use std::collections::HashMap;
+        let env = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |k: &str| map.get(k).cloned()
+        };
+
+        // Absent: upstream's `Atoi` failure arm, verbatim line.
         let mut stderr = Vec::new();
-        let code = run_sandbox_daemon(&mut stderr);
-        assert_eq!(code, 3);
+        assert_eq!(sandbox_daemon(env(&[]), &mut stderr), 3);
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "sandbox: sandbox-daemon: not available in portable mode; recompile on reference host\n"
+            "sandbox: no socket fd (LISTEN_FDS=\"\")\n"
+        );
+
+        // Malformed: same arm with the raw value echoed.
+        let mut stderr = Vec::new();
+        assert_eq!(sandbox_daemon(env(&[("LISTEN_FDS", "x")]), &mut stderr), 3);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "sandbox: no socket fd (LISTEN_FDS=\"x\")\n"
+        );
+
+        // Present but fd 3 is not a live activation socket in this
+        // test process — the fd claim or listener bind fails closed
+        // at the same exit class, still prefixed `sandbox:`.
+        let mut stderr = Vec::new();
+        assert_eq!(sandbox_daemon(env(&[("LISTEN_FDS", "1")]), &mut stderr), 3);
+        assert!(
+            String::from_utf8(stderr).unwrap().starts_with("sandbox: "),
+            "a failure line, never silence"
         );
     }
 

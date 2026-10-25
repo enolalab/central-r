@@ -33,6 +33,10 @@
 //!   `launcher_linux.go`)
 //! - [`namespace`] — `unshare`/`setns` (`launcher_linux.go`'s clone and
 //!   unshare flag sets)
+//! - [`spawn`] — the sandboxed-process launch primitive (R5 task 9 /
+//!   A06): `clone3` with upstream's `Cloneflags`/`Unshareflags`,
+//!   `CLONE_INTO_CGROUP`, the credential drop, `Pdeathsig`, and the
+//!   fd sweep — the safe front door over [`audited::clone3_exec`]
 //! - [`pam`] — the PAM authentication boundary (R5 task 5, decision
 //!   D1): the safe front door over the hand-written `libpam` FFI in
 //!   [`audited::pam_ffi`] — upstream `pam_linux.go`'s
@@ -72,6 +76,8 @@ pub mod pidfd;
 pub mod scm_rights;
 #[forbid(unsafe_code)]
 pub mod seccomp;
+#[forbid(unsafe_code)]
+pub mod spawn;
 #[forbid(unsafe_code)]
 pub mod tty;
 
