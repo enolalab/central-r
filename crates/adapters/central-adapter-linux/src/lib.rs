@@ -3,6 +3,12 @@
 //! PAM/TTY, namespaces, cgroups. One of the two audited `unsafe` sites
 //! (rustix safe wrappers only — rust-engineering-workflow.md §5.2).
 //!
+//! The crate's `unsafe_code` lint is `deny`, not the workspace `forbid`,
+//! so that `sys::audited` — the single audited `unsafe` site — can opt
+//! back in. Every module below re-pins `forbid(unsafe_code)`: raw
+//! syscalls can only ever compile inside `sys::audited`, behind a named
+//! safe wrapper with a `// SAFETY:` proof.
+//!
 //! R3 pull-forwards:
 //!
 //! - [`workspace_seal`] — the `central-harness` `WorkspaceSealer` port
@@ -15,11 +21,24 @@
 //!   client upstream `internal/harnesslauncher/client_linux.go` carries.
 //! - [`group_signals`] — the production `kill(-pgid, …)` boundary for
 //!   the dev-gated `LocalExec` launcher.
+//!
+//! R5:
+//!
+//! - [`sys`] — the audited OS boundary primitives the protected broker
+//!   and sandbox launcher are built from (R5 task 4).
 
+#[forbid(unsafe_code)]
 pub mod dev_bootstrap;
+#[forbid(unsafe_code)]
 pub mod dev_restore_barrier;
+#[forbid(unsafe_code)]
 pub mod dispatch_provision;
+#[forbid(unsafe_code)]
 pub mod group_signals;
+#[forbid(unsafe_code)]
 pub mod launcher_client;
+#[forbid(unsafe_code)]
 pub mod lifecycle_watch;
+pub mod sys;
+#[forbid(unsafe_code)]
 pub mod workspace_seal;

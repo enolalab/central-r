@@ -6,21 +6,42 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# This crate is one of the two places audited `unsafe` may live
-# (workflow §5.2); when implemented it overrides unsafe_code inside the
-# rustix-wrapped syscall boundary only. The stub inherits the workspace
-# forbid until then.
 [dependencies]
 central-adapter-harness = { path = "../central-adapter-harness", version = "0.1.0" }
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
 central-scheduler = { path = "../../capabilities/central-scheduler", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
-rustix.workspace = true
+# `event` (pidfd liveness via `poll`) and `thread` (`PR_SET_NO_NEW_PRIVS`,
+# `PR_CAPBSET_*`, `unshare`/`setns`) are the `sys` boundary's extra API
+# surface — the same additive-per-crate feature pattern
+# `central-harness-launcherd` uses.
+rustix = { workspace = true, features = ["event", "thread"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+# This crate is one of the two places audited `unsafe` may live
+# (workflow §5.2): libc carries the one call site rustix has no safe
+# wrapper for in `sys` — the `seccomp(2)` `SECCOMP_SET_MODE_FILTER`
+# install (R5 decision D2). Every use sits inside `sys::audited`,
+# behind a named safe wrapper with a `// SAFETY:` proof, like the
+# launcher binaries' `sys.rs`.
+libc.workspace = true
 
-[lints]
-workspace = true
+# This crate is one of the two audited `unsafe` sites (workflow §5.2):
+# `sys::audited` opts back in per module, so this crate lists the
+# workspace lints by hand (it cannot both inherit and override
+# `unsafe_code`) with `unsafe_code` at "deny" instead of "forbid".
+# Every `pub mod` in `lib.rs`/`sys/mod.rs` re-pins `forbid`, leaving
+# `sys::audited` the only compilable unsafe site — the same shape as
+# `central-harness-launcherd`'s `sys.rs`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"

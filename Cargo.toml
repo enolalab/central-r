@@ -101,6 +101,11 @@ sha1 = "=0.10.7"
 # --sandbox-launcher protected modes and their uid/os probes)
 rustix = { version = "=1.1.5", features = ["fs", "net", "process", "shm", "mm"] }
 
+# central-adapter-linux's audited `sys` boundary only (R5 decision D2):
+# the seccomp(2) install path rustix 1.1 has no safe wrapper for.
+# crates carry a `// SAFETY:`-documented unsafe block per call site.
+libc = "=0.2.191"
+
 # Cryptography — broker, advisory verification, CSRF/session/approval binding
 ed25519-dalek = "=3.0.0"
 hmac = "=0.13.0"

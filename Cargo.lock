@@ -704,6 +704,7 @@ dependencies = [
  "central-harness",
  "central-scheduler",
  "central-session",
+ "libc",
  "rustix",
  "serde",
  "serde_json",
