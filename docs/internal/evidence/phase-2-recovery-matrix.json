@@ -1,155 +1,30 @@
 {
   "schema": "phase-2-recovery-matrix/v1",
-  "generated_at": "2026-10-25T06:51:14.799431493Z",
-  "central_revision": "0.1.0",
+  "generated_at": "2026-10-25T11:43:45.829101803Z",
+  "central_revision": "40db5677740f6e0eec3ba39060fdf332173e99fe",
+  "candidate_commit": "40db5677740f6e0eec3ba39060fdf332173e99fe",
   "scenarios": [
     {
       "scenario_id": "RTM-01",
       "tier": "machine",
       "status": "passed",
+      "packet": "P2F03",
       "owning_specs": [
-        "S3",
-        "S1"
+        "S1",
+        "S7"
       ],
       "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "parallel + dependent children → correct final result",
-      "observed": "dependency ordering held; c ready only after a+b succeeded",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-11",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S3",
-        "S1"
+      "event_kinds_asserted": [
+        "artifact_finalized",
+        "attempt_started",
+        "attempt_succeeded",
+        "node_declared",
+        "node_dispatched",
+        "node_ready",
+        "node_succeeded"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "idempotent emission replay dedupes; divergent payload refuses",
-      "observed": "idempotent replay deduped; divergent key refused",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-12",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S3",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "depth over max_depth rejects atomically with SPEC_VALIDATION_FAILED",
-      "observed": "over-depth batch rejected atomically",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-14",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S3",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "artifact ordering evidence + authorized read journaled per scope",
-      "observed": "produce + read edges journaled; scopes enforced",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-03",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S2",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "kill mid-attempt: started attempts park ambiguous, siblings survive",
-      "observed": "started attempt parked ambiguous on lease expiry",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-05",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S2",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "unconfirmed launch parks ambiguous; never auto-relaunch",
-      "observed": "unconfirmed launch parked ambiguous; single launch call",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-06",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S2",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "never-started lease expiry fails LEASE_EXPIRED_NOT_STARTED and requeues",
-      "observed": "never-started expiry failed + requeued",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-07",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S2",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "worker lost ladder: suspect at 2 missed beats, lost at 5",
-      "observed": "suspect→lost ladder parked the live attempt",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-15",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S3",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "outbox backlog past the stall threshold reports OUTBOX_PUBLISH_STALLED",
-      "observed": "aged unpublished backlog flagged stalled",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-17",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S3",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "restart reconcile rebuilds readiness from durable state",
-      "observed": "reconcile + operator decision converged the run",
+      "expected": "parallel children fan into a gated aggregator; every final artifact is journaled and resolvable",
+      "observed": "p1+p2 flipped ready while agg stayed declared; both succeeded, agg flipped+claimed+succeeded; 3 produce edges, 3 artifact_finalized rows, every artifact ready-resolvable; 2 agg ordering edges",
       "journal_receipt_ids": [],
       "physical_pointer": null
     },
@@ -157,14 +32,47 @@
       "scenario_id": "RTM-02",
       "tier": "machine",
       "status": "passed",
+      "packet": "P2F02",
+      "owning_specs": [
+        "S4",
+        "S1"
+      ],
+      "reason_codes_asserted": [
+        "PROCESS_EXIT_NONZERO"
+      ],
+      "event_kinds_asserted": [
+        "attempt_failed",
+        "attempt_retry_scheduled",
+        "node_ready"
+      ],
+      "expected": "session crash requeues under backoff",
+      "observed": "PROCESS_EXIT_NONZERO failed the attempt (transient); attempt_retry_scheduled; node ready with not_before set",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-03",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F02",
       "owning_specs": [
         "S2",
         "S1"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "transient failure schedules a bounded-delay retry",
-      "observed": "transient failure scheduled bounded retry",
+      "reason_codes_asserted": [
+        "ATTEMPT_AMBIGUOUS_LEASE_EXPIRED"
+      ],
+      "event_kinds_asserted": [
+        "artifact_finalized",
+        "attempt_ambiguous",
+        "attempt_started",
+        "attempt_succeeded",
+        "lease_expired",
+        "node_dispatched",
+        "node_succeeded"
+      ],
+      "expected": "kill loses no completed outputs; started attempts park ambiguous; reconcile precedes reinvoke",
+      "observed": "A succeeded with identical artifact checksum; B ambiguous/attempt_ambiguous; post-restart node_dispatched ordered after reconcile",
       "journal_receipt_ids": [],
       "physical_pointer": null
     },
@@ -172,14 +80,94 @@
       "scenario_id": "RTM-04",
       "tier": "machine",
       "status": "passed",
+      "packet": "P2F03",
       "owning_specs": [
-        "S3",
+        "S4"
+      ],
+      "reason_codes_asserted": [
+        "BUDGET_EXHAUSTED",
+        "RATE_LIMITED"
+      ],
+      "event_kinds_asserted": [
+        "attempt_failed",
+        "attempt_retry_scheduled",
+        "node_failed_terminal",
+        "node_ready"
+      ],
+      "expected": "rate-limit hints are honored exactly within the cap and ignored off-class",
+      "observed": "90s hint honored (not_before in bound); 48h hint capped at the 10m policy cap; dispatch_infra report ignored its hint; terminal failure closed the node",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-05",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F02",
+      "owning_specs": [
+        "S2"
+      ],
+      "reason_codes_asserted": [
+        "ATTEMPT_AMBIGUOUS_WORKER_LOST",
+        "LEASE_EXPIRED_NOT_STARTED",
+        "WORKER_LOST_GRACE_EXPIRED",
+        "WORKER_SHUTDOWN_LEASE_RELEASED"
+      ],
+      "event_kinds_asserted": [
+        "attempt_ambiguous",
+        "attempt_failed",
+        "lease_expired",
+        "node_ready",
+        "worker_deregistered",
+        "worker_lost",
+        "worker_suspect"
+      ],
+      "expected": "suspect is observable-only; lost expires every held lease; clean shutdown releases",
+      "observed": "worker_suspect once at 2 beats with leases live; worker_lost at 5 beats expired both leases (idle ready, live ambiguous); shutdown released the quiet lease",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-06",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F02",
+      "owning_specs": [
+        "S2",
         "S1"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "retry budget exhaustion lands failed_terminal RETRY_BUDGET_EXHAUSTED",
-      "observed": "budget exhaustion landed terminal",
+      "reason_codes_asserted": [
+        "LEASE_EXPIRED_NOT_STARTED"
+      ],
+      "event_kinds_asserted": [
+        "lease_expired",
+        "node_ready"
+      ],
+      "expected": "never-started expiry requeues under a new lease",
+      "observed": "expired 1 never-started lease; node ready; reclaimed as attempt_seq 2; lease_expired+node_ready journaled",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-07",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F02",
+      "owning_specs": [
+        "S2"
+      ],
+      "reason_codes_asserted": [
+        "ATTEMPT_AMBIGUOUS_LEASE_EXPIRED",
+        "LEASE_FENCE_STALE",
+        "LEASE_RENEWAL_STALE"
+      ],
+      "event_kinds_asserted": [
+        "attempt_ambiguous",
+        "lease_expired",
+        "lease_renewal_rejected"
+      ],
+      "expected": "mid-flight expiry parks ambiguous without requeue; the stale lease fences writes",
+      "observed": "started lease expired to ambiguous/attempt_ambiguous; reclaim empty; Fence+RenewLease refused stale with lease_renewal_rejected journaled",
       "journal_receipt_ids": [],
       "physical_pointer": null
     },
@@ -187,74 +175,20 @@
       "scenario_id": "RTM-08",
       "tier": "machine",
       "status": "passed",
+      "packet": "P2F03",
       "owning_specs": [
-        "S3",
-        "S1"
+        "S5"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "capacity admission defers dispatch without consuming an attempt",
-      "observed": "admission deferred without consuming an attempt",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-13",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S3",
-        "S1"
+      "reason_codes_asserted": [
+        "DUPLICATE_IDEMPOTENCY_KEY"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "node timeout kills the live attempt and lands failed_terminal",
-      "observed": "node timeout killed confirmed and terminated",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-16",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S2",
-        "S1"
+      "event_kinds_asserted": [
+        "attempt_succeeded",
+        "command_deduped",
+        "node_declared"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "worker deregistration releases leases and requeues nodes",
-      "observed": "deregister released leases and requeued",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-19-session",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S2",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "session wall-clock breach kills confirmed SESSION_WALL_CLOCK_REACHED",
-      "observed": "wall-clock breach kill-confirmed, outcome recorded",
-      "journal_receipt_ids": [],
-      "physical_pointer": null
-    },
-    {
-      "scenario_id": "RTM-19-deadlines",
-      "tier": "machine",
-      "status": "passed",
-      "owning_specs": [
-        "S3",
-        "S1"
-      ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "workflow deadline cancels live attempts and lands failed_terminal",
-      "observed": "workflow deadline cascaded cancellations",
+      "expected": "exact replays dedupe observably; same-key different-payload replays conflict",
+      "observed": "outcome replay deduped (one attempt_succeeded, +1 command_deduped, no re-transition, replay result identical to the commit); different fingerprint conflicted DUPLICATE_IDEMPOTENCY_KEY; re-emit returned the committed node id with no second node_declared",
       "journal_receipt_ids": [],
       "physical_pointer": null
     },
@@ -262,14 +196,24 @@
       "scenario_id": "RTM-09",
       "tier": "machine",
       "status": "passed",
+      "packet": "P2F03",
       "owning_specs": [
-        "S3",
-        "S1"
+        "S3"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "checkpoint → resume happy path; digest drift refuses WORKSPACE_DIGEST_MISMATCH",
-      "observed": "checkpoint round-trip + digest-drift refusal",
+      "reason_codes_asserted": [
+        "CHECKPOINT_ARTIFACT_MISSING",
+        "CHECKPOINT_BOUNDARY_ILLEGAL",
+        "CHECKPOINT_INCOMPATIBLE",
+        "RESUME_TOKEN_STALE",
+        "WORKSPACE_DIGEST_MISMATCH"
+      ],
+      "event_kinds_asserted": [
+        "checkpoint_refused",
+        "checkpoint_written",
+        "resume_failed"
+      ],
+      "expected": "legal writes resolve; the four refusals fail safe with codes; live anchors refuse writes",
+      "observed": "seq-1 write resolved via token; unknown+tampered tokens stale (tampered journaled); bumped version incompatible via ResumeSubtree; mutated workspace mismatched; GC'd artifact missing; running anchor refused; every refusal left run state untouched",
       "journal_receipt_ids": [],
       "physical_pointer": null
     },
@@ -277,14 +221,187 @@
       "scenario_id": "RTM-10",
       "tier": "machine",
       "status": "passed",
+      "packet": "P2F03",
       "owning_specs": [
         "S3",
+        "S7"
+      ],
+      "reason_codes_asserted": [
+        "RESUME_REQUIRES_OPERATOR_DECISION"
+      ],
+      "event_kinds_asserted": [
+        "attempt_ambiguous",
+        "checkpoint_written",
+        "lease_expired",
+        "node_ready",
+        "resume_completed",
+        "resume_started"
+      ],
+      "expected": "resume returns unfinished work claimable, parks in-flight ambiguity, and re-exposes reads without restoring payloads",
+      "observed": "preflight ok after restart; unfinished reclaimed as seq 2 and succeeded; flying parked RESUME_REQUIRES_OPERATOR_DECISION; pre-parked ambiguity untouched; ResolveProduced re-resolved X with an unchanged produce set",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-11",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F03",
+      "owning_specs": [
         "S1"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "stale/incompatible resume tokens refuse RESUME_TOKEN_STALE",
-      "observed": "stale + garbled tokens refused",
+      "reason_codes_asserted": [
+        "ATTEMPT_AMBIGUOUS_LEASE_EXPIRED",
+        "LEASE_EXPIRED_NOT_STARTED"
+      ],
+      "event_kinds_asserted": [
+        "attempt_ambiguous",
+        "cancel_requested",
+        "lease_expired",
+        "node_cancelled"
+      ],
+      "expected": "cancel cascades: live nodes signal, ready/declared cancel, ambiguity parks while the cascade flows past",
+      "observed": "BFS covered all 6 nodes; running kept state with cancel_requested; parent+ready+grand+ambchild cancelled; ambiguous parked untouched; re-cancel idempotent",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-12",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F03",
+      "owning_specs": [
+        "S1",
+        "S4"
+      ],
+      "reason_codes_asserted": [
+        "MAX_DEPTH_EXCEEDED",
+        "SPEC_VALIDATION_FAILED"
+      ],
+      "event_kinds_asserted": [
+        "child_spec_rejected",
+        "node_declared"
+      ],
+      "expected": "a cyclic batch rejects atomically naming the cycle; a corrected batch commits",
+      "observed": "A->B->A rejected SPEC_VALIDATION_FAILED naming both keys with zero nodes committed; corrected A,B(dep A) created; the depth-4 child rejected MAX_DEPTH_EXCEEDED under the locked cap",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-13",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F03",
+      "owning_specs": [
+        "S4"
+      ],
+      "reason_codes_asserted": [
+        "BUDGET_EXHAUSTED",
+        "RETRY_BUDGET_EXHAUSTED"
+      ],
+      "event_kinds_asserted": [
+        "compensation_requested",
+        "node_failed_terminal",
+        "node_ready"
+      ],
+      "expected": "budgets exhaust terminally; terminal classes land at once; managed hooks run once, unmanaged journal only",
+      "observed": "3 transient failures exhausted (counts 3/3) RETRY_BUDGET_EXHAUSTED; terminal class landed BUDGET_EXHAUSTED with the dependent declared; managed hook cleaned once + executed result, replay deduped; unmanaged request-only, executor untouched",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-14",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F03",
+      "owning_specs": [
+        "S7",
+        "S5"
+      ],
+      "reason_codes_asserted": [
+        "ARTIFACT_ALREADY_FINALIZED",
+        "ARTIFACT_CHECKSUM_MISMATCH",
+        "ARTIFACT_NOT_FINALIZED",
+        "ARTIFACT_SCOPE_DENIED",
+        "LINEAGE_READ_UNDECLARED"
+      ],
+      "event_kinds_asserted": [
+        "artifact_finalized",
+        "node_dispatched",
+        "node_ready",
+        "node_succeeded"
+      ],
+      "expected": "reads gate on finalization and scope; declare-or-flag journals undeclared reads",
+      "observed": "premature read refused NOT_FINALIZED; finalize flipped the consumer; declared read released verified bytes with the checksum on the edge; double finalize refused with the recorded row standing; mismatch refused then retried clean; in-run read flagged undeclared; foreign-run read denied",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-15",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F03",
+      "owning_specs": [
+        "S8",
+        "S5"
+      ],
+      "reason_codes_asserted": [
+        "CAPACITY_ADMISSION_DEFERRED"
+      ],
+      "event_kinds_asserted": [
+        "admission_deferred",
+        "node_dispatched",
+        "node_succeeded"
+      ],
+      "expected": "one slot admits one node and defers the other; the disk floor denies; stalls surface without corrupting transitions",
+      "observed": "disk floor deferred directly (and admits a healthy snapshot); A claimed while B deferred with ready_at untouched and no attempt row; completing A dispatched B; stalled drain raised OUTBOX_PUBLISH_STALLED via flag+log+health while B's outcome committed correct",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-16",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F02",
+      "owning_specs": [
+        "S2",
+        "S4",
+        "S5"
+      ],
+      "reason_codes_asserted": [
+        "ATTEMPT_AMBIGUOUS_LEASE_EXPIRED"
+      ],
+      "event_kinds_asserted": [
+        "attempt_ambiguous",
+        "attempt_decision",
+        "command_deduped",
+        "lease_expired",
+        "node_dispatched",
+        "node_ready"
+      ],
+      "expected": "timers skip ambiguity; the operator decision is idempotent; the rerun takes a new attempt_seq",
+      "observed": "sweep past the node bounds skipped both ambiguous nodes; rerun readyed with one attempt_decision and claimed attempt_seq 2; resume replay deduped",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-17",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F03",
+      "owning_specs": [
+        "S8"
+      ],
+      "reason_codes_asserted": [
+        "CAPACITY_ADMISSION_DEFERRED"
+      ],
+      "event_kinds_asserted": [
+        "admission_deferred",
+        "node_dispatched",
+        "node_succeeded"
+      ],
+      "expected": "saturation never starves: FIFO holds across re-evaluations and freeing dispatches",
+      "observed": "B held ready_at across 10 saturated re-evaluations with one entry-only deferral; freeing the slot dispatched B on the next claim",
       "journal_receipt_ids": [],
       "physical_pointer": null
     },
@@ -292,14 +409,81 @@
       "scenario_id": "RTM-18",
       "tier": "machine",
       "status": "passed",
+      "packet": "P2F03",
       "owning_specs": [
-        "S3",
-        "S1"
+        "S6"
       ],
-      "reason_codes_asserted": [],
-      "event_kinds_asserted": [],
-      "expected": "journal fold consistency: artifacts + events reconstruct run truth",
-      "observed": "fold reconstructed the journaled truth",
+      "reason_codes_asserted": [
+        "DUPLICATE_EVENT_ID",
+        "EVENT_SEQUENCE_GAP",
+        "UNKNOWN_EVENT_KIND"
+      ],
+      "event_kinds_asserted": [
+        "attempt_started",
+        "attempt_succeeded",
+        "node_declared",
+        "node_dispatched",
+        "node_ready",
+        "node_succeeded"
+      ],
+      "expected": "gaps and undeclared kinds flag; redelivery dedupes; every scenario run journals cataloged kinds",
+      "observed": "contiguous fold clean, gapped fold flagged EVENT_SEQUENCE_GAP; redelivery deduped to its seq (DUPLICATE_EVENT_ID vocabulary-bound, dedupe behaviorally proven via seq identity + single stored row); undeclared kind stored verbatim and flagged UNKNOWN_EVENT_KIND",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-19-session",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F02",
+      "owning_specs": [
+        "S2",
+        "S4",
+        "S8"
+      ],
+      "reason_codes_asserted": [
+        "ATTEMPT_AMBIGUOUS_KILL_UNCONFIRMED",
+        "SESSION_WALL_CLOCK_REACHED"
+      ],
+      "event_kinds_asserted": [
+        "attempt_ambiguous",
+        "attempt_failed",
+        "attempt_retry_scheduled",
+        "node_ready"
+      ],
+      "expected": "confirmed session kill requeues retryable; unconfirmed parks ambiguous",
+      "observed": "confirmed kill landed SESSION_WALL_CLOCK_REACHED with node ready under backoff; unconfirmed kill parked attempt_ambiguous",
+      "journal_receipt_ids": [],
+      "physical_pointer": null
+    },
+    {
+      "scenario_id": "RTM-19-deadlines",
+      "tier": "machine",
+      "status": "passed",
+      "packet": "P2F03",
+      "owning_specs": [
+        "S4",
+        "S2",
+        "S8"
+      ],
+      "reason_codes_asserted": [
+        "ATTEMPT_AMBIGUOUS_LEASE_EXPIRED",
+        "NODE_TIMEOUT",
+        "SESSION_WALL_CLOCK_REACHED",
+        "WORKFLOW_TIMEOUT"
+      ],
+      "event_kinds_asserted": [
+        "attempt_ambiguous",
+        "attempt_decision",
+        "attempt_failed",
+        "cancel_requested",
+        "lease_expired",
+        "node_cancelled",
+        "node_failed_terminal",
+        "node_ready"
+      ],
+      "expected": "expired node bounds land terminal; expired run bounds cancel and land; ambiguity skips both timers",
+      "observed": "node bound landed NODE_TIMEOUT under a confirmed kill (attempt SESSION_WALL_CLOCK_REACHED); amb node+run skipped; after rerun the deferred node timer fired and the run landed WORKFLOW_TIMEOUT over the cancelled cascade",
       "journal_receipt_ids": [],
       "physical_pointer": null
     },
@@ -312,94 +496,71 @@
       ],
       "reason_codes_asserted": [],
       "event_kinds_asserted": [],
-      "expected": "RTM-03 expectations at production tier under a real daemon kill",
-      "observed": "deferred to the physical-tier acceptance track",
+      "expected": "catalog expectations at production tier",
+      "observed": "deferred to physical tier: operator runbook",
       "journal_receipt_ids": [],
-      "physical_pointer": "docs/operations/runbooks/phase-2-physical-acceptance.md#rtm-p1"
+      "physical_pointer": "operator runbook"
     },
     {
       "scenario_id": "RTM-P2",
       "tier": "physical",
       "status": "deferred-physical",
       "owning_specs": [
-        "S8"
+        "S4"
       ],
       "reason_codes_asserted": [],
       "event_kinds_asserted": [],
-      "expected": "host resource exhaustion under real load — machine tier is a scripted analogue",
-      "observed": "deferred to the physical-tier acceptance track",
+      "expected": "catalog expectations at production tier",
+      "observed": "deferred to physical tier: maintainer run",
       "journal_receipt_ids": [],
-      "physical_pointer": "docs/operations/runbooks/phase-2-physical-acceptance.md#rtm-p2"
+      "physical_pointer": "maintainer run"
     },
     {
       "scenario_id": "RTM-P3",
       "tier": "physical",
       "status": "deferred-physical",
       "owning_specs": [
-        "S6"
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "S6",
+        "S7",
+        "S8"
       ],
       "reason_codes_asserted": [],
       "event_kinds_asserted": [],
-      "expected": "network partition mid-dispatch — machine tier is a scripted analogue",
-      "observed": "deferred to the physical-tier acceptance track",
+      "expected": "catalog expectations at production tier",
+      "observed": "deferred to physical tier: phases.md exit track",
       "journal_receipt_ids": [],
-      "physical_pointer": "docs/operations/runbooks/phase-2-physical-acceptance.md#rtm-p3"
+      "physical_pointer": "phases.md exit track"
     }
   ],
   "coverage": {
     "phases_md_scenarios": {
-      "S1": [
-        "RTM-01",
-        "RTM-11",
-        "RTM-12",
-        "RTM-14",
-        "RTM-03",
-        "RTM-05",
+      "expired lease → safe reassignment, no duplicate durable effects": [
         "RTM-06",
         "RTM-07",
-        "RTM-15",
-        "RTM-17",
-        "RTM-02",
-        "RTM-04",
-        "RTM-08",
-        "RTM-13",
-        "RTM-16",
-        "RTM-19-session",
-        "RTM-19-deadlines",
-        "RTM-09",
-        "RTM-10",
-        "RTM-18"
+        "RTM-16"
       ],
-      "S2": [
+      "incompatible checkpoint fails safe + actionable reason": [
+        "RTM-09"
+      ],
+      "kill application/worker loses no completed child outputs": [
         "RTM-03",
         "RTM-05",
-        "RTM-06",
-        "RTM-07",
-        "RTM-02",
-        "RTM-16",
-        "RTM-19-session",
         "RTM-P1"
       ],
-      "S3": [
+      "parallel + dependent children → correct final result": [
         "RTM-01",
-        "RTM-11",
-        "RTM-12",
-        "RTM-14",
-        "RTM-15",
-        "RTM-17",
-        "RTM-04",
-        "RTM-08",
-        "RTM-13",
-        "RTM-19-deadlines",
-        "RTM-09",
-        "RTM-10",
-        "RTM-18"
+        "RTM-14"
       ],
-      "S6": [
-        "RTM-P3"
+      "parent cancel propagates per documented policy": [
+        "RTM-11"
       ],
-      "S8": [
-        "RTM-P2"
+      "repeated idempotency key → no duplicates": [
+        "RTM-08"
       ]
     },
     "specs_consumed": [
@@ -413,5 +574,56 @@
       "S8"
     ],
     "asserted_codes_all_cataloged": true
-  }
+  },
+  "prerequisites": [
+    {
+      "gate": "phase-2-slice",
+      "path": "docs/implementation/phase-2-slices/slice-a-workflow-graph-lineage.md",
+      "sha256": "8d25968ba78a61278506e06cc094fdf590aaf21bdd1dc9dc5ff949b11fd5d713",
+      "parse_status": "ok",
+      "notes": "markdown slice plan; upstream indexes the regenerated JSON acceptance bundles (see divergences)"
+    },
+    {
+      "gate": "phase-2-slice",
+      "path": "docs/implementation/phase-2-slices/slice-b-scheduler-workers.md",
+      "sha256": "938f1049706ec1a64cc7a6c315bccb40f80352e750398d28d67abe4a2b240a03",
+      "parse_status": "ok",
+      "notes": "markdown slice plan; upstream indexes the regenerated JSON acceptance bundles (see divergences)"
+    },
+    {
+      "gate": "phase-2-slice",
+      "path": "docs/implementation/phase-2-slices/slice-c-checkpoint-resume.md",
+      "sha256": "1c94540b33c21c3b2aade049df4b60aa4a4a12daf68e278f426f77b22489f259",
+      "parse_status": "ok",
+      "notes": "markdown slice plan; upstream indexes the regenerated JSON acceptance bundles (see divergences)"
+    },
+    {
+      "gate": "phase-2-slice",
+      "path": "docs/implementation/phase-2-slices/slice-d-retry-idempotency.md",
+      "sha256": "0702efe366d1f5c998989626ad0b297d078b75d7c59204ed7d05b13a50145feb",
+      "parse_status": "ok",
+      "notes": "markdown slice plan; upstream indexes the regenerated JSON acceptance bundles (see divergences)"
+    },
+    {
+      "gate": "phase-2-slice",
+      "path": "docs/implementation/phase-2-slices/slice-e-graph-ui.md",
+      "sha256": "a9f783a3ed26ca62f2c538d35ac99ac3ee688bf652a2dd35a24949633f170f41",
+      "parse_status": "ok",
+      "notes": "markdown slice plan; upstream indexes the regenerated JSON acceptance bundles (see divergences)"
+    }
+  ],
+  "host_profile": {
+    "pg_server_version": "16.15 (Debian 16.15-1.pgdg13+2)",
+    "profile": "test",
+    "rustc_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+  },
+  "commands": [
+    "CENTRAL_TEST_DSN=… cargo test -p central --test phase2_acceptance"
+  ],
+  "divergences": [
+    "per-scenario PostgreSQL databases replace the upstream shared connection (stronger isolation; same-DB probe graphs restore the cross-run legs that need them)",
+    "prerequisites index the phase-2 slice plan markdown (the Rust workspace carries no prior JSON acceptance bundles to re-index)",
+    "RTM-14's read legs drive the production authorize_read/record_read ports through the matrix read seam (scripted bodies) — the `central artifact read` CLI boundary composes the same ports"
+  ],
+  "skip_census": []
 }
