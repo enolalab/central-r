@@ -518,6 +518,52 @@ define_id! {
 }
 
 // ---------------------------------------------------------------------------
+// R5 host-authority identities (upstream `internal/authority` +
+// `internal/secretbootstrap` `uuid.UUID` fields — all minted by
+// `uuid.NewV7()` upstream, so all are UUIDv7 here).
+// ---------------------------------------------------------------------------
+
+define_id! {
+    /// Identifies one generation of protected key material in the
+    /// `protected_file_v1` store (upstream `ProtectedGeneration.
+    /// GenerationID` / `secretbootstrap.Generation.GenerationID`).
+    ProtectedGenerationId
+}
+
+define_id! {
+    /// Identifies one secret-bootstrap binding between a purpose and a
+    /// protected generation (upstream `secretbootstrap.Binding.
+    /// BindingID` and the `BindingID` fields of the handoff records,
+    /// reservations, durable leases, and B05 migration launch binding).
+    SecretBindingId
+}
+
+define_id! {
+    /// Identifies one one-use secret-materialization handoff receipt
+    /// (upstream `secretbootstrap.HandoffReceipt.ReceiptID` and the
+    /// `ReceiptID` fields of `HandoffRequest`/`HandoffOperation`).
+    HandoffReceiptId
+}
+
+define_id! {
+    /// Identifies one broker-signed lifecycle proof (upstream
+    /// `secretbootstrap.LifecycleProof.ProofID`, SC-DEF-12).
+    LifecycleProofId
+}
+
+define_id! {
+    /// Identifies one bounded handoff reservation (upstream
+    /// `secretbootstrap.HandoffReservation.ReservationID`).
+    HandoffReservationId
+}
+
+define_id! {
+    /// Identifies one durable secret-binding lease (upstream
+    /// `secretbootstrap.DurableLease.LeaseID`).
+    DurableLeaseId
+}
+
+// ---------------------------------------------------------------------------
 // UUIDv4 generation newtypes (upstream `internal/artifact`'s opaque
 // generations — UUIDv4 because the persisted columns and their parsers
 // require exactly that version).
@@ -714,6 +760,12 @@ mod tests {
         assert_id_contract::<SecretUseEvidenceId>();
         assert_id_contract::<CorrelationId>();
         assert_id_contract::<CausationId>();
+        assert_id_contract::<ProtectedGenerationId>();
+        assert_id_contract::<SecretBindingId>();
+        assert_id_contract::<HandoffReceiptId>();
+        assert_id_contract::<LifecycleProofId>();
+        assert_id_contract::<HandoffReservationId>();
+        assert_id_contract::<DurableLeaseId>();
     }
 
     /// Runs the shared strict contract against one UUIDv4 generation
