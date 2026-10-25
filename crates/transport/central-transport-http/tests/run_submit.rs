@@ -99,6 +99,9 @@ impl RunsReader for EmptyRuns {
     ) -> BoxFuture<'_, Result<Vec<central_runview::domain::RunSummary>, DomainFailure>> {
         runs_ok!(Vec::new())
     }
+    fn run_scope(&self, _r: RunId) -> BoxFuture<'_, Result<Option<WorkspaceId>, DomainFailure>> {
+        runs_ok!(None)
+    }
     fn run_for_id(
         &self,
         _w: WorkspaceId,

@@ -405,7 +405,7 @@ pub(crate) async fn serve_task_detail(state: Arc<WebState>, req: Request) -> Res
     };
     let workspace_id = sess.workspace_id;
     let query = req.uri().query().unwrap_or_default();
-    let task_id = match query_value(query, "id").and_then(|v| TaskId::parse(v).ok()) {
+    let task_id = match query_value(query, "id").and_then(|v| TaskId::parse(&v).ok()) {
         Some(id) => id,
         None => return render_not_found(),
     };
@@ -487,7 +487,11 @@ pub(crate) async fn serve_task_detail(state: Arc<WebState>, req: Request) -> Res
         permission_panel: None,
         permission_history: Vec::new(),
         permission_notice: "",
-        action_notice: action_notice_text(query_value(query, ACTION_NOTICE_QUERY).unwrap_or("")),
+        action_notice: action_notice_text(
+            query_value(query, ACTION_NOTICE_QUERY)
+                .as_deref()
+                .unwrap_or(""),
+        ),
         finish_cancelling: false,
         finish_cancelling_prepared: false,
         harness_resolvable: false,
@@ -541,7 +545,7 @@ pub(crate) async fn serve_task_detail(state: Arc<WebState>, req: Request) -> Res
     if projection.task.permission_policy == PermissionPolicy::AutoAllow {
         vm.auto_allow_warning = permission_view::AUTO_ALLOW_WARNING;
     }
-    if query_value(query, PERMISSION_STALE_QUERY) == Some(PERMISSION_STALE_VALUE) {
+    if query_value(query, PERMISSION_STALE_QUERY).as_deref() == Some(PERMISSION_STALE_VALUE) {
         vm.permission_notice = PERMISSION_NOT_PENDING_MSG;
     }
     // "Finish cancelling" for a cancelling Task whose current Run was
@@ -725,12 +729,25 @@ async fn claimability(
 }
 
 /// One `key=value` query parameter (the detail/artifact routes use
-/// query-parameter addressing, matching upstream).
-pub(crate) fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+/// query-parameter addressing, matching upstream). Names and values
+/// percent-decode like `r.URL.Query().Get` — a `%3A` inside a cursor
+/// token reads as `:` — and a pair whose name or value fails to decode
+/// is skipped like `url.ParseQuery` (a later duplicate key can still
+/// supply the value). A bare `key` decodes to the empty value, the
+/// same `""` `Query().Get` returns for it.
+pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == key
-        {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let (Some(k), Some(v)) = (
+            crate::middleware::session_auth::percent_decode(k),
+            crate::middleware::session_auth::percent_decode(v),
+        ) else {
+            continue;
+        };
+        if k == key {
             return Some(v);
         }
     }
@@ -759,7 +776,7 @@ async fn resolve_artifact_delivery(
         )));
     };
     let workspace_id = sess.workspace_id;
-    let artifact_id = match query_value(query, "id").and_then(|v| ArtifactId::parse(v).ok()) {
+    let artifact_id = match query_value(query, "id").and_then(|v| ArtifactId::parse(&v).ok()) {
         Some(id) => id,
         None => return Err(Box::new(render_not_found())),
     };

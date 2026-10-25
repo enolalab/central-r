@@ -110,7 +110,9 @@ async fn run_control_prelude(
 /// `scopeRunForControl` — resolves the posted run id inside the
 /// caller's session workspace. Malformed, absent and cross-workspace
 /// ids are the same generic 404; a projection failure is a bare 503;
-/// an unwired Runs port is the same 503.
+/// an unwired Runs port is the same 503. The probe is `run_scope` —
+/// the single-column `workspace_id` read — not the full `run_for_id`
+/// projection.
 async fn scope_run_for_control(
     state: &Arc<WebState>,
     workspace_id: WorkspaceId,
@@ -122,11 +124,9 @@ async fn scope_run_for_control(
     let Some(reader) = state.runs.clone() else {
         return Err(Box::new(error::reject(StatusCode::SERVICE_UNAVAILABLE, "")));
     };
-    match reader.run_for_id(workspace_id, run_id).await {
-        Ok(_) => Ok(run_id),
-        Err(f) if f.kind() == central_foundation::failure::FailureKind::NotFound => {
-            Err(Box::new(render_not_found()))
-        }
+    match reader.run_scope(run_id).await {
+        Ok(Some(scope)) if scope == workspace_id => Ok(run_id),
+        Ok(_) => Err(Box::new(render_not_found())),
         Err(_) => Err(Box::new(error::reject(StatusCode::SERVICE_UNAVAILABLE, ""))),
     }
 }
@@ -306,7 +306,7 @@ pub(crate) async fn serve_run_controls(state: Arc<WebState>, req: Request) -> Re
     let Some(run_id) = query
         .as_deref()
         .and_then(|q| query_value(q, "run"))
-        .and_then(|v| RunId::parse(v).ok())
+        .and_then(|v| RunId::parse(&v).ok())
     else {
         return render_not_found();
     };
@@ -349,7 +349,7 @@ pub(crate) async fn serve_run_controls(state: Arc<WebState>, req: Request) -> Re
             badge_class: node_badge_class(&badge).to_string(),
             badge,
             reason: node.reason.clone(),
-            cancellable: vm.can_cancel && status.is_some_and(|s| !s.is_terminal()),
+            cancellable: vm.can_cancel && !status.is_some_and(|s| s.is_terminal()),
             ambiguous: vm.can_decide && status == Some(NodeStatus::AttemptAmbiguous),
         });
     }

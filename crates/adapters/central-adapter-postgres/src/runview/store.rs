@@ -99,13 +99,22 @@ fn decode_spec_versions(spec: &serde_json::Value, versions: &mut Versions) {
 }
 
 /// `scalarJSON` — renders a JSON scalar as text; compound values report
-/// `None` and are skipped. Numbers render like Go's
+/// `None` and are skipped. Numbers route through `f64` exactly like
+/// upstream's `json.Unmarshal` into `float64`, then render like Go's
 /// `strconv.FormatFloat(f, 'f', -1, 64)`: integral values carry no
-/// decimal point, fractional values the shortest exact decimal.
+/// decimal point and the shortest exact decimal never widens to an
+/// exponent — `Display` on `f64` is precisely that format (`5.0` →
+/// `5`, `1e30` → `1000000000000000000000000000000`).
 fn scalar_json(raw: &serde_json::Value) -> Option<String> {
     match raw {
         serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
+        // `is_finite` is belt-and-braces upstream parity:
+        // `json.Unmarshal` errors on a number overflowing f64 and
+        // serde_json refuses `1e999` at parse, so a non-finite value
+        // can never legitimately reach this formatter.
+        serde_json::Value::Number(n) => {
+            n.as_f64().filter(|f| f.is_finite()).map(|f| format!("{f}"))
+        }
         serde_json::Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
@@ -704,5 +713,55 @@ impl Reader for Store {
             unpublished_depth: i64::try_from(backlog.depth).unwrap_or(i64::MAX),
             oldest_unpublished: backlog.oldest,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `scalarJSON` parity pins — Go renders a JSON number as
+    //! `json.Unmarshal` → `float64` → `strconv.FormatFloat(f,'f',-1,64)`;
+    //! Rust's `Display` on `f64` is exactly that format (shortest
+    //! round-trip decimal, never an exponent). These cases lock the
+    //! shape review asked about: integral, decimal, and exponent-scale
+    //! values.
+
+    use super::scalar_json;
+
+    fn scalar(raw: &str) -> Option<String> {
+        scalar_json(&serde_json::from_str(raw).unwrap())
+    }
+
+    #[test]
+    fn scalar_json_number_format_matches_go() {
+        // Integral values carry no decimal point.
+        assert_eq!(scalar("5").as_deref(), Some("5"));
+        assert_eq!(scalar("5.0").as_deref(), Some("5"));
+        assert_eq!(scalar("-3").as_deref(), Some("-3"));
+        // Ordinary decimals keep the shortest exact form.
+        assert_eq!(scalar("1.5").as_deref(), Some("1.5"));
+        assert_eq!(scalar("0.25").as_deref(), Some("0.25"));
+        // Exponent-scale inputs render expanded, never `1e30`-style —
+        // `FormatFloat(f,'f',-1,64)` spells the same digits.
+        assert_eq!(
+            scalar("1e30").as_deref(),
+            Some("1000000000000000000000000000000")
+        );
+        assert_eq!(scalar("1.25e-7").as_deref(), Some("0.000000125"));
+        // An f64-overflowing literal is no scalar upstream either
+        // (`json.Unmarshal` errors) — serde_json likewise refuses it at
+        // parse, so no `Value` can carry `inf` into the formatter.
+        assert!(serde_json::from_str::<serde_json::Value>("1e999").is_err());
+    }
+
+    #[test]
+    fn scalar_json_non_number_scalars() {
+        assert_eq!(scalar("\"hi\"").as_deref(), Some("hi"));
+        assert_eq!(scalar("true").as_deref(), Some("true"));
+        assert_eq!(scalar("false").as_deref(), Some("false"));
+        // Compound values and null report no scalar — skipped, never
+        // fabricated.
+        assert_eq!(scalar("null"), None);
+        assert_eq!(scalar("{\"a\":1}"), None);
+        assert_eq!(scalar("[1,2]"), None);
     }
 }

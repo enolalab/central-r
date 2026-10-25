@@ -53,7 +53,7 @@
 <h2 id="nodes-h">Per-node lineage</h2>
 {% for node in vm.nodes %}
 <section aria-label="Node {{ node.node_key }}">
-<h3><a href="/app/runs/node?id={{ node.node_id }}">{{ node.node_key }}</a>{% if !node.status.is_empty() %} &mdash; {{ node.status }}{% endif %}</h3>
+<h3>{{ node.node_key }}{% if !node.status.is_empty() %} &mdash; {{ node.status }}{% endif %}</h3>
 {% if let Some(prompt) = node.prompt_ref %}<p>Prompt: {{ lineage_artifact(prompt) }}</p>{% endif %}
 
 {% if !node.produced.is_empty() %}

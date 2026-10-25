@@ -359,6 +359,13 @@ pub trait RunsReader: Send + Sync + 'static {
         run_id: RunId,
     ) -> BoxFuture<'_, Result<central_runview::domain::RunSummary, DomainFailure>>;
 
+    /// `RunScope` — the workspace the run belongs to; `Ok(None)` when
+    /// no run carries the id. The control POSTs' run scope check uses
+    /// this single-column probe rather than the full `run_for_id`
+    /// projection.
+    fn run_scope(&self, run_id: RunId)
+    -> BoxFuture<'_, Result<Option<WorkspaceId>, DomainFailure>>;
+
     /// `NodeForID`.
     fn node_for_id(
         &self,
@@ -416,6 +423,13 @@ where
         run_id: RunId,
     ) -> BoxFuture<'_, Result<central_runview::domain::RunSummary, DomainFailure>> {
         Box::pin(async move { self.run_for_id(workspace_id, run_id).await })
+    }
+
+    fn run_scope(
+        &self,
+        run_id: RunId,
+    ) -> BoxFuture<'_, Result<Option<WorkspaceId>, DomainFailure>> {
+        Box::pin(async move { self.run_scope(run_id).await })
     }
 
     fn node_for_id(

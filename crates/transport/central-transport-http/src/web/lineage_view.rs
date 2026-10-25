@@ -110,7 +110,6 @@ struct LineageReadRow {
 /// artifacts, its journaled reads, and its prompt_ref artifact link
 /// when the spec recorded one.
 struct LineageNodeSection {
-    node_id: String,
     node_key: String,
     status: String,
     produced: Vec<LineageProduceRow>,
@@ -126,8 +125,8 @@ struct RunLineageViewModel {
     /// attempt.
     finals: Vec<LineageProduceRow>,
     /// The same edges grouped per producing/reading node, in graph
-    /// order; only nodes that produced, read, or recorded a prompt_ref
-    /// appear.
+    /// order; every graph node renders a section even when it produced,
+    /// read, and prompted nothing.
     nodes: Vec<LineageNodeSection>,
     /// The journaled reads attributed to no node — the synthetic
     /// operator reader of the lineage spec (OQ-5).
@@ -141,9 +140,13 @@ struct RunLineageViewModel {
 
 /// `lineageNodeKey` — a node id's key, or the id itself when the graph
 /// projection does not name the node (a journaled edge to a node the
-/// graph never materialized still renders, keyed by id).
+/// graph never materialized still renders, keyed by id). An empty key
+/// falls back to the id like upstream's `ok && key != ""` check.
 fn lineage_node_key(keys: &BTreeMap<WorkflowNodeId, String>, id: WorkflowNodeId) -> String {
-    keys.get(&id).cloned().unwrap_or_else(|| id.to_string())
+    keys.get(&id)
+        .filter(|k| !k.is_empty())
+        .cloned()
+        .unwrap_or_else(|| id.to_string())
 }
 
 /// `buildRunLineage` — assembles the view model from the journaled edge
@@ -246,12 +249,21 @@ async fn build_run_lineage(
 
     // Per-node sections in graph order, then any node that has lineage
     // but is absent from the graph projection (a node the run list
-    // never materialized is still rendered, keyed by its id).
+    // never materialized is still rendered, keyed by its id). Every
+    // graph node renders a section — produced/read rows or a prompt_ref
+    // are not prerequisites.
     let mut seen: BTreeMap<WorkflowNodeId, ()> = BTreeMap::new();
     let mut ordered: Vec<WorkflowNodeId> = node_order;
-    for id in produced_by_node.keys().chain(reads_by_node.keys()) {
-        if !ordered.contains(id) {
-            ordered.push(*id);
+    for edge in produced {
+        if !ordered.contains(&edge.node_id) {
+            ordered.push(edge.node_id);
+        }
+    }
+    for edge in reads {
+        if let Some(reader_node_id) = edge.reader_node_id
+            && !ordered.contains(&reader_node_id)
+        {
+            ordered.push(reader_node_id);
         }
     }
     for id in prompt_order {
@@ -264,25 +276,23 @@ async fn build_run_lineage(
             continue;
         }
         seen.insert(id, ());
-        let produced_rows = produced_by_node.remove(&id).unwrap_or_default();
-        let read_rows = reads_by_node.remove(&id).unwrap_or_default();
-        let prompt_ref = match prompt_refs.get(&id) {
-            Some(artifact_id) => Some(lineage_artifact(reader, workspace_id, *artifact_id).await),
-            None => None,
-        };
-        if produced_rows.is_empty() && read_rows.is_empty() && prompt_ref.is_none() {
-            continue;
-        }
         vm.nodes.push(LineageNodeSection {
-            node_id: id.to_string(),
             node_key: lineage_node_key(&node_keys, id),
             status: node_status.get(&id).cloned().unwrap_or_default(),
-            produced: produced_rows,
-            reads: read_rows,
-            prompt_ref,
+            produced: produced_by_node.remove(&id).unwrap_or_default(),
+            reads: reads_by_node.remove(&id).unwrap_or_default(),
+            prompt_ref: match prompt_refs.get(&id) {
+                Some(artifact_id) => {
+                    Some(lineage_artifact(reader, workspace_id, *artifact_id).await)
+                }
+                None => None,
+            },
         });
     }
-    vm.empty = vm.finals.is_empty() && vm.nodes.is_empty() && vm.operator_reads.is_empty();
+    // Upstream `vm.Empty = len(vm.Finals) == 0 && len(reads) == 0`: a
+    // run that journaled only a prompt_ref still reads as empty — the
+    // notice reports provenance-table emptiness, not section count.
+    vm.empty = vm.finals.is_empty() && reads.is_empty();
     vm
 }
 
@@ -304,7 +314,7 @@ pub(crate) async fn serve_run_lineage(state: Arc<WebState>, req: Request) -> Res
     let Some(run_id) = query
         .as_deref()
         .and_then(|q| query_value(q, "run"))
-        .and_then(|v| RunId::parse(v).ok())
+        .and_then(|v| RunId::parse(&v).ok())
     else {
         return render_not_found();
     };

@@ -173,7 +173,7 @@ pub(crate) fn decode_cursor_param(
     query: Option<&str>,
 ) -> Result<Option<central_runview::domain::RunCursor>, ()> {
     let raw = query.and_then(|q| query_value(q, "cursor"));
-    decode_run_cursor(raw).map_err(|_| ())
+    decode_run_cursor(raw.as_deref()).map_err(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -722,7 +722,7 @@ pub(crate) async fn serve_run_detail(state: Arc<WebState>, req: Request) -> Resp
     let Some(run_id) = query
         .as_deref()
         .and_then(|q| query_value(q, "run"))
-        .and_then(|v| RunId::parse(v).ok())
+        .and_then(|v| RunId::parse(&v).ok())
     else {
         return render_not_found();
     };
@@ -772,7 +772,7 @@ pub(crate) async fn serve_node_detail(state: Arc<WebState>, req: Request) -> Res
     let Some(node_id) = query
         .as_deref()
         .and_then(|q| query_value(q, "id"))
-        .and_then(|v| WorkflowNodeId::parse(v).ok())
+        .and_then(|v| WorkflowNodeId::parse(&v).ok())
     else {
         return render_not_found();
     };

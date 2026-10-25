@@ -221,7 +221,11 @@ pub(crate) fn parse_urlencoded(body: &[u8]) -> HashMap<String, Vec<String>> {
     map
 }
 
-fn percent_decode(s: &str) -> Option<String> {
+/// `url.QueryUnescape` — `+` is a space inside a query/form component,
+/// `%XX` decodes, malformed escapes and non-UTF-8 output fail closed
+/// (`None`). `pub(crate)` so the web layer's `?key=value` reads share
+/// the exact decoder `url.ParseQuery` semantics require.
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
