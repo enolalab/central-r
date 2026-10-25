@@ -666,6 +666,7 @@ dependencies = [
  "central-kernel",
  "central-retry",
  "central-runsubmit",
+ "central-runview",
  "central-scheduler",
  "central-task",
  "central-transport-http",

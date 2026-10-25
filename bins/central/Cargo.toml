@@ -51,6 +51,10 @@ tokio.workspace = true
 central-scheduler = { path = "../../crates/capabilities/central-scheduler", version = "0.1.0" }
 central-retry = { path = "../../crates/capabilities/central-retry", version = "0.1.0" }
 central-eventjournal = { path = "../../crates/capabilities/central-eventjournal", version = "0.1.0" }
+# Read projections (`attempts_for_run`, `outbox_health`, deferred
+# admissions, checkpoints) the recovery matrix asserts on — the
+# PostgreSQL reader is `central-adapter-postgres::runview`.
+central-runview = { path = "../../crates/capabilities/central-runview", version = "0.1.0" }
 serde.workspace = true
 uuid.workspace = true
 
