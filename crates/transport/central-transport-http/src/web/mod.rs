@@ -9,8 +9,8 @@
 //! shell in place (upstream's precedent), never a redirect, so the handler
 //! validates the session itself via [`ports::SessionService::validate`].
 //!
-//! R4 surfaces (runs, fleet, lineage, run controls, run submission) are
-//! intentionally absent.
+//! R4 surfaces still absent: runs list/DAG, fleet, lineage, run controls.
+//! (`run_submit` landed in R4 T10.)
 
 pub mod activity_view;
 pub mod budget_view;

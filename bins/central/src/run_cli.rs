@@ -201,7 +201,9 @@ fn fail(
         command_id,
         code,
         reason,
-        serde_json::json!({"reason": reason}),
+        // Upstream `RunDetails.Deduped` has no omitempty — it is emitted
+        // on the failure path too (`run.go:66`).
+        serde_json::json!({"reason": reason, "deduped": false}),
     )
 }
 
