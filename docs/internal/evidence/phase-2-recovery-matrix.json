@@ -1,8 +1,8 @@
 {
   "schema": "phase-2-recovery-matrix/v1",
-  "generated_at": "2026-10-25T11:43:45.829101803Z",
-  "central_revision": "40db5677740f6e0eec3ba39060fdf332173e99fe",
-  "candidate_commit": "40db5677740f6e0eec3ba39060fdf332173e99fe",
+  "generated_at": "2026-10-25T11:49:15.314174901Z",
+  "central_revision": "6a631fe83bc2bd0bd32ecef64b0e7d99ee315a41",
+  "candidate_commit": "6a631fe83bc2bd0bd32ecef64b0e7d99ee315a41",
   "scenarios": [
     {
       "scenario_id": "RTM-01",

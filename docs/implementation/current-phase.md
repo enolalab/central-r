@@ -1,12 +1,26 @@
 # Current Phase
 
-## Active slice: Phase R4 — Multi-Agent Workflow Orchestration
+## Active slice: Phase R5 — Host Authority, Broker & Compose Topology
 
-`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R4 is the active implementation slice**; Phases R1–R3 are complete (see below) — R3 delivered the harness control plane, the session/SSR web surface, `central serve`, and `central-harness-launcherd`.
+`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R5 is the active implementation slice**; Phases R1–R4 are complete (see below) — R4 delivered the Phase 2 orchestration core: workflow graph + event journal, scheduler/retry, run submission and run views, subtree checkpoints, kernel composition, and the 23-scenario recovery acceptance matrix.
 
-R4 scope (roadmap §7): Phase 2 orchestration parity — `central-workflow`, `central-eventjournal`, `central-scheduler`, `central-retry`, `central-runview`, `central-runsubmit`, the `b36` subtree-anchored checkpoints, and the 23-scenario recovery test matrix. R4 tasks T1–T9 (retry taxonomy, workflow graph domain, event journal, `b33`/`b35`/`b37` stores, scheduler claim/dispatch, `node decide`) already landed on this branch while gated on R3 T5/T12/T13; with R3 complete those gates are open and R4 T10–T14 (run submit, runview UI, subtree checkpoints, recovery matrix, acceptance) remain.
+Verification for every R5 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
 
-Verification for every R4 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+## Completed: Phase R4 — Multi-Agent Workflow Orchestration
+
+Phase R4 delivered, per roadmap §7 and the [R4 plan](../internal/superpowers/plans/2026-10-23-phase-r4-multi-agent-workflow-orchestration.md):
+
+- `central-retry`: the Phase 2 retry taxonomy — retry classes, `retry_after`/`not_before` scheduling, budget accounting (`attempt_counts`), terminal-failure reason codes, and `on_terminal_failure` compensation hooks (managed vs unmanaged).
+- `central-workflow`: the `b33` workflow graph domain — emit/recompute readiness, cancel cascade, ambiguity parking, resume/rerun decisions, and `SPEC_VALIDATION_FAILED` cycle/depth refusals naming offending keys.
+- `central-eventjournal`: the `b33` event journal — ordered append, per-run sequence integrity (`EVENT_SEQUENCE_GAP`), redelivery dedupe, undeclared-kind tolerance (`UNKNOWN_EVENT_KIND`), and the outbox publisher (`OUTBOX_PUBLISH_STALLED` health).
+- `central-adapter-postgres`: the `b33`/`b35`/`b37` stores — workflow/journal/scheduler/outcome rows, worker registrations, lease fencing (`LEASE_FENCE_STALE`/`LEASE_RENEWAL_STALE`), admission deferral, `sweep_timeouts` (session wall-clock + node/run deadlines with ambiguity skips), and `runview` read-only projections.
+- `central-scheduler`: admission, claim loops, dispatch, heartbeat ladder (suspect→lost), starvation bounds, and the `Provisioner` port for dispatch workspaces.
+- `central-runsubmit`: the run-submission service shared by `central run submit` and the `/app/runs` PRG form — keyed idempotent resubmission, run-fingerprint adoption, workspace-scoped authorization, and Phase 1 dispatch invisibility.
+- `central-runview`: `/app/runs` list/DAG/node detail, run controls (cancel/decide/resume/checkpoint ops) calling `central-retry`/`central-workflow` services only, fleet census, and lineage views — keyset `SeekCursor` polling, state-matrix semantics, PRG + CSRF.
+- `central-checkpoint` (Phase 2C): subtree-anchored checkpoint write/resolve/preflight, `RESUME_TOKEN_STALE`/`CHECKPOINT_INCOMPATIBLE`/`BOUNDARY_ILLEGAL` refusals, `resume_subtree` execution with seq-2 reclaim and `RESUME_REQUIRES_OPERATOR_DECISION` parking.
+- `central-kernel`: Phase 2 composition — scheduler worker/claim-loop/sweeper components, retry sweeper, checkpoint janitor, outbox publisher, and the scheduler→harness launcher/killer/brief wiring (gated on `CENTRAL_PHASE2_SCHEDULER`); `bins/central` lifts `run submit`, `node decide`, `checkpoint *`, and `artifact read` to env-composed backends.
+- `bins/central/tests/phase2_acceptance`: the 23-record recovery test matrix (`phase-2-recovery-matrix/v1` evidence under `docs/internal/evidence/`) — 20 machine scenarios across graph, leasing, policy, and checkpoint/journal legs plus 3 deferred-physical runbook rows.
+- Committed `.sqlx/` offline query metadata for every new checked statement; the §7 fail-fast pipeline and the `CENTRAL_TEST_DSN`-gated integration suites are green.
 
 ## Completed: Phase R3 — Harness Control Plane & `central serve`
 
@@ -67,6 +81,6 @@ Two upstream decisions shape everything below: [ADR 0035](../adr/0035-freeze-b09
 | R1 | Workspace scaffold, `v0..b37` extraction, native migration runner, durable Task/Execution core | **Complete** |
 | R2 | Verified artifact lifecycle, `central-adapter-s3` | **Complete** |
 | R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | **Complete** |
-| R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | **Active** |
-| R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | Pending |
+| R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | **Complete** |
+| R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | **Active** |
 | R6 | Backup, restore, wipe, maintenance, launcher daemons | Pending |
