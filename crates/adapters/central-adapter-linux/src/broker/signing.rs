@@ -11,14 +11,13 @@
 //! never a durable identity.
 
 use std::fs;
-use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use central_foundation::failure::Failure;
 
-use super::durable::{FINGERPRINT_KEY_FILENAME, PRIVATE_FILE_MODE, ensure_private_root, sync_dir};
+use super::durable::{
+    self, FINGERPRINT_KEY_FILENAME, PRIVATE_FILE_MODE, ensure_private_root, sync_dir,
+};
 use super::wire::hmac_fingerprint;
 use zeroize::Zeroizing;
 
@@ -113,18 +112,12 @@ fn load_or_create_fingerprint_key(root: &Path, key_path: &Path) -> Result<Vec<u8
         ))
     };
     let publish = (|| -> Result<Vec<u8>, Failure> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(PRIVATE_FILE_MODE)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&tmp)
-            .map_err(|e| {
-                Failure::internal(
-                    "broker_signing_os",
-                    format!("broker: create signing key: {e}"),
-                )
-            })?;
+        let mut file = durable::open_exclusive(&tmp, PRIVATE_FILE_MODE).map_err(|e| {
+            Failure::internal(
+                "broker_signing_os",
+                format!("broker: create signing key: {e}"),
+            )
+        })?;
         let mut key = vec![0u8; FINGERPRINT_KEY_SIZE];
         let mut filled = 0usize;
         while filled < FINGERPRINT_KEY_SIZE {
@@ -176,37 +169,41 @@ fn load_or_create_fingerprint_key(root: &Path, key_path: &Path) -> Result<Vec<u8
 
 /// `loadFingerprintKey` — `lstat` shape checks (regular, not symlink,
 /// exact `0600`, owner-owned, link count 1) then read; 32 bytes or
-/// corrupt.
+/// corrupt. `newfstatat` goes through [`durable::lstat`] —
+/// `fs::symlink_metadata` emits `statx`, which the hardened broker's
+/// filter does not allow (ADR 0044).
 fn load_fingerprint_key(key_path: &Path) -> std::io::Result<Vec<u8>> {
-    let meta = fs::symlink_metadata(key_path)?;
-    if !meta.file_type().is_file() || meta.file_type().is_symlink() {
+    let meta = durable::lstat(key_path)?;
+    if !rustix::fs::FileType::from_raw_mode(meta.st_mode).is_file()
+        || rustix::fs::FileType::from_raw_mode(meta.st_mode).is_symlink()
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "broker: signing key is not a regular file",
         ));
     }
-    if meta.permissions().mode() & 0o777 != PRIVATE_FILE_MODE {
+    if meta.st_mode & 0o777 != PRIVATE_FILE_MODE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
                 "broker: insecure signing key permissions {:04o}",
-                (meta.permissions().mode() & 0o777)
+                (meta.st_mode & 0o777)
             ),
         ));
     }
-    if meta.uid() != rustix::process::geteuid().as_raw() {
+    if meta.st_uid != rustix::process::geteuid().as_raw() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "broker: signing key is not owned by the broker user",
         ));
     }
-    if meta.nlink() != 1 {
+    if meta.st_nlink != 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "broker: signing key has an invalid link count",
         ));
     }
-    let key = fs::read(key_path)?;
+    let key = durable::read_file(key_path).map_err(std::io::Error::from)?;
     if key.len() != FINGERPRINT_KEY_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -344,6 +341,7 @@ pub(crate) fn verify_canonical_json_hex(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn persistent_key_survives_restart() {

@@ -18,7 +18,6 @@
 //!   to `prepared.json` which is re-issued then committed.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -30,7 +29,9 @@ use sha2::Digest as _;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::durable::{PRIVATE_DIRECTORY_MODE, rename_noreplace, sync_dir, sync_file};
+use super::durable::{
+    self, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, rename_noreplace, sync_dir, sync_file,
+};
 use super::signing::{Ed25519Signer, SigningService};
 use super::wire::{hex_encode, rfc3339};
 
@@ -118,19 +119,16 @@ impl Journal {
         };
 
         let op_dir = self.root_path.join("lifecycle-records").join(&op.id);
-        fs::create_dir_all(&op_dir)
-            .map_err(|e| internal(format!("journal: lifecycle mkdir: {e}")))?;
-        fs::set_permissions(&op_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        durable::mkdir_p(&op_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("journal: lifecycle mkdir: {e}")))?;
 
         // Allocate next sequence number within the operation directory.
         let mut max_seq = 0u64;
-        for entry in fs::read_dir(&op_dir)
+        for entry in durable::read_dir(&op_dir)
             .map_err(|e| internal(format!("journal: lifecycle readdir: {e}")))?
         {
-            let entry = entry.map_err(|e| internal(format!("journal: lifecycle readdir: {e}")))?;
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(seq) = parse_seq_name(&entry.file_name().to_string_lossy())
+            if entry.file_type.is_dir()
+                && let Some(seq) = parse_seq_name(&entry.name.to_string_lossy())
             {
                 max_seq = max_seq.max(seq);
             }
@@ -138,9 +136,7 @@ impl Journal {
         let seq_num = max_seq + 1;
 
         let seq_dir = op_dir.join(format!("{seq_num:020}"));
-        fs::create_dir_all(&seq_dir)
-            .map_err(|e| internal(format!("journal: lifecycle mkdir seq: {e}")))?;
-        fs::set_permissions(&seq_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        durable::mkdir_p(&seq_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("journal: lifecycle mkdir seq: {e}")))?;
 
         // Phase 1: prepared.
@@ -171,9 +167,7 @@ impl Journal {
             canonical = serde_json::to_vec(&record)
                 .map_err(|e| internal(format!("journal: lifecycle re-marshal: {e}")))?;
         }
-        fs::write(&tmp_path, &canonical)
-            .map_err(|e| internal(format!("journal: lifecycle write tmp: {e}")))?;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400))
+        durable::write_file(&tmp_path, &canonical, 0o400)
             .map_err(|e| internal(format!("journal: lifecycle write tmp: {e}")))?;
         sync_file(&tmp_path)
             .map_err(|e| internal(format!("journal: lifecycle sync tmp: {}", e.message())))?;
@@ -196,19 +190,13 @@ impl Journal {
         payload: &mut AuthorityTransitionPayload,
     ) -> Result<(), Failure> {
         let stream_dir = self.root_path.join("authority-records").join(stream_id);
-        fs::create_dir_all(&stream_dir)
+        durable::mkdir_p(&stream_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
-        fs::set_permissions(
-            &stream_dir,
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
         let seq_dir = stream_dir.join(format!(
             "{:020}-{}",
             payload.sequence_num, payload.operation
         ));
-        fs::create_dir_all(&seq_dir).map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
-        fs::set_permissions(&seq_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        durable::mkdir_p(&seq_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
         self.commit_phases(&seq_dir, payload)
     }
@@ -226,21 +214,15 @@ impl Journal {
         let _guard = self.lock()?;
 
         let stream_dir = self.root_path.join("authority-records").join(stream_id);
-        fs::create_dir_all(&stream_dir)
+        durable::mkdir_p(&stream_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
-        fs::set_permissions(
-            &stream_dir,
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .map_err(|e| internal(format!("journal: mkdir stream: {e}")))?;
 
         let mut max_seq = 0u64;
-        for entry in fs::read_dir(&stream_dir)
+        for entry in durable::read_dir(&stream_dir)
             .map_err(|e| internal(format!("journal: readdir stream: {e}")))?
         {
-            let entry = entry.map_err(|e| internal(format!("journal: readdir stream: {e}")))?;
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(seq) = parse_seq_dir_name(&entry.file_name().to_string_lossy())
+            if entry.file_type.is_dir()
+                && let Some(seq) = parse_seq_dir_name(&entry.name.to_string_lossy())
             {
                 max_seq = max_seq.max(seq);
             }
@@ -251,8 +233,7 @@ impl Journal {
             "{:020}-{}",
             payload.sequence_num, payload.operation
         ));
-        fs::create_dir_all(&seq_dir).map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
-        fs::set_permissions(&seq_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        durable::mkdir_p(&seq_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("journal: mkdir seq: {e}")))?;
 
         self.commit_phases(&seq_dir, payload)?;
@@ -296,9 +277,7 @@ impl Journal {
             committed = serde_json::to_vec(&*payload)
                 .map_err(|e| internal(format!("journal: marshal: {e}")))?;
         }
-        fs::write(&tmp_path, &committed)
-            .map_err(|e| internal(format!("journal: write tmp: {e}")))?;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400))
+        durable::write_file(&tmp_path, &committed, 0o400)
             .map_err(|e| internal(format!("journal: write tmp: {e}")))?;
         sync_file(&tmp_path)?;
         rename_noreplace(&tmp_path, &committed_path).map_err(|e| {
@@ -323,15 +302,12 @@ impl Journal {
     pub fn unsettled(&self) -> Option<PrepareOperation> {
         let _guard = self.mu.lock().ok()?;
         let dir = self.prepare_dir();
-        let entries = fs::read_dir(dir).ok()?;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                || !name.to_string_lossy().ends_with(".json")
-            {
+        let entries = durable::read_dir(&dir).ok()?;
+        for entry in entries {
+            if entry.file_type.is_dir() || !entry.name.to_string_lossy().ends_with(".json") {
                 continue;
             }
-            let Ok(data) = fs::read(entry.path()) else {
+            let Ok(data) = durable::read_file(&dir.join(&entry.name)) else {
                 continue;
             };
             let Ok(op) = serde_json::from_slice::<PrepareOperation>(&data) else {
@@ -352,7 +328,8 @@ impl Journal {
     pub fn exact(&self, id: &str) -> Result<PrepareOperation, Failure> {
         let _guard = self.lock()?;
         let path = self.prepare_dir().join(format!("{id}.json"));
-        let data = fs::read(&path).map_err(|e| internal(format!("journal: exact prepare: {e}")))?;
+        let data = durable::read_file(&path)
+            .map_err(|e| internal(format!("journal: exact prepare: {e}")))?;
         let op: PrepareOperation = serde_json::from_slice(&data)
             .map_err(|e| internal(format!("journal: exact prepare: {e}")))?;
         if op.operation_id != id {
@@ -372,16 +349,13 @@ impl Journal {
     pub fn record_operation(&self, op: &PrepareOperation) -> Result<(), Failure> {
         let _guard = self.lock()?;
         let dir = self.prepare_dir();
-        fs::create_dir_all(&dir).map_err(|e| internal(format!("journal: record prepare: {e}")))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        durable::mkdir_p(&dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
         let data = serde_json::to_vec(op)
             .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
         let path = dir.join(format!("{}.json", op.operation_id));
         let tmp_path = dir.join(format!("{}.json.tmp", op.operation_id));
-        fs::write(&tmp_path, &data)
-            .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+        durable::write_file(&tmp_path, &data, PRIVATE_FILE_MODE)
             .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
         sync_file(&tmp_path)?;
         fs::rename(&tmp_path, &path).map_err(|e| {
@@ -404,26 +378,26 @@ impl Journal {
     pub fn recover(&self) -> Result<usize, Failure> {
         let _guard = self.lock()?;
         let records_dir = self.root_path.join("authority-records");
-        if !records_dir.exists() {
+        if !durable::exists(&records_dir) {
             return Ok(0);
         }
-        let streams = fs::read_dir(&records_dir)
+        let streams = durable::read_dir(&records_dir)
             .map_err(|e| internal(format!("journal: recover readdir: {e}")))?;
         let mut recovered = 0usize;
-        for stream in streams.flatten() {
-            if !stream.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        for stream in streams {
+            if !stream.file_type.is_dir() {
                 continue;
             }
-            let stream_dir = stream.path();
-            let Ok(entries) = fs::read_dir(&stream_dir) else {
+            let stream_dir = records_dir.join(&stream.name);
+            let Ok(entries) = durable::read_dir(&stream_dir) else {
                 continue;
             };
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            for entry in entries {
+                if !entry.file_type.is_dir() {
                     continue;
                 }
-                let seq_dir = entry.path();
-                if seq_dir.join("committed.json").exists() {
+                let seq_dir = stream_dir.join(&entry.name);
+                if durable::exists(&seq_dir.join("committed.json")) {
                     continue;
                 }
                 let issued_path = seq_dir.join("issued.json");
@@ -431,7 +405,7 @@ impl Journal {
 
                 let mut payload: AuthorityTransitionPayload;
                 let mut have_issued = false;
-                match fs::read(&issued_path) {
+                match durable::read_file(&issued_path) {
                     Ok(data) => match serde_json::from_slice(&data) {
                         Ok(p) => {
                             payload = p;
@@ -439,7 +413,7 @@ impl Journal {
                         }
                         Err(_) => continue, // corrupt issued: never reinterpret
                     },
-                    Err(_) => match fs::read(&prepared_path) {
+                    Err(_) => match durable::read_file(&prepared_path) {
                         Ok(data) => match serde_json::from_slice(&data) {
                             Ok(p) => payload = p,
                             Err(_) => continue,
@@ -475,8 +449,7 @@ impl Journal {
                     };
                     committed = c;
                 }
-                if fs::write(&tmp_path, &committed).is_err()
-                    || fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o400)).is_err()
+                if durable::write_file(&tmp_path, &committed, 0o400).is_err()
                     || sync_file(&tmp_path).is_err()
                 {
                     continue;
@@ -503,7 +476,8 @@ impl Journal {
     ) -> Result<(), Failure> {
         let path = seq_dir.join(filename);
         let data = serde_json::to_vec(payload).map_err(|e| internal(format!("journal: {e}")))?;
-        fs::write(&path, &data).map_err(|e| internal(format!("journal: {e}")))?;
+        durable::write_file(&path, &data, PRIVATE_FILE_MODE)
+            .map_err(|e| internal(format!("journal: {e}")))?;
         sync_file(&path)?;
         sync_dir(seq_dir)
     }
@@ -518,7 +492,7 @@ fn write_lifecycle_phase(
 ) -> Result<(), Failure> {
     let path = seq_dir.join(filename);
     let data = serde_json::to_vec(record).map_err(|e| internal(format!("journal: {e}")))?;
-    fs::write(&path, &data).map_err(|e| internal(format!("journal: {e}")))?;
+    durable::write_file(&path, &data, 0o600).map_err(|e| internal(format!("journal: {e}")))?;
     sync_file(&path)?;
     sync_dir(seq_dir)
 }

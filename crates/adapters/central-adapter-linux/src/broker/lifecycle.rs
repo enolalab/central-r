@@ -10,8 +10,6 @@
 //! claim that controls scope or lifetime.
 
 use std::fs;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
 use central_foundation::failure::Failure;
@@ -24,7 +22,7 @@ use sha2::Digest as _;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::durable::{PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, sync_dir};
+use super::durable::{self, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, sync_dir};
 use super::server::Service;
 use super::wire::format_rfc3339_nano;
 use super::wire::hex_encode;
@@ -55,9 +53,7 @@ impl LifecycleNonceStore {
     /// `broker_lifecycle` when the root cannot be created.
     pub fn new(root: &std::path::Path) -> Result<Self, Failure> {
         let root = root.join("lifecycle-nonces");
-        fs::create_dir_all(&root)
-            .map_err(|e| internal(format!("lifecycle nonce store: create root: {e}")))?;
-        fs::set_permissions(&root, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        super::durable::mkdir_p(&root, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("lifecycle nonce store: create root: {e}")))?;
         Ok(Self { root })
     }
@@ -76,14 +72,8 @@ impl LifecycleNonceStore {
         }
         let sum = sha2::Sha256::digest(nonce.as_bytes());
         let path = self.root.join(hex_encode(&sum));
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(PRIVATE_FILE_MODE)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&path)
-        {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        let mut file = match durable::open_exclusive(&path, PRIVATE_FILE_MODE) {
+            Err(rustix::io::Errno::EXIST) => {
                 return Err(denied(ERR_AUTHORIZATION_REPLAY));
             }
             Err(e) => {

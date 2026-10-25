@@ -22,7 +22,6 @@
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use central_foundation::identity::InstanceId;
@@ -252,42 +251,27 @@ pub fn production_broker_root_at(
         .join("protected"))
 }
 
-/// `signal.NotifyContext(SIGINT, SIGTERM)` — an `AtomicBool` a tokio
-/// signal-waiter thread flips (the helper/sandbox daemons' shape).
-fn shutdown_flag() -> Arc<AtomicBool> {
-    let flag = Arc::new(AtomicBool::new(false));
-    let writer = Arc::clone(&flag);
-    let _ = std::thread::Builder::new()
-        .name("broker-signal".to_owned())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(_) => return,
-            };
-            rt.block_on(async {
-                let mut int =
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
-                let mut term =
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    {
-                        Ok(s) => s,
-                        Err(_) => return,
-                    };
-                tokio::select! {
-                    _ = int.recv() => {}
-                    _ = term.recv() => {}
-                }
-            });
-            writer.store(true, Ordering::Release);
-        });
-    flag
+/// `signal.NotifyContext(SIGINT, SIGTERM)` — a `static` flag an
+/// `rt_sigaction` handler flips. tokio's `signal` needs a socketpair
+/// copier (`socketpair`/`poll` are not on the broker's seccomp
+/// allow-list); a plain handler installed before `harden()` keeps
+/// working under the filter — `rt_sigaction` itself is allow-listed
+/// (ADR 0044). `SA_RESTART` plus the accept loop's `EAGAIN` poll
+/// matches upstream's `ctx`-cancel + `listener.Close` cadence.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn mark_shutdown(_signum: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
+fn shutdown_flag() -> &'static AtomicBool {
+    // The install is idempotent — `sigaction` twice is the same
+    // disposition; the `let _ =` mirrors upstream's "NotifyContext
+    // always succeeds" shape (EINVAL is unreachable for
+    // SIGINT/SIGTERM).
+    let _ = crate::sys::audited::install_signal_handler(libc::SIGINT, mark_shutdown);
+    let _ = crate::sys::audited::install_signal_handler(libc::SIGTERM, mark_shutdown);
+    &SHUTDOWN
 }
 
 /// `runBrokerDaemon` — the `--broker` mode body. `instances_root` and
@@ -342,10 +326,13 @@ pub fn run_broker_daemon_at(
         let _ = writeln!(stderr, "broker: harden: {}", e.message());
         return 6;
     }
-    let listen = match crate::sys::audited::socket_activation_fd(0) {
+    // `activation.Listeners`-equivalent: the full activation contract
+    // (LISTEN_PID names this process, LISTEN_FDS covers index 0) plus
+    // the audited fd claim — not a bare `fd 3` grab (R5 T9 P3).
+    let listen = match super::server::activated_listener_at(0, env) {
         Ok(fd) => fd,
         Err(e) => {
-            let _ = writeln!(stderr, "broker: socket fd 3: {e}");
+            let _ = writeln!(stderr, "broker: {}", e.message());
             return 3;
         }
     };
@@ -374,7 +361,7 @@ pub fn run_broker_daemon(env: &dyn Fn(&str) -> Option<String>, stderr: &mut dyn 
 pub fn run_broker_serve_at(
     state_root: &str,
     socket_path: &str,
-    shutdown: Arc<AtomicBool>,
+    shutdown: &AtomicBool,
     stderr: &mut dyn Write,
 ) -> u8 {
     let svc = match Service::new(PathBuf::from(state_root), CENTRAL_RUNTIME_UID) {
@@ -388,11 +375,18 @@ pub fn run_broker_serve_at(
         stderr,
         "broker serve: listening on {socket_path} (state {state_root})"
     );
-    if let Err(e) = serve_on_path(Path::new(socket_path), &svc, shutdown) {
-        let _ = writeln!(stderr, "broker serve: {}", e.message());
-        return 6;
+    match serve_on_path(Path::new(socket_path), &svc, shutdown) {
+        // Upstream `broker_serve.go`: `err != nil && !errors.Is(err,
+        // context.Canceled)` — a signal-cancelled serve is a clean
+        // operator exit 0, while the hardened daemon maps the same
+        // `ctx.Err()` to exit 3 (`main.go`'s `runBrokerDaemon`).
+        Err(e) if e.kind() == central_foundation::failure::FailureKind::Cancelled => 0,
+        Err(e) => {
+            let _ = writeln!(stderr, "broker serve: {}", e.message());
+            6
+        }
+        Ok(()) => 0,
     }
-    0
 }
 
 /// The production entry — the live signal flag.
@@ -741,12 +735,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("central-bs-{}", std::process::id()));
         dir(&root, 0o700);
         let sock = root.join("broker.sock");
-        let flag = Arc::new(AtomicBool::new(true));
+        let flag = AtomicBool::new(true);
         let mut stderr = Vec::new();
         let code = run_broker_serve_at(
             root.to_str().unwrap(),
             sock.to_str().unwrap(),
-            flag,
+            &flag,
             &mut stderr,
         );
         assert_eq!(code, 0);
@@ -768,12 +762,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("central-bs2-{}", std::process::id()));
         std::fs::write(&root, b"x").expect("file");
         let sock = root.with_file_name("bs2.sock");
-        let flag = Arc::new(AtomicBool::new(true));
+        let flag = AtomicBool::new(true);
         let mut stderr = Vec::new();
         let code = run_broker_serve_at(
             root.to_str().unwrap(),
             sock.to_str().unwrap(),
-            flag,
+            &flag,
             &mut stderr,
         );
         assert_eq!(code, 6);

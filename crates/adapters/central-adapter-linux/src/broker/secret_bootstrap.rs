@@ -32,7 +32,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -50,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::durable::{PRIVATE_DIRECTORY_MODE, ensure_private_root, sync_dir};
+use super::durable::{self, PRIVATE_DIRECTORY_MODE, ensure_private_root, sync_dir};
 use super::journal::Journal;
 use super::protected_file::ProtectedFileBackend;
 use super::signing::SigningService;
@@ -484,19 +483,20 @@ impl SecretBootstrap {
         let mut guard = self.lock()?;
 
         let leases_dir = self.lease_dir();
-        if let Ok(entries) = fs::read_dir(&leases_dir) {
-            for e in entries.flatten() {
-                let name = e.file_name();
-                let Some(name) = name.to_str() else { continue };
+        if let Ok(entries) = durable::read_dir(&leases_dir) {
+            for e in entries {
+                let Some(name) = e.name.to_str() else {
+                    continue;
+                };
                 if !name.ends_with(".json") {
                     continue;
                 }
                 // Skip recovery when a revocation tombstone exists.
                 let tombstone = format!("{}.revoked", name.trim_end_matches(".json"));
-                if leases_dir.join(&tombstone).exists() {
+                if durable::exists(&leases_dir.join(&tombstone)) {
                     continue;
                 }
-                let Ok(data) = fs::read(e.path()) else {
+                let Ok(data) = durable::read_file(&leases_dir.join(&e.name)) else {
                     continue;
                 };
                 let Ok(record) = serde_json::from_slice::<LeaseRecord>(&data) else {
@@ -513,26 +513,24 @@ impl SecretBootstrap {
         }
 
         let bindings_dir = self.root_path.join("bindings");
-        if let Ok(entries) = fs::read_dir(&bindings_dir) {
-            for be in entries.flatten() {
-                let Ok(ft) = be.file_type() else { continue };
-                if !ft.is_dir() {
+        if let Ok(entries) = durable::read_dir(&bindings_dir) {
+            for be in entries {
+                if !be.file_type.is_dir() {
                     continue;
                 }
-                let Some(name) = be.file_name().to_str().map(str::to_owned) else {
+                let Some(name) = be.name.to_str().map(str::to_owned) else {
                     continue;
                 };
                 if Uuid::parse_str(&name).is_err() {
                     continue;
                 }
-                let receipts_dir = be.path().join("receipts");
-                if let Ok(receipt_entries) = fs::read_dir(&receipts_dir) {
-                    for re in receipt_entries.flatten() {
-                        let Ok(ft) = re.file_type() else { continue };
-                        if !ft.is_file() {
+                let receipts_dir = bindings_dir.join(&be.name).join("receipts");
+                if let Ok(receipt_entries) = durable::read_dir(&receipts_dir) {
+                    for re in receipt_entries {
+                        if !re.file_type.is_file() {
                             continue;
                         }
-                        let Ok(data) = fs::read(re.path()) else {
+                        let Ok(data) = durable::read_file(&receipts_dir.join(&re.name)) else {
                             continue;
                         };
                         let Ok(record) = serde_json::from_slice::<ReceiptRecord>(&data) else {
@@ -547,14 +545,13 @@ impl SecretBootstrap {
                         guard.receipts.insert(receipt.receipt_id, receipt);
                     }
                 }
-                let ops_dir = be.path().join("operations");
-                if let Ok(op_entries) = fs::read_dir(&ops_dir) {
-                    for oe in op_entries.flatten() {
-                        let Ok(ft) = oe.file_type() else { continue };
-                        if !ft.is_file() {
+                let ops_dir = bindings_dir.join(&be.name).join("operations");
+                if let Ok(op_entries) = durable::read_dir(&ops_dir) {
+                    for oe in op_entries {
+                        if !oe.file_type.is_file() {
                             continue;
                         }
-                        let Ok(data) = fs::read(oe.path()) else {
+                        let Ok(data) = durable::read_file(&ops_dir.join(&oe.name)) else {
                             continue;
                         };
                         let Ok(record) = serde_json::from_slice::<OperationRecord>(&data) else {
@@ -573,14 +570,15 @@ impl SecretBootstrap {
         }
 
         let proofs_dir = self.root_path.join("proofs");
-        if let Ok(entries) = fs::read_dir(&proofs_dir) {
-            for e in entries.flatten() {
-                let name = e.file_name();
-                let Some(name) = name.to_str() else { continue };
+        if let Ok(entries) = durable::read_dir(&proofs_dir) {
+            for e in entries {
+                let Some(name) = e.name.to_str() else {
+                    continue;
+                };
                 if !name.ends_with(".json") {
                     continue;
                 }
-                let Ok(data) = fs::read(e.path()) else {
+                let Ok(data) = durable::read_file(&proofs_dir.join(&e.name)) else {
                     continue;
                 };
                 let Ok(record) = serde_json::from_slice::<ProofRecordLoad>(&data) else {
@@ -607,15 +605,14 @@ impl SecretBootstrap {
     ) -> Result<(SecretBinding, DurableLease), Failure> {
         let guard = self.lock()?;
         let bindings_dir = self.root_path.join("bindings");
-        let entries = fs::read_dir(&bindings_dir)
+        let entries = durable::read_dir(&bindings_dir)
             .map_err(|e| internal(format!("read protected bindings: {e}")))?;
         let mut binding: Option<SecretBinding> = None;
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() {
+        for entry in entries {
+            if !entry.file_type.is_dir() {
                 continue;
             }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            let Some(name) = entry.name.to_str().map(str::to_owned) else {
                 continue;
             };
             let Ok(id) = Uuid::parse_str(&name) else {
@@ -666,13 +663,12 @@ impl SecretBootstrap {
     /// `adopt_b03`'s idempotent return.
     fn find_existing_binding(&self, gen_id: Uuid, instance_id: &str) -> Option<SecretBinding> {
         let bindings_dir = self.root_path.join("bindings");
-        let entries = fs::read_dir(&bindings_dir).ok()?;
-        for e in entries.flatten() {
-            let Ok(ft) = e.file_type() else { continue };
-            if !ft.is_dir() {
+        let entries = durable::read_dir(&bindings_dir).ok()?;
+        for e in entries {
+            if !e.file_type.is_dir() {
                 continue;
             }
-            let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+            let Some(name) = e.name.to_str().map(str::to_owned) else {
                 continue;
             };
             let Ok(binding_uuid) = Uuid::parse_str(&name) else {
@@ -703,7 +699,7 @@ impl SecretBootstrap {
         &self,
         binding_id: &SecretBindingId,
     ) -> Result<BindingMetadata, Failure> {
-        let data = fs::read(self.binding_dir(binding_id).join("metadata.json"))
+        let data = durable::read_file(&self.binding_dir(binding_id).join("metadata.json"))
             .map_err(|e| internal(format!("broker: read binding metadata: {e}")))?;
         serde_json::from_slice(&data)
             .map_err(|e| internal(format!("broker: decode binding metadata: {e}")))
@@ -885,13 +881,8 @@ impl SecretBootstrap {
 
         let binding_id = SecretBindingId::new();
         let binding_dir = self.binding_dir(&binding_id);
-        fs::create_dir_all(&binding_dir)
+        durable::mkdir_p(&binding_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("broker: create binding dir: {e}")))?;
-        fs::set_permissions(
-            &binding_dir,
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .map_err(|e| internal(format!("broker: secure binding dir: {e}")))?;
 
         let mut meta = BindingMetadata::new();
         meta.insert("purpose".to_owned(), Purpose::MinioRoot.as_str().to_owned());
@@ -946,7 +937,7 @@ impl SecretBootstrap {
             .root_path
             .join("evidence")
             .join(format!("{gen_id}.json"));
-        let Ok(data) = fs::read(path) else {
+        let Ok(data) = durable::read_file(&path) else {
             return B03SourceEvidence::default();
         };
         serde_json::from_slice(&data).unwrap_or_default()
@@ -958,9 +949,8 @@ impl SecretBootstrap {
         evidence: &B03SourceEvidence,
     ) -> Result<(), Failure> {
         let dir = self.root_path.join("evidence");
-        fs::create_dir_all(&dir).map_err(|e| internal(format!("broker: evidence dir: {e}")))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|e| internal(format!("broker: secure evidence dir: {e}")))?;
+        durable::mkdir_p(&dir, PRIVATE_DIRECTORY_MODE)
+            .map_err(|e| internal(format!("broker: evidence dir: {e}")))?;
         let data = serde_json::to_vec(evidence)
             .map_err(|e| internal(format!("broker: marshal evidence: {e}")))?;
         let path = dir.join(format!("{gen_id}.json"));
@@ -1293,13 +1283,8 @@ impl SecretBootstrap {
 
         let binding_id = SecretBindingId::new();
         let binding_dir = self.binding_dir(&binding_id);
-        fs::create_dir_all(&binding_dir)
+        durable::mkdir_p(&binding_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| internal(format!("broker: create binding dir: {e}")))?;
-        fs::set_permissions(
-            &binding_dir,
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .map_err(|e| internal(format!("broker: secure binding dir: {e}")))?;
 
         let mut meta = BindingMetadata::new();
         meta.insert("purpose".to_owned(), purpose.as_str().to_owned());
@@ -1361,13 +1346,12 @@ impl SecretBootstrap {
         }
         let mut guard = self.lock()?;
         let bindings_dir = self.root_path.join("bindings");
-        if let Ok(entries) = fs::read_dir(&bindings_dir) {
-            for entry in entries.flatten() {
-                let Ok(ft) = entry.file_type() else { continue };
-                if !ft.is_dir() {
+        if let Ok(entries) = durable::read_dir(&bindings_dir) {
+            for entry in entries {
+                if !entry.file_type.is_dir() {
                     continue;
                 }
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                let Some(name) = entry.name.to_str().map(str::to_owned) else {
                     continue;
                 };
                 let Ok(id) = Uuid::parse_str(&name) else {
@@ -1408,18 +1392,10 @@ impl SecretBootstrap {
         let cleanup = |this: &Self| {
             let _ = this.backend.delete(generation.generation_id);
         };
-        fs::create_dir_all(&binding_dir).map_err(|e| {
+        if let Err(e) = durable::mkdir_p(&binding_dir, PRIVATE_DIRECTORY_MODE) {
             cleanup(self);
-            internal(format!("bind materialized secret: {e}"))
-        })?;
-        fs::set_permissions(
-            &binding_dir,
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .map_err(|e| {
-            cleanup(self);
-            internal(format!("bind materialized secret: {e}"))
-        })?;
+            return Err(internal(format!("bind materialized secret: {e}")));
+        }
         let mut meta = BindingMetadata::new();
         meta.insert("purpose".to_owned(), purpose.as_str().to_owned());
         meta.insert("instance_id".to_owned(), instance_id.to_owned());
@@ -1511,12 +1487,8 @@ impl SecretBootstrap {
         // between the two leaves the tombstone intact and keeps the
         // revoked lease unrecoverable.
         let lease_dir = self.lease_dir();
-        fs::create_dir_all(&lease_dir).map_err(|e| internal(format!("broker: lease dir: {e}")))?;
-        fs::set_permissions(
-            &lease_dir,
-            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-        )
-        .map_err(|e| internal(format!("broker: secure lease dir: {e}")))?;
+        durable::mkdir_p(&lease_dir, PRIVATE_DIRECTORY_MODE)
+            .map_err(|e| internal(format!("broker: lease dir: {e}")))?;
         // Upstream writes the tombstone with `time.RFC3339` — whole
         // seconds, no fractional field.
         let tombstone = format!(
@@ -1583,8 +1555,8 @@ impl SecretBootstrap {
             guard.operations.remove(&id);
         }
         let binding_dir = self.binding_dir(&binding_id);
-        if let Err(e) = fs::remove_dir_all(&binding_dir)
-            && e.kind() != std::io::ErrorKind::NotFound
+        if let Err(e) = durable::remove_all(&binding_dir)
+            && e != rustix::io::Errno::NOENT
         {
             return Err(internal(format!("broker: remove binding dir: {e}")));
         }
@@ -1647,9 +1619,8 @@ impl SecretBootstrap {
 
     fn persist_lease(&self, lease: &DurableLease) -> Result<(), Failure> {
         let dir = self.lease_dir();
-        fs::create_dir_all(&dir).map_err(|e| internal(format!("broker: lease dir: {e}")))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|e| internal(format!("broker: secure lease dir: {e}")))?;
+        durable::mkdir_p(&dir, PRIVATE_DIRECTORY_MODE)
+            .map_err(|e| internal(format!("broker: lease dir: {e}")))?;
         let data = serde_json::to_vec(&lease_record(lease))
             .map_err(|e| internal(format!("broker: marshal lease: {e}")))?;
         let path = dir.join(format!("{}.json", lease.binding_id));
@@ -1663,9 +1634,8 @@ impl SecretBootstrap {
         receipt: &HandoffReceipt,
     ) -> Result<(), Failure> {
         let dir = self.binding_dir(binding_id).join("receipts");
-        fs::create_dir_all(&dir).map_err(|e| internal(format!("broker: receipts dir: {e}")))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|e| internal(format!("broker: secure receipts dir: {e}")))?;
+        durable::mkdir_p(&dir, PRIVATE_DIRECTORY_MODE)
+            .map_err(|e| internal(format!("broker: receipts dir: {e}")))?;
         let data = serde_json::to_vec(&receipt_record(receipt))
             .map_err(|e| internal(format!("broker: marshal receipt: {e}")))?;
         let path = dir.join(format!("{}.json", receipt.receipt_id));
@@ -1674,9 +1644,8 @@ impl SecretBootstrap {
 
     fn persist_operation(&self, op: &HandoffOperation) -> Result<(), Failure> {
         let dir = self.binding_dir(&op.binding_id).join("operations");
-        fs::create_dir_all(&dir).map_err(|e| internal(format!("broker: operations dir: {e}")))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|e| internal(format!("broker: secure operations dir: {e}")))?;
+        durable::mkdir_p(&dir, PRIVATE_DIRECTORY_MODE)
+            .map_err(|e| internal(format!("broker: operations dir: {e}")))?;
         let data = serde_json::to_vec(&operation_record(op))
             .map_err(|e| internal(format!("broker: marshal operation: {e}")))?;
         let path = dir.join(format!("{}.json", op.operation_id));
@@ -1685,9 +1654,8 @@ impl SecretBootstrap {
 
     fn persist_proof(&self, proof: &LifecycleProof) -> Result<(), Failure> {
         let dir = self.root_path.join("proofs");
-        fs::create_dir_all(&dir).map_err(|e| internal(format!("broker: proofs dir: {e}")))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|e| internal(format!("broker: secure proofs dir: {e}")))?;
+        durable::mkdir_p(&dir, PRIVATE_DIRECTORY_MODE)
+            .map_err(|e| internal(format!("broker: proofs dir: {e}")))?;
         let data = proof_to_json(proof)?;
         let path = dir.join(format!("{}.json", proof.proof_id));
         atomic_write_private(&path, &data)?;
@@ -1722,21 +1690,15 @@ fn binding_meta_msg(e: &Failure) -> &'static str {
 /// pattern for `metadata.json`/`evidence/*.json` and the tombstone).
 fn write_private(path: &Path, data: &[u8], mode: u32) -> Result<(), Failure> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(path)
+    let mut file = durable::open_write(path, mode)
         .map_err(|e| internal(format!("broker: write {}: {e}", path.display())))?;
     file.write_all(data)
         .and_then(|()| file.sync_all())
         .map_err(|e| internal(format!("broker: write {}: {e}", path.display())))?;
     // Enforce the mode even when the file pre-existed (O_CREATE keeps
-    // the old mode otherwise).
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    // the old mode otherwise). `fchmod` on the open fd is on the
+    // allow-list; path-based `fchmodat` is not (ADR 0044).
+    rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(mode))
         .map_err(|e| internal(format!("broker: secure {}: {e}", path.display())))?;
     Ok(())
 }
@@ -1765,6 +1727,7 @@ mod tests {
     use super::*;
     use crate::broker::journal::Journal;
     use crate::broker::testutil::TempDir;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn fixture() -> (TempDir, SecretBootstrap) {
         let dir = TempDir::new("sb");

@@ -19,8 +19,6 @@
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use central_foundation::failure::Failure;
@@ -30,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::durable::{PRIVATE_DIRECTORY_MODE, rename_replace, sync_dir};
+use super::durable::{self, PRIVATE_DIRECTORY_MODE, rename_replace, sync_dir};
 
 fn invalid(msg: &'static str) -> Failure {
     Failure::invalid("broker_protected_file", msg)
@@ -111,8 +109,7 @@ impl ProtectedFileBackend {
         }
         let gen_id = Uuid::now_v7();
         let gen_dir = self.generation_dir(&gen_id);
-        fs::create_dir_all(&gen_dir).map_err(|e| os("protected_file: create dir", e))?;
-        fs::set_permissions(&gen_dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        durable::mkdir_p(&gen_dir, PRIVATE_DIRECTORY_MODE)
             .map_err(|e| os("protected_file: create dir", e))?;
 
         let value_path = gen_dir.join("value");
@@ -150,11 +147,8 @@ impl ProtectedFileBackend {
     pub fn current(&self) -> Result<Generation, Failure> {
         let active_path = self.root.join("active.json");
         // Upstream's `os.IsNotExist → no active generation` gate.
-        match fs::symlink_metadata(&active_path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(invalid("protected_file: no active generation"));
-            }
-            _ => {}
+        if durable::lstat(&active_path).is_err_and(|e| e == rustix::io::Errno::NOENT) {
+            return Err(invalid("protected_file: no active generation"));
         }
         let data = self.read_file(&active_path)?;
         #[derive(Deserialize)]
@@ -178,17 +172,22 @@ impl ProtectedFileBackend {
     /// itself cannot be listed.
     pub fn enumerate(&self, purpose: &str) -> Result<Vec<Generation>, Failure> {
         let gens_dir = self.generations_dir();
-        let entries = match fs::read_dir(&gens_dir) {
+        let entries = match durable::read_dir(&gens_dir) {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(os("protected_file: enumerate", e)),
+            Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(Failure::internal(
+                    "broker_protected_file",
+                    format!("protected_file: enumerate: {e}"),
+                ));
+            }
         };
         let mut out = Vec::new();
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        for entry in entries {
+            if !entry.file_type.is_dir() {
                 continue;
             }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            let Some(name) = entry.name.to_str().map(str::to_owned) else {
                 continue;
             };
             let Ok(gen_id) = Uuid::parse_str(&name) else {
@@ -271,9 +270,8 @@ impl ProtectedFileBackend {
         if gen_id.is_nil() {
             return Err(invalid("protected_file: empty generation id"));
         }
-        match fs::remove_dir_all(self.generation_dir(&gen_id)) {
+        match durable::remove_all(&self.generation_dir(&gen_id)) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Failure::internal(
                 "broker_protected_file",
                 format!("protected_file: delete generation {gen_id}: {e}"),
@@ -305,12 +303,7 @@ impl ProtectedFileBackend {
                 .join(format!(".active-{}.tmp", super::wire::hex_encode(&name)))
         };
         let install = (|| -> Result<(), Failure> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o400)
-                .custom_flags(libc::O_CLOEXEC)
-                .open(&tmp)
+            let mut file = durable::open_exclusive(&tmp, 0o400)
                 .map_err(|e| os("protected_file: create active tmp", e))?;
             use std::io::Write as _;
             file.write_all(&payload)
@@ -362,7 +355,8 @@ pub fn open_protected_file(path: &Path) -> Result<fs::File, Failure> {
     if name.is_empty() {
         return Err(invalid("protected_file: invalid path"));
     }
-    let dir_fd = rustix::fs::open(
+    let dir_fd = rustix::fs::openat(
+        rustix::fs::CWD,
         dir.as_os_str(),
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
@@ -380,13 +374,8 @@ pub fn open_protected_file(path: &Path) -> Result<fs::File, Failure> {
 /// Write `payload` to `path` created `O_EXCL`-ish at `0400` — the
 /// protected generation file install (value + metadata).
 fn write_private_0400(path: &Path, payload: &[u8]) -> Result<(), Failure> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| os("protected_file: write", e))?;
+    let mut file =
+        durable::open_exclusive(path, 0o400).map_err(|e| os("protected_file: write", e))?;
     use std::io::Write as _;
     file.write_all(payload)
         .and_then(|()| file.sync_all())
@@ -431,6 +420,7 @@ pub fn to_domain(generation: &Generation) -> ProtectedGeneration {
 mod tests {
     use super::*;
     use crate::broker::testutil::TempDir;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::fs::symlink;
 
     #[test]

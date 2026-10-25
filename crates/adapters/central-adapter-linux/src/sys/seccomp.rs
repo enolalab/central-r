@@ -24,6 +24,29 @@
 //! then `installSeccompFilter`; an unprivileged install is refused by
 //! the kernel otherwise), and a failed install must fail closed — the
 //! broker refuses to start unhardened.
+//!
+//! ## Rust syscall surface (R5 T9 P0-A, ADR 0044)
+//!
+//! The upstream 64-number allow-list was written against Go's runtime
+//! emission table. Rust's stdlib reaches a *different* set for the same
+//! calls, so a verbatim port died with `SIGSYS` on its first hardened
+//! store operation: `std::fs::metadata`/`symlink_metadata`/`Path::exists`
+//! emit `statx` (332 — not listed; `newfstatat` 262 is),
+//! `std::fs::set_permissions` emits `fchmodat` (268 — not listed;
+//! `fchmod` 91 is), `UnixStream::set_read/write_timeout` emits
+//! `setsockopt` (54 — not listed), `UnixListener::set_nonblocking` and
+//! `UnixStream::set_nonblocking` emit `ioctl(FIONBIO)` (16 — not
+//! listed), and tokio's `signal` needs `socketpair`+`poll` (53/7 —
+//! not listed). Rather than widening the list to fit the naive port,
+//! the port was re-aimed at primitives already on it (ADR 0044):
+//! `rustix::fs::statat`/`newfstatat` for metadata, `openat` mode bits
+//! and fd `fchmod` for permissions, `mkdirat`/`unlinkat`/`renameat2`/
+//! `getdents64` for the store tree, `fcntl(O_NONBLOCK)` + `read`/
+//! `write`/`recvmsg` `EAGAIN` retry under a `nanosleep` deadline for
+//! the connection layer, and `rt_sigaction` flag handlers for signal
+//! shutdown. The list itself is unchanged — the `broker_surface` probe
+//! walks every post-`harden()` emission and the `old_shape` probes pin
+//! `fchmodat`/`statx` to `SIGSYS`.
 
 use central_foundation::failure::Failure;
 
@@ -329,5 +352,182 @@ mod tests {
         }
         let err = install().unwrap_err();
         assert_eq!(err.code(), "sys_seccomp_denied");
+    }
+
+    /// Probe child: install the filter, then walk the hardened
+    /// broker's real post-`harden()` syscall surface — the durable
+    /// store (`newfstatat`/`mkdirat`/`openat`/`getdents64`/`unlinkat`/
+    /// `renameat2`/`fchmod`/`fsync`), the connection layer (`fcntl`
+    /// `O_NONBLOCK`, `read`/`write`, `sendmsg`/`recvmsg`,
+    /// `getsockopt`, `accept4`), the signal shutdown (`rt_sigaction`),
+    /// and the cadence/runtime calls (`nanosleep`, `clock_gettime`,
+    /// `getrandom`, `getpid`/`geteuid`). A single missed emission is a
+    /// `SIGSYS` death — the P0-A regression this proves stays out.
+    /// R5 T9 / ADR 0044.
+    #[test]
+    fn probe_child_broker_surface() {
+        if !crate::sys::probe::is("broker-surface") {
+            return;
+        }
+        use std::os::fd::AsFd as _;
+        use std::os::unix::net::UnixListener;
+
+        // Pre-install fixtures: socketpair/listener need `socketpair`
+        // and `bind`/`listen`, none of which the filter admits — the
+        // daemon creates its socket before `harden()` for the same
+        // reason.
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair fixture");
+        let dir = std::env::temp_dir().join(format!("central-surf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("fixture dir");
+        let sock_path = dir.join("l.sock");
+        let listener = UnixListener::bind(&sock_path).expect("fixture listener");
+
+        rustix::thread::set_no_new_privs(true).expect("nnp");
+        install().expect("probe install");
+
+        // -- durable-store surface (broker/durable.rs primitives) --
+        let store = dir.join("store");
+        crate::broker::durable::mkdir_p(&store, 0o700).expect("mkdir_p");
+        let f = store.join("k.json");
+        crate::broker::durable::write_file(&f, b"{}", 0o600).expect("write_file");
+        let st = crate::broker::durable::stat(&f).expect("stat");
+        assert!(rustix::fs::FileType::from_raw_mode(st.st_mode).is_file());
+        let lst = crate::broker::durable::lstat(&f).expect("lstat");
+        assert_eq!(st.st_ino, lst.st_ino);
+        assert!(crate::broker::durable::exists(&f));
+        assert_eq!(
+            crate::broker::durable::read_dir(&store)
+                .expect("read_dir")
+                .len(),
+            1
+        );
+        crate::broker::durable::sync_file(&f).expect("sync_file");
+        crate::broker::durable::sync_dir(&store).expect("sync_dir");
+        // fchmod(91) — the fd-based permission path write_private uses.
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            &f,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("openat");
+        rustix::fs::fchmod(&fd, rustix::fs::Mode::from_raw_mode(0o600)).expect("fchmod");
+        let tmp = store.join("k.tmp");
+        crate::broker::durable::write_file(&tmp, b"{}", 0o600).expect("tmp write");
+        crate::broker::durable::rename_replace(&tmp, &f).expect("renameat2");
+        crate::broker::durable::remove_all(&store).expect("remove_all");
+
+        // -- connection surface (broker/deadline.rs + scm_rights) --
+        let flags = rustix::fs::fcntl_getfl(&b).expect("fcntl_getfl");
+        rustix::fs::fcntl_setfl(&b, flags | rustix::fs::OFlags::NONBLOCK).expect("fcntl_setfl");
+        rustix::io::write(&a, b"x").expect("write socket");
+        let mut data = [0u8; 4];
+        let recv = crate::sys::scm_rights::recv_raw(&b, &mut data).expect("recvmsg");
+        drop(recv);
+        crate::sys::scm_rights::send(&a, &[0x01], &[fd.as_fd()]).expect("sendmsg");
+        crate::sys::peercred::peercred(&a).expect("getsockopt SO_PEERCRED");
+        // accept4(288): nonblocking listener accept -> EAGAIN.
+        let lflags = rustix::fs::fcntl_getfl(&listener).expect("listener getfl");
+        rustix::fs::fcntl_setfl(&listener, lflags | rustix::fs::OFlags::NONBLOCK)
+            .expect("listener nonblock");
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Any non-EAGAIN outcome fails the probe deterministically.
+            _ => std::process::exit(43),
+        }
+
+        // -- signal surface (daemon shutdown flag handlers) --
+        extern "C" fn noop(_sig: libc::c_int) {}
+        audited::install_signal_handler(libc::SIGUSR1, noop).expect("rt_sigaction");
+
+        // -- cadence/runtime surface --
+        audited::nanosleep(std::time::Duration::from_millis(1)); // nanosleep(35)
+        let _ = std::time::Instant::now(); // clock_gettime
+        let mut entropy = [0u8; 8];
+        rustix::rand::getrandom(&mut entropy[..], rustix::rand::GetRandomFlags::empty())
+            .expect("getrandom");
+        let _ = rustix::process::getpid();
+        let _ = rustix::process::geteuid();
+
+        std::process::exit(0);
+    }
+
+    /// Probe child: the pre-fix permission path — `std::fs`'s
+    /// `set_permissions` emits `fchmodat` (268), absent from the
+    /// allow-list by design (fd `fchmod` is what the fixed port uses).
+    /// The kernel kills this child with `SIGSYS`; reaching `exit(42)`
+    /// would mean the regression's old shape silently passes.
+    #[test]
+    fn probe_child_old_fchmodat_dies() {
+        if !crate::sys::probe::is("old-fchmodat") {
+            return;
+        }
+        let f = std::env::temp_dir().join(format!("central-oldf-{}", std::process::id()));
+        std::fs::write(&f, b"x").expect("fixture file");
+        rustix::thread::set_no_new_privs(true).expect("nnp");
+        install().expect("probe install");
+        // fchmodat(268) — SIGSYS here; never returns.
+        let _ = std::fs::set_permissions(
+            &f,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        );
+        std::process::exit(42);
+    }
+
+    /// Probe child: the pre-fix metadata path — `statx` (332) is what
+    /// `std::fs::metadata`/`symlink_metadata`/`Path::exists` emit on a
+    /// modern toolchain, and it is not on the allow-list
+    /// (`newfstatat` is the listed primitive the port switched to).
+    /// The raw `statx` call pins the regression deterministically,
+    /// independent of which emission std picks on a given rustc.
+    #[test]
+    fn probe_child_old_statx_dies() {
+        if !crate::sys::probe::is("old-statx") {
+            return;
+        }
+        rustix::thread::set_no_new_privs(true).expect("nnp");
+        install().expect("probe install");
+        // Raw `statx` via the audited boundary — this module is
+        // `#[forbid(unsafe_code)]`; the filter kills here and the
+        // call never returns.
+        let _ = audited::statx_raw(c"/");
+        std::process::exit(42);
+    }
+
+    /// Parent halves of the R5 T9 syscall-surface probes: the real
+    /// post-`harden()` surface exits clean, while the two pre-fix
+    /// emissions (`fchmodat`, `statx`) die by `SIGSYS` — the
+    /// before/after pair the P0-A fix is pinned by.
+    #[test]
+    fn broker_surface_and_old_shape_probes() {
+        let surface = crate::sys::probe::run_on(
+            "sys::seccomp::tests::probe_child_broker_surface",
+            "broker-surface",
+        );
+        assert!(
+            surface.success(),
+            "broker-surface probe died (P0-A regression): {surface:?}"
+        );
+
+        let chmod = crate::sys::probe::run_on(
+            "sys::seccomp::tests::probe_child_old_fchmodat_dies",
+            "old-fchmodat",
+        );
+        assert_eq!(
+            chmod.signal(),
+            Some(libc::SIGSYS),
+            "old fchmodat shape must die by SIGSYS, got {chmod:?}"
+        );
+
+        let statx = crate::sys::probe::run_on(
+            "sys::seccomp::tests::probe_child_old_statx_dies",
+            "old-statx",
+        );
+        assert_eq!(
+            statx.signal(),
+            Some(libc::SIGSYS),
+            "old statx shape must die by SIGSYS, got {statx:?}"
+        );
     }
 }

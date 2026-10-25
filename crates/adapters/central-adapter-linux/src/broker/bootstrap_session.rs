@@ -23,7 +23,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -49,9 +48,9 @@ fn internal(msg: impl Into<String>) -> Failure {
 /// Upstream's `syncFile` — fsync the just-written tmp file before the
 /// rename publishes it.
 fn sync_file(path: &std::path::Path) -> Result<(), Failure> {
-    fs::File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| internal(format!("broker: fsync {}: {e}", path.display())))
+    let fd = super::durable::open_read(path)
+        .map_err(|e| internal(format!("broker: fsync {}: {e}", path.display())))?;
+    rustix::fs::fsync(&fd).map_err(|e| internal(format!("broker: fsync {}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -134,9 +133,9 @@ impl BootstrapSession {
         let Some(path) = &session.state_path else {
             return Ok(session);
         };
-        let data = match fs::read(path) {
+        let data = match super::durable::read_file(path) {
             Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(session),
+            Err(rustix::io::Errno::NOENT) => return Ok(session),
             Err(_) => return Err(internal("broker: load bootstrap candidate state")),
         };
         let record: StateRecordLoad = serde_json::from_slice(&data)
@@ -284,19 +283,14 @@ impl BootstrapSession {
         };
         let write_result = (|| -> Result<(), Failure> {
             use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(PRIVATE_FILE_MODE)
-                .custom_flags(libc::O_CLOEXEC)
-                .open(&tmp)
+            // Drop any stale tmp so `mode(0600)` applies at creation —
+            // post-`harden()` `fchmodat` is not on the allow-list, so the
+            // mode must be set by `openat` itself (ADR 0044).
+            let _ = fs::remove_file(&tmp);
+            let mut file = super::durable::open_write(&tmp, PRIVATE_FILE_MODE)
                 .map_err(|e| internal(format!("broker: write {}: {e}", tmp.display())))?;
             file.write_all(&data)
                 .map_err(|e| internal(format!("broker: write {}: {e}", tmp.display())))?;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-                .map_err(|e| internal(format!("broker: secure {}: {e}", tmp.display())))?;
             sync_file(&tmp)?;
             fs::rename(&tmp, path)
                 .map_err(|e| internal(format!("broker: publish {}: {e}", path.display())))?;
@@ -546,6 +540,7 @@ impl BootstrapPresenter {
 mod tests {
     use super::*;
     use crate::broker::testutil::TempDir;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn binding(id: &str, generation: u64, seed: u8) -> CandidateBinding {
         CandidateBinding {

@@ -79,8 +79,10 @@ impl HandoffService {
 /// `sys_scm_rights_*` for the ancillary-shape refusals;
 /// `broker_handoff` wrapping `sys_memfd_*` for the descriptor-shape
 /// refusals.
-pub fn receive_descriptor(conn: &UnixStream) -> Result<OwnedFd, Failure> {
-    let fd = scm_rights::recv_marker_descriptor(conn)?;
+pub(crate) fn receive_descriptor(
+    conn: &crate::broker::deadline::DeadlineStream,
+) -> Result<OwnedFd, Failure> {
+    let fd = conn.recv_marker_descriptor()?;
     memfd::validate_destination(&fd, Uid::ROOT)
         .map_err(|e| internal(format!("transport: {}", e.message())))?;
     Ok(fd)
@@ -211,13 +213,14 @@ pub struct DefaultTransport {
     pub signing: std::sync::Arc<SigningService>,
 }
 
+#[cfg(test)]
 impl DefaultTransport {
     /// `HandleMaterialize` — receive+validate the destination
     /// descriptor (denial frame `0x02` on any refusal), write the
     /// value, then emit the ACK frame `[0x01|len|uid|gid|proof]`.
-    pub fn handle_materialize(
+    pub(crate) fn handle_materialize(
         &self,
-        mut conn: &UnixStream,
+        conn: &crate::broker::deadline::DeadlineStream,
         req: &HandoffRequest,
         secret: &[u8],
     ) -> Result<(), Failure> {
@@ -246,7 +249,8 @@ impl DefaultTransport {
         frame.extend_from_slice(&1000u16.to_be_bytes());
         frame.extend_from_slice(&1000u16.to_be_bytes());
         frame.extend_from_slice(&opaque_proof);
-        conn.write_all(&frame)
+        (&*conn)
+            .write_all(&frame)
             .map_err(|e| internal(format!("B04 transport: write ack: {e}")))
     }
 }
@@ -402,7 +406,12 @@ mod tests {
             }
             (fd, marker[0], rest)
         });
-        let result = transport.handle_materialize(&a, &req, b"root-password");
+        let conn = crate::broker::deadline::DeadlineStream::new(
+            a.into(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("deadline stream");
+        let result = transport.handle_materialize(&conn, &req, b"root-password");
         let (fd, marker, rest) = helper.join().expect("join");
         if is_root {
             result.expect("materialize succeeds as root");

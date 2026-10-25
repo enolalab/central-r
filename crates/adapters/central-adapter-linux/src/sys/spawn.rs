@@ -310,6 +310,72 @@ mod tests {
         }
     }
 
+    /// R5 T9 P0-B: `SANDBOX_CREATE` carries `CLONE_NEWPID`, so the
+    /// child is PID 1 of its new namespace and the kernel reports
+    /// `getppid() == 0` for it — a post-`PR_SET_PDEATHSIG` `getppid`
+    /// compare against the outer parent pid would `ESRCH` every
+    /// sandboxed child before `exec`. The trampoline now skips the
+    /// userspace compare only under `NEWPID` (the kernel still tracks
+    /// the real parent for the armed signal); this test proves the
+    /// child reaches `execve` — `/bin/true` exits 0.
+    ///
+    /// Root-gated: namespace creation needs `CAP_SYS_ADMIN` (or a
+    /// delegated userns the reference host supplies); on other hosts
+    /// the skip mirrors `sandbox_namespaces_deny_or_spawn`.
+    #[test]
+    fn newpid_pdeathsig_child_reaches_exec() {
+        if !rustix::process::geteuid().is_root() {
+            return;
+        }
+        let spec = SpawnSpec {
+            program: CString::new("/bin/true").expect("program"),
+            argv: vec![CString::new("true").expect("argv0")],
+            env: Vec::new(),
+            namespaces: NamespaceFlags::SANDBOX_CREATE,
+            unshare: NamespaceFlags::SANDBOX_UNSHARE,
+            uid: rustix::process::geteuid().as_raw(),
+            gid: rustix::process::getegid().as_raw(),
+            pdeathsig: libc::SIGKILL,
+            cgroup: None,
+            nofile: 0,
+        };
+        // Pre-fix this returned `sys_spawn_child` with errno ESRCH —
+        // the condemned child never reached exec.
+        let spawned = spawn_namespaced(&spec).expect("NEWPID+pdeathsig spawn");
+        let (_, status) = waitpid(Some(spawned.pid), WaitOptions::empty())
+            .expect("waitpid")
+            .expect("wait result");
+        assert_eq!(
+            status.exit_status(),
+            Some(0),
+            "NEWPID child must reach exec and exit 0"
+        );
+    }
+
+    /// The non-`NEWPID` compare is kept: a plain spawn whose recorded
+    /// `parent_pid` matches the real parent still passes the liveness
+    /// gate — the `NEWPID` skip is scoped, not deleted.
+    #[test]
+    fn pdeathsig_compare_runs_without_newpid() {
+        let spec = SpawnSpec {
+            program: CString::new("/bin/true").expect("program"),
+            argv: vec![CString::new("true").expect("argv0")],
+            env: Vec::new(),
+            namespaces: NamespaceFlags::NONE,
+            unshare: NamespaceFlags::NONE,
+            uid: rustix::process::geteuid().as_raw(),
+            gid: rustix::process::getegid().as_raw(),
+            pdeathsig: libc::SIGKILL,
+            cgroup: None,
+            nofile: 0,
+        };
+        let spawned = spawn_namespaced(&spec).expect("plain pdeathsig spawn");
+        let (_, status) = waitpid(Some(spawned.pid), WaitOptions::empty())
+            .expect("waitpid")
+            .expect("wait result");
+        assert_eq!(status.exit_status(), Some(0));
+    }
+
     /// `waitpid` + `kill_process` on the pidfd fallback path: a
     /// spawned sleeper can be SIGKILLed and reaped through the handles
     /// `Spawned` returns.

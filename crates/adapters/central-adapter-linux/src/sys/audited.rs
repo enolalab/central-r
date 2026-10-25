@@ -85,6 +85,68 @@ pub(crate) fn unshare(flags: crate::sys::namespace::NamespaceFlags) -> Result<()
     unsafe { rustix::thread::unshare_unsafe(flags) }
 }
 
+/// `sigaction(signum, {handler, empty mask, SA_RESTART})` — installs a
+/// plain-C handler with no flags beyond `SA_RESTART`, glibc's
+/// `sigaction(3)` entry point so the restorer is wired exactly as a C
+/// program's. The handler must be async-signal-safe; the only caller
+/// (`broker::daemon`'s shutdown flag) stores one word to a `static`
+/// `AtomicBool` — the `signal.NotifyContext(SIGINT, SIGTERM)` shape
+/// without tokio's signal driver, whose self-pipe `socketpair` (53) is
+/// not on the broker's seccomp allow-list (ADR 0044).
+///
+/// `rt_sigaction` (13) IS allow-listed, so this survives `harden()` —
+/// which is the point: the daemon arms the flag before `install()` and
+/// the handler must keep working under the filter.
+///
+/// # Errors
+/// `Errno` of the `sigaction` failure (`EINVAL` for an unusable
+/// signum — `SIGKILL`/`SIGSTOP` cannot be caught).
+pub(crate) fn install_signal_handler(
+    signum: libc::c_int,
+    handler: extern "C" fn(libc::c_int),
+) -> Result<(), Errno> {
+    // SAFETY: `act` names a live `sigaction` for the call's duration.
+    // `handler` is an `extern "C"` fn item — a valid handler address by
+    // type — and `SA_RESTART` + an empty mask matches upstream
+    // `signal.NotifyContext`'s disposition. libc::sigaction installs
+    // the kernel's required SA_RESTORER trampoline itself.
+    unsafe {
+        let mut act: libc::sigaction = std::mem::zeroed();
+        act.sa_sigaction = handler as usize;
+        act.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&raw mut act.sa_mask);
+        if libc::sigaction(signum, &raw const act, std::ptr::null_mut()) != 0 {
+            return Err(last_errno());
+        }
+    }
+    Ok(())
+}
+
+/// `nanosleep(2)` — the raw syscall, not the library shape.
+/// `std::thread::sleep` and glibc's `nanosleep` both route through
+/// `clock_nanosleep` (230) on this toolchain; the broker's seccomp
+/// allow-list carries `nanosleep` (35) only (ADR 0044). Used by the
+/// accept poll and the connection-deadline cadence.
+///
+/// `EINTR` returns early — callers that need the full duration loop
+/// on their own deadline; both existing callers do.
+pub(crate) fn nanosleep(dur: std::time::Duration) {
+    let ts = libc::timespec {
+        tv_sec: dur.as_secs() as libc::time_t,
+        tv_nsec: i64::from(dur.subsec_nanos()) as libc::c_long,
+    };
+    // SAFETY: `ts` is a live `timespec` for the call's duration; the
+    // remainder out-param is NULL — the interrupt is the caller's to
+    // handle.
+    unsafe {
+        libc::syscall(
+            libc::SYS_nanosleep,
+            &raw const ts,
+            std::ptr::null_mut::<libc::timespec>(),
+        );
+    }
+}
+
 /// `LISTEN_FDS` socket activation: fd `3 + index` is handed to this
 /// process by the supervisor — the descriptor is owned exclusively by
 /// this process per the activation contract, so wrapping it in
@@ -93,6 +155,34 @@ pub(crate) fn unshare(flags: crate::sys::namespace::NamespaceFlags) -> Result<()
 ///
 /// # Errors
 /// `EBADF` when the fd is not open.
+/// Raw `statx` — the test-only emission the `old-statx` probe pins to
+/// `SIGSYS` (R5 T9 / ADR 0044). `std::fs::metadata` reaches this
+/// syscall on modern toolchains; the fixed port uses `statat` /
+/// `newfstatat` (262), which the filter lists. Not for production
+/// callers: this exists only so the probe can fire the denied syscall
+/// deterministically under `#[forbid(unsafe_code)]` seccomp tests.
+///
+/// # Errors
+/// Returns the raw syscall result (`-errno` style `c_long`) — under
+/// the installed filter it never returns at all.
+#[cfg(test)]
+pub(crate) fn statx_raw(path: &core::ffi::CStr) -> libc::c_long {
+    // SAFETY: `stx` is a live zeroed `statx` out-buffer for the call's
+    // duration and `path` is a live C string; a denied statx is killed
+    // by the filter before any return value matters.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0,
+            libc::STATX_ALL,
+            &raw mut stx,
+        )
+    }
+}
+
 pub(crate) fn socket_activation_fd(index: u32) -> Result<std::os::fd::OwnedFd, Errno> {
     let raw = 3i32 + i32::try_from(index).map_err(|_| Errno::BADF)?;
     // SAFETY: the socket-activation contract makes `3 + index` an open
@@ -614,14 +704,18 @@ fn close_range_or_fail(err_fd: i32) {
 /// The post-clone child half — upstream `SysProcAttr` realized as the
 /// exact sequence Go's `forkAndExecInChild1` runs:
 ///
-/// `unshare(Unshareflags)` → `setgroups(0)` (the credential drop must
-/// not keep root's supplementary groups) → `setgid`/`setuid`
+/// `unshare(Unshareflags)` + the `MS_REC|MS_PRIVATE` `/` remount
+/// upstream pairs with `CLONE_NEWNS` → `setgroups(0)` (the credential
+/// drop must not keep root's supplementary groups) → `setgid`/`setuid`
 /// (`Credential`) → `PR_SET_PDEATHSIG` + `getppid` liveness check
-/// (`Pdeathsig`, with the died-before-prctl race closed) → `setpgid`
-/// (`Setpgid`) → `TIOCNOTTY` on the inherited stdin (`Noctty`, result
-/// ignored exactly as Go ignores it) → stdin `/dev/null`, stdout ←
-/// stderr (`cmd.Stdin = nil`, `Stdout = Stderr = os.Stderr`) →
-/// `RLIMIT_NOFILE` → `close_range` fd sweep → `execve`.
+/// (`Pdeathsig`, with the died-before-prctl race closed; the compare
+/// is skipped under `CLONE_NEWPID`, where the kernel hides the outer
+/// parent by design — `docs/internal/tasks/r5-t9-newpid-pdeathsig.md`)
+/// → `setpgid` (`Setpgid`) → `TIOCNOTTY` on the inherited stdin
+/// (`Noctty`, result ignored where upstream fails on ENOTTY —
+/// deliberately, for the ctty-less daemon shape) → stdin `/dev/null`,
+/// stdout ← stderr (`cmd.Stdin = nil`, `Stdout = Stderr = os.Stderr`)
+/// → `RLIMIT_NOFILE` → `close_range` fd sweep → `execve`.
 ///
 /// Only async-signal-safe libc entry points run in the child — no
 /// allocation, no locks, no Rust runtime — on the child's own
@@ -643,16 +737,41 @@ fn child_exec(spec: &CloneExecSpec) -> ! {
         // Truncating a u64 that only ever holds 32-bit CLONE_NEW* bits
         // is lossless — `NamespaceFlags` cannot carry anything else.
         step!(libc::unshare(spec.unshare_flags as libc::c_int));
+        // Upstream `forkAndExecInChild1`: the kernel's `unshare` does
+        // not unshare mount points mounted `--shared` — and systemd
+        // mounts `/` shared (debian bug 739593) — so a `CLONE_NEWNS`
+        // unshare must be followed by `mount(NULL, "/", NULL,
+        // MS_REC|MS_PRIVATE)`. Without it every mount the child makes
+        // propagates back into the host's mount table.
+        // SAFETY: `mount` takes literals only — none, "/", none,
+        // flags, none — the exact `SYS_MOUNT` shape upstream emits.
+        if spec.unshare_flags & u64::from(libc::CLONE_NEWNS as u32)
+            == u64::from(libc::CLONE_NEWNS as u32)
+        {
+            step!(libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null()
+            ));
+        }
     }
-    // Root's supplementary groups must not survive the identity drop.
-    // The `setgroups`/`setgid`/`setuid` triplet requires CAP_SETGID/
-    // CAP_SETUID, so it runs only when the target identity actually
-    // differs — the launcher's contract (root daemon → uid 502)
-    // always enters here; a same-identity spawn (tests, a future
-    // same-uid launcher) skips it because the drop is already a
-    // no-op and an unprivileged caller could not satisfy it.
-    // SAFETY: `getuid`/`getgid` cannot fail.
-    if spec.uid != unsafe { libc::getuid() } || spec.gid != unsafe { libc::getgid() } {
+    // Root's supplementary groups must never survive into the child.
+    // Upstream runs `setgroups(0)` whenever the spawn carried a
+    // `Credential` — the kernel's own EPERM gate on an unprivileged
+    // `setgroups` is what makes that unconditional call safe, not a
+    // reason to keep a privileged supplementary set. Our spec always
+    // carries a target identity, so the gate is privilege-based: a
+    // still-root parent (the launcher's contract) drops groups even
+    // on a same-uid spawn; an unprivileged parent launching a
+    // same-identity child is the one narrow case where `setgroups`
+    // could only EPERM — it has no supplementary set beyond its own
+    // to shed, so skipping it loses nothing.
+    // SAFETY: `getuid`/`getgid`/`geteuid` cannot fail.
+    let identity_differs = unsafe { spec.uid != libc::getuid() || spec.gid != libc::getgid() };
+    let privileged = unsafe { libc::geteuid() } == 0;
+    if identity_differs || privileged {
         step!(libc::setgroups(0, std::ptr::null()));
         step!(libc::setgid(spec.gid));
         step!(libc::setuid(spec.uid));
@@ -668,17 +787,30 @@ fn child_exec(spec: &CloneExecSpec) -> ! {
         // The Pdeathsig race: the parent exited between clone and this
         // prctl, so the kernel never armed a death signal — `getppid`
         // would now report a reparent. Go's forkExec performs the same
-        // check and aborts the child; ESRCH names the cause to the
-        // parent's error-pipe reader.
+        // check and aborts the child — but only where the child can
+        // see the parent: under `CLONE_NEWPID` this child is PID 1 of
+        // the new namespace, the kernel reports `getppid() == 0` for a
+        // namespace root, and the outer parent is never observable —
+        // upstream's compare would condemn every sandboxed child.
+        // Skipping the userspace compare only under NEWPID loses no
+        // protection: the kernel tracks the real outer-namespace
+        // parent and still delivers the armed signal when it dies.
         // SAFETY: `getppid` has no failure mode.
-        if unsafe { libc::getppid() } != spec.parent_pid {
+        let new_pid_ns = spec.clone_flags & u64::from(libc::CLONE_NEWPID as u32) != 0;
+        if !new_pid_ns && unsafe { libc::getppid() } != spec.parent_pid {
             child_fail(spec.err_fd, libc::ESRCH);
         }
     }
     step!(libc::setpgid(0, 0));
-    // `Noctty` — disassociate the controlling terminal. Go ignores the
-    // ioctl's result (a ctty-less daemon yields ENOTTY, which is fine);
-    // we do the same, on the inherited stdin as upstream does.
+    // `Noctty` — disassociate the controlling terminal. Upstream does
+    // NOT ignore this ioctl: `forkAndExecInChild1` aborts the child on
+    // `err1 != 0`, so a spawn whose stdin already has no controlling
+    // terminal — the daemon launch shape, where the kernel answers
+    // ENOTTY — would die outright. This implementation deliberately
+    // ignores the result: the detach is best-effort where upstream's
+    // check is wrong for a ctty-less daemon, and fd 0 is replaced by
+    // /dev/null immediately below, making the observed state identical
+    // whether or not a controlling tty was there to release.
     // SAFETY: fd 0 is the child's own; TIOCNOTTY takes no memory.
     unsafe {
         libc::syscall(libc::SYS_ioctl, 0i32, libc::TIOCNOTTY, 0i32);

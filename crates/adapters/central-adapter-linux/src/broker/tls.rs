@@ -43,7 +43,7 @@ use time::{Duration, OffsetDateTime};
 use x509_parser::prelude::FromDer as _;
 use zeroize::Zeroize as _;
 
-use super::durable::{PRIVATE_FILE_MODE, ensure_private_root, validate_owner};
+use super::durable::{self, PRIVATE_FILE_MODE, ensure_private_root, validate_owner};
 use super::wire::{b64, sha256_hex};
 
 const TLS_AUTHORITY_STATE_FILENAME: &str = "tls-authority.json";
@@ -146,7 +146,7 @@ impl TlsAuthority {
     pub fn new_persistent(root: &Path) -> Result<Self, Failure> {
         ensure_private_root(root)?;
         let state_path = root.join(TLS_AUTHORITY_STATE_FILENAME);
-        match fs::symlink_metadata(&state_path) {
+        match durable::lstat(&state_path) {
             Ok(_) => {
                 let state = load_tls_authority_state(&state_path)?;
                 let authority = authority_from_state(state)?;
@@ -155,7 +155,7 @@ impl TlsAuthority {
                     state_path: Some(state_path),
                 });
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(rustix::io::Errno::NOENT) => {}
             Err(e) => {
                 return Err(internal(format!(
                     "broker: inspect persistent TLS authority state: {e}"
@@ -485,16 +485,14 @@ fn ca_params_from_cert(
 /// symlink, exact `0600`, owner, link count 1, `0 < size ≤ 64 KiB`),
 /// then read + JSON decode.
 fn load_tls_authority_state(path: &Path) -> Result<TlsAuthorityState, Failure> {
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    let meta = fs::symlink_metadata(path).map_err(|e| {
+    let meta = durable::lstat(path).map_err(|e| {
         internal(format!(
             "broker: inspect persistent TLS authority state: {e}"
         ))
     })?;
-    if !meta.file_type().is_file()
-        || meta.file_type().is_symlink()
-        || meta.permissions().mode() & 0o777 != PRIVATE_FILE_MODE
+    if !rustix::fs::FileType::from_raw_mode(meta.st_mode).is_file()
+        || rustix::fs::FileType::from_raw_mode(meta.st_mode).is_symlink()
+        || meta.st_mode & 0o777 != PRIVATE_FILE_MODE
     {
         return Err(Failure::denied(
             "broker_tls_denied",
@@ -502,10 +500,13 @@ fn load_tls_authority_state(path: &Path) -> Result<TlsAuthorityState, Failure> {
         ));
     }
     validate_owner(&meta, "persistent TLS authority state")?;
-    if meta.nlink() != 1 || meta.size() == 0 || meta.size() > MAX_TLS_AUTHORITY_STATE_BYTES {
+    if meta.st_nlink != 1
+        || meta.st_size == 0
+        || meta.st_size > MAX_TLS_AUTHORITY_STATE_BYTES as i64
+    {
         return Err(invalid("broker: invalid persistent TLS authority state"));
     }
-    let data = fs::read(path)
+    let data = durable::read_file(path)
         .map_err(|e| internal(format!("broker: read persistent TLS authority state: {e}")))?;
     serde_json::from_slice(&data).map_err(|e| {
         invalid(format!(
@@ -537,18 +538,11 @@ fn save_tls_authority_state(path: &Path, state: &TlsAuthorityState) -> Result<()
     };
     let result = (|| -> Result<(), Failure> {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(PRIVATE_FILE_MODE)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&tmp)
-            .map_err(|e| {
-                internal(format!(
-                    "broker: create persistent TLS authority state: {e}"
-                ))
-            })?;
+        let mut file = durable::open_exclusive(&tmp, PRIVATE_FILE_MODE).map_err(|e| {
+            internal(format!(
+                "broker: create persistent TLS authority state: {e}"
+            ))
+        })?;
         file.write_all(&data)
             .and_then(|()| file.sync_all())
             .map_err(|e| internal(format!("broker: write persistent TLS authority state: {e}")))?;

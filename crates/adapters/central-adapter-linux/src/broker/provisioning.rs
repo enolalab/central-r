@@ -12,8 +12,6 @@
 //! own snake_case tags.
 
 use std::fs;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use central_backup::domain::{SessionBinding, TargetIdentity};
@@ -23,7 +21,7 @@ use sha2::Digest as _;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::durable::{PRIVATE_DIRECTORY_MODE, sync_dir};
+use super::durable::{self, PRIVATE_DIRECTORY_MODE, sync_dir};
 use super::journal::Journal;
 use super::wire::{hex_encode, is_go_zero_time, rfc3339};
 
@@ -458,7 +456,7 @@ impl ProvisioningStore {
             }
         }
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        if dir.exists() {
+        if super::durable::exists(dir) {
             sync_dir(dir)?;
         }
         Ok(())
@@ -467,10 +465,8 @@ impl ProvisioningStore {
     /// `readCurrent` — `(record, absent)`: `ENOENT` is the absent
     /// sentinel, not an error; corruption is.
     fn read_current(&self, path: &Path) -> Result<(ProvisioningRecord, bool), Failure> {
-        match fs::read(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok((ProvisioningRecord::absent_placeholder(), true))
-            }
+        match durable::read_file(path) {
+            Err(rustix::io::Errno::NOENT) => Ok((ProvisioningRecord::absent_placeholder(), true)),
             Err(e) => Err(Failure::internal(
                 "broker_provisioning",
                 format!("provisioning: read record: {e}"),
@@ -544,26 +540,18 @@ fn write_new_exclusive(path: &Path, record: &ProvisioningRecord) -> Result<(), F
     let data = serde_json::to_vec(record)
         .map_err(|e| Failure::internal("broker_provisioning", format!("marshal: {e}")))?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir)
+    super::durable::mkdir_p(dir, PRIVATE_DIRECTORY_MODE)
         .map_err(|e| Failure::internal("broker_provisioning", format!("mkdir: {e}")))?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-        .map_err(|e| Failure::internal("broker_provisioning", format!("mkdir: {e}")))?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .custom_flags(libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                denied("provisioning: create denied: record already exists")
-            } else {
-                Failure::internal(
-                    "broker_provisioning",
-                    format!("provisioning: create: write: {e}"),
-                )
-            }
-        })?;
+    let mut file = durable::open_exclusive(path, 0o400).map_err(|e| {
+        if e == rustix::io::Errno::EXIST {
+            denied("provisioning: create denied: record already exists")
+        } else {
+            Failure::internal(
+                "broker_provisioning",
+                format!("provisioning: create: write: {e}"),
+            )
+        }
+    })?;
     let write_result = {
         use std::io::Write as _;
         file.write_all(&data)
@@ -583,19 +571,11 @@ fn write_atomic(path: &Path, record: &ProvisioningRecord) -> Result<(), Failure>
     let data = serde_json::to_vec(record)
         .map_err(|e| Failure::internal("broker_provisioning", format!("marshal: {e}")))?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir)
-        .map_err(|e| Failure::internal("broker_provisioning", format!("mkdir: {e}")))?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+    super::durable::mkdir_p(dir, PRIVATE_DIRECTORY_MODE)
         .map_err(|e| Failure::internal("broker_provisioning", format!("mkdir: {e}")))?;
     let tmp_path = path.with_extension("json.tmp");
     {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o400)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&tmp_path)
+        let mut file = durable::open_write(&tmp_path, 0o400)
             .map_err(|e| Failure::internal("broker_provisioning", format!("write tmp: {e}")))?;
         use std::io::Write as _;
         file.write_all(&data)

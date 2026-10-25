@@ -97,16 +97,19 @@ pub fn send<Fd: AsFd>(sock: Fd, data: &[u8], fds: &[BorrowedFd<'_>]) -> Result<u
 }
 
 /// `recvmsg` once into `data`, collecting every received descriptor —
-/// `unix.Recvmsg` + `unix.ParseSocketControlMessage`.
+/// `unix.Recvmsg` + `unix.ParseSocketControlMessage`, `Errno`-flavored.
+/// [`crate::broker::deadline::DeadlineStream`] retries `EAGAIN` at its
+/// own cadence under the connection deadline, so it needs the `Errno`,
+/// not the `Failure` [`recv`] maps it into.
 ///
-/// The receiver decides strictness; [`recv_one`] enforces the broker's
-/// inbound shape. A `CTRUNC` in `flags` means the kernel dropped part
-/// of the control data — treat the message as untrusted.
+/// The receiver decides strictness; [`validate_one`] enforces the
+/// broker's inbound shape. A `CTRUNC` in `flags` means the kernel
+/// dropped part of the control data — treat the message as untrusted.
 ///
 /// # Errors
-/// `sys_scm_rights_os` on the `recvmsg` failure (including `EAGAIN`
-/// for the caller to map into a timeout retry policy).
-pub fn recv<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<Recv, Failure> {
+/// The `Errno` of the `recvmsg` failure (including `EAGAIN` on a
+/// nonblocking socket for the caller's retry policy).
+pub fn recv_raw<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<Recv, Errno> {
     let mut iov = [IoSliceMut::new(data)];
     // Room for the malformed shapes the strict checks refuse — a
     // too-small buffer would surface them as CTRUNC instead of the
@@ -115,8 +118,7 @@ pub fn recv<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<Recv, Failure> {
     let mut space = [MaybeUninit::<u8>::uninit();
         cmsg_space!(ScmRights(MAX_FDS), ScmRights(MAX_FDS), ScmCredentials(1))];
     let mut cmsg = RecvAncillaryBuffer::new(&mut space);
-    let ret =
-        recvmsg(sock, &mut iov, &mut cmsg, RECV_FLAGS).map_err(|e| os_failure("recvmsg", e))?;
+    let ret = recvmsg(sock, &mut iov, &mut cmsg, RECV_FLAGS)?;
     let mut fds = Vec::new();
     let mut rights_msgs = 0usize;
     let mut other_msgs = 0usize;
@@ -138,20 +140,26 @@ pub fn recv<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<Recv, Failure> {
     })
 }
 
-/// `extractSingleDescriptor` + `validateReceivedDescriptor` — the strict
-/// inbound shape: the data frame read into `data`, no truncation, no
-/// non-rights ancillary data, exactly one `SCM_RIGHTS` message with
-/// exactly one descriptor.
-///
-/// Returns `(bytes, fd)` — the caller owns the frame's payload framing
-/// (marker check, JSON decode, …); [`recv_marker_descriptor`] is the
-/// B04-shaped specialization.
+/// [`recv_raw`] with the `Errno` mapped to `sys_scm_rights_os` —
+/// blocking-socket callers' shape.
 ///
 /// # Errors
-/// `sys_scm_rights_denied` for every malformed shape upstream refuses;
-/// `sys_scm_rights_os` when `recvmsg` itself fails.
-pub fn recv_one<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<(usize, OwnedFd), Failure> {
-    let r = recv(sock, data)?;
+/// `sys_scm_rights_os` on the `recvmsg` failure.
+pub fn recv<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<Recv, Failure> {
+    recv_raw(sock, data).map_err(|e| os_failure("recvmsg", e))
+}
+
+/// `extractSingleDescriptor` + `validateReceivedDescriptor`'s checks
+/// over an already-received frame — split from the `recvmsg` so a
+/// retrying caller ([`crate::broker::deadline::DeadlineStream`]) applies
+/// the same strict shape to its own receive loop.
+///
+/// Returns `(bytes, fd)` — the caller owns the frame's payload framing
+/// (marker check, JSON decode, …).
+///
+/// # Errors
+/// `sys_scm_rights_denied` for every malformed shape upstream refuses.
+pub fn validate_one(r: Recv) -> Result<(usize, OwnedFd), Failure> {
     if r.flags.intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC) {
         return Err(denied("truncated ancillary data or oversized data frame"));
     }
@@ -179,6 +187,22 @@ pub fn recv_one<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<(usize, OwnedFd),
         // shape total anyway.
         None => Err(denied("expected single descriptor over protected socket")),
     }
+}
+
+/// `extractSingleDescriptor` + `validateReceivedDescriptor` — the strict
+/// inbound shape: the data frame read into `data`, no truncation, no
+/// non-rights ancillary data, exactly one `SCM_RIGHTS` message with
+/// exactly one descriptor.
+///
+/// Returns `(bytes, fd)` — the caller owns the frame's payload framing
+/// (marker check, JSON decode, …); [`recv_marker_descriptor`] is the
+/// B04-shaped specialization.
+///
+/// # Errors
+/// `sys_scm_rights_denied` for every malformed shape upstream refuses;
+/// `sys_scm_rights_os` when `recvmsg` itself fails.
+pub fn recv_one<Fd: AsFd>(sock: Fd, data: &mut [u8]) -> Result<(usize, OwnedFd), Failure> {
+    validate_one(recv(sock, data)?)
 }
 
 /// `ReceiveDescriptor`'s marker gate — one `[TRANSPORT_MARKER]` byte

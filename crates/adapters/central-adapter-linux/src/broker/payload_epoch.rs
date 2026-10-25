@@ -15,8 +15,6 @@
 //! unavailable.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use central_foundation::failure::Failure;
@@ -25,7 +23,7 @@ use sha2::Digest as _;
 use uuid::Uuid;
 
 use super::durable::{
-    PRIVATE_DIRECTORY_MODE, open_lock, replace_json, sync_dir, unlock_and_close,
+    self, PRIVATE_DIRECTORY_MODE, open_lock, replace_json, sync_dir, unlock_and_close,
     validate_broker_owned_root, validate_private_directory, validate_private_file,
     write_exclusive_json,
 };
@@ -199,18 +197,17 @@ impl ActivePayloadEpochSource {
 /// Load the persistent signing key without creating it (the read-only
 /// composition's strict counterpart to `new_persistent`).
 fn load_signing_key(key_path: &Path) -> Result<SigningService, Failure> {
-    let meta = fs::symlink_metadata(key_path).map_err(|_| unavailable())?;
-    if !meta.file_type().is_file()
-        || meta.file_type().is_symlink()
-        || meta.permissions().mode() & 0o777 != super::durable::PRIVATE_FILE_MODE
+    let meta = durable::lstat(key_path).map_err(|_| unavailable())?;
+    if !rustix::fs::FileType::from_raw_mode(meta.st_mode).is_file()
+        || rustix::fs::FileType::from_raw_mode(meta.st_mode).is_symlink()
+        || meta.st_mode & 0o777 != super::durable::PRIVATE_FILE_MODE
     {
         return Err(unavailable());
     }
-    use std::os::unix::fs::MetadataExt as _;
-    if meta.uid() != rustix::process::geteuid().as_raw() || meta.nlink() != 1 {
+    if meta.st_uid != rustix::process::geteuid().as_raw() || meta.st_nlink != 1 {
         return Err(unavailable());
     }
-    let key = fs::read(key_path).map_err(|_| unavailable())?;
+    let key = durable::read_file(key_path).map_err(|_| unavailable())?;
     if key.len() != 32 {
         return Err(unavailable());
     }
@@ -218,15 +215,15 @@ fn load_signing_key(key_path: &Path) -> Result<SigningService, Failure> {
 }
 
 fn create_and_validate_epoch_directory(path: &Path) -> Result<(), Failure> {
-    let created = match fs::create_dir(path) {
+    let created = match rustix::fs::mkdirat(
+        rustix::fs::CWD,
+        path.as_os_str(),
+        rustix::fs::Mode::from_raw_mode(PRIVATE_DIRECTORY_MODE),
+    ) {
         Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(rustix::io::Errno::EXIST) => false,
         Err(_) => return Err(unavailable()),
     };
-    if created {
-        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .map_err(|_| unavailable())?;
-    }
     if validate_private_directory(path, "payload epoch directory").is_err() {
         return Err(unavailable());
     }
@@ -435,8 +432,8 @@ impl PayloadEpochStore {
     /// is `false`, not an error; anything else invalid is
     /// `errPayloadEpochUnavailable`.
     fn read_active_record(&self) -> Result<(ActiveRecord, bool), Failure> {
-        match fs::symlink_metadata(&self.active) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        match durable::lstat(&self.active) {
+            Err(rustix::io::Errno::NOENT) => {
                 return Ok((empty_active(), false));
             }
             Err(_) => return Err(unavailable()),
@@ -464,10 +461,7 @@ impl PayloadEpochStore {
     /// generation record: unique genesis, no forks, every record
     /// reachable, unique tip.
     fn read_generation_graph(&self) -> Result<EpochGraph, Failure> {
-        let entries = fs::read_dir(&self.generations).map_err(|_| unavailable())?;
-        let entries: Vec<_> = entries
-            .collect::<Result<_, _>>()
-            .map_err(|_| unavailable())?;
+        let entries = durable::read_dir(&self.generations).map_err(|_| unavailable())?;
         if entries.len() > MAX_GENERATIONS {
             return Err(unavailable());
         }
@@ -480,10 +474,10 @@ impl PayloadEpochStore {
         let mut genesis = Uuid::nil();
         let entry_count = entries.len();
         for entry in &entries {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if entry.file_type.is_dir() {
                 return Err(unavailable());
             }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            let Some(name) = entry.name.to_str().map(str::to_owned) else {
                 return Err(unavailable());
             };
             let Some(operation_text) = name.strip_suffix(".json") else {
@@ -645,8 +639,8 @@ fn read_canonical_epoch_json<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<(T, Vec<u8>), Failure> {
     let file = open_protected_file(path).map_err(|_| unavailable())?;
-    let meta = file.metadata().map_err(|_| unavailable())?;
-    if meta.len() == 0 || meta.len() > MAX_RECORD_BYTES {
+    let meta = rustix::fs::fstat(&file).map_err(|_| unavailable())?;
+    if meta.st_size == 0 || meta.st_size > MAX_RECORD_BYTES as i64 {
         return Err(unavailable());
     }
     if validate_private_file(&meta, "payload epoch record").is_err() {
@@ -675,6 +669,8 @@ fn read_canonical_epoch_json<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use crate::broker::testutil::TempDir;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn store(dir: &Path) -> PayloadEpochStore {
         new_payload_epoch_store(dir, SigningService::new()).unwrap()

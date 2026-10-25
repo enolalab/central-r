@@ -24,7 +24,6 @@
 //!   bundle slice — this module carries only the token, identity, key
 //!   derivation, and scan guard (upstream's secrets-adjacent surface).
 
-use std::fs;
 use std::path::Path;
 
 use central_foundation::failure::Failure;
@@ -34,6 +33,7 @@ use sha2::Sha256;
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
+use super::durable;
 use super::signing::{sign_canonical_json, verify_canonical_json_hex};
 use super::wire;
 
@@ -282,7 +282,7 @@ pub fn load_or_mint_export_identity(
     gid: u32,
     now: OffsetDateTime,
 ) -> Result<(ExportIdentity, bool), Failure> {
-    match fs::read(path) {
+    match durable::read_file(path) {
         Ok(raw) => {
             let identity: ExportIdentity = serde_json::from_slice(&raw)
                 .map_err(|e| internal(format!("portable: export identity corrupt: {e}")))?;
@@ -300,7 +300,7 @@ pub fn load_or_mint_export_identity(
             }
             Ok((identity, false))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(rustix::io::Errno::NOENT) => {
             let mut seed = Zeroizing::new([0u8; 32]);
             rustix::rand::getrandom(&mut seed[..], rustix::rand::GetRandomFlags::empty())
                 .map_err(|e| internal(format!("portable: identity key gen: {e}")))?;
@@ -314,18 +314,11 @@ pub fn load_or_mint_export_identity(
                 .map_err(|e| internal(format!("portable: marshal identity: {e}")))?;
             encoded.push(b'\n');
             use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_CLOEXEC)
-                .open(path)
-            {
+            let mut file = match durable::open_exclusive(path, 0o600) {
                 Ok(f) => f,
                 // A racing creator won — adopt the established identity
                 // (upstream's `IsExist` → recursive reload).
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(rustix::io::Errno::EXIST) => {
                     return load_or_mint_export_identity(path, uid, gid, now);
                 }
                 Err(e) => {
@@ -335,16 +328,14 @@ pub fn load_or_mint_export_identity(
             file.write_all(&encoded)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| internal(format!("portable: write identity: {e}")))?;
-            drop(file);
             // `os.Chmod(0600)` then `os.Chown(uid, gid)` — ownership
             // follows the state root (instance UID); failures fail the
             // export rather than leaving a root-owned key in instance
-            // space.
-            fs::set_permissions(
-                path,
-                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-            )
-            .map_err(|e| internal(format!("portable: secure identity: {e}")))?;
+            // space. `fchmod` on the open fd: path `fchmodat` is not on
+            // the broker's seccomp allow-list (ADR 0044).
+            rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
+                .map_err(|e| internal(format!("portable: secure identity: {e}")))?;
+            drop(file);
             rustix::fs::chown(
                 path,
                 Some(rustix::process::Uid::from_raw(uid)),
@@ -389,14 +380,14 @@ pub fn scan_protected_subset(root: &Path) -> Result<(), Failure> {
 }
 
 fn scan_dir(dir: &Path) -> Result<(), Failure> {
-    let entries = fs::read_dir(dir)
+    let entries = super::durable::read_dir(dir)
         .map_err(|e| internal(format!("portable: scan {}: {e}", dir.display())))?;
     // Sorted for deterministic first-error behavior.
-    let mut names: Vec<_> = entries.flatten().collect();
-    names.sort_by_key(|e| e.file_name());
+    let mut names: Vec<_> = entries;
+    names.sort_by(|a, b| a.name.cmp(&b.name));
     for entry in names {
-        let path = entry.path();
-        let base = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let path = dir.join(&entry.name);
+        let base = entry.name.to_string_lossy().to_ascii_lowercase();
         for denied_name in DENIED_NAMES {
             if base.contains(denied_name) {
                 return Err(internal(format!(
@@ -405,17 +396,14 @@ fn scan_dir(dir: &Path) -> Result<(), Failure> {
                 )));
             }
         }
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if ft.is_dir() {
+        if entry.file_type.is_dir() {
             scan_dir(&path)?;
             continue;
         }
-        if !ft.is_file() {
+        if !entry.file_type.is_file() {
             continue;
         }
-        let Ok(raw) = fs::read(&path) else {
+        let Ok(raw) = durable::read_file(&path) else {
             continue;
         };
         let text = String::from_utf8_lossy(&raw);
@@ -435,6 +423,7 @@ fn scan_dir(dir: &Path) -> Result<(), Failure> {
 mod tests {
     use super::*;
     use crate::broker::testutil::TempDir;
+    use std::fs;
     use time::Duration;
 
     fn key() -> ed25519_dalek::SigningKey {

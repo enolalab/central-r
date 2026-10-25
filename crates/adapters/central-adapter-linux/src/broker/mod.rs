@@ -19,6 +19,7 @@
 
 pub mod bootstrap_session;
 pub mod daemon;
+pub(crate) mod deadline;
 pub(crate) mod durable;
 pub mod export_token;
 pub mod handoff;

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::durable::{PRIVATE_FILE_MODE, sync_dir};
+use super::durable::{self, PRIVATE_FILE_MODE, sync_dir};
 use super::journal::Journal;
 use super::provisioning::{SessionBindingWire, TargetIdentityWire, target_fingerprint};
 use super::signing::SigningService;
@@ -274,7 +274,7 @@ pub fn new_persistent_proof_service(
 ) -> Result<ProofService, Failure> {
     let state_path = root_path.join("migration-proof-state.json");
     let mut state = ProofState::default();
-    match fs::read(&state_path) {
+    match durable::read_file(&state_path) {
         Ok(data) => {
             #[derive(Deserialize)]
             struct Stored {
@@ -288,7 +288,7 @@ pub fn new_persistent_proof_service(
             state.consumed = stored.consumed;
             state.reset_used = stored.reset_used;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(rustix::io::Errno::NOENT) => {}
         Err(e) => return Err(internal(format!("load migration proof state: {e}"))),
     }
     Ok(ProofService {
@@ -374,14 +374,7 @@ impl ProofService {
         let tmp = state_path.with_extension("json.tmp");
         {
             use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(PRIVATE_FILE_MODE)
-                .custom_flags(libc::O_CLOEXEC)
-                .open(&tmp)
+            let mut file = durable::open_write(&tmp, PRIVATE_FILE_MODE)
                 .map_err(|e| internal(format!("write proof state tmp: {e}")))?;
             file.write_all(&data)
                 .and_then(|()| file.sync_all())

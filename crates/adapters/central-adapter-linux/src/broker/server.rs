@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write as _};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1177,12 +1177,12 @@ impl Service {
     #[allow(clippy::too_many_lines)]
     fn handle_b04_materialize_transport(
         &self,
-        conn: &mut std::os::unix::net::UnixStream,
+        conn: &mut super::deadline::DeadlineStream,
         req: &BrokerRequest,
         peer: &PeerCred,
     ) -> Result<(), Failure> {
         const CLASS: &str = "B04_HANDOFF_DENIED: ";
-        let deny = |conn: &mut std::os::unix::net::UnixStream, msg: String| {
+        let deny = |conn: &mut super::deadline::DeadlineStream, msg: String| {
             protocol::write_deny(conn, &req.operation_id, &msg);
         };
         let Some(raw) = req.payload.as_ref().and_then(|p| p.get("request")) else {
@@ -1360,7 +1360,7 @@ impl Service {
     /// this slice: upstream's exact `s.launches == nil` denial.
     fn handle_b05_materialize_transport(
         &self,
-        conn: &mut std::os::unix::net::UnixStream,
+        conn: &mut super::deadline::DeadlineStream,
         req: &BrokerRequest,
         _peer: &PeerCred,
     ) -> Result<(), Failure> {
@@ -1376,7 +1376,7 @@ impl Service {
     /// R6; the peer gate has already run, so deny closed.
     fn handle_b10_minio_runtime_transport(
         &self,
-        conn: &mut std::os::unix::net::UnixStream,
+        conn: &mut super::deadline::DeadlineStream,
         req: &BrokerRequest,
         _peer: &PeerCred,
     ) -> Result<(), Failure> {
@@ -1394,7 +1394,7 @@ impl Service {
     /// authorized peer's frame is read and then denied.
     fn handle_b10_minio_provisioned_transport(
         &self,
-        conn: &mut std::os::unix::net::UnixStream,
+        conn: &mut super::deadline::DeadlineStream,
         descriptor: &central_infra::authority::MinioProvisionedDescriptor,
         fd: OwnedFd,
         peer: &PeerCred,
@@ -1436,17 +1436,13 @@ impl Service {
 /// `broker` on any protocol violation — the denial is already written
 /// to the connection before the error returns.
 pub fn handle_conn(conn: std::os::unix::net::UnixStream, svc: &Service) -> Result<(), Failure> {
-    let mut conn = conn;
-    // One-second deadline over the framed exchange — the audited
-    // primitive sets SO_RCVTIMEO/SO_SNDTIMEO.
-    conn.set_read_timeout(Some(CONNECTION_DEADLINE))
-        .map_err(|e| {
-            Failure::internal("broker", format!("broker: set connection deadline: {e}"))
-        })?;
-    conn.set_write_timeout(Some(CONNECTION_DEADLINE))
-        .map_err(|e| {
-            Failure::internal("broker", format!("broker: set connection deadline: {e}"))
-        })?;
+    // One-second deadline over the framed exchange — upstream's
+    // `conn.SetDeadline(now+1s)` runs on Go's epoll netpoller; the
+    // port carries it on `fcntl`-set `O_NONBLOCK` + `read`/`write` +
+    // a `nanosleep` cadence so every syscall the hardened broker
+    // emits is on the seccomp allow-list (ADR 0044 — `SO_RCVTIMEO`,
+    // `FIONBIO`, `recvfrom`/`sendto` are not).
+    let mut conn = super::deadline::DeadlineStream::new(conn.into(), CONNECTION_DEADLINE)?;
 
     let peer = match peercred(&conn) {
         Ok(p) => p,
@@ -1624,8 +1620,9 @@ pub fn handle_conn(conn: std::os::unix::net::UnixStream, svc: &Service) -> Resul
             let mut line = Vec::with_capacity(256);
             line.push(first[0]);
             {
-                let read_half = conn.try_clone().map_err(io_failure)?;
-                let reader = BufReader::with_capacity(MAX_REQUEST_LINE, read_half);
+                // `&DeadlineStream: Read` — no second descriptor is
+                // dup'd; the borrow ends before the write half runs.
+                let reader = BufReader::with_capacity(MAX_REQUEST_LINE, &conn);
                 // Upstream's `bufio.Scanner` aborts once a token passes
                 // its 64 KiB buffer — a peer withholding '\n' can never
                 // grow it further. `Take` bounds the read side the same
@@ -1672,11 +1669,11 @@ pub fn handle_conn(conn: std::os::unix::net::UnixStream, svc: &Service) -> Resul
 
 /// `readB10ProvisionedFrame` — one `recvmsg` carrying the
 /// length-prefixed JSON descriptor AND the sealed memfd as ancillary
-/// data; [`crate::sys::scm_rights::recv_one`] enforces the
-/// single-rights single-fd shape, then
+/// data; [`DeadlineStream::recv_one`] enforces the single-rights
+/// single-fd shape under the connection deadline, then
 /// [`crate::sys::memfd::validate_sealed`] proves the descriptor.
-fn read_b10_provisioned_frame<Fd: AsFd>(
-    conn: Fd,
+fn read_b10_provisioned_frame(
+    conn: &super::deadline::DeadlineStream,
 ) -> Result<
     (
         central_infra::authority::MinioProvisionedDescriptor,
@@ -1685,7 +1682,7 @@ fn read_b10_provisioned_frame<Fd: AsFd>(
     Failure,
 > {
     let mut data = vec![0u8; MAX_B10_PROVISIONED_FRAME_SIZE];
-    let (n, fd) = crate::sys::scm_rights::recv_one(conn, &mut data).map_err(|e| {
+    let (n, fd) = conn.recv_one(&mut data).map_err(|e| {
         Failure::invalid(
             "broker",
             format!("broker: read provisioned frame: {}", e.message()),
@@ -1711,7 +1708,7 @@ fn read_b10_provisioned_frame<Fd: AsFd>(
 /// The JSON-path peer-authorization chain from `HandleConn`, then
 /// `Dispatch`.
 fn dispatch_json(
-    conn: &mut std::os::unix::net::UnixStream,
+    conn: &mut super::deadline::DeadlineStream,
     svc: &Service,
     req: &BrokerRequest,
     peer: &PeerCred,
@@ -1832,10 +1829,6 @@ fn dispatch_json(
     Ok(())
 }
 
-fn io_failure(e: std::io::Error) -> Failure {
-    Failure::internal("broker", format!("broker: io: {e}"))
-}
-
 // ---------------------------------------------------------------------------
 // Serve — socket activation and path binding
 // ---------------------------------------------------------------------------
@@ -1848,17 +1841,24 @@ fn io_failure(e: std::io::Error) -> Failure {
 /// no `UnixListener` equivalent on a borrowed accept.
 ///
 /// # Errors
-/// `broker` when the fd is not a listener or `accept` fails for a
-/// reason other than a would-block poll.
+/// `broker` cancelled when `shutdown` fires — upstream's
+/// `ctx.Err()` return (`main.go` exits the daemon 3 on it; the
+/// `broker serve` operator path maps it back to a clean exit 0);
+/// `broker` internal when the fd is not a listener or `accept` fails
+/// for a reason other than a would-block poll.
 pub fn serve(
     listen_fd: OwnedFd,
     svc: &Service,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) -> Result<(), Failure> {
-    let listener = UnixListener::from(listen_fd);
-    listener
-        .set_nonblocking(true)
+    // `O_NONBLOCK` via `fcntl` — `UnixListener::set_nonblocking` emits
+    // `ioctl(FIONBIO)`, which the broker's seccomp filter does not
+    // allow (ADR 0044).
+    let flags = rustix::fs::fcntl_getfl(&listen_fd)
         .map_err(|e| Failure::internal("broker", format!("broker: file listener: {e}")))?;
+    rustix::fs::fcntl_setfl(&listen_fd, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|e| Failure::internal("broker", format!("broker: file listener: {e}")))?;
+    let listener = UnixListener::from(listen_fd);
     while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
         match listener.accept() {
             Ok((conn, _)) => {
@@ -1867,14 +1867,19 @@ pub fn serve(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+                // `thread::sleep` emits `clock_nanosleep` (230) — not
+                // on the allow-list; `nanosleep` (35) is (ADR 0044).
+                crate::sys::audited::nanosleep(Duration::from_millis(10));
             }
             Err(e) => {
                 return Err(Failure::internal("broker", format!("broker: accept: {e}")));
             }
         }
     }
-    Ok(())
+    // Upstream `Serve` returns `ctx.Err()` when the context is
+    // canceled — the daemon's exit-3 shape; `run_broker_serve_at`
+    // maps it to operator-mode exit 0.
+    Err(Failure::cancelled("broker", "context canceled"))
 }
 
 /// `ServeOnPath` — bind a `0666` Unix socket at `socket_path` and serve
@@ -1886,7 +1891,7 @@ pub fn serve(
 pub fn serve_on_path(
     socket_path: &std::path::Path,
     svc: &Service,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) -> Result<(), Failure> {
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| Failure::internal("broker", format!("broker: listen: {e}")))?;
@@ -1904,20 +1909,28 @@ pub fn serve_on_path(
 /// # Errors
 /// `broker` denied on any activation-environment violation.
 pub fn activated_listener(index: u32) -> Result<OwnedFd, Failure> {
-    let listen_pid: u64 = std::env::var("LISTEN_PID")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    activated_listener_at(index, &|k| std::env::var(k).ok())
+}
+
+/// [`activated_listener`] with the environment read through `env` —
+/// `run_broker_daemon_at`'s test seam. The checks are the activation
+/// contract itself: only the process `LISTEN_PID` names may claim a
+/// descriptor, and only below `LISTEN_FDS`.
+///
+/// # Errors
+/// `broker` denied on any activation-environment violation.
+pub(crate) fn activated_listener_at(
+    index: u32,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<OwnedFd, Failure> {
+    let listen_pid: u64 = env("LISTEN_PID").and_then(|v| v.parse().ok()).unwrap_or(0);
     if listen_pid != u64::from(std::process::id()) {
         return Err(Failure::denied(
             "broker",
             "broker: LISTEN_PID does not name this process",
         ));
     }
-    let listen_fds: u32 = std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let listen_fds: u32 = env("LISTEN_FDS").and_then(|v| v.parse().ok()).unwrap_or(0);
     if index >= listen_fds {
         return Err(Failure::denied(
             "broker",
