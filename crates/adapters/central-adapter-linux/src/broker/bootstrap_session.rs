@@ -21,7 +21,6 @@
 //!   denied to prevent candidate rollback.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -286,21 +285,26 @@ impl BootstrapSession {
             // Drop any stale tmp so `mode(0600)` applies at creation —
             // post-`harden()` `fchmodat` is not on the allow-list, so the
             // mode must be set by `openat` itself (ADR 0044).
-            let _ = fs::remove_file(&tmp);
+            let _ = super::durable::remove_file(&tmp);
             let mut file = super::durable::open_write(&tmp, PRIVATE_FILE_MODE)
                 .map_err(|e| internal(format!("broker: write {}: {e}", tmp.display())))?;
             file.write_all(&data)
                 .map_err(|e| internal(format!("broker: write {}: {e}", tmp.display())))?;
             sync_file(&tmp)?;
-            fs::rename(&tmp, path)
-                .map_err(|e| internal(format!("broker: publish {}: {e}", path.display())))?;
+            super::durable::rename_replace(&tmp, path).map_err(|e| {
+                internal(format!(
+                    "broker: publish {}: {}",
+                    path.display(),
+                    e.message()
+                ))
+            })?;
             let dir = path
                 .parent()
                 .ok_or_else(|| internal("broker: state path has no parent"))?;
             super::durable::sync_dir(dir)
         })();
         if write_result.is_err() {
-            let _ = fs::remove_file(&tmp);
+            let _ = super::durable::remove_file(&tmp);
         }
         write_result
     }
@@ -540,6 +544,7 @@ impl BootstrapPresenter {
 mod tests {
     use super::*;
     use crate::broker::testutil::TempDir;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
     fn binding(id: &str, generation: u64, seed: u8) -> CandidateBinding {

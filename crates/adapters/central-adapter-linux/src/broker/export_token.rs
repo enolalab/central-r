@@ -331,17 +331,19 @@ pub fn load_or_mint_export_identity(
             // `os.Chmod(0600)` then `os.Chown(uid, gid)` — ownership
             // follows the state root (instance UID); failures fail the
             // export rather than leaving a root-owned key in instance
-            // space. `fchmod` on the open fd: path `fchmodat` is not on
-            // the broker's seccomp allow-list (ADR 0044).
+            // space. Both run on the still-open fd: the path forms emit
+            // `fchmodat` (268) / `fchownat` (260), which the broker's
+            // seccomp allow-list does not carry; `fchmod` (91) and
+            // `fchown` (93) are listed (ADR 0044).
             rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(0o600))
                 .map_err(|e| internal(format!("portable: secure identity: {e}")))?;
-            drop(file);
-            rustix::fs::chown(
-                path,
+            rustix::fs::fchown(
+                &file,
                 Some(rustix::process::Uid::from_raw(uid)),
                 Some(rustix::process::Gid::from_raw(gid)),
             )
             .map_err(|e| internal(format!("portable: chown identity: {e}")))?;
+            drop(file);
             Ok((identity, true))
         }
         Err(e) => Err(internal(format!("portable: read identity: {e}"))),

@@ -26,7 +26,6 @@
 //! port models it honestly as `leaf_key: None` — `persist` refuses an
 //! incomplete authority in exactly the same state.
 
-use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -550,7 +549,7 @@ fn save_tls_authority_state(path: &Path, state: &TlsAuthorityState) -> Result<()
         super::durable::rename_replace(&tmp, path)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = durable::remove_file(&tmp);
     }
     result?;
     super::durable::sync_dir(dir)
@@ -596,6 +595,7 @@ impl central_infra::port::TlsAuthority for TlsAuthority {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;

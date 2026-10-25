@@ -17,7 +17,6 @@
 //!   reinterpreted as prepared), and a missing issued file falls back
 //!   to `prepared.json` which is re-issued then committed.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -30,7 +29,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::durable::{
-    self, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, rename_noreplace, sync_dir, sync_file,
+    self, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, rename_noreplace, rename_replace, sync_dir,
+    sync_file,
 };
 use super::signing::{Ed25519Signer, SigningService};
 use super::wire::{hex_encode, rfc3339};
@@ -172,7 +172,7 @@ impl Journal {
         sync_file(&tmp_path)
             .map_err(|e| internal(format!("journal: lifecycle sync tmp: {}", e.message())))?;
         rename_noreplace(&tmp_path, &committed_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
+            let _ = durable::remove_file(&tmp_path);
             internal(format!("journal: lifecycle atomic commit: {}", e.message()))
         })?;
         sync_dir(&seq_dir)
@@ -281,7 +281,7 @@ impl Journal {
             .map_err(|e| internal(format!("journal: write tmp: {e}")))?;
         sync_file(&tmp_path)?;
         rename_noreplace(&tmp_path, &committed_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
+            let _ = durable::remove_file(&tmp_path);
             internal(format!("journal: atomic commit: {}", e.message()))
         })?;
         sync_dir(seq_dir)
@@ -358,9 +358,9 @@ impl Journal {
         durable::write_file(&tmp_path, &data, PRIVATE_FILE_MODE)
             .map_err(|e| internal(format!("journal: record prepare: {e}")))?;
         sync_file(&tmp_path)?;
-        fs::rename(&tmp_path, &path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            internal(format!("journal: record prepare: {e}"))
+        rename_replace(&tmp_path, &path).map_err(|e| {
+            let _ = durable::remove_file(&tmp_path);
+            internal(format!("journal: record prepare: {}", e.message()))
         })?;
         sync_dir(&dir)
     }
@@ -455,7 +455,7 @@ impl Journal {
                     continue;
                 }
                 if rename_noreplace(&tmp_path, &committed_path).is_err() {
-                    let _ = fs::remove_file(&tmp_path);
+                    let _ = durable::remove_file(&tmp_path);
                     continue;
                 }
                 if sync_dir(&seq_dir).is_err() {
@@ -530,6 +530,7 @@ fn raw_payload_bytes(record: &AuthorityTransitionPayload) -> &[u8] {
 mod tests {
     use super::*;
     use crate::broker::testutil::TempDir;
+    use std::fs;
     use std::sync::Arc;
 
     fn journal(dir: &Path) -> Journal {

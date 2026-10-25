@@ -11,7 +11,6 @@
 //! sees exported names. `ProvisioningJournalEntry` carries upstream's
 //! own snake_case tags.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use central_backup::domain::{SessionBinding, TargetIdentity};
@@ -445,9 +444,8 @@ impl ProvisioningStore {
     /// `broker_provisioning` on the removal or dir-sync failure.
     pub fn delete_provisioning_record(&self, target: &TargetIdentity) -> Result<(), Failure> {
         let path = self.record_path(target);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        match durable::remove_file(&path) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
             Err(e) => {
                 return Err(Failure::internal(
                     "broker_provisioning",
@@ -560,7 +558,7 @@ fn write_new_exclusive(path: &Path, record: &ProvisioningRecord) -> Result<(), F
     };
     drop(file);
     if write_result.is_err() {
-        let _ = fs::remove_file(path);
+        let _ = durable::remove_file(path);
         return write_result;
     }
     sync_dir(dir)
@@ -581,13 +579,13 @@ fn write_atomic(path: &Path, record: &ProvisioningRecord) -> Result<(), Failure>
         file.write_all(&data)
             .and_then(|()| file.sync_all())
             .map_err(|e| {
-                let _ = fs::remove_file(&tmp_path);
+                let _ = durable::remove_file(&tmp_path);
                 Failure::internal("broker_provisioning", format!("sync tmp: {e}"))
             })?;
     }
-    fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        Failure::internal("broker_provisioning", format!("rename: {e}"))
+    durable::rename_replace(&tmp_path, path).map_err(|e| {
+        let _ = durable::remove_file(&tmp_path);
+        Failure::internal("broker_provisioning", format!("rename: {}", e.message()))
     })?;
     sync_dir(dir)
 }

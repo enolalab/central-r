@@ -1895,6 +1895,11 @@ pub fn serve_on_path(
 ) -> Result<(), Failure> {
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| Failure::internal("broker", format!("broker: listen: {e}")))?;
+    // Pre-`harden()` path only: this is the operator `broker serve`
+    // mode — `UnixListener::bind` itself emits `socket`/`bind`/`listen`,
+    // none of which the filter admits, so `fs::set_permissions`'s
+    // `fchmodat` (268) can never run under it. The hardened daemon
+    // serves the socket-activated fd instead (ADR 0044).
     fs::set_permissions(
         socket_path,
         std::os::unix::fs::PermissionsExt::from_mode(0o666),

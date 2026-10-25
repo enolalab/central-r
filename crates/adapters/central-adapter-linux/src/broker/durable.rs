@@ -19,8 +19,8 @@ use std::path::{Component, Path, PathBuf};
 
 use central_foundation::failure::Failure;
 use rustix::fs::{
-    AtFlags, CWD, FileType, Mode, OFlags, RawDir, RenameFlags, mkdirat, openat, renameat_with,
-    statat, unlinkat,
+    AtFlags, CWD, FileType, Mode, OFlags, RawDir, RenameFlags, linkat, mkdirat, openat,
+    renameat_with, statat, unlinkat,
 };
 use rustix::io::Errno;
 
@@ -232,6 +232,39 @@ pub(crate) fn read_dir(path: &Path) -> Result<Vec<DirEnt>, Errno> {
         });
     }
     Ok(out)
+}
+
+/// `os.Remove` — `unlinkat(AT_FDCWD, path, 0)`: the single-entry
+/// removal every `.tmp` rollback and record delete uses.
+/// `fs::remove_file` emits `unlink` (87) on glibc ≥ 2.37 and only
+/// reaches `unlinkat` on older toolchains — a toolchain-dependent
+/// emission the fixed allow-list cannot admit; `unlinkat` (263) is the
+/// listed primitive (ADR 0044).
+///
+/// # Errors
+/// `Errno` of the `unlinkat` failure (`NOENT` for absent paths —
+/// callers that treat absent-as-success check for it).
+pub(crate) fn remove_file(path: &Path) -> Result<(), Errno> {
+    unlinkat(CWD, path.as_os_str(), AtFlags::empty())
+}
+
+/// `os.Link` — `linkat(AT_FDCWD, old, AT_FDCWD, new, 0)`: the
+/// install-if-absent publish the signing-key store uses.
+/// `fs::hard_link` emits `link` (86) on glibc ≥ 2.37 and `linkat` only
+/// on older toolchains — toolchain-dependent again; `linkat` (265) is
+/// the listed primitive (ADR 0044). Empty flags mean no
+/// `AT_SYMLINK_FOLLOW` — exactly Linux `link()` semantics.
+///
+/// # Errors
+/// `Errno` of the `linkat` failure (`EXIST` when `new` is occupied).
+pub(crate) fn hard_link(old_path: &Path, new_path: &Path) -> Result<(), Errno> {
+    linkat(
+        CWD,
+        old_path.as_os_str(),
+        CWD,
+        new_path.as_os_str(),
+        AtFlags::empty(),
+    )
 }
 
 /// `os.RemoveAll` — `unlinkat` files, depth-first recursion into real
@@ -470,12 +503,11 @@ pub(crate) fn replace_json<T: serde::Serialize>(path: &Path, value: &T) -> Resul
             .and_then(|()| file.sync_all())
             .map_err(|e| internal("broker_durable_os", format!("write tmp: {e}")))?;
         drop(file);
-        fs::rename(&tmp, path)
-            .map_err(|e| internal("broker_durable_os", format!("rename: {e}")))?;
+        rename_replace(&tmp, path)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = remove_file(&tmp);
     }
     result?;
     sync_dir(dir)

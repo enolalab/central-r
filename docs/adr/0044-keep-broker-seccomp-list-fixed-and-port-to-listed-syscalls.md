@@ -33,7 +33,11 @@ The Rust port kept the list verbatim and initially died with `SIGSYS` (the R5 T9
 | `std::thread::sleep` | `clock_nanosleep` (230) | raw `nanosleep` (35) via `libc::syscall` |
 | tokio `signal::unix::signal` (the original shutdown waiter) | `socketpair` (53) + `poll`/`epoll` | `rt_sigaction` (13) flag handler, polled flag |
 | `fs::create_dir`/`create_dir_all` | `mkdir` (83) | `mkdirat` (258), mode at creation |
-| `fs::rename`/`remove_file`/`hard_link`/`read_dir` | `renameat`/`unlinkat`/`linkat`/`getdents64` | already listed — no change needed |
+| `fs::rename` | `rename` (82) — unconditional on x86_64; `std::fs` never emits `renameat` | `renameat` (264) / `renameat2` (316) via `rustix::fs::renameat_with` — `durable::rename_replace`/`rename_noreplace` |
+| `fs::remove_file` | `unlink` (87) on glibc ≥ 2.37, `unlinkat` below — toolchain-dependent | `unlinkat` (263) via `rustix::fs::unlinkat` — `durable::remove_file`/`remove_all` |
+| `fs::hard_link` | `link` (86) or `linkat` (265) at the libc's discretion — toolchain-dependent | `linkat` (265) via `rustix::fs::linkat` — `durable::hard_link` |
+| `rustix::fs::chown` (path form) | `fchownat` (260) | `fchown` (93) on the already-open fd |
+| `fs::read_dir` | `openat` + `getdents64` — both listed, but per-entry `metadata`/`file_type` probes can emit `statx` | `getdents64` `d_type`-only via `durable::read_dir`; `lstat` by name when more is needed |
 
 Two forces collide: (a) the filter's whole value is that it is a *closed* surface — every historic upstream widening (SC-DEF-02/07/10/24/36/40/45/48) added exactly one justified primitive; (b) the Rust port needs a syscall surface the list does not currently contain for *every* filesystem and timeout operation the broker performs.
 
@@ -41,11 +45,11 @@ Two forces collide: (a) the filter's whole value is that it is a *closed* surfac
 
 **The allow-list stays exactly the upstream 64 numbers, in upstream order — no additions, no removals.** The Rust broker is re-aimed at primitives the list already admits:
 
-1. `broker::durable` owns the filter-safe filesystem primitives: `stat`/`lstat` (`statat`/`newfstatat`), `exists`, `mkdir_p` (`mkdirat`, mode at creation — no mkdir-then-chmod race), `write_file`/`open_read`/`open_write`/`open_exclusive` (`openat`, mode at creation), `read_file`, `read_dir` (`getdents64`, `d_type` only), `remove_all` (`unlinkat` recursion), `sync_file`/`sync_dir` (`openat` + `fsync`), `open_lock`, `rename_noreplace`/`rename_replace` (`renameat2`). All post-`harden()` broker stores (journal, lifecycle, signing, TLS, payload epoch, provisioning, bootstrap session, secret bootstrap, protected file, export token) route through them.
+1. `broker::durable` owns the filter-safe filesystem primitives: `stat`/`lstat` (`statat`/`newfstatat`), `exists`, `mkdir_p` (`mkdirat`, mode at creation — no mkdir-then-chmod race), `write_file`/`open_read`/`open_write`/`open_exclusive` (`openat`, mode at creation), `read_file`, `read_dir` (`getdents64`, `d_type` only), `remove_file`/`remove_all` (`unlinkat` at 263), `hard_link` (`linkat` at 265), `sync_file`/`sync_dir` (`openat` + `fsync`), `open_lock`, `rename_noreplace`/`rename_replace` (`renameat2` at 316). All post-`harden()` broker stores (journal, lifecycle, signing, TLS, payload epoch, provisioning, bootstrap session, secret bootstrap, protected file, export token) route through them.
 2. `broker::deadline::DeadlineStream` realizes upstream's `conn.SetDeadline` on `fcntl(O_NONBLOCK)` + `read`/`write`/`recvmsg` `EAGAIN`/`EINTR` retry under an `Instant` deadline with a bounded `nanosleep` cadence — the same cadence the accept loop already uses. `broker::server` sets the listener nonblocking via `fcntl`, never `ioctl(FIONBIO)`.
 3. `audited::install_signal_handler` + a `static` flag replaces the tokio signal-waiter thread for `SIGINT`/`SIGTERM` shutdown (`rt_sigaction` is listed; `socketpair`/`poll` are not). `audited::nanosleep` is the raw `SYS_nanosleep` for every post-`harden()` sleep.
-4. `fchmod` on an open fd (not `fchmodat` on a path) carries the remaining "tighten a pre-existing file's mode" cases (`secret_bootstrap::write_private`, export identity mint).
-5. Regression pins in `sys::seccomp::tests`: `probe_child_broker_surface` installs the real filter then walks the whole post-`harden()` surface (store ops, `fcntl` nonblock, `sendmsg`/`recvmsg`, `SO_PEERCRED`, `accept4`, `rt_sigaction`, `nanosleep`, `clock_gettime`, `getrandom`) to a clean exit; `probe_child_old_fchmodat_dies` and `probe_child_old_statx_dies` pin the two pre-fix emissions to `SIGSYS`. `allowlist_matches_upstream` keeps the 64-number list byte-verified.
+4. `fchmod`/`fchown` on an open fd (not `fchmodat`/`fchownat` on a path) carries the remaining "tighten a pre-existing file's mode or ownership" cases (`secret_bootstrap::write_private`, export identity mint).
+5. Regression pins in `sys::seccomp::tests`: `probe_child_broker_surface` installs the real filter then walks the whole post-`harden()` surface (store ops including a tmp-write→fsync→`renameat2`→`unlinkat` persist path and a `linkat` publish, `fcntl` nonblock, `sendmsg`/`recvmsg`, `SO_PEERCRED`, `accept4`, `rt_sigaction`, `nanosleep`, `clock_gettime`, `getrandom`) to a clean exit; `probe_child_old_*_dies` pin every pre-fix emission — `fchmodat`, `statx`, `rename`, `unlink`, `link`, `fchownat` — to `SIGSYS` via raw `audited::*_raw` syscalls, so the pins hold regardless of which emission a future std/glibc picks. `allowlist_matches_upstream` keeps the 64-number list byte-verified.
 
 ## Consequences
 

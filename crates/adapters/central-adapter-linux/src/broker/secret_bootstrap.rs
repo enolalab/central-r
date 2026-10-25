@@ -31,7 +31,6 @@
 //!   (`B04_HANDOFF_DENIED`, `RECEIPT_CONSUMED`, `FENCING_CONFLICT`, …).
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1506,8 +1505,8 @@ impl SecretBootstrap {
             join(e);
         }
         guard.leases.remove(&binding_id);
-        if let Err(e) = fs::remove_file(lease_dir.join(format!("{binding_id}.json")))
-            && e.kind() != std::io::ErrorKind::NotFound
+        if let Err(e) = durable::remove_file(&lease_dir.join(format!("{binding_id}.json")))
+            && e != rustix::io::Errno::NOENT
         {
             join(internal(format!("broker: remove lease: {e}")));
         }
@@ -1535,7 +1534,7 @@ impl SecretBootstrap {
             ));
         }
         guard.leases.remove(&binding_id);
-        let _ = fs::remove_file(self.lease_dir().join(format!("{binding_id}.json")));
+        let _ = durable::remove_file(&self.lease_dir().join(format!("{binding_id}.json")));
         let receipt_ids: Vec<HandoffReceiptId> = guard
             .receipts
             .iter()
@@ -1713,11 +1712,16 @@ fn atomic_write_private(path: &Path, data: &[u8]) -> Result<(), Failure> {
         PathBuf::from(p)
     };
     let result = write_private(&tmp, data, PRIVATE_READ_ONLY_MODE).and_then(|()| {
-        fs::rename(&tmp, path)
-            .map_err(|e| internal(format!("broker: publish {}: {e}", path.display())))
+        durable::rename_replace(&tmp, path).map_err(|e| {
+            internal(format!(
+                "broker: publish {}: {}",
+                path.display(),
+                e.message()
+            ))
+        })
     });
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = durable::remove_file(&tmp);
     }
     result
 }
@@ -1727,6 +1731,7 @@ mod tests {
     use super::*;
     use crate::broker::journal::Journal;
     use crate::broker::testutil::TempDir;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
     fn fixture() -> (TempDir, SecretBootstrap) {

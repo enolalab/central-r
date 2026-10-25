@@ -13,7 +13,6 @@
 //! ordering.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -379,13 +378,13 @@ impl ProofService {
             file.write_all(&data)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| {
-                    let _ = fs::remove_file(&tmp);
+                    let _ = durable::remove_file(&tmp);
                     internal(format!("sync proof state tmp: {e}"))
                 })?;
         }
-        fs::rename(&tmp, state_path).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            internal(format!("rename proof state: {e}"))
+        durable::rename_replace(&tmp, state_path).map_err(|e| {
+            let _ = durable::remove_file(&tmp);
+            internal(format!("rename proof state: {}", e.message()))
         })?;
         sync_dir(
             state_path

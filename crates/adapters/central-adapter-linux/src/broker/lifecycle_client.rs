@@ -186,6 +186,8 @@ impl LifecycleClient {
         {
             return Err(denied(ERR_B04_SCM_RIGHTS_TRANSPORT_REQUIRED));
         }
+        // Helper-side process — unfiltered; `create_dir_all`/`OpenOptions`
+        // may emit whatever `std::fs` reaches on this toolchain.
         std::fs::create_dir_all(&handoff.target)
             .map_err(|e| internal(format!("broker lifecycle: handoff target mkdir: {e}")))?;
         let stats = rustix::fs::statfs(&handoff.target)
@@ -268,6 +270,10 @@ impl LifecycleClient {
         conn.read_exact(&mut proof)
             .map_err(|e| internal(format!("broker lifecycle: B04 proof read: {e}")))?;
         drop(file); // upstream `unix.Close(fd)` before chmod/chown
+        // These path-based calls run in the *helper* process, which
+        // installs no seccomp filter — only the broker daemon hardens
+        // (`broker::daemon::run_broker_daemon_at`); `fchmodat`/
+        // `fchownat` emissions are safe here (ADR 0044).
         rustix::fs::chmodat(
             rustix::fs::CWD,
             &path,

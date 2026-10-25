@@ -319,7 +319,7 @@ impl ProtectedFileBackend {
             })
         })();
         if install.is_err() {
-            let _ = fs::remove_file(&tmp);
+            let _ = durable::remove_file(&tmp);
         }
         install?;
         sync_dir(&self.root)

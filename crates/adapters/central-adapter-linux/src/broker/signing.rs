@@ -10,7 +10,6 @@
 //! design: signatures prove "this broker instance signed this record",
 //! never a durable identity.
 
-use std::fs;
 use std::path::Path;
 
 use central_foundation::failure::Failure;
@@ -140,11 +139,11 @@ fn load_or_create_fingerprint_key(root: &Path, key_path: &Path) -> Result<Vec<u8
                 )
             })?;
         drop(file);
-        match fs::hard_link(&tmp, key_path) {
+        match durable::hard_link(&tmp, key_path) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(rustix::io::Errno::EXIST) => {
                 // A racing creator won — adopt the established key.
-                let _ = fs::remove_file(&tmp);
+                let _ = durable::remove_file(&tmp);
                 return load_fingerprint_key(key_path).map_err(|e| {
                     Failure::internal(
                         "broker_signing_os",
@@ -161,7 +160,7 @@ fn load_or_create_fingerprint_key(root: &Path, key_path: &Path) -> Result<Vec<u8
         }
         Ok(key)
     })();
-    let _ = fs::remove_file(&tmp);
+    let _ = durable::remove_file(&tmp);
     let key = publish?;
     sync_dir(root)?;
     Ok(key)
@@ -341,6 +340,7 @@ pub(crate) fn verify_canonical_json_hex(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]

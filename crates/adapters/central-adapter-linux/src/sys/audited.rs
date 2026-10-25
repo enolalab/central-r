@@ -183,6 +183,67 @@ pub(crate) fn statx_raw(path: &core::ffi::CStr) -> libc::c_long {
     }
 }
 
+/// Raw `rename` (82) — the syscall `std::fs::rename` emits
+/// unconditionally on x86_64; the `old-rename` probe pins it to
+/// `SIGSYS` (R5 T9 P0-A round 2 / ADR 0044). Not for production
+/// callers: the allow-listed shape is `renameat`/`renameat2` via
+/// `broker::durable::rename_replace`/`rename_noreplace`.
+///
+/// # Errors
+/// Returns the raw syscall result (`-errno` style `c_long`) — under
+/// the installed filter it never returns at all.
+#[cfg(test)]
+pub(crate) fn rename_raw(old: &core::ffi::CStr, new: &core::ffi::CStr) -> libc::c_long {
+    // SAFETY: both C strings are live for the call's duration; a
+    // denied rename is killed by the filter on entry, before any
+    // return value matters.
+    unsafe { libc::syscall(libc::SYS_rename, old.as_ptr(), new.as_ptr()) }
+}
+
+/// Raw `unlink` (87) — the syscall `std::fs::remove_file` emits on
+/// glibc ≥ 2.37 (`unlinkat` on older); the `old-unlink` probe pins it
+/// to `SIGSYS` (R5 T9 P0-A round 2 / ADR 0044). Not for production
+/// callers: the allow-listed shape is `unlinkat` via
+/// `broker::durable::remove_file`/`remove_all`.
+///
+/// # Errors
+/// Returns the raw syscall result — under the installed filter it
+/// never returns at all.
+#[cfg(test)]
+pub(crate) fn unlink_raw(path: &core::ffi::CStr) -> libc::c_long {
+    // SAFETY: `path` is a live C string for the call's duration.
+    unsafe { libc::syscall(libc::SYS_unlink, path.as_ptr()) }
+}
+
+/// Raw `link` (86) — the syscall `std::fs::hard_link` emits on glibc ≥
+/// 2.37; the `old-link` probe pins it to `SIGSYS` (R5 T9 P0-A round 2 /
+/// ADR 0044). Not for production callers: the allow-listed shape is
+/// `linkat` via `broker::durable::hard_link`.
+///
+/// # Errors
+/// Returns the raw syscall result — under the installed filter it
+/// never returns at all.
+#[cfg(test)]
+pub(crate) fn link_raw(old: &core::ffi::CStr, new: &core::ffi::CStr) -> libc::c_long {
+    // SAFETY: both C strings are live for the call's duration.
+    unsafe { libc::syscall(libc::SYS_link, old.as_ptr(), new.as_ptr()) }
+}
+
+/// Raw `fchownat` (260) — the syscall `rustix::fs::chown` (and `std`'s
+/// `chown`-family paths) emit on Linux; the `old-fchownat` probe pins
+/// it to `SIGSYS` (R5 T9 P0-A round 2 / ADR 0044). Not for production
+/// callers: the allow-listed shape is `fchown` (93) on an open fd.
+///
+/// # Errors
+/// Returns the raw syscall result — under the installed filter it
+/// never returns at all.
+#[cfg(test)]
+pub(crate) fn fchownat_raw(path: &core::ffi::CStr) -> libc::c_long {
+    // SAFETY: `path` is a live C string for the call's duration; the
+    // uid/gid are irrelevant — the filter kills the call on entry.
+    unsafe { libc::syscall(libc::SYS_fchownat, libc::AT_FDCWD, path.as_ptr(), 0, 0, 0) }
+}
+
 pub(crate) fn socket_activation_fd(index: u32) -> Result<std::os::fd::OwnedFd, Errno> {
     let raw = 3i32 + i32::try_from(index).map_err(|_| Errno::BADF)?;
     // SAFETY: the socket-activation contract makes `3 + index` an open

@@ -40,13 +40,21 @@
 //! not listed). Rather than widening the list to fit the naive port,
 //! the port was re-aimed at primitives already on it (ADR 0044):
 //! `rustix::fs::statat`/`newfstatat` for metadata, `openat` mode bits
-//! and fd `fchmod` for permissions, `mkdirat`/`unlinkat`/`renameat2`/
-//! `getdents64` for the store tree, `fcntl(O_NONBLOCK)` + `read`/
-//! `write`/`recvmsg` `EAGAIN` retry under a `nanosleep` deadline for
-//! the connection layer, and `rt_sigaction` flag handlers for signal
-//! shutdown. The list itself is unchanged — the `broker_surface` probe
+//! and fd `fchmod`/`fchown` for permissions/ownership, `mkdirat`/
+//! `unlinkat`/`linkat`/`renameat2`/`getdents64` for the store tree,
+//! `fcntl(O_NONBLOCK)` + `read`/`write`/`recvmsg` `EAGAIN` retry under
+//! a `nanosleep` deadline for the connection layer, and `rt_sigaction`
+//! flag handlers for signal shutdown. Round 2 (the P0-A migration was
+//! incomplete) removed the residual `std::fs` path calls `std` emitted
+//! as `rename` (82 — unconditional on x86_64), `unlink` (87), `link`
+//! (86), and `fchownat` (260) — every rename now goes through
+//! `durable::rename_replace`/`rename_noreplace` (`renameat2` 316),
+//! removals through `durable::remove_file`/`remove_all` (`unlinkat`
+//! 263), the signing publish through `durable::hard_link` (`linkat`
+//! 265), and the export-identity `chown` through `fchown` (93) on the
+//! open fd. The list itself is unchanged — the `broker_surface` probe
 //! walks every post-`harden()` emission and the `old_shape` probes pin
-//! `fchmodat`/`statx` to `SIGSYS`.
+//! `fchmodat`/`statx`/`rename`/`unlink`/`link`/`fchownat` to `SIGSYS`.
 
 use central_foundation::failure::Failure;
 
@@ -416,6 +424,24 @@ mod tests {
         let tmp = store.join("k.tmp");
         crate::broker::durable::write_file(&tmp, b"{}", 0o600).expect("tmp write");
         crate::broker::durable::rename_replace(&tmp, &f).expect("renameat2");
+        // The persist shape that leaked before the round-2 fix:
+        // tmp-write -> fsync -> atomic replace, the `unlinkat`
+        // rollback/cleanup, the `linkat` publish, and the
+        // `RENAME_NOREPLACE` journal commit (N1/N2 sites).
+        crate::broker::durable::replace_json(&store.join("j.json"), &serde_json::json!({"k": 1}))
+            .expect("replace_json");
+        let link = store.join("j.link");
+        crate::broker::durable::hard_link(&store.join("j.json"), &link).expect("linkat");
+        crate::broker::durable::remove_file(&link).expect("unlinkat");
+        let occupied = store.join("occupied.json");
+        crate::broker::durable::write_file(&occupied, b"{}", 0o600).expect("occupied target");
+        let tmp2 = store.join("k2.tmp");
+        crate::broker::durable::write_file(&tmp2, b"{}", 0o600).expect("tmp2 write");
+        assert!(
+            crate::broker::durable::rename_noreplace(&tmp2, &occupied).is_err(),
+            "rename_noreplace must refuse an occupied target"
+        );
+        crate::broker::durable::remove_file(&tmp2).expect("tmp2 unlink");
         crate::broker::durable::remove_all(&store).expect("remove_all");
 
         // -- connection surface (broker/deadline.rs + scm_rights) --
@@ -495,6 +521,70 @@ mod tests {
         std::process::exit(42);
     }
 
+    /// Probe child: the pre-fix rename emission — `fs::rename` reaches
+    /// `rename` (82) unconditionally on x86_64; the allow-list carries
+    /// `renameat` (264)/`renameat2` (316) only. The raw syscall pins
+    /// the regression deterministically regardless of what std picks
+    /// on a given toolchain (R5 T9 P0-A round 2).
+    #[test]
+    fn probe_child_old_rename_dies() {
+        if !crate::sys::probe::is("old-rename") {
+            return;
+        }
+        rustix::thread::set_no_new_privs(true).expect("nnp");
+        install().expect("probe install");
+        // rename(82) — the filter kills on entry; never returns.
+        let _ = audited::rename_raw(c"/nonexistent-a", c"/nonexistent-b");
+        std::process::exit(42);
+    }
+
+    /// Probe child: the pre-fix remove emission — `fs::remove_file`
+    /// reaches `unlink` (87) on glibc ≥ 2.37 (and only `unlinkat` on
+    /// older toolchains); the raw syscall pins the denied primitive,
+    /// toolchain-independent (R5 T9 P0-A round 2).
+    #[test]
+    fn probe_child_old_unlink_dies() {
+        if !crate::sys::probe::is("old-unlink") {
+            return;
+        }
+        rustix::thread::set_no_new_privs(true).expect("nnp");
+        install().expect("probe install");
+        // unlink(87) — the filter kills on entry; never returns.
+        let _ = audited::unlink_raw(c"/nonexistent");
+        std::process::exit(42);
+    }
+
+    /// Probe child: the pre-fix hard-link emission — `fs::hard_link`
+    /// reaches `link` (86) on glibc ≥ 2.37; the raw syscall pins the
+    /// denied primitive (R5 T9 P0-A round 2).
+    #[test]
+    fn probe_child_old_link_dies() {
+        if !crate::sys::probe::is("old-link") {
+            return;
+        }
+        rustix::thread::set_no_new_privs(true).expect("nnp");
+        install().expect("probe install");
+        // link(86) — the filter kills on entry; never returns.
+        let _ = audited::link_raw(c"/nonexistent-a", c"/nonexistent-b");
+        std::process::exit(42);
+    }
+
+    /// Probe child: the pre-fix ownership emission — the path-based
+    /// `rustix::fs::chown` the export-identity mint used reaches
+    /// `fchownat` (260); the allow-listed shape is `fchown` (93) on
+    /// the open fd (R5 T9 P0-A round 2).
+    #[test]
+    fn probe_child_old_fchownat_dies() {
+        if !crate::sys::probe::is("old-fchownat") {
+            return;
+        }
+        rustix::thread::set_no_new_privs(true).expect("nnp");
+        install().expect("probe install");
+        // fchownat(260) — the filter kills on entry; never returns.
+        let _ = audited::fchownat_raw(c"/nonexistent");
+        std::process::exit(42);
+    }
+
     /// Parent halves of the R5 T9 syscall-surface probes: the real
     /// post-`harden()` surface exits clean, while the two pre-fix
     /// emissions (`fchmodat`, `statx`) die by `SIGSYS` — the
@@ -529,5 +619,38 @@ mod tests {
             Some(libc::SIGSYS),
             "old statx shape must die by SIGSYS, got {statx:?}"
         );
+
+        // Round-2 pins: the emissions `std::fs`/`rustix` path calls
+        // reached pre-fix — `rename` (82, unconditional), `unlink`
+        // (87), `link` (86), `fchownat` (260) — must all still die.
+        for (test, mode, name) in [
+            (
+                "sys::seccomp::tests::probe_child_old_rename_dies",
+                "old-rename",
+                "rename",
+            ),
+            (
+                "sys::seccomp::tests::probe_child_old_unlink_dies",
+                "old-unlink",
+                "unlink",
+            ),
+            (
+                "sys::seccomp::tests::probe_child_old_link_dies",
+                "old-link",
+                "link",
+            ),
+            (
+                "sys::seccomp::tests::probe_child_old_fchownat_dies",
+                "old-fchownat",
+                "fchownat",
+            ),
+        ] {
+            let status = crate::sys::probe::run_on(test, mode);
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGSYS),
+                "old {name} shape must die by SIGSYS, got {status:?}"
+            );
+        }
     }
 }

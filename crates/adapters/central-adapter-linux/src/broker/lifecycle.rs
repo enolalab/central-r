@@ -9,7 +9,6 @@
 //! request_digest|peer_uid|peer_pid|nonce|expires_at_unixnano` — every
 //! claim that controls scope or lifetime.
 
-use std::fs;
 use std::path::PathBuf;
 
 use central_foundation::failure::Failure;
@@ -89,7 +88,7 @@ impl LifecycleNonceStore {
             .and_then(|()| file.sync_all());
         drop(file);
         if let Err(e) = write_result {
-            let _ = fs::remove_file(&path);
+            let _ = durable::remove_file(&path);
             return Err(internal(format!(
                 "lifecycle nonce store: write marker: {e}"
             )));
