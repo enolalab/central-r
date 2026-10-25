@@ -368,7 +368,12 @@ pub fn compose_scheduler_harness(
 ) -> Result<(SchedulerNodeLauncher, SchedulerKiller), Failure> {
     // Upstream `filepath.Clean`s both sides before the prefix test:
     // collect the components back so `.` segments and doubled or
-    // trailing separators cannot slip the containment check.
+    // trailing separators cannot slip the containment check, and
+    // reject `..` outright — `components().collect()` does not
+    // resolve ParentDir lexically the way `filepath.Clean` does.
+    // Production inputs already pass the `load` validators which
+    // refuse ParentDir, but the struct fields are `pub`, so this
+    // composition-side check must not rely on that pre-validation.
     let root = hc
         .worktree_root()
         .components()
@@ -376,7 +381,11 @@ pub fn compose_scheduler_harness(
     let scratch = std::path::Path::new(&sc.scratch_root)
         .components()
         .collect::<std::path::PathBuf>();
-    if scratch != root && !scratch.starts_with(&root) {
+    if scratch != root && !scratch.starts_with(&root)
+        || scratch
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(Failure::denied(
             CODE_SCRATCH_ESCAPES,
             format!(
