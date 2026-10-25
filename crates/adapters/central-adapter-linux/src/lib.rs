@@ -18,6 +18,7 @@
 
 pub mod dev_bootstrap;
 pub mod dev_restore_barrier;
+pub mod dispatch_provision;
 pub mod group_signals;
 pub mod launcher_client;
 pub mod lifecycle_watch;

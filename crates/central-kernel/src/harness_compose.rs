@@ -41,7 +41,7 @@ use central_adapter_harness::launcher::client::{self, HostLauncher};
 use central_adapter_harness::localexec::{self, LocalExec};
 use central_adapter_linux::dev_bootstrap::DevFileProtectedBootstrap;
 use central_foundation::failure::{Failure, FailureKind};
-use central_harness::port::ProcessLauncher;
+use central_harness::port::{Adapter, ProcessLauncher};
 use time::{Duration, OffsetDateTime};
 
 /// `errHarnessConfig` — every config/selection failure carries this
@@ -692,6 +692,58 @@ pub fn build_localexec_launcher(
         signals,
     )?;
     Ok(Arc::new(launcher))
+}
+
+/// `newHarnessAdapter` — builds the backend adapter over `launcher`
+/// from the configured [`Backend`]. Shared by the Phase-1 dispatcher
+/// chain and the Phase-2 scheduler seam — upstream's factory serves
+/// both composition sites the same way.
+///
+/// # Errors
+/// Propagates the selected adapter constructor's config refusal.
+pub fn build_adapter(
+    cfg: &HarnessConfig,
+    launcher: Arc<dyn ProcessLauncher>,
+) -> Result<Arc<dyn Adapter>, Failure> {
+    let probe_dir = cfg.probe_work_dir().to_string_lossy().into_owned();
+    match cfg.backend {
+        Backend::ClaudeCode => Ok(Arc::new(
+            central_adapter_harness::claudecode::ClaudeCode::new(
+                central_adapter_harness::claudecode::Config {
+                    launcher: Some(launcher),
+                    pinned_version: cfg.claude_version.clone(),
+                    allow_unpinned: false,
+                    probe_work_dir: probe_dir,
+                },
+            )?,
+        )),
+        Backend::Opencode => Ok(Arc::new(central_adapter_harness::opencode::OpenCode::new(
+            central_adapter_harness::opencode::Config {
+                launcher: Some(launcher),
+                pinned_version: cfg.opencode_version.clone(),
+                allow_unpinned: false,
+                probe_work_dir: probe_dir,
+            },
+        )?)),
+        Backend::Codex => Ok(Arc::new(central_adapter_harness::codex::Codex::new(
+            central_adapter_harness::codex::Config {
+                launcher: Some(launcher),
+                pinned_version: cfg.codex_version.clone(),
+                allow_unpinned: false,
+                probe_work_dir: probe_dir,
+            },
+        )?)),
+        Backend::Antigravity => Ok(Arc::new(
+            central_adapter_harness::antigravity::Antigravity::new(
+                central_adapter_harness::antigravity::Config {
+                    launcher: Some(launcher),
+                    pinned_version: cfg.antigravity_version.clone(),
+                    allow_unpinned: false,
+                    probe_work_dir: probe_dir,
+                },
+            )?,
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -192,6 +192,20 @@ pub trait Component: Send + 'static {
     fn settle(&mut self) -> BoxFuture<'_, Result<(), Failure>>;
 }
 
+/// A boxed component is itself a component — the forwarding impl lets
+/// composition modules return heterogeneous `Vec<Box<dyn Component>>`
+/// that [`Profile::add_component`] registers directly (upstream's
+/// `[]kernel.Component` slice shape).
+impl Component for Box<dyn Component> {
+    fn run(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+        (**self).run()
+    }
+
+    fn settle(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+        (**self).settle()
+    }
+}
+
 /// The result of a startup admission check. `security_epoch` carries the
 /// authoritative epoch observed by the preflight; the profile records it
 /// on readiness so every startup consumer sees the same value without it

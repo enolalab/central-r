@@ -20,6 +20,14 @@ central-task = { path = "../capabilities/central-task", version = "0.1.0" }
 # runsubmit saga over the runtime pool for `POST /app/runs/submit` —
 # the same service the `central run submit` CLI composes.
 central-runsubmit = { path = "../capabilities/central-runsubmit", version = "0.1.0" }
+# R4 task 12 (issue #93/#94/#95): the serve root composes the Phase-2
+# scheduler stack — worker/claim-loop/sweepers, retry timeout kills and
+# compensation, checkpoint GC, and the event outbox publisher — behind
+# CENTRAL_PHASE2_SCHEDULER.
+central-scheduler = { path = "../capabilities/central-scheduler", version = "0.1.0" }
+central-retry = { path = "../capabilities/central-retry", version = "0.1.0" }
+central-checkpoint = { path = "../capabilities/central-checkpoint", version = "0.1.0" }
+central-eventjournal = { path = "../capabilities/central-eventjournal", version = "0.1.0" }
 central-adapter-harness = { path = "../adapters/central-adapter-harness", version = "0.1.0" }
 central-adapter-linux = { path = "../adapters/central-adapter-linux", version = "0.1.0" }
 central-adapter-postgres = { path = "../adapters/central-adapter-postgres", version = "0.1.0" }

@@ -14,6 +14,7 @@ publish.workspace = true
 central-adapter-harness = { path = "../central-adapter-harness", version = "0.1.0" }
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
+central-scheduler = { path = "../../capabilities/central-scheduler", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
 rustix.workspace = true
 serde.workspace = true

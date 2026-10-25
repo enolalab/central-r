@@ -60,6 +60,7 @@ use central_adapter_postgres::artifact::Store as PgArtifactStore;
 use central_adapter_postgres::execution::{EpochMarkerRead, Store as PgExecutionStore};
 use central_adapter_postgres::harness::PgHarnessStore;
 use central_adapter_postgres::migrate::Inspector as PgMigrateInspector;
+use central_adapter_postgres::scheduler::PgSchedulerStore;
 use central_adapter_postgres::serve_support as pg_serve;
 use central_adapter_postgres::session::PgSessionStore;
 use central_adapter_postgres::task::{
@@ -173,7 +174,7 @@ pub const ENV_OBJECT_TLS: &str = "CENTRAL_ARTIFACT_OBJECT_USE_TLS";
 /// `CENTRAL_PHASE2_SCHEDULER` — `1` enables the Phase-2 scheduler stack
 /// (upstream `envSchedulerEnabled`). Unset/anything else keeps it off;
 /// the fleet page renders residual rows under the disabled notice.
-pub const ENV_PHASE2_SCHEDULER: &str = "CENTRAL_PHASE2_SCHEDULER";
+pub const ENV_PHASE2_SCHEDULER: &str = crate::scheduler_compose::ENV_SCHEDULER_ENABLED;
 
 /// Every config failure carries this code so `serve` classifies the
 /// refusal `CONFIG_INVALID` (upstream `compositionExit`).
@@ -270,9 +271,11 @@ pub struct ServeConfig {
     /// The `CENTRAL_RECOVERY_RESUME` acknowledgement (harness phase
     /// 3f decisions 3–11).
     pub recovery_resume: Option<RecoveryResumeAck>,
-    /// `CENTRAL_PHASE2_SCHEDULER` — the fleet page's residual-rows
-    /// notice gate (upstream `h.schedulerEnabled`).
-    pub scheduler_enabled: bool,
+    /// The validated Phase-2 scheduler environment
+    /// ([`crate::scheduler_compose::SchedulerConfig`]); `enabled`
+    /// drives the fleet page's residual-rows notice gate (upstream
+    /// `h.schedulerEnabled`) and the whole Slice-2B component stack.
+    pub scheduler: crate::scheduler_compose::SchedulerConfig,
 }
 
 impl ServeConfig {
@@ -347,7 +350,10 @@ impl ServeConfig {
             profile: ProfileConfig::default(),
             pool_max,
             recovery_resume,
-            scheduler_enabled: getenv(ENV_PHASE2_SCHEDULER).as_deref() == Some("1"),
+            scheduler: crate::scheduler_compose::SchedulerConfig::load(|name| {
+                getenv(name).unwrap_or_default()
+            })
+            .map_err(|f| config_err(format!("scheduler config: {}", f.message())))?,
         })
     }
 }
@@ -702,6 +708,23 @@ where
 {
     fn recover<'a>(&'a self, fence: &'a ArtifactFence) -> BoxFuture<'a, Result<(), Failure>> {
         Box::pin(async move { self.reconcile(fence).await.map(|_| ()) })
+    }
+}
+
+/// `schedulerReconcile` — the Slice-2B startup reconcile seam the
+/// recovery gate calls between harness reconciliation and artifact
+/// recovery (upstream's injectable `func(ctx) error` field, narrowed
+/// so tests substitute a double).
+pub trait SchedulerStartupReconcile: Send + Sync + 'static {
+    /// One reconcile-before-reinvoke pass.
+    fn run<'a>(&'a self) -> BoxFuture<'a, Result<(), Failure>>;
+}
+
+impl SchedulerStartupReconcile
+    for central_scheduler::app::reconciler::Reconciler<Arc<PgSchedulerStore>>
+{
+    fn run<'a>(&'a self) -> BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(async move { self.run().await })
     }
 }
 
@@ -1836,6 +1859,10 @@ struct ServeRecoveryPreflight {
     pool: Option<sqlx::PgPool>,
     coordinator: Arc<dyn RecoveryGateCoordinator>,
     harness_reconcile: Option<Arc<HarnessReconciler>>,
+    /// The Slice-2B startup reconciler — upstream
+    /// `schedulerReconcile` (the `schedapp.Reconciler` preflight).
+    /// `None` while the scheduler gate is off.
+    scheduler_reconcile: Option<Arc<dyn SchedulerStartupReconcile>>,
     artifact_startup: Option<Arc<dyn ArtifactStartupRecovery>>,
     recovery: Arc<ServeRecoveryMonitor>,
     resume: Option<RecoveryResumeAck>,
@@ -1946,6 +1973,15 @@ impl ServeRecoveryPreflight {
             let (_summary, result) =
                 or_runtime(runtime, async { Ok(reconcile.run().await) }).await?;
             result?;
+        }
+        // `schedulerReconcile` — reconcile-before-reinvoke (spec-2
+        // decision 9): the claim loop must never accept work whose
+        // leases were left by a crashed instance until the startup
+        // pass has fenced them. It rides the scheduler gate — `None`
+        // is a no-op — and runs after harness reconciliation, before
+        // artifact recovery, upstream's exact order.
+        if let Some(reconcile) = &self.scheduler_reconcile {
+            or_runtime(runtime, reconcile.run()).await?;
         }
         // `runArtifactRecovery` — an unconfigured capability is not a
         // degradation: nothing runs and readiness is untouched. The
@@ -2384,53 +2420,10 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         // `antigravity/issue-129`), never the pinned tool version
         // (upstream `newHarnessAdapter` returns it alongside the
         // adapter).
-        let probe_dir = cfg.probe_work_dir().to_string_lossy().into_owned();
-        let adapter: Arc<dyn Adapter> = match cfg.backend {
-            Backend::ClaudeCode => Arc::new(
-                central_adapter_harness::claudecode::ClaudeCode::new(
-                    central_adapter_harness::claudecode::Config {
-                        launcher: Some(launcher.clone()),
-                        pinned_version: cfg.claude_version.clone(),
-                        allow_unpinned: false,
-                        probe_work_dir: probe_dir.clone(),
-                    },
-                )
-                .map_err(|f| config_err(format!("claude-code adapter: {}", f.code())))?,
-            ),
-            Backend::Opencode => Arc::new(
-                central_adapter_harness::opencode::OpenCode::new(
-                    central_adapter_harness::opencode::Config {
-                        launcher: Some(launcher.clone()),
-                        pinned_version: cfg.opencode_version.clone(),
-                        allow_unpinned: false,
-                        probe_work_dir: probe_dir.clone(),
-                    },
-                )
-                .map_err(|f| config_err(format!("opencode adapter: {}", f.code())))?,
-            ),
-            Backend::Codex => Arc::new(
-                central_adapter_harness::codex::Codex::new(
-                    central_adapter_harness::codex::Config {
-                        launcher: Some(launcher.clone()),
-                        pinned_version: cfg.codex_version.clone(),
-                        allow_unpinned: false,
-                        probe_work_dir: probe_dir.clone(),
-                    },
-                )
-                .map_err(|f| config_err(format!("codex adapter: {}", f.code())))?,
-            ),
-            Backend::Antigravity => Arc::new(
-                central_adapter_harness::antigravity::Antigravity::new(
-                    central_adapter_harness::antigravity::Config {
-                        launcher: Some(launcher.clone()),
-                        pinned_version: cfg.antigravity_version.clone(),
-                        allow_unpinned: false,
-                        probe_work_dir: probe_dir.clone(),
-                    },
-                )
-                .map_err(|f| config_err(format!("antigravity adapter: {}", f.code())))?,
-            ),
-        };
+        let adapter: Arc<dyn Adapter> =
+            crate::harness_compose::build_adapter(cfg, launcher.clone()).map_err(|f| {
+                config_err(format!("{} adapter: {}", cfg.backend.as_str(), f.code()))
+            })?;
         let adapter_version = cfg.backend.adapter_version().to_owned();
 
         // Sealed gitclone provisioner/capture (the D2 boundary), then
@@ -2535,6 +2528,79 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         ));
     }
 
+    // 7a. The Phase-2 Slice-2B scheduler stack — upstream
+    //     `openServeDeps`'s `composeScheduler` block (issues #93/#94/
+    //     #95): composes only while `CENTRAL_PHASE2_SCHEDULER=1`. The
+    //     postgres scheduler store is wired with the Slice-2D killer
+    //     and compensation seams explicitly — the composition root,
+    //     never a store default, owns each choice. The launcher seam
+    //     is the real harness pair when `CENTRAL_HARNESS_ENABLED=1`,
+    //     the documented stub only behind the explicit
+    //     `CENTRAL_PHASE2_SCHEDULER_ALLOW_STUB=1` dev gate.
+    let mut scheduler_req = crate::scheduler_compose::SchedulerCompositionRequest {
+        config: config.scheduler.clone(),
+        store: None,
+        launcher: None,
+        checkpoint_gc: None,
+        timeout_sweep: None,
+        outbox_drain: None,
+        outbox_consumers: None,
+    };
+    if config.scheduler.enabled {
+        let mut sched_store = crate::scheduler_compose::new_scheduler_store(pool.clone(), None);
+        if config.harness.enabled {
+            let (launcher, killer) = crate::scheduler_harness::compose_scheduler_harness(
+                &config.harness,
+                &config.scheduler,
+            )
+            .map_err(|f| {
+                config_err(format!(
+                    "scheduler harness wiring could not be composed: {}",
+                    f.message()
+                ))
+            })?;
+            scheduler_req.launcher = Some(crate::scheduler_compose::SchedulerLauncher::Harness(
+                launcher,
+            ));
+            sched_store.killer = Some(Arc::new(killer));
+        } else {
+            crate::scheduler_harness::check_scheduler_launch_gate(
+                &config.harness,
+                &config.scheduler,
+            )
+            .map_err(|f| config_err(f.message()))?;
+            tracing::warn!(
+                "scheduler stub dev gate is set -- dispatch journals attempt_started for \
+                 sessions nothing runs; never a real run path"
+            );
+        }
+        // `newSchedulerCompensation` — the durable workspace path the
+        // latest attempt recorded, freed through the provisioner the
+        // dispatch path shares the scratch root with.
+        sched_store.compensation = Some(Arc::new(
+            crate::retry_compose::SchedulerCompensation::new(
+                sched_store.clone(),
+                &config.scheduler,
+            )
+            .map_err(|f| config_err(f.message()))?,
+        ));
+        let sched_store = Arc::new(sched_store);
+        scheduler_req.timeout_sweep = Some((*sched_store).clone());
+        scheduler_req.store = Some(sched_store);
+        scheduler_req.checkpoint_gc = Some(central_adapter_postgres::checkpoint::Store::new(
+            pool.clone(),
+        ));
+        scheduler_req.outbox_drain = Some(central_adapter_postgres::eventjournal::Store::new(
+            pool.clone(),
+        ));
+    }
+    let mut scheduler_capability = crate::scheduler_compose::compose_scheduler(scheduler_req)
+        .map_err(|f| config_err(format!("scheduler could not be composed: {}", f.message())))?;
+    let scheduler_reconcile = scheduler_capability
+        .preflight()
+        .map(|r| r as Arc<dyn SchedulerStartupReconcile>);
+    let scheduler_components = scheduler_capability.take_components();
+
     // 8. The operator surface — always composed.
     let dispatcher_for_status = dispatcher.clone();
     let operator: Arc<dyn web::harness::HarnessOperator> =
@@ -2629,7 +2695,7 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
                 pool.clone(),
             ))),
         },
-        scheduler_enabled: config.scheduler_enabled,
+        scheduler_enabled: config.scheduler.enabled,
         workspace: config.workspace,
         allowed_roots: config.allowed_roots.clone(),
         epoch_source: epoch_source.clone(),
@@ -2694,6 +2760,7 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         pool: Some(pool.clone()),
         coordinator: coordinator.clone(),
         harness_reconcile: Some(harness_reconcile),
+        scheduler_reconcile,
         artifact_startup: artifact_reconciler
             .clone()
             .map(|r| r as Arc<dyn ArtifactStartupRecovery>),
@@ -2761,6 +2828,14 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
             coordinator.clone(),
             move || source.lock().unwrap_or_else(|p| p.into_inner()).clone(),
         ));
+    }
+    // The Slice-2B scheduler components register LAST — reverse-order
+    // settlement drains them first (claim loop's in-flight dispatches
+    // join, then the worker deregisters) before the listeners and
+    // monitors settle (upstream `components = append(components,
+    // schedCap.Components()...)`).
+    for component in scheduler_components {
+        profile.add_component(component);
     }
 
     Ok(ServeComposition {
@@ -2874,6 +2949,7 @@ mod tests {
                 pool: None,
                 coordinator,
                 harness_reconcile: None,
+                scheduler_reconcile: None,
                 artifact_startup,
                 recovery: recovery.clone(),
                 resume: None,
@@ -3760,6 +3836,7 @@ mod tests {
                 token: runtime.clone(),
             }),
             harness_reconcile: None,
+            scheduler_reconcile: None,
             artifact_startup: None,
             recovery: ServeRecoveryMonitor::new(),
             resume: Some(RecoveryResumeAck {
@@ -3853,5 +3930,116 @@ mod tests {
         let untyped = bootstrap_reconcile_failure(SessionFailure::untyped("session store: revoke"));
         assert_eq!(untyped.kind(), FailureKind::Conflict);
         assert_eq!(untyped.code(), "BOOTSTRAP_RECONCILIATION_FAILED");
+    }
+
+    // ------------------------------------------------------------------
+    // `TestSchedulerReconcileRunsInsideTheStartupGate` — the Slice-2B
+    // reconcile runs inside the recovery gate, after the B08 pass and
+    // before the fenced B10 artifact recovery; a failure fails the gate
+    // before artifact recovery runs, and `None` skips the step.
+    // ------------------------------------------------------------------
+
+    struct RecordingSchedulerReconcile {
+        order: Arc<StdMutex<Vec<&'static str>>>,
+        err: Option<Failure>,
+    }
+
+    impl SchedulerStartupReconcile for RecordingSchedulerReconcile {
+        fn run<'a>(&'a self) -> BoxFuture<'a, Result<(), Failure>> {
+            self.order.lock().unwrap().push("scheduler");
+            let err = self.err.clone();
+            Box::pin(async move {
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_reconcile_runs_inside_the_startup_gate() {
+        // Ordering: b08 (claim/complete), then scheduler, then the
+        // fenced artifact pass — upstream's exact gate order.
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let (mut preflight, _recovery) = test_gate(
+            Arc::new(ScriptedCoordinator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                order: order.clone(),
+                epoch: epoch(),
+            }),
+            Some(Arc::new(RecordingArtifactRecovery {
+                order: order.clone(),
+                saw_fence: Arc::new(StdMutex::new(None)),
+            })),
+            Arc::new(StdMutex::new(None)),
+        );
+        preflight.scheduler_reconcile = Some(Arc::new(RecordingSchedulerReconcile {
+            order: order.clone(),
+            err: None,
+        }));
+        preflight
+            .run_for_serve(CancellationToken::new(), far_startup())
+            .await
+            .expect("runGateSteps");
+        let steps = order.lock().unwrap().clone();
+        let scheduler_at = steps.iter().position(|s| *s == "scheduler");
+        let complete_at = steps.iter().rposition(|s| *s == "complete");
+        let artifact_at = steps.iter().position(|s| *s == "artifact");
+        assert!(
+            complete_at < scheduler_at && scheduler_at < artifact_at,
+            "gate order = {steps:?}, want complete < scheduler < artifact"
+        );
+
+        // A failed reconcile fails the gate before artifact recovery.
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let (mut preflight, _recovery) = test_gate(
+            Arc::new(ScriptedCoordinator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                order: order.clone(),
+                epoch: epoch(),
+            }),
+            Some(Arc::new(RecordingArtifactRecovery {
+                order: order.clone(),
+                saw_fence: Arc::new(StdMutex::new(None)),
+            })),
+            Arc::new(StdMutex::new(None)),
+        );
+        preflight.scheduler_reconcile = Some(Arc::new(RecordingSchedulerReconcile {
+            order: order.clone(),
+            err: Some(Failure::internal("scheduler", "reconcile failed")),
+        }));
+        let err = preflight
+            .run_for_serve(CancellationToken::new(), far_startup())
+            .await
+            .expect_err("a failed scheduler reconcile did not fail the gate");
+        assert_eq!(err.message(), "reconcile failed");
+        assert!(
+            !order.lock().unwrap().contains(&"artifact"),
+            "artifact recovery ran behind a failed scheduler reconcile"
+        );
+
+        // `None` skips the step when the gate is off.
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let (mut preflight, _recovery) = test_gate(
+            Arc::new(ScriptedCoordinator {
+                calls: Arc::new(AtomicUsize::new(0)),
+                order: order.clone(),
+                epoch: epoch(),
+            }),
+            Some(Arc::new(RecordingArtifactRecovery {
+                order: order.clone(),
+                saw_fence: Arc::new(StdMutex::new(None)),
+            })),
+            Arc::new(StdMutex::new(None)),
+        );
+        preflight
+            .run_for_serve(CancellationToken::new(), far_startup())
+            .await
+            .expect("runGateSteps without a scheduler");
+        assert!(
+            !order.lock().unwrap().contains(&"scheduler"),
+            "scheduler reconcile ran while the gate was off"
+        );
     }
 }

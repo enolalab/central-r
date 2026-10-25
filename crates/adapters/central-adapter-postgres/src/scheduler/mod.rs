@@ -22,4 +22,4 @@ mod outcome;
 mod store;
 
 pub use outcome::PgOutcomeStore;
-pub use store::PgSchedulerStore;
+pub use store::{DynCompensationExecutor, DynKiller, PgSchedulerStore};
