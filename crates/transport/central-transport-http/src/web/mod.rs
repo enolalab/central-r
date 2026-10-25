@@ -9,19 +9,24 @@
 //! shell in place (upstream's precedent), never a redirect, so the handler
 //! validates the session itself via [`ports::SessionService::validate`].
 //!
-//! R4 surfaces still absent: runs list/DAG, fleet, lineage, run controls.
-//! (`run_submit` landed in R4 T10.)
+//! R4 task 11 landed the runview surfaces: the `/app/runs` census, the
+//! run-detail DAG, node detail, fleet, lineage, and the operator run
+//! controls (issue #96 slice 2E).
 
 pub mod activity_view;
 pub mod budget_view;
+pub mod fleet_view;
 pub mod handler;
 pub mod harness;
+pub mod lineage_view;
 pub mod office_view;
 pub mod overview_view;
 pub mod permission_form;
 pub mod permission_view;
 pub mod repository_analysis;
+pub mod run_controls;
 pub mod run_submit;
+pub mod run_view;
 pub mod task_view;
 
 use std::collections::HashMap;
@@ -74,6 +79,26 @@ pub struct WebState {
     /// the same bare 503 as an unwired read port — upstream's
     /// nil-tolerant `RunControlPorts.Submitter`.
     pub run_submitter: Option<Arc<dyn ports::RunSubmitter>>,
+    /// OPTIONAL workspace-run reader (`web.RunsReader`): run list,
+    /// run detail, node detail and the controls' scope checks. `None`
+    /// answers 503 while the submit form stays wired — upstream's
+    /// independent port-set behaviour.
+    pub runs: Option<Arc<dyn ports::RunsReader>>,
+    /// OPTIONAL fleet reader (`web.FleetReader`); `None` answers the
+    /// fleet page 503.
+    pub fleet: Option<Arc<dyn ports::FleetReader>>,
+    /// OPTIONAL run-lineage reader (`web.RunLineageReader`); `None`
+    /// answers the lineage page 503.
+    pub run_lineage: Option<Arc<dyn ports::RunLineageReader>>,
+    /// OPTIONAL write-side control ports (`web.RunControlPorts`) —
+    /// canceller/resolver/resumer/checkpoints, each independently
+    /// nil-tolerant.
+    pub controls: ports::RunControlPorts,
+    /// `CENTRAL_PHASE2_SCHEDULER` — the fleet page's residual-rows
+    /// notice gate (`h.schedulerEnabled`): off renders whatever rows
+    /// the tables still hold under a "scheduler disabled" notice
+    /// rather than failing.
+    pub scheduler_enabled: bool,
     /// The fixed workspace the bootstrap exchange mints sessions for.
     pub workspace: WorkspaceId,
     /// The operator-configured `workspace_root_id` allowlist a
@@ -240,6 +265,82 @@ pub fn routes(state: &Arc<WebState>) -> Vec<RoutedSpec> {
             move |req: Request| run_submit::serve_run_submit(Arc::clone(&st), req)
         }),
     );
+    // R4 task 11 (issue #96 slice 2E) — the runview read pages and the
+    // operator controls. `mutation(false)` carries the run-control
+    // security prelude upstream's RouteSpec declares: POST-only,
+    // non-empty Origin, the session's CSRF validated by the
+    // middleware's session-csrf gate (the handler additionally
+    // enforces exactly one well-formed `csrf` form field — the same
+    // belt as task mutations).
+    push(
+        Method::GET,
+        "/app/runs/detail",
+        safe_page(policy::HTML_RESPONSE_CAP),
+        get({
+            let st = Arc::clone(state);
+            move |req: Request| run_view::serve_run_detail(Arc::clone(&st), req)
+        }),
+    );
+    push(
+        Method::GET,
+        "/app/runs/node",
+        safe_page(policy::HTML_RESPONSE_CAP),
+        get({
+            let st = Arc::clone(state);
+            move |req: Request| run_view::serve_node_detail(Arc::clone(&st), req)
+        }),
+    );
+    push(
+        Method::GET,
+        "/app/runs/fleet",
+        safe_page(policy::HTML_RESPONSE_CAP),
+        get({
+            let st = Arc::clone(state);
+            move |req: Request| fleet_view::serve_fleet(Arc::clone(&st), req)
+        }),
+    );
+    push(
+        Method::GET,
+        "/app/runs/lineage",
+        safe_page(policy::HTML_RESPONSE_CAP),
+        get({
+            let st = Arc::clone(state);
+            move |req: Request| lineage_view::serve_run_lineage(Arc::clone(&st), req)
+        }),
+    );
+    push(
+        Method::GET,
+        "/app/runs/controls",
+        safe_page(policy::HTML_RESPONSE_CAP),
+        get({
+            let st = Arc::clone(state);
+            move |req: Request| run_controls::serve_run_controls(Arc::clone(&st), req)
+        }),
+    );
+    macro_rules! mutate_rc {
+        ($path:literal, $f:ident) => {
+            push(
+                Method::POST,
+                $path,
+                mutation(false),
+                post({
+                    let st = Arc::clone(state);
+                    move |req: Request| run_controls::$f(Arc::clone(&st), req)
+                }),
+            );
+        };
+    }
+    mutate_rc!("/app/runs/cancel", serve_control_cancel_run);
+    mutate_rc!("/app/runs/node/cancel", serve_control_cancel_node);
+    mutate_rc!("/app/runs/node/decide", serve_control_decide);
+    mutate_rc!("/app/runs/resume", serve_control_resume);
+    mutate_rc!(
+        "/app/runs/checkpoint/create",
+        serve_control_checkpoint_write
+    );
+    mutate_rc!("/app/runs/checkpoint/pin", serve_control_checkpoint_pin);
+    mutate_rc!("/app/runs/checkpoint/unpin", serve_control_checkpoint_unpin);
+    mutate_rc!("/app/runs/checkpoint/gc", serve_control_checkpoint_gc);
     page!(
         "/app/tasks/artifact/preview",
         policy::HTML_RESPONSE_CAP,

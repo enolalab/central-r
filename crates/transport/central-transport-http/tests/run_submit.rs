@@ -23,7 +23,7 @@ use central_transport_http::api;
 use central_transport_http::b64;
 use central_transport_http::health::ProbeState;
 use central_transport_http::middleware::admission::AdmissionConfig;
-use central_transport_http::ports::{BoxFuture, RunSubmitter};
+use central_transport_http::ports::{BoxFuture, RunSubmitter, RunsReader};
 use central_transport_http::router::{TransportConfig, build_app_router};
 use central_transport_http::web::{self, WebState};
 use central_workflow::domain::NodeStatus;
@@ -80,7 +80,91 @@ struct Fixture {
     app: Router,
 }
 
+/// A runs projection wired but always empty/not-found — the submit
+/// tests care about the form, not the census rows.
+struct EmptyRuns;
+
+macro_rules! runs_ok {
+    ($v:expr) => {
+        Box::pin(async move { Ok($v) })
+    };
+}
+
+impl RunsReader for EmptyRuns {
+    fn list_runs(
+        &self,
+        _w: WorkspaceId,
+        _a: Option<central_runview::domain::RunCursor>,
+        _l: i64,
+    ) -> BoxFuture<'_, Result<Vec<central_runview::domain::RunSummary>, DomainFailure>> {
+        runs_ok!(Vec::new())
+    }
+    fn run_for_id(
+        &self,
+        _w: WorkspaceId,
+        _r: RunId,
+    ) -> BoxFuture<'_, Result<central_runview::domain::RunSummary, DomainFailure>> {
+        Box::pin(async move {
+            Err(DomainFailure::new(
+                central_foundation::failure::FailureKind::NotFound,
+                "RUNVIEW_NOT_FOUND",
+                "absent",
+            ))
+        })
+    }
+    fn node_for_id(
+        &self,
+        _w: WorkspaceId,
+        _n: central_foundation::identity::WorkflowNodeId,
+    ) -> BoxFuture<'_, Result<central_runview::domain::GraphNode, DomainFailure>> {
+        Box::pin(async move {
+            Err(DomainFailure::new(
+                central_foundation::failure::FailureKind::NotFound,
+                "RUNVIEW_NOT_FOUND",
+                "absent",
+            ))
+        })
+    }
+    fn graph_for_run(
+        &self,
+        _r: RunId,
+    ) -> BoxFuture<'_, Result<central_runview::domain::RunGraph, DomainFailure>> {
+        runs_ok!(Default::default())
+    }
+    fn events_for_run(
+        &self,
+        _r: RunId,
+    ) -> BoxFuture<'_, Result<Vec<central_eventjournal::domain::RunEvent>, DomainFailure>> {
+        runs_ok!(Vec::new())
+    }
+    fn attempts_for_node(
+        &self,
+        _n: central_foundation::identity::WorkflowNodeId,
+    ) -> BoxFuture<'_, Result<Vec<central_runview::domain::AttemptRow>, DomainFailure>> {
+        runs_ok!(Vec::new())
+    }
+    fn nodes_current(
+        &self,
+        _r: RunId,
+    ) -> BoxFuture<'_, Result<std::collections::BTreeMap<String, String>, DomainFailure>> {
+        runs_ok!(Default::default())
+    }
+    fn live_leases(
+        &self,
+        _w: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<central_runview::domain::LeaseRow>, DomainFailure>> {
+        runs_ok!(Vec::new())
+    }
+}
+
 fn fixture(submitter: Option<Arc<FakeSubmitter>>) -> Fixture {
+    fixture_with_runs(submitter, None)
+}
+
+fn fixture_with_runs(
+    submitter: Option<Arc<FakeSubmitter>>,
+    runs: Option<Arc<dyn RunsReader>>,
+) -> Fixture {
     let sessions = Arc::new(FakeSessions::new());
     let state = Arc::new(WebState {
         readiness: Arc::new(StaticProbe(ProbeState::Ready)),
@@ -91,6 +175,11 @@ fn fixture(submitter: Option<Arc<FakeSubmitter>>) -> Fixture {
         turn_activity: None,
         harness: None,
         run_submitter: submitter.clone().map(|s| s as Arc<dyn RunSubmitter>),
+        runs,
+        fleet: None,
+        run_lineage: None,
+        controls: Default::default(),
+        scheduler_enabled: false,
         workspace: WorkspaceId::sentinel(),
         allowed_roots: vec!["root".to_string()],
         epoch_source: Arc::new(|| SecurityEpoch(0)),
@@ -317,7 +406,7 @@ async fn submit_validation_is_400_other_errors_503() {
 /// the POST a bare 503 and the list renders no form.
 #[tokio::test]
 async fn submit_unwired_is_503_and_list_hides_form() {
-    let f = fixture(None);
+    let f = fixture_with_runs(None, Some(Arc::new(EmptyRuns)));
     let resp = post_form(
         &f,
         &[
@@ -351,7 +440,10 @@ async fn submit_unwired_is_503_and_list_hides_form() {
 /// form with the hidden csrf + per-render idempotency fields.
 #[tokio::test]
 async fn list_renders_submit_form_when_wired() {
-    let f = fixture(Some(Arc::new(FakeSubmitter::ok())));
+    let f = fixture_with_runs(
+        Some(Arc::new(FakeSubmitter::ok())),
+        Some(Arc::new(EmptyRuns)),
+    );
     let (t, c) = active_cookies(&f);
     let resp = f
         .app

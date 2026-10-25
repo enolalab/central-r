@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT n.id, n.run_id, n.node_key, n.state, n.attempt_count, n.max_attempts, n.not_before, n.created_at, p.node_key AS \"parent_key?\", COALESCE(r.reason_code, '') AS \"reason!\" FROM central.workflow_nodes n LEFT JOIN central.workflow_nodes p ON p.id = n.parent_node_id LEFT JOIN LATERAL ( SELECT e.reason_code FROM central.run_events e WHERE e.run_id = n.run_id AND e.node_id = n.id AND e.reason_code IS NOT NULL ORDER BY e.seq DESC LIMIT 1 ) r ON true WHERE n.run_id = $1 ORDER BY n.depth, n.created_at, n.node_key",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "node_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "attempt_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "not_before",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "parent_key?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "reason!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "27726c030dafd60d9265e4d8369f9bf3b4b856010fbd899f5f52e953c1521a22"
+}

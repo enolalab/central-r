@@ -59,6 +59,11 @@ fn fixture_with(harness: Option<Arc<FakeHarness>>) -> Fixture {
             .clone()
             .map(|h| h as Arc<dyn web::harness::HarnessOperator>),
         run_submitter: None,
+        runs: None,
+        fleet: None,
+        run_lineage: None,
+        controls: Default::default(),
+        scheduler_enabled: false,
         workspace: WorkspaceId::sentinel(),
         allowed_roots: vec!["root".to_string()],
         epoch_source: Arc::new(|| SecurityEpoch(0)),

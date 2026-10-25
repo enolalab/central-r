@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Run controls</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body class="wide-body">
+<main>
+<h1>Run controls</h1>
+<nav><a href="/app/runs/detail?run={{ vm.run_id }}">Run</a> &middot; <a href="/app/runs">Runs</a> &middot; <a href="/app/runs/lineage?run={{ vm.run_id }}">Lineage</a> &middot; <a href="/app/runs/fleet">Fleet</a> &middot; <a href="/app/tasks">Tasks</a></nav>
+{% include "harness_banner.html" %}
+
+<section aria-labelledby="run-h">
+<h2 id="run-h">Run <code>{{ vm.run_id }}</code></h2>
+<p><span class="badge badge-{{ vm.status }}">{{ vm.status }}</span> {{ vm.label }}{% if !vm.run_key.is_empty() %} &mdash; key <code>{{ vm.run_key }}</code>{% endif %}</p>
+</section>
+
+{% if !vm.any_control %}
+<section class="alert" role="alert" aria-labelledby="unavailable-h">
+<h2 id="unavailable-h">Controls unavailable</h2>
+<p>No operator-control backend is wired in this composition. The run views are unaffected.</p>
+</section>
+{% endif %}
+
+<section aria-labelledby="run-controls-h">
+<h2 id="run-controls-h">Run controls</h2>
+
+{% if vm.can_cancel %}
+<form method="post" action="/app/runs/cancel">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <p id="attest-run-cancel">By cancelling, you confirm every root of this run should cancel; the cascade stops or parks every reachable node, and live attempts receive a cancel request.</p>
+  <button type="submit" aria-describedby="attest-run-cancel">Cancel run</button>
+</form>
+{% endif %}
+
+{% if vm.can_resume %}
+<form method="post" action="/app/runs/resume">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <label for="resume-token">Resume token</label>
+  <input type="text" id="resume-token" name="token" required autocomplete="off">
+  <p id="attest-resume">By resuming, you confirm the checkpoint's in-flight attempts are no longer running; the subtree is rebuilt under a fresh dispatch.</p>
+  <button type="submit" aria-describedby="attest-resume">Resume from checkpoint</button>
+</form>
+{% endif %}
+
+{% if vm.can_checkpoint %}
+<form method="post" action="/app/runs/checkpoint/gc">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <p id="attest-gc">By collecting, you confirm one garbage-collection pass may delete every collectable (unpinned) checkpoint now.</p>
+  <button type="submit" aria-describedby="attest-gc">Run checkpoint GC once</button>
+</form>
+{% endif %}
+</section>
+
+<section aria-labelledby="nodes-h">
+<h2 id="nodes-h">Nodes</h2>
+{% if vm.nodes_empty %}
+<p role="status" aria-live="polite">This run declared no workflow nodes.</p>
+{% else %}
+<table>
+<thead>
+<tr><th scope="col">Node</th><th scope="col">State</th><th scope="col">Reason</th><th scope="col">Controls</th></tr>
+</thead>
+<tbody>
+{% for node in vm.nodes %}
+<tr>
+<td><a href="/app/runs/node?id={{ node.id }}"><code>{{ node.key }}</code></a></td>
+<td><span class="badge badge-{{ node.badge_class }}">{{ node.badge }}</span></td>
+<td>{{ node.reason }}</td>
+<td>
+{% if node.cancellable %}
+<form method="post" action="/app/runs/node/cancel" class="inline">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <input type="hidden" name="node_id" value="{{ node.id }}">
+  <button type="submit" aria-describedby="attest-node-cancel">Cancel node</button>
+</form>
+{% endif %}
+{% if node.ambiguous %}
+<form method="post" action="/app/runs/node/decide" class="inline">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <input type="hidden" name="node_id" value="{{ node.id }}">
+  <input type="hidden" name="decision" value="resume">
+  <button type="submit" aria-describedby="attest-decide-resume">Decide: resume</button>
+</form>
+<form method="post" action="/app/runs/node/decide" class="inline">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <input type="hidden" name="node_id" value="{{ node.id }}">
+  <input type="hidden" name="decision" value="rerun">
+  <button type="submit" aria-describedby="attest-decide-rerun">Decide: rerun</button>
+</form>
+{% endif %}
+{% if !node.cancellable && !node.ambiguous %}<span class="hint">none</span>{% endif %}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p id="attest-node-cancel" class="hint">Cancel node: the node and its descendants stop or park; live attempts receive a cancel request.</p>
+<p id="attest-decide-resume" class="hint">Decide resume: the parked attempt is left for its harness to reattach; the node stays attempt_ambiguous until then.</p>
+<p id="attest-decide-rerun" class="hint">Decide rerun: the parked attempt's outcome is set aside and the node returns to ready for a fresh attempt.</p>
+{% endif %}
+</section>
+
+{% if vm.can_checkpoint %}
+<section aria-labelledby="checkpoints-h">
+<h2 id="checkpoints-h">Checkpoints</h2>
+
+<form method="post" action="/app/runs/checkpoint/create">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <label for="cp-node">Anchor node</label>
+  <select id="cp-node" name="node_id">
+    {% for node in vm.nodes %}<option value="{{ node.id }}">{{ node.key }}</option>{% endfor %}
+  </select>
+  <label for="cp-seq">Seq</label>
+  <input type="number" id="cp-seq" name="seq" min="1" step="1" required>
+  <label for="cp-class">Retention class</label>
+  <select id="cp-class" name="gc_class">
+    <option value="supersedeable" selected>supersedeable</option>
+    <option value="run_terminal">run_terminal</option>
+    <option value="pinned">pinned</option>
+  </select>
+  <p id="attest-cp-create">By writing, you confirm a checkpoint of this node's subtree may be recorded at the given seq; the same seq replays the recorded checkpoint.</p>
+  <button type="submit" aria-describedby="attest-cp-create"{% if vm.nodes_empty %} disabled{% endif %}>Write checkpoint</button>
+</form>
+
+{% if !vm.checkpoints.is_empty() %}
+<table>
+<thead>
+<tr><th scope="col">Checkpoint</th><th scope="col">Seq</th><th scope="col">Anchor</th><th scope="col">Class</th><th scope="col">Created</th><th scope="col">Expires</th><th scope="col">Controls</th></tr>
+</thead>
+<tbody>
+{% for cp in vm.checkpoints %}
+<tr>
+<td><code>{{ cp.id }}</code></td>
+<td>{{ cp.seq }}</td>
+<td><code>{{ cp.anchor }}</code></td>
+<td><code>{{ cp.gc_class }}</code></td>
+<td>{{ cp.created }}</td>
+<td>{% if !cp.expires.is_empty() %}{{ cp.expires }}{% else %}<span class="hint">none</span>{% endif %}</td>
+<td>
+{% if cp.pinnable %}
+<form method="post" action="/app/runs/checkpoint/pin" class="inline">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <input type="hidden" name="checkpoint_id" value="{{ cp.id }}">
+  <button type="submit" aria-describedby="attest-cp-pin">Pin</button>
+</form>
+{% endif %}
+{% if cp.pinned %}
+<form method="post" action="/app/runs/checkpoint/unpin" class="inline">
+  <input type="hidden" name="csrf" value="{{ vm.csrf_field }}">
+  <input type="hidden" name="run_id" value="{{ vm.run_id }}">
+  <input type="hidden" name="checkpoint_id" value="{{ cp.id }}">
+  <button type="submit" aria-describedby="attest-cp-unpin">Unpin</button>
+</form>
+{% endif %}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p id="attest-cp-pin" class="hint">Pin: the checkpoint is exempt from garbage collection until unpinned.</p>
+<p id="attest-cp-unpin" class="hint">Unpin: the checkpoint returns to the supersedeable retention class and may be collected.</p>
+{% else %}
+<p role="status" aria-live="polite">No checkpoints recorded for this run.</p>
+{% endif %}
+</section>
+{% endif %}
+</main>
+</body>
+</html>

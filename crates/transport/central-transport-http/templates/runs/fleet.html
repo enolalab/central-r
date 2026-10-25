@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Fleet</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body class="wide-body">
+<main>
+<h1>Fleet</h1>
+<nav><a href="/app/runs">Runs</a> &middot; <a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
+
+{% if vm.scheduler_disabled %}
+<section class="alert" role="status" aria-labelledby="sched-off-h">
+<h2 id="sched-off-h">Scheduler disabled</h2>
+<p>The Phase-2 scheduler is gated off (<code>CENTRAL_PHASE2_SCHEDULER</code> is unset): no workers are running and no new leases or deferrals are produced. The tables below show whatever residual state remains recorded.</p>
+</section>
+{% endif %}
+
+{% if !vm.silent.is_empty() %}
+<section class="alert" role="alert" aria-labelledby="silent-h">
+<h2 id="silent-h">{{ vm.silent.len() }} worker(s) suspect or lost</h2>
+<p>Registered workers whose heartbeat age crossed the scheduler's missed-beat ladder (suspect at {{ vm.suspect_beats }} missed beats, lost at {{ vm.lost_beats }}). A suspect verdict is observable only; a lost worker's leases all expire.</p>
+<ul>
+{% for w in vm.silent %}<li><code>{{ w.id }}</code> is <strong>{{ w.observed }}</strong>{% if w.missed_beats > 0 %}: {{ w.missed_beats }} missed beat(s), last heartbeat {{ w.beat_age }}s ago{% endif %}{% if w.live_leases > 0 %} &mdash; holds {{ w.live_leases }} live lease(s){% endif %}{% if !w.recorded.is_empty() && w.recorded != w.observed %} <span class="hint">(recorded state: {{ w.recorded }})</span>{% endif %}</li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+
+<section aria-labelledby="workers-h">
+<h2 id="workers-h">Workers</h2>
+{% if !vm.workers.is_empty() %}
+<table>
+<caption class="visually-hidden">Registered workers by registration time</caption>
+<thead>
+<tr>
+<th scope="col">Worker</th>
+<th scope="col">Capabilities</th>
+<th scope="col">Max concurrent</th>
+<th scope="col">Live leases</th>
+<th scope="col">Last heartbeat</th>
+<th scope="col">Recorded state</th>
+<th scope="col">Observed</th>
+</tr>
+</thead>
+<tbody aria-live="polite">
+{% for w in vm.workers %}
+<tr>
+<td><code>{{ w.id }}</code></td>
+<td>{% if !w.harness_kinds.is_empty() %}harness: {{ w.harness_kinds }}<br>{% endif %}{% if !w.workspace_kinds.is_empty() %}workspace: {{ w.workspace_kinds }}{% endif %}{% if w.harness_kinds.is_empty() && w.workspace_kinds.is_empty() %}<span class="hint">none declared</span>{% endif %}</td>
+<td>{{ w.max_concurrent }}</td>
+<td>{{ w.live_leases }}</td>
+<td>{% if w.beat_age_set %}{{ w.beat_age }} ago <span class="hint">({{ w.missed_beats }} missed beat(s))</span>{% else %}{{ w.beat_age }}{% endif %}</td>
+<td><span class="badge badge-{{ w.recorded }}">{{ w.recorded }}</span></td>
+<td>{% if !w.observed.is_empty() %}{% if w.flagged %}<strong>{{ w.observed }}</strong>{% else %}{{ w.observed }}{% endif %}{% else %}<span class="hint">not evaluated</span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p role="status" aria-live="polite">No workers registered.</p>
+{% endif %}
+</section>
+
+<section aria-labelledby="leases-h">
+<h2 id="leases-h">Live leases</h2>
+{% if !vm.leases.is_empty() %}
+<table>
+<caption class="visually-hidden">Live leases by issue time</caption>
+<thead>
+<tr>
+<th scope="col">Node</th>
+<th scope="col">Run</th>
+<th scope="col">Attempt</th>
+<th scope="col">Worker</th>
+<th scope="col">Lease</th>
+<th scope="col">Issued</th>
+<th scope="col">Heartbeat</th>
+<th scope="col">Expires</th>
+<th scope="col">State</th>
+</tr>
+</thead>
+<tbody>
+{% for l in vm.leases %}
+<tr>
+<td><a href="/app/runs/node?id={{ l.node_id }}"><code>{{ l.node_key }}</code></a></td>
+<td><a href="/app/runs/detail?run={{ l.run_id }}"><code>{{ l.run_id }}</code></a></td>
+<td>{{ l.attempt_seq }} <span class="hint"><code>{{ l.attempt_id }}</code></span></td>
+<td><code>{{ l.worker_id }}</code></td>
+<td><code>{{ l.id }}</code></td>
+<td>{{ l.issued_at }}</td>
+<td>{{ l.heartbeat_age }}s ago <span class="hint">({{ l.missed_beats }} missed beat(s))</span></td>
+<td>{{ l.expires_at }}</td>
+<td>{% if l.flagged %}<strong>{{ l.state }}</strong>{% else %}{{ l.state }}{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p role="status" aria-live="polite">No live leases.</p>
+{% endif %}
+</section>
+
+<section aria-labelledby="deferred-h">
+<h2 id="deferred-h">Deferred admissions</h2>
+<p class="hint">Journaled <code>admission_deferred</code> events of live runs, in claim-FIFO order (<code>COALESCE(ready_at, created_at)</code> then <code>node_key</code>) &mdash; the queue position is the order itself; no stored position exists.</p>
+{% if !vm.deferred.is_empty() %}
+{% for group in vm.deferred %}
+<section aria-labelledby="deferred-run-{{ group.run_id }}">
+<h3 id="deferred-run-{{ group.run_id }}">Run <a href="/app/runs/detail?run={{ group.run_id }}"><code>{{ group.run_id }}</code></a> <span class="badge badge-{{ group.status }}">{{ group.status }}</span>{% if !group.run_key.is_empty() %} <span class="hint">key <code>{{ group.run_key }}</code></span>{% endif %}</h3>
+<table>
+<thead>
+<tr>
+<th scope="col">Seq</th>
+<th scope="col">Node</th>
+<th scope="col">Reason</th>
+<th scope="col">Ready at</th>
+<th scope="col">Recorded</th>
+</tr>
+</thead>
+<tbody>
+{% for row in group.deferred %}
+<tr>
+<td>{{ row.seq }}</td>
+<td><a href="/app/runs/node?id={{ row.node_id }}"><code>{{ row.node_key }}</code></a></td>
+<td>{{ row.reason }}</td>
+<td>{% if !row.ready_at.is_empty() %}{{ row.ready_at }}{% else %}<span class="hint">not set</span>{% endif %}</td>
+<td>{{ row.recorded_at }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endfor %}
+{% else %}
+<p role="status" aria-live="polite">No deferred admissions on live runs.</p>
+{% endif %}
+</section>
+
+<section aria-labelledby="outbox-h">
+<h2 id="outbox-h">Outbox health</h2>
+<dl>
+<dt>Unpublished depth</dt><dd>{{ vm.outbox.depth }} <span class="hint">(stall threshold &gt; {{ vm.outbox.depth_limit }})</span></dd>
+{% if vm.outbox.has_oldest %}<dt>Oldest unpublished</dt><dd>{{ vm.outbox.oldest }} <span class="hint">({{ vm.outbox.oldest_age_seconds }}s ago; stall threshold &gt; {{ vm.outbox.age_limit_seconds }}s)</span></dd>{% else %}<dt>Oldest unpublished</dt><dd><span class="hint">backlog empty</span></dd>{% endif %}
+</dl>
+{% if vm.outbox.stalled %}
+<p class="alert" role="alert"><strong>OUTBOX_PUBLISH_STALLED</strong> &mdash; {{ vm.outbox.stall_reason }}. The outbox publisher is not keeping up; journaled events are durably recorded but publication to consumers is behind.</p>
+{% else %}
+<p role="status" aria-live="polite">Outbox publication is within the stall thresholds.</p>
+{% endif %}
+</section>
+</main>
+</body>
+</html>

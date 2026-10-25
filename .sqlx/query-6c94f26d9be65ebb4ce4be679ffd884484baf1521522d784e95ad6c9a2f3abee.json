@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id, a.node_id, n.node_key, a.attempt_seq, a.state, a.dispatch_reason_code, a.worker_id, a.claimed_at, a.started_at, a.ended_at, h.adapter_version AS \"adapter_version?\", h.harness_version, n.spec FROM central.session_attempts a JOIN central.workflow_nodes n ON n.id = a.node_id LEFT JOIN central.harness_attempts h ON h.id = a.harness_attempt_id WHERE a.node_id = $1 ORDER BY a.attempt_seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "node_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt_seq",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "dispatch_reason_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "worker_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "claimed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "ended_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "adapter_version?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "harness_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "spec",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "6c94f26d9be65ebb4ce4be679ffd884484baf1521522d784e95ad6c9a2f3abee"
+}

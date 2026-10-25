@@ -45,14 +45,32 @@ fn run_control_failure(status: StatusCode) -> Response {
     error::reject(status, "RUN_CONTROL_FAILED")
 }
 
-/// `ServeRunList` — `GET /app/runs`. The anonymous surface is the same
-/// bootstrap shell every safe `/app` GET renders (upstream's
-/// precedent); the submit form renders only while the OPTIONAL
-/// [`ports::RunSubmitter`] port is wired.
+/// `ServeRunList` — `GET /app/runs`: the workspace's complete run
+/// census, newest first, keyset-paginated by the opaque `?cursor`
+/// token, above the optional submission form. Phase-1 runs with zero
+/// workflow nodes render in the same list. The cursor is the previous
+/// page's last `(created_at, id)` pair; a malformed token is the same
+/// generic 404 as a malformed id (a silently-reset first page would
+/// present stale data under a page-N URL). Nil-tolerant like
+/// `run_lineage`: an unwired runs port answers the same bare 503 as a
+/// read failure rather than serving a partial page.
 pub(crate) async fn serve_run_list(state: Arc<WebState>, req: Request) -> Response {
-    let Some(_sess) = active_session(&state, req.headers()).await else {
+    let Some(sess) = active_session(&state, req.headers()).await else {
         return render_bootstrap(&req, StatusCode::OK, "");
     };
+    let Some(reader) = state.runs.clone() else {
+        return error::reject(StatusCode::SERVICE_UNAVAILABLE, "");
+    };
+    let cursor = match super::run_view::decode_cursor_param(req.uri().query()) {
+        Ok(c) => c,
+        Err(()) => return super::render_not_found(),
+    };
+    let (rows, next_cursor) =
+        match super::run_view::run_list_page(&reader, sess.workspace_id, cursor).await {
+            Ok(v) => v,
+            Err(()) => return error::reject(StatusCode::SERVICE_UNAVAILABLE, ""),
+        };
+    let banner = super::handler::harness_banner(&state, sess.workspace_id).await;
     let can_submit = state.run_submitter.is_some();
     let csrf_field = session_csrf_value(&req);
     // `mintIdempotencyKey` — a fresh per-render receipt key, like the
@@ -68,6 +86,10 @@ pub(crate) async fn serve_run_list(state: Arc<WebState>, req: Request) -> Respon
             can_submit,
             csrf_field,
             idempotency_key,
+            empty: rows.is_empty(),
+            rows,
+            next_cursor,
+            banner,
         }
         .render(),
     )
@@ -148,9 +170,9 @@ async fn submit_with(
     }
 }
 
-/// `runListViewModel` — the runs page's submit section. `can_submit`
-/// mirrors upstream's `Submitter != nil`; the census table itself is
-/// Task 11's surface.
+/// `runListViewModel` — the runs page: the workspace census rows plus
+/// the optional submit section. `can_submit` mirrors upstream's
+/// `Submitter != nil`.
 #[derive(Template)]
 #[template(path = "runs_list.html")]
 struct RunsListTemplate {
@@ -162,6 +184,15 @@ struct RunsListTemplate {
     csrf_field: String,
     /// The fresh per-render receipt key for `idempotency_key`.
     idempotency_key: String,
+    /// The census rows (upstream `Rows`).
+    rows: Vec<super::run_view::RunListRow>,
+    /// `Empty` — no runs in the workspace census.
+    empty: bool,
+    /// `NextCursor` — the opaque next-page token, "" when this is the
+    /// last page.
+    next_cursor: String,
+    /// The mandatory harness banner.
+    banner: super::harness::HarnessBannerView,
 }
 
 impl RunsListTemplate {

@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Run detail</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body class="wide-body">
+<main>
+<h1>Run detail</h1>
+<nav><a href="/app/runs">Runs</a> &middot; <a href="/app/runs/fleet">Fleet</a> &middot; <a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
+
+{# The whole state summary -- status, label, node census, timestamps --
+   is one polite live region so a state transition announces as a unit. #}
+<section aria-labelledby="run-h" aria-live="polite">
+<h2 id="run-h">Run <code>{{ vm.run_id }}</code></h2>
+<p>
+<span class="badge badge-{{ vm.status }}">{{ vm.status }}</span> {{ vm.label }}
+&mdash; run {{ vm.index }} of task <a href="/app/tasks/detail?id={{ vm.task_id }}"><code>{{ vm.task_id }}</code></a>{% if !vm.run_key.is_empty() %} &mdash; key <code>{{ vm.run_key }}</code>{% endif %}
+&mdash; <a href="/app/runs/lineage?run={{ vm.run_id }}">lineage</a>
+&mdash; <a href="/app/runs/controls?run={{ vm.run_id }}">controls</a>
+</p>
+{% if !vm.counts.is_empty() %}<p>Nodes: {% for chip in vm.counts %}<span class="badge badge-{{ chip.state }}">{{ chip.state }} {{ chip.count }}</span> {% endfor %}</p>{% endif %}
+<dl>
+<dt>Created</dt><dd>{{ vm.created }}</dd>
+<dt>Updated</dt><dd>{{ vm.updated }}</dd>
+{% if !vm.started.is_empty() %}<dt>Started</dt><dd>{{ vm.started }}</dd>{% endif %}
+{% if !vm.ended.is_empty() %}<dt>Ended</dt><dd>{{ vm.ended }}</dd>{% endif %}
+{% if !vm.deadline.is_empty() %}<dt>Deadline</dt><dd>{{ vm.deadline }}</dd>{% endif %}
+</dl>
+</section>
+
+{% if !vm.divergence.is_empty() %}
+<section class="alert" role="alert" aria-labelledby="divergence-h">
+<h2 id="divergence-h">RECONSTRUCTION_DIVERGED</h2>
+<p>The materialized node state disagrees with the journal fold. The journal is the canonical record; this banner names every disagreement instead of hiding it.</p>
+<ul>
+{% for f in vm.divergence %}<li><strong>{{ f.reason }}</strong> {{ f.detail }} <span class="hint">(seq {{ f.seq }})</span></li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+
+{% if !vm.journal_findings.is_empty() %}
+<section class="alert" role="alert" aria-labelledby="journal-h">
+<h2 id="journal-h">Journal anomalies</h2>
+<ul>
+{% for f in vm.journal_findings %}<li><strong>{{ f.reason }}</strong> {{ f.detail }} <span class="hint">(seq {{ f.seq }})</span></li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+
+{% if !vm.parked.is_empty() %}
+<section class="alert" role="alert" aria-labelledby="parked-h">
+<h2 id="parked-h">{{ vm.parked.len() }} node(s) parked in attempt_ambiguous</h2>
+<p>The attempt outcome is indeterminate -- reconciliation parked the node rather than guessing. An operator decision is required; these nodes are not executing.</p>
+<ul>
+{% for p in vm.parked %}<li><a href="/app/runs/node?id={{ p.id }}"><code>{{ p.key }}</code></a>{% if !p.reason.is_empty() %} &mdash; {{ p.reason }}{% endif %}</li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+
+{% if !vm.lease_warnings.is_empty() %}
+<section class="alert" role="alert" aria-labelledby="leases-h">
+<h2 id="leases-h">Live leases on silent workers</h2>
+<p>Live leases of this run whose heartbeat has missed the suspect/lost ladder thresholds.</p>
+<ul>
+{% for w in vm.lease_warnings %}<li><a href="/app/runs/node?id={{ w.node_id }}"><code>{{ w.node_key }}</code></a> &mdash; worker <code>{{ w.worker_id }}</code> is <strong>{{ w.state }}</strong>: {{ w.missed_beats }} missed beat(s), last heartbeat {{ w.age_seconds }}s ago</li>{% endfor %}
+</ul>
+</section>
+{% endif %}
+
+<section aria-labelledby="dag-h">
+<h2 id="dag-h">Workflow graph</h2>
+{% if vm.dag_empty %}
+<p role="status" aria-live="polite">This run declared no workflow nodes.</p>
+{% else %}
+<ul class="dag">
+{{ vm.dag_html|safe }}
+</ul>
+{% endif %}
+</section>
+
+<section aria-labelledby="events-h">
+<h2 id="events-h">Run events</h2>
+{% if !vm.events.is_empty() %}
+{% if vm.events_truncated %}<p class="hint">Showing the first {{ vm.events.len() }} of {{ vm.events_total }} events.</p>{% endif %}
+<table>
+<thead>
+<tr><th scope="col">Seq</th><th scope="col">Recorded</th><th scope="col">Kind</th><th scope="col">Node</th><th scope="col">Actor</th><th scope="col">Reason</th><th scope="col">Detail</th></tr>
+</thead>
+<tbody>
+{% for ev in vm.events %}
+<tr>
+<td>{{ ev.seq }}</td>
+<td>{{ ev.at }}</td>
+<td><code>{{ ev.kind }}</code></td>
+<td>{% if !ev.node_link.is_empty() %}<a href="/app/runs/node?id={{ ev.node_link }}"><code>{{ ev.node_key }}</code></a>{% endif %}</td>
+<td>{{ ev.actor }}</td>
+<td>{{ ev.reason }}</td>
+<td>{{ ev.detail }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p role="status" aria-live="polite">No events journaled for this run yet.</p>
+{% endif %}
+</section>
+</main>
+</body>
+</html>

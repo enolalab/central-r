@@ -1,0 +1,91 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.id, r.task_id, r.workspace_id, r.run_index, r.status, r.run_key, r.created_at, r.updated_at, r.deadline, ev.started_at, ev.ended_at, COALESCE(nc.counts, '{}'::jsonb) AS \"counts!\" FROM central.runs r LEFT JOIN LATERAL ( SELECT MIN(e.recorded_at) AS started_at, MAX(e.recorded_at) AS ended_at FROM central.run_events e WHERE e.run_id = r.id ) ev ON true LEFT JOIN LATERAL ( SELECT jsonb_object_agg(state, cnt) AS counts FROM ( SELECT n.state, COUNT(*) AS cnt FROM central.workflow_nodes n WHERE n.run_id = r.id GROUP BY n.state ) counted ) nc ON true WHERE r.workspace_id = $1 AND ($2::timestamptz IS NULL OR (r.created_at, r.id) < ($2::timestamptz, $3::uuid)) ORDER BY r.created_at DESC, r.id DESC LIMIT $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "run_index",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "run_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "deadline",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "ended_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "counts!",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "fc0391d30d2770e7ec78d9794fca3c824558950c71a03b37a4c7549281196c51"
+}

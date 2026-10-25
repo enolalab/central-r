@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Node {{ key }}</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body class="wide-body">
+<main>
+<h1>Node <code>{{ key }}</code></h1>
+<nav><a href="/app/runs/detail?run={{ run_id }}">Run</a> &middot; <a href="/app/runs/controls?run={{ run_id }}">Controls</a> &middot; <a href="/app/runs">Runs</a> &middot; <a href="/app/runs/fleet">Fleet</a> &middot; <a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a></nav>
+{% include "harness_banner.html" %}
+
+<section aria-labelledby="node-h">
+<h2 id="node-h">Node state</h2>
+<p>
+<span class="badge badge-{{ badge_class }}" aria-live="polite">{{ badge }}</span>
+{% if badge != status %}<span class="hint">(state <code>{{ status }}</code>)</span>{% endif %}
+{% if !not_before.is_empty() %}&mdash; not before {{ not_before }}{% endif %}
+&mdash; attempts {{ attempts }}
+</p>
+<dl>
+<dt>Node</dt><dd><code>{{ node_id }}</code></dd>
+<dt>Run</dt><dd><a href="/app/runs/detail?run={{ run_id }}"><code>{{ run_id }}</code></a></dd>
+{% if !parent_key.is_empty() %}<dt>Parent</dt><dd><code>{{ parent_key }}</code></dd>{% endif %}
+{% if !reason.is_empty() %}<dt>Reason</dt><dd>{{ reason }}</dd>{% endif %}
+<dt>Created</dt><dd>{{ created }}</dd>
+</dl>
+</section>
+
+<section aria-labelledby="attempts-h">
+<h2 id="attempts-h">Attempts</h2>
+{% if !attempt_rows.is_empty() %}
+<table>
+<thead>
+<tr>
+<th scope="col">#</th><th scope="col">State</th><th scope="col">Reason</th>
+<th scope="col">Worker</th><th scope="col">Claimed</th><th scope="col">Started</th><th scope="col">Ended</th>
+<th scope="col">Adapter</th><th scope="col">Harness</th><th scope="col">Spec</th><th scope="col">Prompt</th>
+</tr>
+</thead>
+<tbody>
+{% for a in attempt_rows %}
+<tr>
+<td>{{ a.seq }}</td>
+<td><code>{{ a.state }}</code></td>
+<td>{{ a.reason }}</td>
+<td>{% if !a.worker.is_empty() %}<code>{{ a.worker }}</code>{% endif %}</td>
+<td>{{ a.claimed }}</td>
+<td>{{ a.started }}</td>
+<td>{{ a.ended }}</td>
+<td>{{ a.adapter }}</td>
+<td>{{ a.harness }}</td>
+<td>{% if !a.spec_extras.is_empty() %}{% for e in a.spec_extras %}<code>{{ e.key }}={{ e.value }}</code> {% endfor %}{% else %}<span class="hint">not recorded</span>{% endif %}</td>
+<td>{% if !a.prompt_ref.is_empty() %}<a href="/app/tasks/artifact/preview?id={{ a.prompt_ref }}"><code>{{ a.prompt_ref }}</code></a>{% else %}<span class="hint">not recorded</span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p role="status" aria-live="polite">No session attempts recorded for this node.</p>
+{% endif %}
+</section>
+
+<section aria-labelledby="node-events-h">
+<h2 id="node-events-h">Node events</h2>
+{% if !events.is_empty() %}
+<table>
+<thead>
+<tr><th scope="col">Seq</th><th scope="col">Recorded</th><th scope="col">Kind</th><th scope="col">Actor</th><th scope="col">Reason</th><th scope="col">Detail</th></tr>
+</thead>
+<tbody>
+{% for ev in events %}
+<tr>
+<td>{{ ev.seq }}</td>
+<td>{{ ev.at }}</td>
+<td><code>{{ ev.kind }}</code></td>
+<td>{{ ev.actor }}</td>
+<td>{{ ev.reason }}</td>
+<td>{{ ev.detail }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p role="status" aria-live="polite">No journaled events reference this node.</p>
+{% endif %}
+</section>
+</main>
+</body>
+</html>

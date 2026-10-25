@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — {{ vm.action }}</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>{{ vm.action }}</h1>
+<nav>{% if !vm.run_id.is_empty() %}<a href="/app/runs/controls?run={{ vm.run_id }}">Controls</a> &middot; <a href="/app/runs/detail?run={{ vm.run_id }}">Run</a> &middot;{% endif %} <a href="/app/runs">Runs</a> &middot; <a href="/app/tasks">Tasks</a></nav>
+{% include "harness_banner.html" %}
+
+<section aria-labelledby="result-h">
+<h2 id="result-h">Result</h2>
+{% if !vm.rows.is_empty() %}
+<table>
+<thead>
+<tr><th scope="col">Subject</th><th scope="col">Verdict</th><th scope="col">Reason</th><th scope="col">Detail</th></tr>
+</thead>
+<tbody>
+{% for row in vm.rows %}
+<tr>
+<td><code>{{ row.subject }}</code></td>
+<td>{{ row.verdict }}</td>
+<td>{% if !row.reason.is_empty() %}<code>{{ row.reason }}</code>{% endif %}</td>
+<td>{{ row.detail }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p role="status" aria-live="polite">The control completed without a per-subject verdict.</p>
+{% endif %}
+
+{% if !vm.checkpoint_id.is_empty() %}
+<p>Checkpoint <code>{{ vm.checkpoint_id }}</code></p>
+{% endif %}
+{% if !vm.token.is_empty() %}
+<section aria-labelledby="token-h">
+<h3 id="token-h">Resume token</h3>
+<p><code>{{ vm.token }}</code></p>
+<p class="hint">This token resumes the checkpoint's subtree. Store it safely; it is the checkpoint's resume credential.</p>
+</section>
+{% endif %}
+{% if let Some(collected) = vm.collected %}
+<p>Collected {{ collected }} checkpoint row(s).</p>
+{% endif %}
+</section>
+</main>
+</body>
+</html>

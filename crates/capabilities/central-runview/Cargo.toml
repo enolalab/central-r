@@ -1,10 +1,19 @@
 [package]
 name = "central-runview"
-description = "Runview capability — Phase 2E DAG projections, run lineage views, fleet probes (domain.rs/port.rs/query.rs/app.rs)"
+description = "Runview capability — Phase 2E DAG projections, run lineage views, fleet probes (domain.rs/port.rs/query.rs)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+central-foundation = { path = "../../central-foundation", version = "0.1.0" }
+# Approved edge for the canonical RunEvent envelope the read seam
+# returns verbatim (rust-application-boundaries.md §2, R4 plan DAG):
+# the run view drives central-eventjournal fold/compare directly.
+central-eventjournal = { path = "../central-eventjournal", version = "0.1.0" }
+time.workspace = true
+trait-variant.workspace = true
 
 [lints]
 workspace = true

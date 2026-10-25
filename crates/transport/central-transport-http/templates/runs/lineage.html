@@ -1,0 +1,118 @@
+{% macro lineage_artifact(artifact) %}
+{%- if artifact.linkable -%}
+<a href="/app/tasks/artifact/preview?id={{ artifact.id }}"><code>{{ artifact.id }}</code></a>
+{%- else if artifact.scope_denied -%}
+<code>{{ artifact.id }}</code> <strong>scope denied</strong>
+{%- else -%}
+<code>{{ artifact.id }}</code> <span>{{ artifact.state }}</span>
+{%- endif -%}
+{% endmacro %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Central — Run lineage</title>
+<link rel="stylesheet" href="/assets/central.css">
+</head>
+<body>
+<main>
+<h1>Run lineage</h1>
+<nav><a href="/app/runs/detail?run={{ vm.run_id }}">Run</a> &middot; <a href="/app/runs">Runs</a> &middot; <a href="/app/runs/controls?run={{ vm.run_id }}">Controls</a> &middot; <a href="/app/runs/fleet">Fleet</a> &middot; <a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
+
+<p>Run: <code>{{ vm.run_id }}</code></p>
+
+{% if vm.undeclared_count > 0 %}
+<p role="alert"><strong>{{ vm.undeclared_count }} undeclared read(s) journaled</strong> &mdash; attempt-scoped reads outside the reader node's declared input set. They are flagged, never hidden.</p>
+{% endif %}
+
+{% if vm.empty %}
+<p role="status" aria-live="polite">No lineage journaled for this run yet.</p>
+{% else %}
+
+<section aria-labelledby="finals-h">
+<h2 id="finals-h">Final artifacts</h2>
+<p>Every finalized artifact of the run, traced to the node and attempt that produced it.</p>
+<table>
+<thead><tr><th scope="col">Artifact</th><th scope="col">Produced by</th><th scope="col">Attempt</th><th scope="col">Finalized</th></tr></thead>
+<tbody>
+{% for row in vm.finals %}
+<tr>
+<td>{{ lineage_artifact(row.artifact) }}</td>
+<td>{{ row.node_key }}</td>
+<td>{% if let Some(seq) = row.attempt_seq %}attempt {{ seq }}{% else %}<code>{{ row.attempt_id }}</code>{% endif %}</td>
+<td><time datetime="{{ row.when }}">{{ row.when }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+
+<section aria-labelledby="nodes-h">
+<h2 id="nodes-h">Per-node lineage</h2>
+{% for node in vm.nodes %}
+<section aria-label="Node {{ node.node_key }}">
+<h3><a href="/app/runs/node?id={{ node.node_id }}">{{ node.node_key }}</a>{% if !node.status.is_empty() %} &mdash; {{ node.status }}{% endif %}</h3>
+{% if let Some(prompt) = node.prompt_ref %}<p>Prompt: {{ lineage_artifact(prompt) }}</p>{% endif %}
+
+{% if !node.produced.is_empty() %}
+<table>
+<caption>Produced</caption>
+<thead><tr><th scope="col">Artifact</th><th scope="col">Attempt</th><th scope="col">Finalized</th></tr></thead>
+<tbody>
+{% for row in node.produced %}
+<tr>
+<td>{{ lineage_artifact(row.artifact) }}</td>
+<td>{% if let Some(seq) = row.attempt_seq %}attempt {{ seq }}{% else %}<code>{{ row.attempt_id }}</code>{% endif %}</td>
+<td><time datetime="{{ row.when }}">{{ row.when }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+{% if !node.reads.is_empty() %}
+<table>
+<caption>Read</caption>
+<thead><tr><th scope="col">Artifact</th><th scope="col">Attempt</th><th scope="col">Declaration</th><th scope="col">Checksum</th><th scope="col">Read</th></tr></thead>
+<tbody>
+{% for row in node.reads %}
+<tr>
+<td>{{ lineage_artifact(row.artifact) }}</td>
+<td>{% if let Some(seq) = row.attempt_seq %}attempt {{ seq }}{% else %}<code>{{ row.attempt_id }}</code>{% endif %}</td>
+<td>{% if row.undeclared %}<strong>Undeclared read</strong>{% else %}declared{% endif %}</td>
+<td><code>{{ row.checksum }}</code></td>
+<td><time datetime="{{ row.when }}">{{ row.when }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+{% endfor %}
+</section>
+
+{% if !vm.operator_reads.is_empty() %}
+<section aria-labelledby="operator-reads-h">
+<h2 id="operator-reads-h">Operator reads</h2>
+<p>Reads journaled outside any node context, attributed to the operator reader.</p>
+<table>
+<thead><tr><th scope="col">Artifact</th><th scope="col">Checksum</th><th scope="col">Read</th></tr></thead>
+<tbody>
+{% for row in vm.operator_reads %}
+<tr>
+<td>{{ lineage_artifact(row.artifact) }}</td>
+<td><code>{{ row.checksum }}</code></td>
+<td><time datetime="{{ row.when }}">{{ row.when }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+
+{% endif %}
+</main>
+</body>
+</html>

@@ -9,7 +9,8 @@
 <body class="wide-body">
 <main>
 <h1>Runs</h1>
-<nav><a href="/app/tasks">Tasks</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/office">Office</a> &middot; <a href="/app/activity">Activity</a></nav>
+<nav><a href="/app/tasks">Tasks</a> &middot; <a href="/app/runs/fleet">Fleet</a> &middot; <a href="/app/overview">Overview</a> &middot; <a href="/app/office">Office</a> &middot; <a href="/app/activity">Activity</a></nav>
+{% include "harness_banner.html" %}
 {% if can_submit %}
 <section aria-labelledby="run-submit-heading">
 <h2 id="run-submit-heading">Submit a run</h2>
@@ -24,7 +25,41 @@
 </form>
 </section>
 {% endif %}
-<p class="hint">The workspace run census lands with the R4 run views.</p>
+
+{% if empty %}
+<p role="status" aria-live="polite">No runs recorded for this workspace yet.</p>
+{% else %}
+<table>
+<caption class="visually-hidden">Workspace runs, newest first</caption>
+<thead>
+<tr>
+<th scope="col">Run</th>
+<th scope="col">Task</th>
+<th scope="col">#</th>
+<th scope="col">Status</th>
+<th scope="col">Nodes</th>
+<th scope="col">Created</th>
+<th scope="col">Started</th>
+<th scope="col">Ended</th>
+</tr>
+</thead>
+<tbody aria-live="polite">
+{% for row in rows %}
+<tr>
+<td><a href="/app/runs/detail?run={{ row.id }}"><code>{{ row.id }}</code></a>{% if !row.run_key.is_empty() %}<br><span class="hint">key <code>{{ row.run_key }}</code></span>{% endif %}</td>
+<td><a href="/app/tasks/detail?id={{ row.task_id }}"><code>{{ row.task_id }}</code></a></td>
+<td>{{ row.index }}</td>
+<td><span class="badge badge-{{ row.status }}">{{ row.status }}</span><br><span>{{ row.label }}</span></td>
+<td>{% if !row.counts.is_empty() %}{% for chip in row.counts %}<span class="badge badge-{{ chip.state }}">{{ chip.state }} {{ chip.count }}</span> {% endfor %}{% else %}<span class="hint">no workflow nodes</span>{% endif %}</td>
+<td>{{ row.created }}</td>
+<td>{{ row.started }}</td>
+<td>{{ row.ended }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% if !next_cursor.is_empty() %}<p><a href="/app/runs?cursor={{ next_cursor }}">Older runs</a></p>{% endif %}
+{% endif %}
 </main>
 </body>
 </html>

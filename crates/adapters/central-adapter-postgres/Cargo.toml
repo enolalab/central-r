@@ -18,6 +18,7 @@ central-execution = { path = "../../capabilities/central-execution", version = "
 central-eventjournal = { path = "../../capabilities/central-eventjournal", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }
 central-retry = { path = "../../capabilities/central-retry", version = "0.1.0" }
+central-runview = { path = "../../capabilities/central-runview", version = "0.1.0" }
 central-scheduler = { path = "../../capabilities/central-scheduler", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
 central-workflow = { path = "../../capabilities/central-workflow", version = "0.1.0" }

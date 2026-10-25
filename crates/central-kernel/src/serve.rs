@@ -170,6 +170,11 @@ pub const ENV_OBJECT_REGION: &str = "CENTRAL_ARTIFACT_OBJECT_REGION";
 /// `CENTRAL_ARTIFACT_OBJECT_USE_TLS`.
 pub const ENV_OBJECT_TLS: &str = "CENTRAL_ARTIFACT_OBJECT_USE_TLS";
 
+/// `CENTRAL_PHASE2_SCHEDULER` — `1` enables the Phase-2 scheduler stack
+/// (upstream `envSchedulerEnabled`). Unset/anything else keeps it off;
+/// the fleet page renders residual rows under the disabled notice.
+pub const ENV_PHASE2_SCHEDULER: &str = "CENTRAL_PHASE2_SCHEDULER";
+
 /// Every config failure carries this code so `serve` classifies the
 /// refusal `CONFIG_INVALID` (upstream `compositionExit`).
 pub const ERR_SERVE_CONFIG: &str = "serve_config_invalid";
@@ -265,6 +270,9 @@ pub struct ServeConfig {
     /// The `CENTRAL_RECOVERY_RESUME` acknowledgement (harness phase
     /// 3f decisions 3–11).
     pub recovery_resume: Option<RecoveryResumeAck>,
+    /// `CENTRAL_PHASE2_SCHEDULER` — the fleet page's residual-rows
+    /// notice gate (upstream `h.schedulerEnabled`).
+    pub scheduler_enabled: bool,
 }
 
 impl ServeConfig {
@@ -339,6 +347,7 @@ impl ServeConfig {
             profile: ProfileConfig::default(),
             pool_max,
             recovery_resume,
+            scheduler_enabled: getenv(ENV_PHASE2_SCHEDULER).as_deref() == Some("1"),
         })
     }
 }
@@ -2579,6 +2588,20 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         }),
         None => Arc::new(UnconfiguredArtifactDelivery),
     };
+    // R4 task 11 (issue #96 slice 2E): the runview read store backs
+    // both the `RunsReader` and `FleetReader` ports (upstream's
+    // `pgrunview.Store` is a superset); the lineage composite joins it
+    // with the artifact lineage store (`runLineageBackend`), and the
+    // control ports ride the workflow + checkpoint stores. Each port
+    // gets its own store instance over the shared pool — upstream
+    // wires the same `*Store` to several fields, Rust needs one `Arc`
+    // per trait-object type.
+    let runs_reader: Arc<dyn tports::RunsReader> =
+        Arc::new(central_adapter_postgres::runview::Store::new(pool.clone()));
+    let fleet_reader: Arc<dyn tports::FleetReader> =
+        Arc::new(central_adapter_postgres::runview::Store::new(pool.clone()));
+    let lineage_store = central_adapter_postgres::artifact::Store::new(pool.clone());
+    let lineage_runs = central_adapter_postgres::runview::Store::new(pool.clone());
     let web_state = Arc::new(WebState {
         readiness: Arc::new(KernelProbe {
             readiness: readiness.clone(),
@@ -2590,6 +2613,23 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         turn_activity: None,
         harness: Some(operator.clone()),
         run_submitter: Some(run_submitter),
+        runs: Some(runs_reader),
+        fleet: Some(fleet_reader),
+        run_lineage: Some(Arc::new(tports::RunLineageBackend {
+            runs: lineage_runs,
+            lineage: lineage_store,
+        })),
+        controls: tports::RunControlPorts {
+            canceller: Some(Arc::new(PgWorkflowStore::new(pool.clone()))),
+            resolver: Some(Arc::new(PgWorkflowStore::new(pool.clone()))),
+            resumer: Some(Arc::new(central_adapter_postgres::checkpoint::Store::new(
+                pool.clone(),
+            ))),
+            checkpoints: Some(Arc::new(central_adapter_postgres::checkpoint::Store::new(
+                pool.clone(),
+            ))),
+        },
+        scheduler_enabled: config.scheduler_enabled,
         workspace: config.workspace,
         allowed_roots: config.allowed_roots.clone(),
         epoch_source: epoch_source.clone(),

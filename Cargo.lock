@@ -718,6 +718,7 @@ dependencies = [
  "central-harness",
  "central-retry",
  "central-runsubmit",
+ "central-runview",
  "central-scheduler",
  "central-session",
  "central-task",
@@ -951,6 +952,12 @@ dependencies = [
 [[package]]
 name = "central-runview"
 version = "0.1.0"
+dependencies = [
+ "central-eventjournal",
+ "central-foundation",
+ "time",
+ "trait-variant",
+]
 
 [[package]]
 name = "central-scheduler"
@@ -992,9 +999,13 @@ dependencies = [
  "askama",
  "axum",
  "central-artifact",
+ "central-checkpoint",
+ "central-eventjournal",
  "central-execution",
  "central-foundation",
  "central-runsubmit",
+ "central-runview",
+ "central-scheduler",
  "central-session",
  "central-task",
  "central-workflow",

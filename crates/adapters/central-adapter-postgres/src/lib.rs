@@ -31,6 +31,7 @@ pub mod eventjournal;
 pub mod execution;
 pub mod harness;
 pub mod migrate;
+pub mod runview;
 pub mod scheduler;
 pub mod serve_support;
 pub mod session;

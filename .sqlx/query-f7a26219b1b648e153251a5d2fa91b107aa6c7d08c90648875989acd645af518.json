@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, protocol_version, harness_kinds, workspace_kinds, max_concurrent_attempts, state, registered_at, last_seen_at, (EXTRACT(EPOCH FROM (now() - last_seen_at)))::bigint AS beat_age_seconds, deregistered_at FROM central.worker_registrations WHERE workspace_id = $1 ORDER BY registered_at, id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "protocol_version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "harness_kinds",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "workspace_kinds",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_concurrent_attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "registered_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "beat_age_seconds",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "deregistered_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      true
+    ]
+  },
+  "hash": "f7a26219b1b648e153251a5d2fa91b107aa6c7d08c90648875989acd645af518"
+}

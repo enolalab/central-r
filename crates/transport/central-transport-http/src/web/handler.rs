@@ -662,7 +662,7 @@ async fn harness_resolve(
 
 /// `harnessBanner` — the banner every `/app` page renders; absent
 /// operator surface means no banner.
-async fn harness_banner(
+pub(crate) async fn harness_banner(
     state: &WebState,
     workspace_id: central_foundation::identity::WorkspaceId,
 ) -> harness::HarnessBannerView {
@@ -726,7 +726,7 @@ async fn claimability(
 
 /// One `key=value` query parameter (the detail/artifact routes use
 /// query-parameter addressing, matching upstream).
-fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=')
             && k == key

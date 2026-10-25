@@ -9,10 +9,15 @@ publish.workspace = true
 [dependencies]
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-artifact = { path = "../../capabilities/central-artifact", version = "0.1.0" }
+central-checkpoint = { path = "../../capabilities/central-checkpoint", version = "0.1.0" }
+central-eventjournal = { path = "../../capabilities/central-eventjournal", version = "0.1.0" }
 central-execution = { path = "../../capabilities/central-execution", version = "0.1.0" }
+central-runview = { path = "../../capabilities/central-runview", version = "0.1.0" }
+central-scheduler = { path = "../../capabilities/central-scheduler", version = "0.1.0" }
 central-session = { path = "../../capabilities/central-session", version = "0.1.0" }
 central-task = { path = "../../capabilities/central-task", version = "0.1.0" }
 central-runsubmit = { path = "../../capabilities/central-runsubmit", version = "0.1.0" }
+central-workflow = { path = "../../capabilities/central-workflow", version = "0.1.0" }
 askama.workspace = true
 axum.workspace = true
 prometheus-client.workspace = true
