@@ -62,9 +62,16 @@ pub fn authenticate(username: &str, secret: &[u8]) -> Result<(), Failure> {
 /// hard-coding it into the production path's call sites; production
 /// callers use [`authenticate`].
 ///
+/// `pub(crate)` until a cross-crate caller exists — the service name
+/// is not part of the exported surface.
+///
 /// # Errors
 /// As [`authenticate`].
-pub fn authenticate_service(service: &str, username: &str, secret: &[u8]) -> Result<(), Failure> {
+pub(crate) fn authenticate_service(
+    service: &str,
+    username: &str,
+    secret: &[u8],
+) -> Result<(), Failure> {
     // Upstream checks emptiness before building the C strings: the
     // refusal is "the credential was never collected", and folding it
     // into the PAM result would make a collection failure read as an
@@ -87,17 +94,20 @@ pub fn authenticate_service(service: &str, username: &str, secret: &[u8]) -> Res
     let user = cstring("username", username.as_bytes())?;
     // Zeroizing wraps the allocation: the secret is wiped on every
     // return path, panic included — the FFI call below is the only
-    // place it is ever exposed. The NUL terminator is appended in
-    // place and the buffer borrowed as a CStr, so no un-wiped copy of
+    // place it is ever exposed. The buffer is sized for the NUL
+    // terminator up front — a growth realloc would abandon a copy of
+    // the cleartext in the freed allocation — so no un-wiped copy of
     // the password exists.
-    let mut secret = Zeroizing::new(secret.to_vec());
-    if secret.contains(&0) {
+    let mut buf = Zeroizing::new(Vec::with_capacity(secret.len() + 1));
+    buf.extend_from_slice(secret);
+    if buf.contains(&0) {
         return Err(Failure::invalid(
             "sys_pam_credential",
             "pam: password cannot be carried in a C string",
         ));
     }
-    secret.push(0);
+    buf.push(0);
+    let secret = buf;
     let secret = CStr::from_bytes_with_nul(secret.as_slice()).map_err(|_| {
         Failure::invalid(
             "sys_pam_credential",
