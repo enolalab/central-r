@@ -10,7 +10,11 @@
 //!   stable CLI exit-class mappings, and the structured `Failure` carrier.
 //! - [`local_result`]: the `central.local-result/v1` operator-result
 //!   envelope every `central` command emits exactly once on stdout.
+//! - [`jcs`]: RFC 8785 JSON canonicalization (Phase R5 D6 — hand-written
+//!   over `serde_json::Value`, byte-compatible with upstream
+//!   `gowebpki/jcs`).
 
 pub mod failure;
 pub mod identity;
+pub mod jcs;
 pub mod local_result;
