@@ -1157,7 +1157,8 @@ pub fn handle_conn(conn: std::os::unix::net::UnixStream, svc: &Service) -> Resul
                 // way: at most `MAX_REQUEST_LINE + 1` bytes accumulate
                 // before the too-long check refuses, instead of
                 // `read_until` buffering unboundedly first.
-                let mut limited = reader.take((MAX_REQUEST_LINE + 1 - line.len()) as u64);
+                let mut limited =
+                    reader.take((MAX_REQUEST_LINE + 1).saturating_sub(line.len()) as u64);
                 match limited.read_until(b'\n', &mut line) {
                     Err(e) => {
                         return Err(Failure::internal(
