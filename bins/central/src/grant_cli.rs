@@ -314,35 +314,17 @@ impl std::fmt::Display for GenesisProbe {
     }
 }
 
+/// The T13 classifier itself — `productionGenesisEnv().state()`
+/// verbatim, replacing the pre-T13 path-shape approximation this
+/// probe used to carry.
 fn probe_genesis_state() -> GenesisProbe {
-    use modes::{
-        GENESIS_ANCESTORS, GENESIS_PROTECTED_INSTANCES, GENESIS_PROTECTED_ROOT,
-        GENESIS_STATE_INSTANCES, empty_genesis_root_or_missing, genesis_ancestor_ok,
-        genesis_dir_missing_or_root_0700,
-    };
-    for path in GENESIS_ANCESTORS {
-        if !genesis_ancestor_ok(path) {
-            return GenesisProbe::Broken;
-        }
-    }
-    if !genesis_dir_missing_or_root_0700(GENESIS_PROTECTED_ROOT) {
-        return GenesisProbe::Broken;
-    }
-    let state_empty = match empty_genesis_root_or_missing(GENESIS_STATE_INSTANCES) {
-        Some(empty) => empty,
-        None => return GenesisProbe::Broken,
-    };
-    let protected_empty = match empty_genesis_root_or_missing(GENESIS_PROTECTED_INSTANCES) {
-        Some(empty) => empty,
-        None => return GenesisProbe::Broken,
-    };
-    match (state_empty, protected_empty) {
-        (true, true) => GenesisProbe::Absent,
-        // "protected state … has no state instance" and the converse
-        // (the instance's protected root could not resolve) are both
-        // upstream's broken branch.
-        (true, false) | (false, true) => GenesisProbe::Broken,
-        (false, false) => GenesisProbe::Present,
+    match central_adapter_linux::genesis::GenesisEnv::production()
+        .state()
+        .0
+    {
+        central_adapter_linux::genesis::GenesisState::Absent => GenesisProbe::Absent,
+        central_adapter_linux::genesis::GenesisState::Present => GenesisProbe::Present,
+        central_adapter_linux::genesis::GenesisState::Broken => GenesisProbe::Broken,
     }
 }
 

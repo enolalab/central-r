@@ -25,6 +25,8 @@ pub mod module_cache;
 pub mod oci;
 pub mod release_stage;
 pub mod service;
+pub mod store;
+pub mod version_zero;
 
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -56,6 +58,8 @@ pub use release_stage::{
     stage_release_dir,
 };
 pub use service::{PrepareService, new_prepare_handler};
+pub use store::CandidateStore;
+pub use version_zero::{VERSION_ZERO_SELECTOR, ensure_version_zero_receipt};
 
 /// Adapter-side machine codes for the fetch path (upstream
 /// `internal/adapter/dependencyprepare`'s `ErrFetch*` sentinels).

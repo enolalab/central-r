@@ -31,12 +31,15 @@
 //!   the protected daemon's denial matrix (R5 task 9 / A06).
 
 #[forbid(unsafe_code)]
+pub mod backup_repository;
 pub mod broker;
 pub mod dev_bootstrap;
 #[forbid(unsafe_code)]
 pub mod dev_restore_barrier;
 #[forbid(unsafe_code)]
 pub mod dispatch_provision;
+#[forbid(unsafe_code)]
+pub mod genesis;
 #[forbid(unsafe_code)]
 pub mod group_signals;
 pub mod helper;

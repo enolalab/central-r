@@ -56,6 +56,12 @@ pub struct ProductionInstanceComposition {
     /// The instance's validated identity — the directory name,
     /// `InstanceId`-parsed and config-verified.
     pub instance_id: String,
+    /// `<instances_root>/<instance_id>` — upstream
+    /// `productionInstanceComposition.AuthoritativeStateRoot`.
+    pub authoritative_state_root: String,
+    /// `<authoritative_state_root>/dependencies` — upstream's
+    /// `DependencyRoot`, where the active dependency receipt lives.
+    pub dependency_root: String,
 }
 
 /// `filepath.IsAbs(path) && filepath.Clean(path) == path` — absolute
@@ -189,7 +195,11 @@ pub fn load_production_instance_composition_for_owner(
     {
         return Err(INSTANCE_UNAVAILABLE);
     }
-    Ok(ProductionInstanceComposition { instance_id })
+    Ok(ProductionInstanceComposition {
+        instance_id,
+        authoritative_state_root: state_root.clone(),
+        dependency_root: format!("{state_root}/dependencies"),
+    })
 }
 
 /// `resolveProductionInstanceComposition` — the production owners
@@ -788,6 +798,8 @@ mod tests {
         let id = InstanceId::new().to_string();
         let comp = ProductionInstanceComposition {
             instance_id: id.clone(),
+            authoritative_state_root: String::new(),
+            dependency_root: String::new(),
         };
         // Missing root.
         let err =

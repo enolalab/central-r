@@ -24,6 +24,22 @@ use crate::modes;
 
 /// Upstream `InitHintStartHelper` (internal/command/init.go).
 const INIT_HINT_START_HELPER: &str = "central local init: the helper is not reachable; start it with: sudo systemctl start central-helper.socket";
+/// Upstream `InitHintBrokenHost`.
+const INIT_HINT_BROKEN_HOST: &str = "central local init: this host holds partial Central state under /var/lib/central-state/v1/instances or /var/lib/central-protected/v1/instances; journalctl -u central-helper names it";
+/// Upstream `InitHintCapacity`.
+const INIT_HINT_CAPACITY: &str = "central local init: the filesystem of /var/lib/central-state needs 40 GiB free; nothing was written";
+/// Upstream `InitHintConsole`.
+const INIT_HINT_CONSOLE: &str = "central local init: run it as the operator at this machine's physical console (a VT or serial console, not SSH) and answer the PAM and CONFIRM prompts there; on a host with no console, root can authorize one run over SSH first: sudo central grant issue --kind init --ttl 10m";
+/// Upstream `InitHintConfirmationMismatch`.
+const INIT_HINT_CONFIRMATION_MISMATCH: &str = "central local init: the typed phrase did not match the one shown, twice; nothing was created. At the physical console, turn off any input method (plain keyboard layout), run central local init again and type the phrase exactly as shown";
+/// Upstream `InitHintInspect`.
+const INIT_HINT_INSPECT: &str = "central local init: initialization failed; the console where you confirmed shows either the paths to remove as root or that nothing is to be removed (then run central local init again); if it showed neither, check ls /var/lib/central-state/v1/instances /var/lib/central-protected/v1/instances as root before retrying";
+/// Upstream `InitHintNoAnswer`.
+const INIT_HINT_NO_ANSWER: &str = "central local init: the helper closed the connection without answering; check journalctl -u central-helper, and start it with: sudo systemctl start central-helper.socket";
+/// Upstream `InitHintUnconfirmed`.
+const INIT_HINT_UNCONFIRMED: &str = "central local init: the instance may have been created but could not be confirmed; remove nothing, and run central local status or central local init again";
+/// Upstream `InitHintUntrusted`.
+const INIT_HINT_UNTRUSTED: &str = "central local init: the helper's answer could not be trusted; run central local init again to learn whether the instance exists, and check journalctl -u central-helper";
 
 /// The null UUID upstream refuses for `--resume` (prepare.go).
 const NULL_UUID: &str = "00000000-0000-0000-0000-000000000000";
@@ -166,12 +182,86 @@ fn parse_init_args(tokens: &[String]) -> Result<&'static str, String> {
     }
 }
 
-/// Ports `runInit` + the nil-client `runBareInit` branch: grammar
-/// errors are `INVALID_INVOCATION` at exit 2 under the `local.init`
-/// command id; the flag forms keep their own ids in the deferred
-/// envelope; the bare form fails closed `HELPER_UNAVAILABLE` at exit
-/// 3 with the upstream hint on stderr (the helper client lands in
-/// T6).
+/// `mapHelperInitError` — the helper's exit class and whitelisted
+/// reason mapped to the contract's `(exit class, reason, hint)`
+/// (§7.4). A broken host is `HELPER_UNAVAILABLE` exit 3, as an
+/// unreachable helper is, with a hint that names the instance roots.
+fn map_helper_init_error(
+    err: &central_adapter_linux::helper::init::InitClientError,
+) -> (ExitClass, &'static str, &'static str) {
+    use central_adapter_linux::helper::init::*;
+    if err.no_answer {
+        return (
+            ExitClass::Unavailable,
+            "HELPER_UNAVAILABLE",
+            INIT_HINT_NO_ANSWER,
+        );
+    }
+    if err.untrusted {
+        return (ExitClass::Terminal, "MUTATION_FAILED", INIT_HINT_UNTRUSTED);
+    }
+    match err.reason.as_str() {
+        INIT_REASON_HELPER_UNAVAILABLE => (
+            ExitClass::Unavailable,
+            "HELPER_UNAVAILABLE",
+            INIT_HINT_START_HELPER,
+        ),
+        INIT_REASON_INSTANCE_BROKEN => (
+            ExitClass::Unavailable,
+            "HELPER_UNAVAILABLE",
+            INIT_HINT_BROKEN_HOST,
+        ),
+        INIT_REASON_CAPACITY => (
+            ExitClass::Timeout,
+            "CAPACITY_INSUFFICIENT",
+            INIT_HINT_CAPACITY,
+        ),
+        INIT_REASON_LOCK_TIMEOUT => (ExitClass::Timeout, "LOCK_TIMEOUT", ""),
+        INIT_REASON_AUTHORITY_DENIED => (ExitClass::Denied, "AUTHORITY_DENIED", INIT_HINT_CONSOLE),
+        INIT_REASON_CONFIRMATION_MISMATCH => {
+            // The contract's reason stays AUTHORITY_DENIED; the hint
+            // differs, because the operator was at the console and
+            // mistyped (install D1 decision 2).
+            (
+                ExitClass::Denied,
+                "AUTHORITY_DENIED",
+                INIT_HINT_CONFIRMATION_MISMATCH,
+            )
+        }
+        INIT_REASON_MUTATION_FAILED => (ExitClass::Terminal, "MUTATION_FAILED", INIT_HINT_INSPECT),
+        INIT_REASON_INVALID_REQUEST => (ExitClass::Usage, "INVALID_INVOCATION", ""),
+        INIT_REASON_UNCONFIRMED => {
+            // The contract's reason stays MUTATION_FAILED; the hint
+            // differs, because there is nothing to remove.
+            (
+                ExitClass::Terminal,
+                "MUTATION_FAILED",
+                INIT_HINT_UNCONFIRMED,
+            )
+        }
+        _ => match err.exit_code {
+            // An unknown reason keeps its exit class.
+            2 => (ExitClass::Usage, "INVALID_INVOCATION", ""),
+            3 => (
+                ExitClass::Unavailable,
+                "HELPER_UNAVAILABLE",
+                INIT_HINT_START_HELPER,
+            ),
+            4 => (ExitClass::Timeout, "LOCK_TIMEOUT", ""),
+            5 => (ExitClass::Incompatible, "UNSUPPORTED_IN_THIS_SLICE", ""),
+            7 => (ExitClass::Denied, "AUTHORITY_DENIED", INIT_HINT_CONSOLE),
+            _ => (ExitClass::Terminal, "MUTATION_FAILED", INIT_HINT_INSPECT),
+        },
+    }
+}
+
+/// Ports `runInit` + `runBareInit`: grammar errors are
+/// `INVALID_INVOCATION` at exit 2 under the `local.init` command id;
+/// the flag forms keep their own ids in the deferred envelope; the
+/// bare form dials the helper through the real [`InitClient`]
+/// (`installInitClient`'s composition — `CENTRAL_HELPER_SOCKET` or
+/// the production socket) and maps the answer through
+/// [`map_helper_init_error`].
 fn run_init(tokens: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
     let form = match parse_init_args(tokens) {
         Ok(form) => form,
@@ -200,17 +290,49 @@ fn run_init(tokens: &[String], stdout: &mut impl Write, stderr: &mut impl Write)
             None,
         );
     }
-    // No init client is installed this slice — upstream's nil-client
-    // branch: hint on stderr, HELPER_UNAVAILABLE envelope at exit 3.
-    let _ = writeln!(stderr, "{INIT_HINT_START_HELPER}");
-    emit(
-        "local.init",
-        stdout,
-        stderr,
-        ExitClass::Unavailable,
-        Some("HELPER_UNAVAILABLE"),
-        None,
-    )
+    let socket_path = std::env::var("CENTRAL_HELPER_SOCKET").unwrap_or_else(|_| {
+        central_adapter_linux::helper::client::PRODUCTION_SOCKET_PATH.to_owned()
+    });
+    let client = central_adapter_linux::helper::init::InitClient::new(socket_path);
+    run_bare_init(&client, stdout, stderr)
+}
+
+/// `runBareInit` — one minted operation id, one `Init` call, then
+/// either the three-ID success detail or the mapped failure.
+fn run_bare_init(
+    client: &central_adapter_linux::helper::init::InitClient,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    let operation_id = central_foundation::identity::OperationId::new().to_string();
+    match client.init(&operation_id) {
+        Ok(result) => {
+            let reason = if result.already_initialized {
+                "ALREADY_INITIALIZED"
+            } else {
+                "ok"
+            };
+            emit(
+                "local.init",
+                stdout,
+                stderr,
+                ExitClass::Success,
+                Some(reason),
+                Some(serde_json::json!({
+                    "instance_id": result.instance_id,
+                    "config_binding_id": result.config_binding_id,
+                    "init_operation_id": result.init_operation_id,
+                })),
+            )
+        }
+        Err(err) => {
+            let (class, reason, hint) = map_helper_init_error(&err);
+            if !hint.is_empty() {
+                let _ = writeln!(stderr, "{hint}");
+            }
+            emit("local.init", stdout, stderr, class, Some(reason), None)
+        }
+    }
 }
 
 // -- `local up|down|status` ----------------------------------------------
@@ -736,7 +858,18 @@ mod tests {
 
     #[test]
     fn init_bare_is_helper_unavailable_exit_3() {
-        let (code, stdout, stderr) = invoke("local.init", &[]);
+        // A socket nothing listens on — the production shape an
+        // absent host takes without systemd, deterministic on any
+        // machine.
+        let client =
+            central_adapter_linux::helper::init::InitClient::new("/nonexistent-central-init.sock");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_bare_init(&client, &mut out, &mut err);
+        let (stdout, stderr) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
         assert_eq!(code, 3);
         assert_eq!(stderr, format!("{INIT_HINT_START_HELPER}\n"));
         let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
@@ -745,6 +878,124 @@ mod tests {
         assert_eq!(parsed["exit_code"], 3);
         assert_eq!(parsed["reason"], "HELPER_UNAVAILABLE");
         assert!(parsed.get("details").is_none());
+    }
+
+    /// `mapHelperInitError` — the whole upstream reason→contract
+    /// table: helper-class reasons keep their exit class, the two
+    /// re-reasoned cases (`CONFIRMATION_MISMATCH`,
+    /// `INIT_UNCONFIRMED`) carry their distinct hints, and the
+    /// unknown-reason fallback keeps the exit class.
+    #[test]
+    fn map_helper_init_error_table() {
+        use central_adapter_linux::helper::init::*;
+        let err = |exit_code: i64, reason: &str| InitClientError {
+            exit_code,
+            reason: reason.to_owned(),
+            no_answer: false,
+            untrusted: false,
+        };
+        for (given, want) in [
+            (
+                err(3, INIT_REASON_HELPER_UNAVAILABLE),
+                (
+                    ExitClass::Unavailable,
+                    "HELPER_UNAVAILABLE",
+                    INIT_HINT_START_HELPER,
+                ),
+            ),
+            (
+                err(3, INIT_REASON_INSTANCE_BROKEN),
+                (
+                    ExitClass::Unavailable,
+                    "HELPER_UNAVAILABLE",
+                    INIT_HINT_BROKEN_HOST,
+                ),
+            ),
+            (
+                err(4, INIT_REASON_CAPACITY),
+                (
+                    ExitClass::Timeout,
+                    "CAPACITY_INSUFFICIENT",
+                    INIT_HINT_CAPACITY,
+                ),
+            ),
+            (
+                err(4, INIT_REASON_LOCK_TIMEOUT),
+                (ExitClass::Timeout, "LOCK_TIMEOUT", ""),
+            ),
+            (
+                err(7, INIT_REASON_AUTHORITY_DENIED),
+                (ExitClass::Denied, "AUTHORITY_DENIED", INIT_HINT_CONSOLE),
+            ),
+            (
+                err(7, INIT_REASON_CONFIRMATION_MISMATCH),
+                (
+                    ExitClass::Denied,
+                    "AUTHORITY_DENIED",
+                    INIT_HINT_CONFIRMATION_MISMATCH,
+                ),
+            ),
+            (
+                err(6, INIT_REASON_MUTATION_FAILED),
+                (ExitClass::Terminal, "MUTATION_FAILED", INIT_HINT_INSPECT),
+            ),
+            (
+                err(2, INIT_REASON_INVALID_REQUEST),
+                (ExitClass::Usage, "INVALID_INVOCATION", ""),
+            ),
+            (
+                err(6, INIT_REASON_UNCONFIRMED),
+                (
+                    ExitClass::Terminal,
+                    "MUTATION_FAILED",
+                    INIT_HINT_UNCONFIRMED,
+                ),
+            ),
+            // Unknown reason → the exit class fallback table.
+            (
+                err(2, "BOGUS"),
+                (ExitClass::Usage, "INVALID_INVOCATION", ""),
+            ),
+            (
+                err(3, "BOGUS"),
+                (
+                    ExitClass::Unavailable,
+                    "HELPER_UNAVAILABLE",
+                    INIT_HINT_START_HELPER,
+                ),
+            ),
+            (err(4, "BOGUS"), (ExitClass::Timeout, "LOCK_TIMEOUT", "")),
+            (
+                err(5, "BOGUS"),
+                (ExitClass::Incompatible, "UNSUPPORTED_IN_THIS_SLICE", ""),
+            ),
+            (
+                err(7, "BOGUS"),
+                (ExitClass::Denied, "AUTHORITY_DENIED", INIT_HINT_CONSOLE),
+            ),
+            (
+                err(9, "BOGUS"),
+                (ExitClass::Terminal, "MUTATION_FAILED", INIT_HINT_INSPECT),
+            ),
+        ] {
+            assert_eq!(map_helper_init_error(&given), want, "{:?}", given.reason);
+        }
+        let mut no_answer = err(6, "");
+        no_answer.no_answer = true;
+        assert_eq!(
+            map_helper_init_error(&no_answer),
+            (
+                ExitClass::Unavailable,
+                "HELPER_UNAVAILABLE",
+                INIT_HINT_NO_ANSWER
+            )
+        );
+        let mut untrusted = err(0, "");
+        untrusted.untrusted = true;
+        assert_eq!(
+            map_helper_init_error(&untrusted),
+            (ExitClass::Terminal, "MUTATION_FAILED", INIT_HINT_UNTRUSTED)
+        );
     }
 
     #[test]

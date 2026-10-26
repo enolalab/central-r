@@ -7,21 +7,22 @@
 //! What this slice composes is deliberately the protocol shell: the
 //! peer and socket policies, the closed matrix, the genesis transport
 //! (init admitted, everything else denied), and `prepare`'s explicit
-//! unavailable answer. The handlers that need the T13 genesis core,
-//! the infralifecycle service, the advisory evaluator, or the broker
-//! are the later tasks' composition; their verbs keep upstream's
+//! unavailable answer. `init` is real on both branches — the genesis
+//! handler on an absent host, the present-instance answer on the
+//! ordinary server (R5 T13). The handlers that need the
+//! infralifecycle service, the advisory evaluator, or the broker are
+//! the later tasks' composition; their verbs keep upstream's
 //! unconfigured-handler answers, never a made-up success.
 
-use super::PeerIdentity;
 use super::client::PRODUCTION_SOCKET_PATH;
-use super::init::{INIT_REASON_HELPER_UNAVAILABLE, InitHandler, InitRequest, new_init_denial};
+use super::init::{GenesisInitHandler, PresentInitHandler};
+use super::pam_ceremony::PamConfirmer;
 use super::prepare::UnavailablePrepareHandler;
-use super::protocol::Response;
 use super::server::{GenesisServer, PeerPolicy, Server, SocketPolicy, serve, serve_genesis};
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// `helperPeerPolicyFromEnvironment` — operator ids from
 /// `CENTRAL_OPERATOR_UID`/`CENTRAL_OPERATOR_GID` (nonzero `ParseUint`
@@ -78,20 +79,6 @@ pub fn helper_socket_path(env: &dyn Fn(&str) -> Option<String>) -> String {
         .unwrap_or_else(|| PRODUCTION_SOCKET_PATH.to_owned())
 }
 
-/// The init answer the genesis transport installs before the T13
-/// genesis core exists: `HELPER_UNAVAILABLE` at exit 3, the closed
-/// refusal upstream's `helperUnavailable` class produces. The
-/// transport — admission, the init-only allowlist, the stop rules —
-/// is real; the genesis core it would call is the deferred part.
-struct UnavailableInitHandler;
-
-impl InitHandler for UnavailableInitHandler {
-    fn init(&self, _peer: PeerIdentity, _deadline: Instant, request: InitRequest) -> Response {
-        let _ = &request;
-        new_init_denial(&request.operation_id, 3, INIT_REASON_HELPER_UNAVAILABLE)
-    }
-}
-
 /// The daemon's shared accept-loop budget — `60 * time.Second`,
 /// upstream's `Serve(ctx, 3, srv, 60*time.Second)`.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -144,10 +131,16 @@ pub fn run_helper_daemon(
         }
     };
     if genesis_absent {
+        // `newGenesisHelperServer`: the physical-TTY confirmer
+        // (`NewPAMConfirmer` directly — the instance ceremony store
+        // does not exist yet), the physical console, and the genesis
+        // grant store under the protected root.
         let srv = Arc::new(GenesisServer {
             peer_policy: Some(peer),
             socket: Some(socket),
-            init: Box::new(UnavailableInitHandler),
+            init: Box::new(GenesisInitHandler::production(
+                Box::new(PamConfirmer::new()),
+            )),
             auditor: None,
         });
         if let Err(e) = serve_genesis(listen, &srv, IDLE_TIMEOUT, cancel) {
@@ -169,6 +162,10 @@ pub fn run_helper_daemon(
         // seam), so the handler stays the explicit refusal until that
         // composition can complete — upstream's rule verbatim.
         prepare: Some(Box::new(UnavailablePrepareHandler)),
+        // `newPresentInitHandler` — the ordinary server's init:
+        // the resolved instance's three IDs with no ceremony and no
+        // mutation.
+        init: Some(Box::new(PresentInitHandler::production())),
         // `lifecycle` stays unset for the same dependency-chain reason,
         // one link deeper: `infra::lifecycle::new_production_service`
         // needs (1) the B01 advisory evaluator — the same deferred seam

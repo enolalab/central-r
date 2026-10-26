@@ -301,11 +301,20 @@ mod tests {
     #[test]
     fn write_value_closes_fd_on_success() {
         use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt as _;
         let fd = empty_memfd_0400();
         let raw = fd.as_raw_fd();
+        let orig_inode = rustix::fs::fstat(&fd).expect("fstat memfd").st_ino;
         write_value_to_descriptor(fd, b"secret").expect("write");
         // The descriptor number is closed — /proc self lookup fails.
-        assert!(std::fs::File::open(format!("/proc/self/fd/{raw}")).is_err());
+        // Under parallel tests the number can be reassigned to an
+        // unrelated open before the lookup runs, so a resolving
+        // lookup is only a failure when it still names this memfd
+        // (same inode); anything else is reuse, not a leaked fd.
+        if let Ok(f) = std::fs::File::open(format!("/proc/self/fd/{raw}")) {
+            let inode = f.metadata().expect("fd metadata").ino();
+            assert_ne!(inode, orig_inode, "memfd {orig_inode} is still open at fd {raw}");
+        }
     }
 
     #[test]

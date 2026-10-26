@@ -10,8 +10,12 @@
 //! - [`port`] — the migration-domain contracts
 //!   (`internal/backup/port/migration_port.go`): the broker proof
 //!   service, runner request/result types, and inspector facts.
+//! - [`repository`] — the repository binding and sealed-backup
+//!   manifest (`internal/backup/repository_metadata.go`,
+//!   `repository_seal.go`) genesis initializes (R5 task 13).
 //!
 //! `query` / `app` land in this capability's later R-slices.
 
 pub mod domain;
 pub mod port;
+pub mod repository;

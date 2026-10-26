@@ -202,8 +202,12 @@ fn is_reference_host() -> bool {
 /// `Serve`/`ServeGenesis` on the activated socket (`fd 3`). The env
 /// seam keeps the failure arms testable without systemd.
 pub(crate) fn run_helper_daemon(stderr: &mut impl Write) -> u8 {
+    // `helperModeFor`: the genesis server only on an absent host —
+    // the real classifier the helper will run again inside, not a
+    // path shape approximation.
+    let (state, _, _) = central_adapter_linux::genesis::GenesisEnv::production().state();
     helper_daemon(
-        genesis_roots_absent(),
+        state == central_adapter_linux::genesis::GenesisState::Absent,
         |key| std::env::var(key).ok(),
         stderr,
     )
@@ -215,82 +219,6 @@ fn helper_daemon(
     stderr: &mut impl Write,
 ) -> u8 {
     central_adapter_linux::helper::daemon::run_helper_daemon(genesis_absent, &env, stderr)
-}
-
-/// The genesis host-root layout (`genesisRoots`): the two instance
-/// roots `state()` distinguishes plus the ancestor set and the
-/// protected root it gates on first.
-pub(crate) const GENESIS_STATE_INSTANCES: &str = "/var/lib/central-state/v1/instances";
-pub(crate) const GENESIS_PROTECTED_INSTANCES: &str = "/var/lib/central-protected/v1/instances";
-pub(crate) const GENESIS_PROTECTED_ROOT: &str = "/var/lib/central-protected/v1";
-pub(crate) const GENESIS_ANCESTORS: [&str; 3] = [
-    "/var/lib/central-state",
-    "/var/lib/central-state/v1",
-    "/var/lib/central-protected",
-];
-
-/// `genesisAncestorMissingOrRootOwned(path, 0)`: missing, or a real
-/// directory owned by root that is neither group- nor
-/// other-writable. A symlink fails upstream's `O_NOFOLLOW` open the
-/// same way it fails `is_dir` on `symlink_metadata` here.
-pub(crate) fn genesis_ancestor_ok(path: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o022 == 0,
-        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
-/// `protectedGenesisRootMissingOrExact` (`exactOwnedDirectory`):
-/// missing, or a real root:root directory with mode exactly 0700.
-pub(crate) fn genesis_dir_missing_or_root_0700(path: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            meta.is_dir() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o7777 == 0o700
-        }
-        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
-/// `emptyGenesisRootOrMissing`: `Some(empty)` when the path is missing
-/// or a root:root 0700 directory (`empty` = no entries); `None` for
-/// every upstream error case — a non-directory, wrong owner or mode,
-/// or a directory that cannot be listed.
-pub(crate) fn empty_genesis_root_or_missing(path: &str) -> Option<bool> {
-    if !genesis_dir_missing_or_root_0700(path) {
-        return None;
-    }
-    match std::fs::read_dir(path) {
-        Ok(mut entries) => Some(entries.next().is_none()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(true),
-        Err(_) => None,
-    }
-}
-
-/// Whether upstream `genesisEnv.state()` would call this host absent,
-/// at the fidelity reachable without the instance loader: ancestors
-/// and the protected root pass verbatim, then each instances root
-/// must be missing or an empty root:root 0700 dir. Everything else —
-/// including upstream's protected-without-state inconsistency — is
-/// not absent, which is all `helperModeFor` needs to pick the
-/// instance branch.
-fn genesis_roots_absent() -> bool {
-    for path in GENESIS_ANCESTORS {
-        if !genesis_ancestor_ok(path) {
-            return false;
-        }
-    }
-    if !genesis_dir_missing_or_root_0700(GENESIS_PROTECTED_ROOT) {
-        return false;
-    }
-    matches!(
-        (
-            empty_genesis_root_or_missing(GENESIS_STATE_INSTANCES),
-            empty_genesis_root_or_missing(GENESIS_PROTECTED_INSTANCES),
-        ),
-        (Some(true), Some(true))
-    )
 }
 
 /// `central --broker` after the gates — upstream `runBrokerDaemon`,

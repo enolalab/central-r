@@ -425,6 +425,13 @@ pub const CENTRAL_MIGRATE_UID: u32 = 986;
 /// See [`CENTRAL_MIGRATE_UID`].
 pub const CENTRAL_MIGRATE_GID: u32 = 986;
 
+/// The fixed `central-browser` identity — the third allocation in
+/// `UidGidMap`'s negotiated order (runtime 501, agent 502, browser
+/// 503; upstream `authority`'s locked-identity table).
+pub const CENTRAL_BROWSER_UID: u32 = 503;
+/// See [`CENTRAL_BROWSER_UID`].
+pub const CENTRAL_BROWSER_GID: u32 = 503;
+
 /// The only origin the managed browser may open
 /// (`authority.FixedBrowserOrigin`).
 pub const FIXED_BROWSER_ORIGIN: &str = "https://127.0.0.1:8080";

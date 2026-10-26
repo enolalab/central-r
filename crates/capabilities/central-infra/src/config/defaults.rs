@@ -43,6 +43,18 @@ pub struct Instance {
     pub state_root: String,
 }
 
+impl Instance {
+    /// The genesis caller's constructor — `#[non_exhaustive]` keeps
+    /// struct literals inside this crate, so adapters name the two
+    /// fields explicitly here.
+    pub fn new(instance_id: String, state_root: String) -> Self {
+        Instance {
+            instance_id,
+            state_root,
+        }
+    }
+}
+
 /// The versioned per-token price table the default provider profile is
 /// priced from.
 #[non_exhaustive]

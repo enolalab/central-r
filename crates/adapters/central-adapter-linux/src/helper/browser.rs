@@ -699,7 +699,10 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let sock = dir.join("wayland-9");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let conn = dial_unix_bounded(&sock, Duration::from_secs(1)).unwrap();
+        // The success dial gets headroom for a loaded parallel test
+        // runner; the assertion is that it connects at all, not that
+        // it connects inside one second.
+        let conn = dial_unix_bounded(&sock, Duration::from_secs(10)).unwrap();
         // Connected: no pending SO_ERROR on the finished stream.
         assert!(conn.take_error().unwrap().is_none());
         drop(conn);
