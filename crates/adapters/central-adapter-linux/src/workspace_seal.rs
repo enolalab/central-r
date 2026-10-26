@@ -225,19 +225,25 @@ impl LinuxWorkspaceSealer {
 /// Opens `path` beneath `dir` refusing every symlink/magic-link/escape
 /// (`openat2`), or `Err` on `ELOOP`/`EXDEV`/missing. `dir` is the
 /// trusted anchor: the run dir or clone-root descriptor.
+///
+/// The flag set is this module's deliberate subset of
+/// [`sys::openat2::RESOLVE_FLAGS`]: `NO_XDEV` stays off because a clone
+/// may legitimately contain mounts (the walk refuses to descend into
+/// them, it does not refuse their existence). The call itself routes
+/// through [`sys::openat2::resolve_with`] — the workspace's single
+/// `openat2` site.
 fn open_beneath(
     dir: &impl std::os::fd::AsFd,
     path: &Path,
     oflags: OFlags,
 ) -> Result<rustix::fd::OwnedFd, rustix::io::Errno> {
-    rustix::fs::openat2(
-        dir,
-        path,
-        oflags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
+    crate::sys::openat2::resolve_with(dir, path, oflags | OFlags::NOFOLLOW, SEAL_RESOLVE_FLAGS)
 }
+
+/// The sealer's `openat2` resolve set — [`sys::openat2::RESOLVE_FLAGS`]
+/// minus `NO_XDEV` (see [`open_beneath`]).
+const SEAL_RESOLVE_FLAGS: ResolveFlags =
+    ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS.union(ResolveFlags::NO_MAGICLINKS));
 
 /// `vanishedErr` — an open or stat under the untrusted clone failed
 /// because the entry is not there as a real file or directory beneath

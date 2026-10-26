@@ -6,6 +6,8 @@
 use super::PeerIdentity;
 use central_foundation::failure::Failure;
 use serde::Serialize;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
 fn denied() -> Failure {
@@ -231,20 +233,24 @@ pub trait ManagedBrowserStateForLaunch: Send + Sync {
     fn approved_for(&self, launch: &ManagedBrowserLaunch) -> Result<bool, Failure>;
 }
 
-/// `FreshPAM` — one authentication, never reused.
+/// `FreshPAM` — one authentication, never reused. `peer`/`deadline`
+/// are what upstream's `ctx` carried: the admitted socket peer and the
+/// request's bounded window, resolved per call — the impl itself is
+/// stateless exactly like `systemFreshPAM{}`.
 pub trait FreshPam: Send + Sync {
-    fn authenticate(&self) -> Result<(), Failure>;
+    fn authenticate(&self, peer: &PeerIdentity, deadline: Option<Instant>) -> Result<(), Failure>;
 }
 
 /// `ControllingTTY` — the peer's controlling-terminal check.
 pub trait ControllingTty: Send + Sync {
-    fn check(&self) -> Result<(), Failure>;
+    fn check(&self, peer: &PeerIdentity) -> Result<(), Failure>;
 }
 
 /// `BootstrapPresenter` — shows the bootstrap value on the trusted
-/// plane; it receives no plaintext from the request.
+/// plane; it receives no plaintext from the request. `peer` selects
+/// the terminal upstream's `ctx` carried (`lifecyclePeerFromContext`).
 pub trait BootstrapPresenter: Send + Sync {
-    fn present(&self) -> Result<(), Failure>;
+    fn present(&self, peer: &PeerIdentity) -> Result<(), Failure>;
 }
 
 /// The `presentation` slot's three shapes, in upstream's dispatch
@@ -393,8 +399,15 @@ impl BootstrapShowHandler {
     }
 
     /// `Show` — current proof, approved managed state, fresh PAM,
-    /// controlling TTY, presentation guard, present.
-    pub fn show(&self, presented: &ReadyProof) -> Result<(), Failure> {
+    /// controlling TTY, presentation guard, present. `peer`/`deadline`
+    /// are the admitted connection's identity and window — the values
+    /// upstream read from `ctx`.
+    pub fn show(
+        &self,
+        presented: &ReadyProof,
+        peer: &PeerIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<(), Failure> {
         let current = self.proofs.current().map_err(|_| denied())?;
         if !same_current_proof(&current, presented) {
             return Err(denied());
@@ -411,20 +424,26 @@ impl BootstrapShowHandler {
         if !approved {
             return Err(denied());
         }
-        self.pam.authenticate().map_err(|_| denied())?;
-        self.tty.check().map_err(|_| denied())?;
+        self.pam
+            .authenticate(peer, deadline)
+            .map_err(|_| denied())?;
+        self.tty.check(peer).map_err(|_| denied())?;
         if let Some(Presentation::Guard(guard)) = &self.presentation {
             guard.validate_presentation().map_err(|_| denied())?;
         }
-        self.presenter.present().map_err(|_| denied())?;
+        self.presenter.present(peer).map_err(|_| denied())?;
         Ok(())
     }
 
     /// `ShowCurrent` — the transport entry point; the current proof is
     /// fetched inside the helper.
-    pub fn show_current(&self) -> Result<(), Failure> {
+    pub fn show_current(
+        &self,
+        peer: &PeerIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<(), Failure> {
         let proof = self.proofs.current().map_err(|_| denied())?;
-        self.show(&proof)
+        self.show(&proof, peer, deadline)
     }
 }
 
@@ -446,16 +465,13 @@ fn same_current_proof(current: &ReadyProof, presented: &ReadyProof) -> bool {
     !current.is_expired(now) && !presented.is_expired(now)
 }
 
-/// `systemFreshPAM` — fresh authentication against the socket peer.
-pub struct SystemFreshPam {
-    pub peer: PeerIdentity,
-    pub deadline: Option<Instant>,
-}
+/// `systemFreshPAM` — stateless; the peer and the request window come
+/// from the call, exactly like upstream's `ctx`.
+pub struct SystemFreshPam;
 
 impl FreshPam for SystemFreshPam {
-    fn authenticate(&self) -> Result<(), Failure> {
-        let session =
-            super::pam_ceremony::authenticate(self.peer, self.deadline).map_err(|_| denied())?;
+    fn authenticate(&self, peer: &PeerIdentity, deadline: Option<Instant>) -> Result<(), Failure> {
+        let session = super::pam_ceremony::authenticate(*peer, deadline).map_err(|_| denied())?;
         if !session.valid {
             return Err(denied());
         }
@@ -466,19 +482,17 @@ impl FreshPam for SystemFreshPam {
 /// `systemControllingTTY` — `/proc/<pid>/fd/0` names a real terminal
 /// (`/dev/tty` or `/dev/pts/N`) and `/proc/<pid>/stat` reports a
 /// controlling tty (field 7 after the `)` — `tty_nr` must be nonzero).
-pub struct SystemControllingTty {
-    pub peer: PeerIdentity,
-}
+pub struct SystemControllingTty;
 
 impl ControllingTty for SystemControllingTty {
-    fn check(&self) -> Result<(), Failure> {
-        if !self.peer.available() {
+    fn check(&self, peer: &PeerIdentity) -> Result<(), Failure> {
+        if !peer.available() {
             return Err(denied());
         }
-        let target = std::fs::read_link(format!("/proc/{}/fd/0", self.peer.pid))
+        let target = std::fs::read_link(format!("/proc/{}/fd/0", peer.pid))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let stat = std::fs::read(format!("/proc/{}/stat", self.peer.pid)).unwrap_or_default();
+        let stat = std::fs::read(format!("/proc/{}/stat", peer.pid)).unwrap_or_default();
         if !is_controlling_tty(&target, &stat) {
             return Err(denied());
         }
@@ -512,9 +526,42 @@ fn is_controlling_tty(target: &str, stat: &[u8]) -> bool {
 /// nil-check would deny.
 pub struct DenyingControllingTty;
 impl ControllingTty for DenyingControllingTty {
-    fn check(&self) -> Result<(), Failure> {
+    fn check(&self, _peer: &PeerIdentity) -> Result<(), Failure> {
         Err(denied())
     }
+}
+
+/// `isTTYPath` — `/dev/tty` or a `/dev/pts/N` link target.
+fn is_tty_path(path: &str) -> bool {
+    path == "/dev/tty" || (path.starts_with("/dev/pts/") && path.len() > "/dev/pts/".len())
+}
+
+/// `helper.WriteControllingTTY` — writes only to the authenticated
+/// peer's existing terminal: `/proc/<pid>/fd/0` must name a TTY,
+/// `/proc/<pid>/fd/1` must name the same one, and the write goes
+/// through that link target opened `O_WRONLY|O_NOCTTY`. It never uses
+/// the helper daemon's stdout or stderr.
+pub fn write_controlling_tty(peer: &PeerIdentity, data: &[u8]) -> Result<(), Failure> {
+    if !peer.available() {
+        return Err(denied());
+    }
+    let stdin_target =
+        std::fs::read_link(format!("/proc/{}/fd/0", peer.pid)).map_err(|_| denied())?;
+    let stdin_target = stdin_target.to_string_lossy();
+    if !is_tty_path(&stdin_target) {
+        return Err(denied());
+    }
+    let stdout_target =
+        std::fs::read_link(format!("/proc/{}/fd/1", peer.pid)).map_err(|_| denied())?;
+    if stdout_target.to_string_lossy() != stdin_target {
+        return Err(denied());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&stdout_target)
+        .map_err(|_| denied())?;
+    file.write_all(data).map_err(|_| denied())
 }
 
 #[cfg(test)]

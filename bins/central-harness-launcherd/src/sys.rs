@@ -118,22 +118,18 @@ pub fn pgroup_alive(pgid: i32) -> bool {
 }
 
 /// `pidfd_send_signal(pidfd, sig, NULL, 0)` — the monitor's SIGTERM/
-/// SIGKILL of its namespace init.
+/// SIGKILL of its namespace init. The primitive itself moved to the
+/// shared audited site (R5 task 14, D5): this shim only bridges the
+/// raw fd/signal pair the monitor holds into
+/// [`central_adapter_linux::sys::pidfd::send_signal`]'s owned
+/// signature — both call sites keep the result.
 pub fn pidfd_send_signal(pidfd: RawFd, sig: i32) -> Result<(), Errno> {
-    // SAFETY: `pidfd` is an open pidfd; `sig` a signal number.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd,
-            sig,
-            std::ptr::null::<u8>(),
-            0,
-        )
-    } != 0
-    {
-        return Err(last_errno());
-    }
-    Ok(())
+    use rustix::process::Signal;
+    // SAFETY: `pidfd` is an open pidfd the monitor owns for the call's
+    // duration; `borrow_raw` creates no ownership.
+    let fd = unsafe { BorrowedFd::borrow_raw(pidfd) };
+    let signal = Signal::from_named_raw(sig).ok_or(Errno::INVAL)?;
+    central_adapter_linux::sys::pidfd::send_signal(fd, signal).map_err(|_| Errno::INVAL)
 }
 
 /// `prctl(PR_SET_CHILD_SUBREAPER, 1)` — the monitor and the no-isolation
@@ -228,50 +224,12 @@ pub fn unsetenv(name: &CStr) {
     unsafe { libc::unsetenv(name.as_ptr()) };
 }
 
-/// One `passwd` record, reduced to what the daemon needs.
-pub struct Passwd {
-    pub uid: u32,
-    pub gid: u32,
-    pub name: CString,
-    pub home: CString,
-}
-
-/// `getpwnam(3)` — the operator and runtime user lookups.
-pub fn getpwnam(name: &CStr) -> Option<Passwd> {
-    // SAFETY: getpwnam returns a thread-static record; we copy the four
-    // fields out before returning. Single-threaded here.
-    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
-    if pw.is_null() {
-        return None;
-    }
-    // SAFETY: `pw` is a valid passwd record (checked non-null above).
-    let (uid, gid, pname, dir) = unsafe {
-        (
-            (*pw).pw_uid,
-            (*pw).pw_gid,
-            CStr::from_ptr((*pw).pw_name).to_owned(),
-            CStr::from_ptr((*pw).pw_dir).to_owned(),
-        )
-    };
-    Some(Passwd {
-        uid,
-        gid,
-        name: pname,
-        home: dir,
-    })
-}
-
-/// `getgrnam(3)` — the `tty` group for the private devpts.
-pub fn getgrnam(name: &CStr) -> Option<u32> {
-    // SAFETY: getgrnam returns a thread-static record; read one field.
-    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
-    // SAFETY: `gr` checked non-null.
-    if gr.is_null() {
-        None
-    } else {
-        Some(unsafe { (*gr).gr_gid })
-    }
-}
+/// The NSS lookups moved to the shared audited boundary (R5 task 14,
+/// D5): `central-adapter-linux::sys::nss` carries this module's own
+/// `getpwnam`/`getgrnam` pair forward verbatim — the `Passwd` shape is
+/// the one that lived here — so the call sites keep their `sys::`
+/// path through the re-export.
+pub use central_adapter_linux::sys::nss::{getgrnam, getpwnam};
 
 /// Install `handler` as `sig`'s action with an empty mask.
 ///

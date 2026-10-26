@@ -47,14 +47,31 @@ fn denied(step: &str, rel: &Path) -> Failure {
 /// # Errors
 /// `sys_openat2_os` on any `openat2` refusal.
 pub fn resolve<Fd: AsFd>(root: Fd, rel: &Path, oflags: OFlags) -> Result<OwnedFd, Failure> {
-    openat2(
-        root,
-        rel,
-        oflags | OFlags::CLOEXEC,
-        Mode::empty(),
-        RESOLVE_FLAGS,
-    )
-    .map_err(|e| os_failure("openat2", rel, e))
+    resolve_with(root, rel, oflags, RESOLVE_FLAGS).map_err(|e| os_failure("openat2", rel, e))
+}
+
+/// The flag-parameterized primitive behind [`resolve`] — the single
+/// `openat2` call site every confined resolution in the workspace
+/// routes through (R5 task 14 / D5 carry-forward). Callers with a
+/// different deliberate resolve policy pass their own `resolve` set:
+/// [`crate::workspace_seal`]'s `open_beneath` drops `NO_XDEV` because
+/// sealed clone trees may legitimately contain mounts, and the harness
+/// launcherd resolves work trees under `RESOLVE_BENEATH` alone since
+/// in-tree symlinks are legal there.
+///
+/// The raw `Errno` is returned so the caller keeps its own errno
+/// discrimination (`ELOOP`/`EXDEV`/`ENOENT` verdicts) — [`resolve`] is
+/// the `Failure`-mapping convenience for the sandbox path's policy.
+///
+/// # Errors
+/// The `openat2` `Errno` unchanged.
+pub fn resolve_with<Fd: AsFd>(
+    root: Fd,
+    rel: &Path,
+    oflags: OFlags,
+    resolve: ResolveFlags,
+) -> Result<OwnedFd, Errno> {
+    openat2(root, rel, oflags | OFlags::CLOEXEC, Mode::empty(), resolve)
 }
 
 /// `ResolveDirectory` — [`resolve`] with `O_DIRECTORY|O_NOFOLLOW`:

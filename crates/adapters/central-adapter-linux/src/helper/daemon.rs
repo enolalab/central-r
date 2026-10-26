@@ -14,6 +14,15 @@
 //! the later tasks' composition; their verbs keep upstream's
 //! unconfigured-handler answers, never a made-up success.
 
+use super::browser::{
+    BootstrapShowHandler, BrowserHandler, Presentation, PresentationGuard,
+    PresentationLeaseStarterV2, SystemControllingTty, SystemFreshPam, SystemWaylandSeat,
+};
+use super::browser_runtime::{
+    ChromiumManagedLauncher, FileManagedBrowserState, FileReadyProofSource,
+    ProtectedBootstrapPresenter, broker_socket_path, browser_approval_path, ready_proof_path,
+    remove_browser_approval, runtime_generation_path,
+};
 use super::client::PRODUCTION_SOCKET_PATH;
 use super::init::{GenesisInitHandler, PresentInitHandler};
 use super::pam_ceremony::PamConfirmer;
@@ -83,15 +92,93 @@ pub fn helper_socket_path(env: &dyn Fn(&str) -> Option<String>) -> String {
 /// upstream's `Serve(ctx, 3, srv, 60*time.Second)`.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The bin-supplied runtime pieces the adapter cannot own:
+/// `runtimePresentationGuard` opens a dedicated `central_runtime`
+/// PostgreSQL connection per call inside upstream's `cmd` — this crate
+/// holds no `sqlx`, so the bin bridges it behind the two trait shapes
+/// the one upstream object fills. `begin` feeds the browser-open V2
+/// lease slot; `validate` feeds the bootstrap-show guard. Both or
+/// neither — upstream's PAM-and-TTY-together rule for injected host
+/// seams.
+pub struct HelperRuntimeDeps {
+    pub begin_presentation: Option<Box<dyn PresentationLeaseStarterV2>>,
+    pub validate_presentation: Option<Box<dyn PresentationGuard>>,
+}
+
+impl HelperRuntimeDeps {
+    /// The reference-host/test arm: no presentation bridge — the
+    /// browser and bootstrap verbs stay unconfigured and deny.
+    pub const fn absent() -> Self {
+        Self {
+            begin_presentation: None,
+            validate_presentation: None,
+        }
+    }
+}
+
+/// `main.go`'s `runHelperDaemon` browser/bootstrap composition —
+/// `fileReadyProofSource`, `removeBrowserApproval`, the managed
+/// chromium launcher, the broker bootstrap presenter, and the default
+/// PAM/TTY seams. A partial `deps` is a composition error, exactly
+/// like upstream's "host bootstrap seams must provide PAM and TTY
+/// together".
+fn compose_browser_handlers(
+    env: &dyn Fn(&str) -> Option<String>,
+    deps: HelperRuntimeDeps,
+) -> Result<(Option<BrowserHandler>, Option<BootstrapShowHandler>), String> {
+    let (begin, validate) = match (deps.begin_presentation, deps.validate_presentation) {
+        (None, None) => return Ok((None, None)),
+        (Some(b), Some(v)) => (b, v),
+        _ => {
+            return Err(
+                "host bootstrap presentation seams must provide begin and validate together"
+                    .to_owned(),
+            );
+        }
+    };
+    let proofs = FileReadyProofSource::new(ready_proof_path(env), runtime_generation_path(env));
+    let approval = browser_approval_path(env);
+    // `_ = removeBrowserApproval()` — the startup clear's error is
+    // deliberately dropped upstream.
+    let _ = remove_browser_approval(&approval);
+    let launcher = ChromiumManagedLauncher::new(approval.clone());
+    let browser = BrowserHandler::with_presentation(
+        Box::new(proofs.clone()),
+        Box::new(SystemWaylandSeat),
+        Box::new(launcher.clone()),
+        Some(Box::new(launcher)),
+        Presentation::LeaseV2(begin),
+    )
+    .map_err(|e| format!("browser handler: {e}"))?;
+    let producer =
+        crate::broker::bootstrap_session::BootstrapPresenter::new(broker_socket_path(env).into())
+            .map_err(|e| format!("bootstrap presenter: {e}"))?;
+    let show = BootstrapShowHandler::with_presentation(
+        Box::new(proofs),
+        Box::new(FileManagedBrowserState::new(approval.clone())),
+        Some(Box::new(FileManagedBrowserState::new(approval))),
+        Box::new(SystemFreshPam),
+        Box::new(SystemControllingTty),
+        Box::new(ProtectedBootstrapPresenter::new(producer)),
+        Presentation::Guard(validate),
+    )
+    .map_err(|e| format!("bootstrap-show handler: {e}"))?;
+    Ok((Some(browser), Some(show)))
+}
+
 /// `runHelperDaemon` — returns the process exit code; `stderr` is the
 /// daemon's journal line writer. `env` is the environment seam so the
 /// grammar-level tests can exercise the failure arms without systemd.
 /// `genesis_absent` is the mode split upstream takes from
 /// `productionGenesisEnv().state(ctx)`; a broken state lands on the
-/// instance branch, exactly as `helperModeFor` decides.
+/// instance branch, exactly as `helperModeFor` decides. `deps` carries
+/// the PostgreSQL presentation bridge the bin owns (see
+/// [`HelperRuntimeDeps`]); [`HelperRuntimeDeps::absent`] leaves the
+/// browser and bootstrap-show verbs configured-but-denying.
 pub fn run_helper_daemon(
     genesis_absent: bool,
     env: &dyn Fn(&str) -> Option<String>,
+    deps: HelperRuntimeDeps,
     stderr: &mut dyn Write,
 ) -> u8 {
     // `strconv.Atoi(os.Getenv("LISTEN_FDS"))` must parse to >= 1: the
@@ -149,6 +236,13 @@ pub fn run_helper_daemon(
         }
         return 0;
     }
+    let (browser_slot, bootstrap_show_slot) = match compose_browser_handlers(env, deps) {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = writeln!(stderr, "helper: composition: {e}");
+            return 6;
+        }
+    };
     let srv = Arc::new(Server {
         peer_policy: Some(peer),
         socket: Some(socket),
@@ -166,6 +260,13 @@ pub fn run_helper_daemon(
         // the resolved instance's three IDs with no ceremony and no
         // mutation.
         init: Some(Box::new(PresentInitHandler::production())),
+        // `browser`/`bootstrap_show` — `main.go`'s managed-browser
+        // composition: stored-proof source, chromium launcher, broker
+        // presenter, default PAM/TTY, and the bin's PostgreSQL
+        // presentation bridge. A composition refusal exits 6 like the
+        // policy arm above.
+        browser: browser_slot,
+        bootstrap_show: bootstrap_show_slot,
         // `lifecycle` stays unset for the same dependency-chain reason,
         // one link deeper: `infra::lifecycle::new_production_service`
         // needs (1) the B01 advisory evaluator — the same deferred seam
@@ -303,7 +404,11 @@ mod tests {
         for raw in ["", "abc", "0", "-1"] {
             let env = env_of(&[("LISTEN_FDS", raw)]);
             let mut stderr = Vec::new();
-            assert_eq!(run_helper_daemon(true, &env, &mut stderr), 3, "{raw:?}");
+            assert_eq!(
+                run_helper_daemon(true, &env, HelperRuntimeDeps::absent(), &mut stderr),
+                3,
+                "{raw:?}"
+            );
             assert_eq!(
                 String::from_utf8(stderr).unwrap(),
                 format!("helper: no socket fd (LISTEN_FDS={raw:?})\n")
@@ -313,14 +418,20 @@ mod tests {
         // fails at 6 on the right branch name.
         let env = env_of(&[("LISTEN_FDS", "1")]);
         let mut stderr = Vec::new();
-        assert_eq!(run_helper_daemon(true, &env, &mut stderr), 6);
+        assert_eq!(
+            run_helper_daemon(true, &env, HelperRuntimeDeps::absent(), &mut stderr),
+            6
+        );
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             "helper: genesis composition: operator UID policy is not provisioned\n"
         );
         let env = env_of(&[("LISTEN_FDS", "1")]);
         let mut stderr = Vec::new();
-        assert_eq!(run_helper_daemon(false, &env, &mut stderr), 6);
+        assert_eq!(
+            run_helper_daemon(false, &env, HelperRuntimeDeps::absent(), &mut stderr),
+            6
+        );
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             "helper: composition: operator UID policy is not provisioned\n"

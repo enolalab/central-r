@@ -36,6 +36,7 @@ pub mod serve_lifecycle;
 pub mod serve_operator;
 pub mod serve_support;
 pub mod serve_tasks;
+pub mod serve_tls;
 pub mod session_compose;
 
 /// Object-safe boxed future shared by the kernel-owned trait objects —

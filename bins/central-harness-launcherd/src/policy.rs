@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 
 use central_adapter_harness::launcher::protocol::Reason;
-use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags, Stat, fstat, open, openat2};
+use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags, Stat, fstat, open};
 use rustix::io::Errno;
 
 use crate::knobs;
@@ -611,21 +611,28 @@ fn openat2_beneath(
     flags: OFlags,
     resolve: ResolveFlags,
 ) -> Result<OwnedFd, Errno> {
-    let Some(p) = sys::bytes_cstring(path) else {
-        return Err(Errno::INVAL);
-    };
-    openat2(dirfd, p.as_c_str(), flags, Mode::empty(), resolve)
+    use std::os::unix::ffi::OsStrExt;
+    // R5 task 14, D5: the `openat2` call itself lives in the shared
+    // audited boundary — `resolve_with` is this shim's exact upstream
+    // shape (`Mode::empty()`, `CLOEXEC` added inside). A byte path
+    // with an interior NUL fails the same `INVAL` `bytes_cstring`
+    // produced, one hop deeper.
+    central_adapter_linux::sys::openat2::resolve_with(
+        dirfd,
+        std::path::Path::new(std::ffi::OsStr::from_bytes(path)),
+        flags,
+        resolve,
+    )
 }
 
 /// `open_owned_dir` — walk the canonical absolute path from "/" with no
 /// symlink, every component (and "/") passing `tree_component_ok`.
 fn open_owned_dir(path: &[u8]) -> Result<OwnedFd, Errno> {
     let mut prefix: Vec<u8> = Vec::new();
-    let mut cur = openat2(
+    let mut cur = central_adapter_linux::sys::openat2::resolve_with(
         CWD,
-        c"/",
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
+        std::path::Path::new("/"),
+        OFlags::PATH | OFlags::DIRECTORY,
         RESOLVE_NO_SYMLINKS,
     )?;
     if !tree_component_ok(&cur, &prefix) {

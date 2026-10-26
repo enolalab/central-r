@@ -747,43 +747,97 @@ pub fn build_adapter(
 }
 
 // ---------------------------------------------------------------------------
-// Bootstrap selection — the R3 D1/R5 deferral
+// Bootstrap selection — broker `ProtectedBootstrap` + the R3 dev gate
 // ---------------------------------------------------------------------------
 
-/// `bootstrapFile` — the protected bootstrap the session service
-/// consumes. In production the broker-backed bootstrap supplies it;
-/// under the explicit dev gate the file-backed
-/// [`DevFileProtectedBootstrap`] stands in (R3 D1).
-#[must_use]
-pub enum BootstrapSelection {
-    /// `CENTRAL_LOCALEXEC=1` dev path — the file-backed bootstrap.
-    Dev(DevFileProtectedBootstrap),
-    /// Broker-backed bootstrap — R5, not available in this slice.
-    Broker,
+/// `CENTRAL_BROKER_SOCKET` — upstream `brokerSocketPath()`'s env seam:
+/// the reference-host test composition points the runtime's broker
+/// clients at a per-test socket; production leaves it unset and takes
+/// [`central_adapter_linux::broker::PRODUCTION_SOCKET_PATH`].
+pub const ENV_BROKER_SOCKET: &str = "CENTRAL_BROKER_SOCKET";
+
+/// `brokerSocketPath()` — env override or the socket-activated
+/// production path.
+fn broker_socket_path(getenv: &impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    getenv(ENV_BROKER_SOCKET)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(central_adapter_linux::broker::PRODUCTION_SOCKET_PATH))
 }
 
-/// The dev-gated bootstrap rule: `CENTRAL_LOCALEXEC=1` returns the
-/// file-backed bootstrap at `root`; anything else fails closed —
-/// the broker-backed bootstrap is deferred to R5 and serve must not
-/// silently accept a substitute.
+/// The protected bootstrap the session service consumes
+/// (`bootstrapFile` upstream): the broker-backed
+/// [`BootstrapActivator`] is the production default; the file-backed
+/// [`DevFileProtectedBootstrap`] stands in only under the explicit
+/// `CENTRAL_LOCALEXEC=1` development gate (R3 D1 carry-forward).
+/// Enum dispatch keeps `Service<PgSessionStore, ServeBootstrap>`
+/// concrete — one monomorphic session service per composition.
+pub enum ServeBootstrap {
+    /// `broker.NewBootstrapActivator` — production path: candidate
+    /// evidence crosses the protected socket; the verifier never
+    /// leaves the broker.
+    Broker(central_adapter_linux::broker::bootstrap_session::BootstrapActivator),
+    /// `CENTRAL_LOCALEXEC=1` dev path — the file-backed bootstrap.
+    Dev(DevFileProtectedBootstrap),
+}
+
+impl std::fmt::Debug for ServeBootstrap {
+    /// `BootstrapActivator` carries no `Debug`; the variant shape is
+    /// the only useful debug surface anyway.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Broker(_) => f.write_str("ServeBootstrap::Broker(..)"),
+            Self::Dev(_) => f.write_str("ServeBootstrap::Dev(..)"),
+        }
+    }
+}
+
+impl central_session::port::ProtectedBootstrap for ServeBootstrap {
+    async fn register(
+        &self,
+        binding: central_session::contract::CandidateBinding,
+    ) -> Result<(), central_session::contract::Failure> {
+        match self {
+            Self::Broker(b) => b.register(binding).await,
+            Self::Dev(b) => b.register(binding).await,
+        }
+    }
+
+    async fn activate(
+        &self,
+        binding: central_session::contract::CandidateBinding,
+    ) -> Result<(), central_session::contract::Failure> {
+        match self {
+            Self::Broker(b) => b.activate(binding).await,
+            Self::Dev(b) => b.activate(binding).await,
+        }
+    }
+}
+
+/// The bootstrap selection rule — upstream
+/// `broker.NewBootstrapActivator(brokerSocketPath())` is the default
+/// and only production bootstrap; the file-backed dev bootstrap is
+/// reachable only when `CENTRAL_LOCALEXEC=1` is exactly set
+/// (issue-#120 gate, same rule as [`select_launcher`]).
 ///
 /// # Errors
-/// `harness_config_invalid` ([`FailureKind::Denied`] under the hood
-/// for the gate refusal — classified `CONFIG_INVALID` at the serve
-/// boundary) when the dev gate is unset; propagates
-/// [`DevFileProtectedBootstrap::new`] errors otherwise.
+/// Propagates [`DevFileProtectedBootstrap::new`] (mapped through
+/// [`session_failure`]) under the dev gate; propagates
+/// [`BootstrapActivator::new`]'s refusal when the resolved socket
+/// path is unusable.
 pub fn select_bootstrap(
     getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
     root: &Path,
-) -> Result<DevFileProtectedBootstrap, Failure> {
+) -> Result<ServeBootstrap, Failure> {
     let gate_open = getenv(ENV_LOCALEXEC).is_some_and(|v| v == "1");
-    if !gate_open {
-        return Err(Failure::denied(
-            ERR_HARNESS_CONFIG,
-            "session bootstrap requires the broker-backed protected bootstrap (deferred to R5); set CENTRAL_LOCALEXEC=1 for the file-backed development bootstrap",
+    if gate_open {
+        return Ok(ServeBootstrap::Dev(
+            DevFileProtectedBootstrap::new(root).map_err(session_failure)?,
         ));
     }
-    DevFileProtectedBootstrap::new(root).map_err(session_failure)
+    let socket = broker_socket_path(&getenv);
+    central_adapter_linux::broker::bootstrap_session::BootstrapActivator::new(socket)
+        .map(ServeBootstrap::Broker)
 }
 
 /// Maps a session-contract failure onto the foundation taxonomy the
@@ -939,10 +993,58 @@ mod tests {
         assert_eq!(err.code(), localexec::codes::DEV_GATE_REQUIRED);
     }
 
+    /// D5: the broker `ProtectedBootstrap` is the default — every
+    /// non-`1` gate value selects `BootstrapActivator` over the
+    /// `CENTRAL_BROKER_SOCKET`-resolved path, and only the exact dev
+    /// gate reaches the R3 file-backed stand-in.
     #[test]
-    fn bootstrap_fail_closed_without_gate() {
-        let err = select_bootstrap(|_| None, Path::new("/tmp/x")).unwrap_err();
-        assert_eq!(err.code(), ERR_HARNESS_CONFIG);
+    fn bootstrap_selection_gate_matrix() {
+        // Unset gate, `0`, `true`, `yes` — everything but exact `1`
+        // takes the production broker activator.
+        for v in [None, Some("0"), Some("true"), Some("yes"), Some("")] {
+            let sel = select_bootstrap(|_| v.map(std::ffi::OsString::from), Path::new("/tmp/x"))
+                .expect("broker bootstrap");
+            assert!(
+                matches!(sel, ServeBootstrap::Broker(_)),
+                "gate {v:?} must select the broker activator"
+            );
+        }
+        // The env seam routes the activator's socket path like
+        // upstream `brokerSocketPath()`.
+        let sel = select_bootstrap(
+            |name| {
+                (name == ENV_BROKER_SOCKET)
+                    .then(|| std::ffi::OsString::from("/tmp/test-broker.sock"))
+            },
+            Path::new("/tmp/x"),
+        )
+        .expect("broker bootstrap");
+        assert!(matches!(sel, ServeBootstrap::Broker(_)));
+
+        // Exact `1` takes the dev arm — never the broker. The adapter
+        // constructor re-checks the gate against the real process
+        // environment (the injected `getenv` cannot open it), so under
+        // an ungated test process the outcome is the constructor's
+        // own fail-closed refusal: provably never `Broker`.
+        let root = std::env::temp_dir().join(format!(
+            "central-kernel-dev-bootstrap-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let sel = select_bootstrap(
+            |name| (name == ENV_LOCALEXEC).then(|| std::ffi::OsString::from("1")),
+            &root,
+        );
+        match sel {
+            Ok(ServeBootstrap::Dev(_)) => {}
+            Ok(ServeBootstrap::Broker(_)) => {
+                unreachable!("CENTRAL_LOCALEXEC=1 must not select the broker activator")
+            }
+            // `DevFileProtectedBootstrap::new` refused without the
+            // real-env gate — the double-gate working as designed.
+            Err(_) => {}
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     struct NoSignals;

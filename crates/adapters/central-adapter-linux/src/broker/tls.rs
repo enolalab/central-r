@@ -360,6 +360,46 @@ fn new_authority_state() -> Result<AuthorityState, Failure> {
     })
 }
 
+/// The serve listener's broker-owned TLS material (B06): the active
+/// leaf certificate, its private key, and the CA certificate — DER
+/// only, exported out of the validated persisted state.
+pub struct ServeMaterialExport {
+    /// The active leaf certificate DER.
+    pub leaf_cert_der: Vec<u8>,
+    /// The leaf's PKCS#8 private key (zeroized on drop).
+    pub leaf_key_pkcs8: PrivatePkcs8KeyDer<'static>,
+    /// The CA certificate DER.
+    pub ca_cert_der: Vec<u8>,
+}
+
+/// Load-only export for `central serve`: reads
+/// `tls-authority.json` under `state_root` (the broker protected root),
+/// re-validates the full persisted chain via [`authority_from_state`]
+/// (CA shape, leaf signature, both key/cert matches), and exports the
+/// DER the listener needs. Unlike [`TlsAuthority::new_persistent`] this
+/// never mints — a missing state file is `broker_tls` internal, a
+/// corrupt one refuses, so serve cannot silently run on a half
+/// authority. The file's `0600`/owner/link-count custody checks still
+/// apply, which is why only a process sharing the broker's uid may
+/// take this path (dev/loopback compositions); everyone else uses the
+/// provisioned `CENTRAL_TLS_ROOT` bundle (kernel `serve_tls`).
+///
+/// # Errors
+/// `broker_tls` failures on custody, decode, or chain-validation
+/// violations.
+pub fn load_serve_material(state_root: &Path) -> Result<ServeMaterialExport, Failure> {
+    let state = load_tls_authority_state(&state_root.join(TLS_AUTHORITY_STATE_FILENAME))?;
+    let export = ServeMaterialExport {
+        leaf_cert_der: state.leaf_cert.clone(),
+        leaf_key_pkcs8: PrivatePkcs8KeyDer::from(state.leaf_key.clone()),
+        ca_cert_der: state.ca_cert.clone(),
+    };
+    // The export is only released after the persisted chain validates
+    // — `authority_from_state` consumes (and zeroizes) the state.
+    let _ = authority_from_state(state)?;
+    Ok(export)
+}
+
 /// `tlsAuthorityFromState` — re-validate the persisted authority: all
 /// four fields present, CA parses and carries `CA:true`, leaf parses and
 /// verifies under the CA public key, and each private key matches its

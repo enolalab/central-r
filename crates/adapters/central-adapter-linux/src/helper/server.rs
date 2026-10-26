@@ -326,7 +326,7 @@ impl Server {
                 self.handle_lifecycle(req, peer, deadline)
             }
             v if v == verb::BROWSER_OPEN => self.handle_browser_open(req, peer),
-            v if v == verb::BOOTSTRAP_SHOW => self.handle_bootstrap_show(req, peer),
+            v if v == verb::BOOTSTRAP_SHOW => self.handle_bootstrap_show(req, peer, deadline),
             v if v == verb::PREPARE => {
                 // Prepare's one route is the injection arm; reaching
                 // dispatch directly gets the matrix's own refusal.
@@ -403,9 +403,17 @@ impl Server {
         }
     }
 
-    fn handle_bootstrap_show(&self, req: &Request, _peer: PeerIdentity) -> Response {
+    /// `handleBootstrapShow` — the peer and the operation window are
+    /// what upstream's `ctx` carried into PAM, the TTY check, and the
+    /// controlling-TTY write.
+    fn handle_bootstrap_show(
+        &self,
+        req: &Request,
+        peer: PeerIdentity,
+        deadline: Instant,
+    ) -> Response {
         match (&self.bootstrap_show, parse_bootstrap_show_request(req)) {
-            (Some(show), Ok(_)) => match show.show_current() {
+            (Some(show), Ok(_)) => match show.show_current(&peer, Some(deadline)) {
                 Ok(()) => Response::new(&req.operation_id, "success", 0, ""),
                 Err(_) => Response::denied(&req.operation_id, 7, "AUTHORITY_DENIED"),
             },

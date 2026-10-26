@@ -17,6 +17,15 @@
 //! registers those purposes as closed denials so the wire contract is
 //! complete before the machinery lands.
 
+/// `broker.ProductionSocketPath` — where
+/// `packaging/systemd/central-broker.socket` binds the protected
+/// broker for the runtime's `BootstrapActivator`/presenter clients
+/// (upstream `internal/adapter/authority/broker/socket_path.go`).
+/// `CENTRAL_BROKER_SOCKET` overrides it for the reference-host test
+/// composition; the kernel names the env once in
+/// `harness_compose::ENV_BROKER_SOCKET`.
+pub const PRODUCTION_SOCKET_PATH: &str = "/run/central-broker/broker.sock";
+
 pub mod bootstrap_session;
 pub mod daemon;
 pub(crate) mod deadline;

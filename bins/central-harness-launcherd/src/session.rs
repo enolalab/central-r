@@ -29,13 +29,14 @@ use std::ffi::{CStr, CString};
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use central_adapter_harness::launcher::protocol as wire;
 use wire::{Opcode, Reason, Scope};
 
 use rustix::event::Timespec;
-use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags, fstat, mkdirat, open, openat2};
+use rustix::fs::{CWD, FileType, Mode, OFlags, ResolveFlags, fstat, mkdirat, open};
 use rustix::io::{Errno, read, write};
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
@@ -414,10 +415,16 @@ fn openat2_beneath(
     flags: OFlags,
     resolve: ResolveFlags,
 ) -> Result<OwnedFd, Errno> {
-    let Some(p) = sys::bytes_cstring(path) else {
-        return Err(Errno::INVAL);
-    };
-    openat2(dirfd, p.as_c_str(), flags, Mode::empty(), resolve)
+    use std::os::unix::ffi::OsStrExt;
+    // R5 task 14, D5: the `openat2` call itself lives in the shared
+    // audited boundary — `resolve_with` is this shim's exact upstream
+    // shape (`Mode::empty()`, `CLOEXEC` added inside).
+    central_adapter_linux::sys::openat2::resolve_with(
+        dirfd,
+        std::path::Path::new(std::ffi::OsStr::from_bytes(path)),
+        flags,
+        resolve,
+    )
 }
 
 /// `private_devpts` mounts a new devpts instance on /dev/pts and binds
@@ -728,15 +735,11 @@ fn build_view(p: &Plan) -> Result<(), Errno> {
                 continue;
             }
             let target = if i == nhidden - 1 {
-                let Some(h) = sys::bytes_cstring(hidden[i]) else {
-                    result = Err(fail_check(hide_steps[i]));
-                    break 'out;
-                };
-                openat2(
+                // R5 task 14, D5: the shared audited `openat2` site.
+                central_adapter_linux::sys::openat2::resolve_with(
                     CWD,
-                    h.as_c_str(),
-                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                    Mode::empty(),
+                    std::path::Path::new(std::ffi::OsStr::from_bytes(hidden[i])),
+                    OFlags::PATH | OFlags::DIRECTORY,
                     RESOLVE_NO_SYMLINKS,
                 )
             } else {

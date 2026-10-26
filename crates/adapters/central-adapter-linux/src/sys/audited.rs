@@ -244,6 +244,67 @@ pub(crate) fn fchownat_raw(path: &core::ffi::CStr) -> libc::c_long {
     unsafe { libc::syscall(libc::SYS_fchownat, libc::AT_FDCWD, path.as_ptr(), 0, 0, 0) }
 }
 
+/// `getpwnam(3)` — name → `(uid, gid, name, home)`. rustix has no NSS
+/// API; the record is copied out of the thread-static return buffer
+/// before it can be invalidated. Callers must be single-threaded with
+/// respect to NSS (the daemon and helper are).
+pub(crate) fn getpwnam(
+    name: &core::ffi::CStr,
+) -> Option<(u32, u32, std::ffi::CString, std::ffi::CString)> {
+    // SAFETY: `name` is a valid NUL-terminated string; the returned
+    // thread-static `passwd` is read completely before returning.
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    // SAFETY: `pw` is a live `passwd` record (checked non-null above).
+    unsafe {
+        Some((
+            (*pw).pw_uid,
+            (*pw).pw_gid,
+            core::ffi::CStr::from_ptr((*pw).pw_name).to_owned(),
+            core::ffi::CStr::from_ptr((*pw).pw_dir).to_owned(),
+        ))
+    }
+}
+
+/// `getgrnam(3)` — group name → gid. Same thread-static read pattern
+/// as [`getpwnam`].
+pub(crate) fn getgrnam(name: &core::ffi::CStr) -> Option<u32> {
+    // SAFETY: `name` is a valid NUL-terminated string; `gr` is checked
+    // non-null before the single field read.
+    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
+    if gr.is_null() {
+        None
+    } else {
+        // SAFETY: `gr` is a live `group` record (checked non-null).
+        Some(unsafe { (*gr).gr_gid })
+    }
+}
+
+/// `pidfd_send_signal(pidfd, sig, NULL, 0)` — signal the process a
+/// pidfd names (carried forward from `central-harness-launcherd`'s
+/// monitor SIGTERM/SIGKILL of its namespace init, R5 task 14 D5).
+/// rustix 1.1 has no `pidfd_send_signal` wrapper.
+pub(crate) fn pidfd_send_signal(fd: std::os::fd::RawFd, sig: i32) -> Result<(), Errno> {
+    // SAFETY: `pidfd_send_signal` takes a descriptor number and a
+    // signal value; no memory is shared. The caller proves the fd is a
+    // live pidfd (`sys::pidfd` call sites borrow only owned handles).
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            sig,
+            std::ptr::null::<u8>(),
+            0,
+        )
+    } != 0
+    {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
 pub(crate) fn socket_activation_fd(index: u32) -> Result<std::os::fd::OwnedFd, Errno> {
     let raw = 3i32 + i32::try_from(index).map_err(|_| Errno::BADF)?;
     // SAFETY: the socket-activation contract makes `3 + index` an open
@@ -952,4 +1013,34 @@ pub(crate) fn clone3_exec(spec: &CloneExecSpec) -> Result<libc::pid_t, Errno> {
     }
     #[allow(clippy::cast_possible_truncation)]
     Ok(pid as libc::pid_t)
+}
+
+/// `SysProcAttr.Credential` for a plain `std::process::Command`:
+/// `setgroups(0)` → `setgid(gid)` → `setuid(uid)` in the child — the
+/// same three-call sequence `child_exec` runs for the namespaced
+/// spawn (root's supplementary groups must never survive), installed
+/// through `pre_exec` because `CommandExt::pre_exec` is `unsafe` and
+/// every caller of this wrapper lives under `forbid(unsafe_code)`.
+/// The helper's managed-browser launch uses it to drop to the locked
+/// `central-browser` identity (R5 task 14).
+pub(crate) fn command_run_as(cmd: &mut std::process::Command, uid: u32, gid: u32) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs only in the post-fork child before
+    // exec; the three calls are async-signal-safe libc entry points
+    // on the child's own copy-on-write pages — the exact sequence
+    // `child_exec` audits above.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(uid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    };
 }

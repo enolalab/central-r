@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
-use central_foundation::failure::ExitClass;
+use central_foundation::failure::{ExitClass, Failure};
 use central_foundation::local_result::LocalResult;
 
 /// The upstream mode set (`cmd/central/modes.go`), one variant per
@@ -218,7 +218,187 @@ fn helper_daemon(
     env: impl Fn(&str) -> Option<String>,
     stderr: &mut impl Write,
 ) -> u8 {
-    central_adapter_linux::helper::daemon::run_helper_daemon(genesis_absent, &env, stderr)
+    // `runtimePresentationGuard` — upstream binds the PostgreSQL
+    // presentation lease unconditionally; the bin owns the `sqlx`
+    // bridge because `central-adapter-linux` deliberately holds none.
+    let deps = central_adapter_linux::helper::daemon::HelperRuntimeDeps {
+        begin_presentation: Some(Box::new(PgRuntimePresentation)),
+        validate_presentation: Some(Box::new(PgRuntimePresentation)),
+    };
+    central_adapter_linux::helper::daemon::run_helper_daemon(genesis_absent, &env, deps, stderr)
+}
+
+/// `runtimePresentationGuard` (upstream `cmd/central/main.go`) — the
+/// PostgreSQL presentation lease the helper daemon cannot reach on its
+/// own: a dedicated `central_runtime` pool of one per call, exactly
+/// like `openDedicatedConn(ctx, connString, "helper_presentation")`.
+/// Stateless — the descriptor path resolves per call through the same
+/// env the serve composition reads.
+struct PgRuntimePresentation;
+
+impl PgRuntimePresentation {
+    /// The sync-over-async bridge: a single-use current-thread runtime
+    /// opens the one-connection pool and runs the store call —
+    /// upstream's dedicated-conn shape kept per call.
+    fn with_store<T>(
+        f: impl FnOnce(
+            central_adapter_postgres::session::PgSessionStore,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, Failure>> + Send>,
+        >,
+    ) -> Result<T, Failure> {
+        let dsn = load_runtime_credential_descriptor()?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| Failure::unavailable("helper_presentation", "tokio runtime"))?;
+        rt.block_on(async move {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .min_connections(0)
+                .connect(&dsn)
+                .await
+                .map_err(|_| {
+                    Failure::unavailable("helper_presentation", "dedicated runtime conn")
+                })?;
+            f(central_adapter_postgres::session::PgSessionStore::new(pool)).await
+        })
+    }
+}
+
+/// The kernel's `session_failure` mapping, private here for the same
+/// boundary reason: the capability's `Failure` crosses into the
+/// helper as a foundation `Failure` (the handler collapses it to
+/// `AUTHORITY_DENIED` regardless).
+fn session_failure(f: central_session::contract::Failure) -> Failure {
+    use central_session::contract::FailureClass;
+    let code = f
+        .class
+        .map(|c| c.as_str())
+        .unwrap_or("session_bootstrap_failed");
+    match f.class {
+        Some(FailureClass::CsrfInvalid | FailureClass::BootstrapInvalid) => {
+            Failure::invalid(code, f.reason)
+        }
+        Some(FailureClass::BootstrapThrottled) => Failure::conflict(code, f.reason),
+        Some(FailureClass::SessionInvalidated | FailureClass::AuthorityDenied) => {
+            Failure::denied(code, f.reason)
+        }
+        None => Failure::internal(code, f.reason),
+    }
+}
+
+impl central_adapter_linux::helper::browser::PresentationLeaseStarterV2 for PgRuntimePresentation {
+    /// `BeginPresentation` — the durable lease, converted to the
+    /// helper's `PresentationLease` wire shape.
+    fn begin_presentation(
+        &self,
+    ) -> Result<central_adapter_linux::helper::browser::PresentationLease, Failure> {
+        use central_session::port::PresentationStore;
+        Self::with_store(|store| {
+            Box::pin(async move {
+                store
+                    .begin_presentation()
+                    .await
+                    .map_err(session_failure)
+                    .map(
+                        |lease| central_adapter_linux::helper::browser::PresentationLease {
+                            generation: lease.generation,
+                            // `None` is Go's zero time — the managed
+                            // launcher's deadline gate denies epoch-zero.
+                            deadline_unix: lease.deadline.map_or(0, |d| d.unix_timestamp()),
+                        },
+                    )
+            })
+        })
+    }
+}
+
+impl central_adapter_linux::helper::browser::PresentationGuard for PgRuntimePresentation {
+    /// `ValidatePresentation` — the durable deadline check.
+    fn validate_presentation(&self) -> Result<(), Failure> {
+        use central_session::port::PresentationStore;
+        Self::with_store(|store| {
+            Box::pin(async move { store.validate_presentation().await.map_err(session_failure) })
+        })
+    }
+}
+
+/// `loadCredentialDescriptor` — the strict runtime-descriptor read:
+/// 0400 regular file owned by the effective uid, one `host:port:db:
+/// role:secret` line, fixed `127.0.0.1:55432:central:central_runtime`
+/// shape, plaintext-DSN injection refused. The DSN is rebuilt with
+/// `url.UserPassword` userinfo escaping, never trusted raw.
+fn load_runtime_credential_descriptor() -> Result<String, Failure> {
+    fn bad() -> Failure {
+        Failure::denied(
+            "helper_presentation_credential",
+            "invalid runtime credential descriptor",
+        )
+    }
+    let path = std::env::var(central_kernel::serve::ENV_CREDENTIAL_DESCRIPTOR)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(bad)?;
+    let meta = std::fs::symlink_metadata(&path).map_err(|_| bad())?;
+    use std::os::unix::fs::MetadataExt;
+    if !meta.is_file()
+        || meta.mode() & 0o777 != 0o400
+        || meta.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(bad());
+    }
+    let data = std::fs::read(&path).map_err(|_| bad())?;
+    if data.is_empty()
+        || data.len() > 4096
+        || data.iter().filter(|b| **b == b'\n').count() != 1
+        || data.contains(&b'\r')
+    {
+        return Err(bad());
+    }
+    let line = std::str::from_utf8(&data)
+        .map_err(|_| bad())?
+        .trim_end_matches('\n');
+    if line.contains("://") {
+        return Err(Failure::denied(
+            "helper_presentation_credential",
+            "plaintext runtime DSN is forbidden",
+        ));
+    }
+    let fields: Vec<&str> = line.split(':').collect();
+    if fields.len() != 5
+        || fields[0] != "127.0.0.1"
+        || fields[1] != "55432"
+        || fields[2] != "central"
+        || fields[3] != "central_runtime"
+        || fields[4].is_empty()
+    {
+        return Err(bad());
+    }
+    // `url.UserPassword(role, secret)` — Go's userinfo escape set:
+    // unreserved + `!$&'()*+,;=` + `:` survive; everything else is
+    // %XX (uppercase).
+    fn userinfo_escape(s: &str) -> String {
+        const ALLOWED: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:";
+        let mut out = String::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            if ALLOWED.contains(&b) {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+    Ok(format!(
+        "postgres://{}:{}@{}:{}/{}?sslmode=disable",
+        userinfo_escape(fields[3]),
+        userinfo_escape(fields[4]),
+        fields[0],
+        fields[1],
+        fields[2]
+    ))
 }
 
 /// `central --broker` after the gates — upstream `runBrokerDaemon`,

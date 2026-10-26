@@ -37,6 +37,8 @@
 //!   A06): `clone3` with upstream's `Cloneflags`/`Unshareflags`,
 //!   `CLONE_INTO_CGROUP`, the credential drop, `Pdeathsig`, and the
 //!   fd sweep — the safe front door over [`audited::clone3_exec`]
+//! - [`nss`] — `getpwnam`/`getgrnam` identity lookups (carried forward
+//!   from `central-harness-launcherd`'s local boundary, R5 task 14 D5)
 //! - [`pam`] — the PAM authentication boundary (R5 task 5, decision
 //!   D1): the safe front door over the hand-written `libpam` FFI in
 //!   [`audited::pam_ffi`] — upstream `pam_linux.go`'s
@@ -64,6 +66,8 @@ pub mod hardening;
 pub mod memfd;
 #[forbid(unsafe_code)]
 pub mod namespace;
+#[forbid(unsafe_code)]
+pub mod nss;
 #[forbid(unsafe_code)]
 pub mod openat2;
 #[forbid(unsafe_code)]

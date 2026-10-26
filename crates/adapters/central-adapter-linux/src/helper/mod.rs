@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod browser;
+pub mod browser_runtime;
 pub mod client;
 pub mod daemon;
 pub mod grant;

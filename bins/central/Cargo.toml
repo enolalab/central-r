@@ -42,6 +42,13 @@ central-adapter-s3 = { path = "../../crates/adapters/central-adapter-s3", versio
 # helper daemon the same way, over the workspace-pinned adapter the
 # kernel already pulls in.
 central-adapter-linux = { path = "../../crates/adapters/central-adapter-linux", version = "0.1.0" }
+# `central --helper` browser/bootstrap composition (Phase R5 task 14):
+# the `PresentationStore` port the `PgRuntimePresentation` bridge
+# implements — upstream `cmd/central` calls `pgsession.NewStore(conn)`
+# inside `runtimePresentationGuard`; the adapter holds no `sqlx`, so
+# the port type comes through the capability crate the bin already
+# composes against.
+central-session = { path = "../../crates/capabilities/central-session", version = "0.1.0" }
 # `central --helper`/`--broker`/`--sandbox-launcher` mode gates (Phase
 # R5 task 1): the privilege check needs `rustix::process::getuid` —
 # the same pinned workspace dep the kernel and launcher bins already

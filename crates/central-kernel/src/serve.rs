@@ -137,8 +137,6 @@ pub const ENV_DSN: &str = "CENTRAL_DSN";
 /// non-empty line is the runtime DSN; takes precedence over
 /// [`ENV_DSN`].
 pub const ENV_CREDENTIAL_DESCRIPTOR: &str = "CENTRAL_RUNTIME_CREDENTIAL_DESCRIPTOR";
-/// The application listener bind address.
-pub const ENV_APP_LISTEN: &str = "CENTRAL_APP_LISTEN";
 /// The operations listener bind address — loopback only.
 pub const ENV_OPS_LISTEN: &str = "CENTRAL_OPS_LISTEN";
 /// The fixed workspace the bootstrap exchange mints sessions for.
@@ -149,6 +147,13 @@ pub const ENV_ALLOWED_ROOTS: &str = "CENTRAL_B11_ALLOWED_WORKSPACE_ROOTS";
 pub const ENV_DEV_BOOTSTRAP_ROOT: &str = "CENTRAL_DEV_BOOTSTRAP_ROOT";
 /// `CENTRAL_READY_PROOF_PATH`.
 pub const ENV_READY_PROOF_PATH: &str = "CENTRAL_READY_PROOF_PATH";
+/// `CENTRAL_RUNTIME_GENERATION_PATH` — upstream
+/// `runtimeGenerationPath()`'s env seam; unset, the sidecar is
+/// `<ready proof path>.generation`.
+pub const ENV_RUNTIME_GENERATION_PATH: &str = "CENTRAL_RUNTIME_GENERATION_PATH";
+/// Upstream `readyProofPath()`'s default — the helper's
+/// `fileReadyProofSource` reads the same well-known location.
+const DEFAULT_READY_PROOF_PATH: &str = "/run/central/ready-proof.json";
 
 /// `CENTRAL_RECOVERY_RESUME` — the operator's acknowledged resume of a
 /// degraded epoch, `<generation>:<retry_attempt>`
@@ -180,7 +185,15 @@ pub const ENV_PHASE2_SCHEDULER: &str = crate::scheduler_compose::ENV_SCHEDULER_E
 /// refusal `CONFIG_INVALID` (upstream `compositionExit`).
 pub const ERR_SERVE_CONFIG: &str = "serve_config_invalid";
 
-const DEFAULT_APP_LISTEN: &str = "127.0.0.1:8080";
+/// Upstream `kernel.ApplicationAddress` — a fixed constant, not a
+/// configuration knob (B06): the application listener binds exactly
+/// `127.0.0.1:8080` so the TLS leaf's single `127.0.0.1` SAN, the
+/// fixed `https://127.0.0.1:8080` expected origin, and the managed
+/// browser's `FixedBrowserOrigin` all name the same endpoint.
+const APPLICATION_ADDRESS: &str = "127.0.0.1:8080";
+/// Upstream `kernel.OperationsAddress` — the plain-HTTP operations
+/// listener's default; `CENTRAL_OPS_LISTEN` may move it (loopback
+/// only) for development, matching the kernel's own env seam.
 const DEFAULT_OPS_LISTEN: &str = "127.0.0.1:9090";
 /// Upstream `runtimePoolConfig`: `pool_max_conns` outside `1..=8`
 /// clamps to 4; `validateExecutionPoolSize` refuses a pool under 3
@@ -242,8 +255,9 @@ fn dep_err(msg: impl Into<String>) -> ExitError {
 pub struct ServeConfig {
     /// The runtime DSN (the descriptor file takes precedence).
     pub dsn: String,
-    /// The application listener — `expected_host` derives from it so
-    /// admission never accepts a different Host (upstream
+    /// The application listener — upstream `kernel.ApplicationAddress`
+    /// (`127.0.0.1:8080`, a fixed constant). `expected_host` derives
+    /// from it so admission never accepts a different Host (upstream
     /// `Config.ExpectedHost`).
     pub app_listen: SocketAddr,
     /// The operations listener — asserted loopback-only.
@@ -261,8 +275,13 @@ pub struct ServeConfig {
     /// The B10 object store; `None` means the capability is
     /// unconfigured — never a degradation.
     pub objects: Option<ObjectConfig>,
-    /// `CENTRAL_READY_PROOF_PATH` — the proof file a parent waits on.
-    pub ready_proof_path: Option<PathBuf>,
+    /// `readyProofPath()` — the stored proof file; always resolved
+    /// (env override or the `/run/central` default), matching
+    /// upstream's unconditional `fileReadyProofPublisher`.
+    pub ready_proof_path: PathBuf,
+    /// `runtimeGenerationPath()` — the `.generation` sidecar
+    /// `fileReadyProofSource` cross-checks.
+    pub generation_path: PathBuf,
     /// Lifecycle budgets.
     pub profile: ProfileConfig,
     /// Runtime pool size (`pool_max_conns` from the DSN, clamped to
@@ -276,6 +295,26 @@ pub struct ServeConfig {
     /// drives the fleet page's residual-rows notice gate (upstream
     /// `h.schedulerEnabled`) and the whole Slice-2B component stack.
     pub scheduler: crate::scheduler_compose::SchedulerConfig,
+    /// The TLS material source the application listener terminates
+    /// with (B06 — upstream `serveTLSProvider` selection).
+    pub tls: TlsMaterialSelection,
+}
+
+/// Which [`crate::serve_tls::TlsMaterialProvider`] the composition
+/// builds (upstream `newServeTLSProvider` reads the provisioned file
+/// bundle; the broker-state form is the R5 port's in-process/dev
+/// variant selected by `CENTRAL_BROKER_TLS_STATE`).
+#[derive(Debug, Clone)]
+pub enum TlsMaterialSelection {
+    /// `CENTRAL_TLS_ROOT` file bundle (leaf.pem/leaf.key/ca.pem) —
+    /// upstream's `serveTLSProvider`, the production form provisioned
+    /// from the broker authority by instance setup.
+    Files,
+    /// `CENTRAL_BROKER_TLS_STATE` — the broker's persisted
+    /// `TlsAuthority` read directly; usable only where the serve
+    /// process shares the broker state's owner (dev/in-process
+    /// compositions).
+    BrokerState(PathBuf),
 }
 
 impl ServeConfig {
@@ -295,12 +334,7 @@ impl ServeConfig {
     /// Same as [`Self::from_env`].
     pub fn load(getenv: impl Fn(&str) -> Option<String>) -> Result<Self, ExitError> {
         let dsn = load_dsn(&getenv)?;
-        let app_listen = parse_addr(
-            getenv(ENV_APP_LISTEN)
-                .as_deref()
-                .unwrap_or(DEFAULT_APP_LISTEN),
-            ENV_APP_LISTEN,
-        )?;
+        let app_listen = parse_addr(APPLICATION_ADDRESS, "kernel.ApplicationAddress")?;
         let ops_listen = parse_addr(
             getenv(ENV_OPS_LISTEN)
                 .as_deref()
@@ -333,7 +367,8 @@ impl ServeConfig {
         let harness = HarnessConfig::load(|name| getenv(name).unwrap_or_default())
             .map_err(|f| config_err(format!("harness config: {}", f.code())))?;
         let objects = load_objects(&getenv)?;
-        let ready_proof_path = getenv(ENV_READY_PROOF_PATH).map(PathBuf::from);
+        let ready_proof_path = ready_proof_path(&getenv);
+        let generation_path = runtime_generation_path(&getenv, &ready_proof_path);
         let pool_max = runtime_pool_max(&dsn)?;
         let recovery_resume = load_recovery_resume_config(&getenv)
             .map_err(|f| config_err(format!("{}: {}", f.code(), f.message())))?;
@@ -347,6 +382,7 @@ impl ServeConfig {
             harness,
             objects,
             ready_proof_path,
+            generation_path,
             profile: ProfileConfig::default(),
             pool_max,
             recovery_resume,
@@ -354,8 +390,52 @@ impl ServeConfig {
                 getenv(name).unwrap_or_default()
             })
             .map_err(|f| config_err(format!("scheduler config: {}", f.message())))?,
+            tls: select_tls_material(&getenv)?,
         })
     }
+}
+
+/// `newServeTLSProvider` selection — `CENTRAL_BROKER_TLS_STATE` names
+/// the broker protected root directly; otherwise the provisioned
+/// `CENTRAL_TLS_ROOT` bundle (upstream's only form) is used.
+fn select_tls_material(
+    getenv: &impl Fn(&str) -> Option<String>,
+) -> Result<TlsMaterialSelection, ExitError> {
+    if let Some(state) = getenv(crate::serve_tls::ENV_BROKER_TLS_STATE).filter(|v| !v.is_empty()) {
+        return Ok(TlsMaterialSelection::BrokerState(PathBuf::from(state)));
+    }
+    Ok(TlsMaterialSelection::Files)
+}
+
+/// The composition-resolved TLS material provider — the box lives
+/// inside `compose_serve` so the provider trait object never reaches
+/// `ServeConfig`'s `Clone`/`Debug` surface.
+fn tls_material_provider(
+    selection: &TlsMaterialSelection,
+) -> Result<Box<dyn crate::serve_tls::TlsMaterialProvider>, ExitError> {
+    match selection {
+        TlsMaterialSelection::Files => Ok(Box::new(
+            crate::serve_tls::FileTlsMaterialProvider::from_env(&|name| std::env::var(name).ok()),
+        )),
+        TlsMaterialSelection::BrokerState(root) => Ok(Box::new(
+            crate::serve_tls::BrokerTlsMaterialProvider::new(root),
+        )),
+    }
+}
+
+/// `kernel.Serve`'s TLS gate — `LoadTLS` + `ValidateTLS` fail closed
+/// with upstream's exit `2`/`TLS_INVALID` before the application
+/// listener is ever bound.
+fn load_validated_tls(
+    selection: &TlsMaterialSelection,
+) -> Result<crate::serve_tls::ServeTlsMaterial, ExitError> {
+    let provider = tls_material_provider(selection)?;
+    let material = provider
+        .load_tls()
+        .map_err(|f| ExitError::new(ExitClass::Usage, "TLS_INVALID", f))?;
+    crate::serve_tls::validate_tls(&material, OffsetDateTime::now_utc())
+        .map_err(|f| ExitError::new(ExitClass::Usage, "TLS_INVALID", f))?;
+    Ok(material)
 }
 
 /// `runtimePoolConfig` — reads `pool_max_conns` from the DSN query
@@ -524,11 +604,29 @@ impl tports::ArtifactDelivery for UnconfiguredArtifactDelivery {
 // Listener component — one supervised axum listener
 // ---------------------------------------------------------------------------
 
-/// A bound `TcpListener` serving an axum `Router` — the kernel's port
-/// of upstream's HTTP component (`Serve` + `Shutdown` through the
-/// profile token).
+/// The two listener shapes upstream `kernel.Serve` runs: the
+/// application listener terminates TLS 1.3 over
+/// [`central_transport_http::tls::TlsListener`] (B06), the operations
+/// listener stays plain HTTP on its own loopback bind. Enum dispatch
+/// (rather than a generic `L`) keeps each `axum::serve` call
+/// monomorphic — axum's `Connected` impls are concrete per listener
+/// and its `AddExtension` response type is not publicly nameable, so
+/// a generic `IntoFuture` bound cannot be expressed.
+enum ListenerKind {
+    /// `tls.NewListener`-wrapped application listener — `Connected`
+    /// projection `TlsPeerAddr`, remapped to `ConnectInfo<SocketAddr>`
+    /// by the app router's outermost layer.
+    Tls(central_transport_http::tls::TlsListener),
+    /// The plain operations listener — axum's own
+    /// `Connected<IncomingStream<'_, TcpListener>> for SocketAddr`.
+    Plain(TcpListener),
+}
+
+/// A bound listener serving an axum `Router` — the kernel's port of
+/// upstream's HTTP component (`Serve` + `Shutdown` through the profile
+/// token).
 struct HttpListenerComponent {
-    listener: Option<TcpListener>,
+    listener: Option<ListenerKind>,
     router: Router,
     token: CancellationToken,
 }
@@ -547,16 +645,33 @@ impl Component for HttpListenerComponent {
         let token = self.token.clone();
         Box::pin(async move {
             // `into_make_service_with_connect_info` injects
-            // `ConnectInfo<SocketAddr>` — the admission middleware's
-            // loopback-peer check (upstream `r.RemoteAddr`) reads it;
-            // without it every request fails `PEER_NOT_LOOPBACK`.
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(token.cancelled_owned())
-            .await
-            .map_err(|e| Failure::internal("http_listener_serve", e.to_string()))
+            // `ConnectInfo<C>` — the admission middleware's
+            // loopback-peer check (upstream `r.RemoteAddr`) reads the
+            // canonical `ConnectInfo<SocketAddr>`; for the TLS arm the
+            // `TlsPeerAddr` projection is remapped onto it by the app
+            // router's outermost layer before admission runs.
+            match listener {
+                ListenerKind::Tls(listener) => axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<
+                        central_transport_http::tls::TlsPeerAddr,
+                    >(),
+                )
+                .with_graceful_shutdown(token.cancelled_owned())
+                .await
+                .map_err(|e| {
+                    Failure::internal("http_listener_serve", e.to_string())
+                }),
+                ListenerKind::Plain(listener) => axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(token.cancelled_owned())
+                .await
+                .map_err(|e| {
+                    Failure::internal("http_listener_serve", e.to_string())
+                }),
+            }
         })
     }
 
@@ -1481,12 +1596,7 @@ impl Component for ServeExecutionMonitor {
 /// `delivery_pending` candidate set and drives it through the session
 /// service's fail-closed reconciliation before readiness publishes.
 struct ServeBootstrapReconciler {
-    service: Arc<
-        SessionService<
-            PgSessionStore,
-            central_adapter_linux::dev_bootstrap::DevFileProtectedBootstrap,
-        >,
-    >,
+    service: Arc<SessionService<PgSessionStore, crate::harness_compose::ServeBootstrap>>,
     candidates: PgSessionStore,
     epochs: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -2082,62 +2192,299 @@ impl ServeRecoveryPreflight {
 // Proof publisher — CENTRAL_READY_PROOF_PATH file
 // ---------------------------------------------------------------------------
 
-/// `ReadyProofPublisher` over `CENTRAL_READY_PROOF_PATH` — writes the
-/// safe JSON projection (the nonce never leaves the process;
-/// upstream's `fileReadyProofPublisher`).
+/// `readyProofPath()` — the stored proof's default location; the
+/// helper's `fileReadyProofSource` reads the same path.
+fn ready_proof_path(getenv: &impl Fn(&str) -> Option<String>) -> PathBuf {
+    getenv(ENV_READY_PROOF_PATH)
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from(DEFAULT_READY_PROOF_PATH), PathBuf::from)
+}
+
+/// `runtimeGenerationPath()` — the `.generation` sidecar's default is
+/// derived from the proof path, never its own hardcoded location.
+fn runtime_generation_path(
+    getenv: &impl Fn(&str) -> Option<String>,
+    proof_path: &std::path::Path,
+) -> PathBuf {
+    getenv(ENV_RUNTIME_GENERATION_PATH)
+        .filter(|v| !v.is_empty())
+        .map_or_else(
+            || {
+                let mut p = proof_path.as_os_str().to_owned();
+                p.push(".generation");
+                PathBuf::from(p)
+            },
+            PathBuf::from,
+        )
+}
+
+/// `base64.RawStdEncoding` — the stored nonce's wire alphabet, no
+/// padding. Mirrors `broker::wire::b64_raw_encode`; the codec is
+/// private per site because the stored-file format is the contract,
+/// not the helper.
+fn b64_raw_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 1);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 0x3f] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 0x3f] as char);
+        }
+    }
+    out
+}
+
+/// `storedReadyProof` — the on-disk JSON the file publisher writes
+/// and `fileReadyProofSource` reads. Unlike every rendered form of
+/// `ReadyProof`, the stored form carries the nonce (base64 raw) so
+/// the helper can present exact proof equality.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredReadyProof {
+    launch_id: String,
+    runtime_generation: String,
+    nonce: String,
+    expires_at: String,
+}
+
+/// `fileReadyProofPublisher` — the upstream parity port: an
+/// `O_CREATE|O_RDWR 0600` `<path>.lock` flock held from `begin_startup`
+/// for the whole startup session, the stored proof (with nonce) at
+/// `<path>` mode `0600` via tmp+rename, and the `<path>.generation`
+/// sidecar so `fileReadyProofSource` can cross-check the generation.
 struct FileReadyProofPublisher {
     path: PathBuf,
-    published: StdMutex<Option<String>>,
+    generation_path: PathBuf,
+    /// `sessionLock` — the held flock file for the startup session.
+    session: StdMutex<Option<std::fs::File>>,
+}
+
+impl FileReadyProofPublisher {
+    fn io_err(code: &'static str, e: impl std::fmt::Display) -> Failure {
+        Failure::unavailable(code, e.to_string())
+    }
+
+    /// Opens `path` with mode `0600` (`os.OpenFile(_, O_CREATE|O_WRONLY|
+    /// O_TRUNC, 0600)` semantics for the proof/generation writes).
+    fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, body))
+    }
+
+    /// `acquireReadyProofLock` — non-blocking `LOCK_EX` on
+    /// `<path>.lock` retried every 10 ms; the retry is a sleep inside
+    /// the future so the profile's startup deadline cancels it by
+    /// dropping (close releases the flock).
+    async fn acquire_lock(&self) -> Result<std::fs::File, Failure> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsFd;
+        let lock_path = {
+            let mut p = self.path.as_os_str().to_owned();
+            p.push(".lock");
+            PathBuf::from(p)
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // `O_RDWR|O_CREAT` without `O_TRUNC` — upstream's exact
+            // lock-file open; the descriptor is only flock'd.
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|e| Self::io_err("ready_proof_lock", e))?;
+        loop {
+            match rustix::fs::flock(
+                file.as_fd(),
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ) {
+                Ok(()) => return Ok(file),
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => {
+                    return Err(Self::io_err("ready_proof_lock", e));
+                }
+            }
+        }
+    }
+
+    /// `writeReadyProof` — the stored JSON under the active session:
+    /// tmp + rename at mode `0600`, then the generation sidecar; a
+    /// sidecar failure removes the proof so the pair never diverges.
+    fn write_ready_proof(&self, proof: &ReadyProof) -> Result<(), Failure> {
+        let body = serde_json::to_vec(&StoredReadyProof {
+            launch_id: proof.launch_id.clone(),
+            runtime_generation: proof.runtime_generation.clone(),
+            nonce: b64_raw_encode(&proof.nonce),
+            expires_at: proof
+                .expires_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        })
+        .map_err(|e| Self::io_err("ready_proof_publish", e))?;
+        let tmp = {
+            let mut p = self.path.as_os_str().to_owned();
+            p.push(".tmp");
+            PathBuf::from(p)
+        };
+        Self::write_private(&tmp, &body)
+            .and_then(|()| {
+                std::fs::rename(&tmp, &self.path).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                })
+            })
+            .map_err(|e| Self::io_err("ready_proof_publish", e))?;
+        let generation = format!("{}\n", proof.runtime_generation);
+        Self::write_private(&self.generation_path, generation.as_bytes()).map_err(|e| {
+            let _ = std::fs::remove_file(&self.path);
+            Self::io_err("ready_proof_publish", e)
+        })
+    }
+
+    /// `removeReadyProof` — both artifacts go together; `ENOENT` is a
+    /// no-op on each (upstream's `errors.Join` keeps the first failure
+    /// here — the second is the same class and path family).
+    fn remove_ready_proof(&self) -> Result<(), Failure> {
+        let mut result: Result<(), Failure> = Ok(());
+        for path in [&self.path, &self.generation_path] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    result = result.and(Err(Self::io_err("ready_proof_revoke", e)));
+                }
+            }
+        }
+        result
+    }
+
+    /// `removeReadyProofIfGeneration` — removes only when the stored
+    /// proof's generation matches AND the sidecar still agrees; a
+    /// missing proof or generation file is a no-op (another launch
+    /// may already own the slot).
+    fn remove_ready_proof_if_generation(&self, generation: &str) -> Result<(), Failure> {
+        let data = match std::fs::read(&self.path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Self::io_err("ready_proof_revoke", e)),
+        };
+        let stored: StoredReadyProof =
+            serde_json::from_slice(&data).map_err(|e| Self::io_err("ready_proof_revoke", e))?;
+        if stored.runtime_generation != generation {
+            return Ok(());
+        }
+        match std::fs::read_to_string(&self.generation_path) {
+            Ok(current) if current.trim() == generation => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Self::io_err("ready_proof_revoke", e)),
+        }
+        self.remove_ready_proof()
+    }
 }
 
 impl ReadyProofPublisher for FileReadyProofPublisher {
+    /// `BeginStartup` — takes the `<path>.lock` flock and holds it for
+    /// the session; a second call before `abort_startup`/
+    /// `revoke_if_generation` is the "already active" protocol error.
     fn begin_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn publish(&mut self, proof: ReadyProof) -> BoxFuture<'_, Result<(), Failure>> {
-        let path = self.path.clone();
-        let generation = proof.runtime_generation.clone();
-        let body = serde_json::json!({
-            "launch_id": proof.launch_id,
-            "runtime_generation": proof.runtime_generation,
-            "expires_at": proof.expires_at,
-        })
-        .to_string();
-        Box::pin(async move {
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, body)
-                .and_then(|()| std::fs::rename(&tmp, &path))
-                .map_err(|e| Failure::unavailable("ready_proof_publish", e.to_string()))?;
-            *self.published.lock().unwrap_or_else(|p| p.into_inner()) = Some(generation);
+        Box::pin(async {
+            if self
+                .session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            {
+                return Err(Failure::internal(
+                    "ready_proof_session",
+                    "ready proof startup session is already active",
+                ));
+            }
+            let file = self.acquire_lock().await?;
+            *self.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(file);
             Ok(())
         })
     }
 
+    /// `Publish` — writes the stored proof under the held session.
+    fn publish(&mut self, proof: ReadyProof) -> BoxFuture<'_, Result<(), Failure>> {
+        let result = if self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+        {
+            Err(Failure::internal(
+                "ready_proof_session",
+                "ready proof startup session is not active",
+            ))
+        } else {
+            self.write_ready_proof(&proof)
+        };
+        Box::pin(async move { result })
+    }
+
+    /// `Revoke` — removes the stored pair under the held session.
     fn revoke(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
-        let path = self.path.clone();
+        let result = if self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+        {
+            Err(Failure::internal(
+                "ready_proof_session",
+                "ready proof startup session is not active",
+            ))
+        } else {
+            self.remove_ready_proof()
+        };
+        Box::pin(async move { result })
+    }
+
+    /// `RevokeIfGeneration` — the shutdown path: with the session held
+    /// it removes the pair when the stored generation still matches
+    /// and releases the lock either way; without a session it takes a
+    /// transient lock for the same conditional removal.
+    fn revoke_if_generation(&mut self, generation: String) -> BoxFuture<'_, Result<(), Failure>> {
+        let held = self
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         Box::pin(async move {
-            match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Failure::unavailable("ready_proof_revoke", e.to_string())),
+            match held {
+                Some(_lock) => self.remove_ready_proof_if_generation(&generation),
+                None => {
+                    let _transient = self.acquire_lock().await?;
+                    self.remove_ready_proof_if_generation(&generation)
+                }
             }
+            // Dropping the File releases the flock.
         })
     }
 
-    fn revoke_if_generation(&mut self, generation: String) -> BoxFuture<'_, Result<(), Failure>> {
-        let held = self
-            .published
+    /// `AbortStartup` — releases the session lock without touching a
+    /// published proof.
+    fn abort_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+        self.session
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        if held.as_deref() == Some(generation.as_str()) {
-            return self.revoke();
-        }
-        Box::pin(async { Ok(()) })
-    }
-
-    fn abort_startup(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+            .take();
         Box::pin(async { Ok(()) })
     }
 }
@@ -2709,7 +3056,7 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
                 expected_host: Some(config.app_listen.to_string()),
                 ..AdmissionConfig::default()
             },
-            expected_origin: format!("http://{}", config.app_listen),
+            expected_origin: format!("https://{}", config.app_listen),
             preauth: session.service.clone(),
             sessions: session.service.clone(),
             delivery: session.service.clone(),
@@ -2718,6 +3065,26 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         },
     )
     .map_err(|f| config_err(format!("app router: {}", f.code())))?;
+    // B06 remap: the TLS listener carries its peer through
+    // `ConnectInfo<TlsPeerAddr>` (orphan rule — axum only impls
+    // `Connected` for `TcpListener`). Project it back onto the
+    // canonical `ConnectInfo<SocketAddr>` extension as the outermost
+    // layer so the admission middleware's loopback-peer check reads
+    // exactly the extension it reads on the plain listener; the check
+    // itself is unchanged.
+    let app_router = app_router.layer(axum::middleware::from_fn(
+        |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            use axum::extract::ConnectInfo;
+            if let Some(peer) = req
+                .extensions()
+                .get::<ConnectInfo<central_transport_http::tls::TlsPeerAddr>>()
+            {
+                let addr = peer.0.0;
+                req.extensions_mut().insert(ConnectInfo(addr));
+            }
+            next.run(req).await
+        },
+    ));
     let ops_router = build_ops_router(
         Arc::new(KernelProbe {
             readiness: readiness.clone(),
@@ -2727,9 +3094,21 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
     )
     .map_err(|f| config_err(format!("ops router: {}", f.code())))?;
 
+    // B06: `kernel.Serve`'s TLS gate — `LoadTLS` + `ValidateTLS` run
+    // before the application listener is bound; any refusal is
+    // `TLS_INVALID` (upstream exit 2) and serve never opens a plain
+    // socket for the application surface.
+    let tls_material = load_validated_tls(&config.tls)?;
+    let tls_config = central_transport_http::tls::tls13_server_config(
+        tls_material.chain.clone(),
+        tls_material.key,
+    )
+    .map_err(|f| ExitError::new(ExitClass::Usage, "TLS_INVALID", f))?;
+
     let app_listener = TcpListener::bind(config.app_listen)
         .await
         .map_err(|e| dep_err(format!("app listener {}: {e}", config.app_listen)))?;
+    let app_listener = central_transport_http::tls::TlsListener::new(app_listener, tls_config);
     let ops_listener = TcpListener::bind(config.ops_listen)
         .await
         .map_err(|e| dep_err(format!("ops listener {}: {e}", config.ops_listen)))?;
@@ -2742,12 +3121,15 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
     //     upstream's component order does.
     let mut profile = Profile::new(config.profile, readiness.clone());
     profile.set_launch_id(new_runtime_launch_id(OffsetDateTime::now_utc()));
-    if let Some(path) = &config.ready_proof_path {
-        profile.set_proof_publisher(FileReadyProofPublisher {
-            path: path.clone(),
-            published: StdMutex::new(None),
-        });
-    }
+    // Upstream installs `fileReadyProofPublisher` unconditionally —
+    // the stored proof at `readyProofPath()` is how the helper's
+    // browser-open path obtains a presentable proof, so skipping it
+    // would silently deny every managed browser launch.
+    profile.set_proof_publisher(FileReadyProofPublisher {
+        path: config.ready_proof_path.clone(),
+        generation_path: config.generation_path.clone(),
+        session: StdMutex::new(None),
+    });
     profile.set_control_lock(PgControlLock {
         conn: Some(control_conn),
         lock: pg_serve::ControlLock::new(SERVE_TARGET_EXCLUSION_LOCK_KEY),
@@ -2806,12 +3188,12 @@ pub async fn compose_serve(config: &ServeConfig) -> Result<ServeComposition, Exi
         ))),
     });
     profile.add_component(HttpListenerComponent {
-        listener: Some(app_listener),
+        listener: Some(ListenerKind::Tls(app_listener)),
         router: app_router,
         token: token.clone(),
     });
     profile.add_component(HttpListenerComponent {
-        listener: Some(ops_listener),
+        listener: Some(ListenerKind::Plain(ops_listener)),
         router: ops_router,
         token: token.clone(),
     });
@@ -4084,5 +4466,191 @@ mod tests {
             !order.lock().unwrap().contains(&"scheduler"),
             "scheduler reconcile ran while the gate was off"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // B06 — fixed application bind + TLS material selection
+    // ------------------------------------------------------------------
+
+    /// The smallest env `ServeConfig::load` accepts: a DSN and the
+    /// workspace UUID (objects/harness/scheduler are all optional).
+    fn minimal_env(extra: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let mut map: BTreeMap<&'static str, &'static str> = BTreeMap::from([
+            (ENV_DSN, "postgres://central@localhost/central"),
+            (ENV_WORKSPACE, "018f0c6a-7b4d-7e2f-9a1b-2c3d4e5f6071"),
+        ]);
+        map.extend(extra.iter().copied());
+        move |name| map.get(name).map(|v| (*v).to_owned())
+    }
+
+    /// B06: upstream `kernel.ApplicationAddress` is a constant, not a
+    /// knob — the application listener binds exactly `127.0.0.1:8080`
+    /// and no environment variable can move it (the removed
+    /// `CENTRAL_APP_LISTEN` override must have no effect, even when
+    /// set to a non-loopback address).
+    #[test]
+    fn app_listen_is_the_fixed_upstream_address() {
+        for extra in [
+            &[][..],
+            &[("CENTRAL_APP_LISTEN", "0.0.0.0:443")][..],
+            &[("CENTRAL_APP_LISTEN", "192.0.2.1:8080")][..],
+        ] {
+            let config = ServeConfig::load(minimal_env(extra)).expect("config");
+            assert_eq!(
+                config.app_listen,
+                SocketAddr::from(([127, 0, 0, 1], 8080)),
+                "CENTRAL_APP_LISTEN must not move the application bind"
+            );
+        }
+    }
+
+    /// B06: `CENTRAL_BROKER_TLS_STATE` selects the broker-authority
+    /// material provider; unset, the provisioned `CENTRAL_TLS_ROOT`
+    /// file bundle (upstream `serveTLSProvider`) is used.
+    #[test]
+    fn tls_material_selection_env() {
+        let files = select_tls_material(&|_| None).expect("selection");
+        assert!(matches!(files, TlsMaterialSelection::Files));
+
+        let broker = select_tls_material(&|name| {
+            (name == crate::serve_tls::ENV_BROKER_TLS_STATE)
+                .then(|| "/run/central-broker".to_owned())
+        })
+        .expect("selection");
+        assert!(
+            matches!(broker, TlsMaterialSelection::BrokerState(ref p)
+                if p == &PathBuf::from("/run/central-broker")),
+            "CENTRAL_BROKER_TLS_STATE must select the broker provider"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Ready-proof publisher — upstream `fileReadyProofPublisher` parity
+    // ------------------------------------------------------------------
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "central-readyproof-{tag}-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn test_proof() -> ReadyProof {
+        crate::readyproof::new_ready_proof(
+            "central-runtime-1-abcdef",
+            OffsetDateTime::now_utc(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("proof")
+    }
+
+    /// `readyProofPath()`/`runtimeGenerationPath()` — env overrides or
+    /// the `/run/central` + `.generation` defaults.
+    #[test]
+    fn ready_proof_paths_resolve_like_upstream() {
+        let proof = ready_proof_path(&|_| None);
+        assert_eq!(proof, PathBuf::from(DEFAULT_READY_PROOF_PATH));
+        let generation = runtime_generation_path(&|_| None, &proof);
+        assert_eq!(
+            generation,
+            PathBuf::from(format!("{DEFAULT_READY_PROOF_PATH}.generation"))
+        );
+
+        let proof = ready_proof_path(&|name| {
+            (name == ENV_READY_PROOF_PATH).then(|| "/tmp/p.json".to_owned())
+        });
+        assert_eq!(proof, PathBuf::from("/tmp/p.json"));
+        let generation = runtime_generation_path(
+            &|name| (name == ENV_RUNTIME_GENERATION_PATH).then(|| "/tmp/g".to_owned()),
+            &proof,
+        );
+        assert_eq!(generation, PathBuf::from("/tmp/g"));
+    }
+
+    /// The stored file carries the base64-raw nonce and the
+    /// `.generation` sidecar — the exact `storedReadyProof` upstream's
+    /// helper-side `fileReadyProofSource` parses — at mode `0600`.
+    #[tokio::test]
+    async fn publisher_stores_nonce_and_generation_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("publish");
+        let path = root.join("ready-proof.json");
+        let generation_path = root.join("ready-proof.json.generation");
+        let mut publisher = FileReadyProofPublisher {
+            path: path.clone(),
+            generation_path: generation_path.clone(),
+            session: StdMutex::new(None),
+        };
+
+        // Publish without a startup session fails closed.
+        assert!(
+            publisher.publish(test_proof()).await.is_err(),
+            "publish outside the startup session must fail"
+        );
+
+        publisher.begin_startup().await.expect("begin_startup");
+        let proof = test_proof();
+        publisher.publish(proof.clone()).await.expect("publish");
+
+        let stored: StoredReadyProof =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.launch_id, proof.launch_id);
+        assert_eq!(stored.runtime_generation, proof.runtime_generation);
+        assert_eq!(stored.nonce, b64_raw_encode(&proof.nonce));
+        assert_eq!(
+            std::fs::read_to_string(&generation_path).unwrap(),
+            format!("{}\n", proof.runtime_generation)
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&generation_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        // A foreign generation leaves the pair alone; the owned one
+        // removes both.
+        publisher
+            .revoke_if_generation("other-generation".to_owned())
+            .await
+            .expect("foreign revoke");
+        assert!(path.exists(), "foreign generation must not revoke");
+
+        let mut publisher = FileReadyProofPublisher {
+            path: path.clone(),
+            generation_path: generation_path.clone(),
+            session: StdMutex::new(None),
+        };
+        publisher
+            .revoke_if_generation(proof.runtime_generation.clone())
+            .await
+            .expect("transient revoke");
+        assert!(!path.exists() && !generation_path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `b64_raw_encode` is exactly `base64.RawStdEncoding` for the
+    /// 32-byte nonce shape (and partial trailing groups).
+    #[test]
+    fn b64_raw_encode_matches_raw_std() {
+        // 32 bytes → 43 chars, no padding: 10 full triplets + a
+        // 2-byte tail for the `0xab` pattern.
+        let nonce = [0xabu8; 32];
+        assert_eq!(b64_raw_encode(&nonce), format!("{}q6s", "q6ur".repeat(10)));
+        // Partial groups: 1 byte → 2 chars, 2 bytes → 3 chars.
+        assert_eq!(b64_raw_encode(&[0xff]), "/w");
+        assert_eq!(b64_raw_encode(&[0xff, 0xff]), "//8");
+        assert_eq!(b64_raw_encode(b"hello"), "aGVsbG8");
+        // The stored nonce never carries padding.
+        assert!(!b64_raw_encode(&nonce).contains('='));
     }
 }

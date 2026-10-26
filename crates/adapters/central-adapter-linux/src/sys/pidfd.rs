@@ -8,14 +8,16 @@
 //!   dead one becomes `POLLIN`-readable and stays so.
 //! - [`is_pidfd`] is the descriptor-kind check upstream applies to
 //!   SCM_RIGHTS'd handles: `fstatfs` must report the pidfs.
+//! - [`send_signal`] wraps `pidfd_send_signal(2)` — signaling that PID
+//!   reuse cannot redirect (the launcherd monitor's stop path).
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use central_foundation::failure::Failure;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{Timespec, fstatfs};
 use rustix::io::Errno;
-use rustix::process::{Pid, PidfdFlags, pidfd_open};
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open};
 
 /// `PID_FS_MAGIC` — `fstatfs.f_type` for a pidfd
 /// (`include/uapi/linux/magic.h`: `#define PID_FS_MAGIC 0x50494446`).
@@ -79,6 +81,19 @@ pub fn alive<Fd: AsFd>(pidfd: Fd) -> Result<bool, Failure> {
     // POLLIN = the process exited. POLLERR counts too — a torn-down
     // descriptor is not "alive".
     Ok(!revents.intersects(PollFlags::IN | PollFlags::ERR))
+}
+
+/// `pidfd_send_signal(fd, sig, NULL, 0)` — signal the exact process
+/// the descriptor names; PID reuse cannot redirect it (carried forward
+/// from `central-harness-launcherd`'s monitor stop path, R5 task 14
+/// D5 — the shared boundary owns the primitive now).
+///
+/// # Errors
+/// `sys_pidfd_os` on the syscall failure (`ESRCH` when the process is
+/// already gone, `EBADF` when `fd` is not an open pidfd).
+pub fn send_signal<Fd: AsFd>(pidfd: Fd, sig: Signal) -> Result<(), Failure> {
+    super::audited::pidfd_send_signal(pidfd.as_fd().as_raw_fd(), sig.as_raw())
+        .map_err(|e| os_failure("pidfd_send_signal", e))
 }
 
 #[cfg(test)]

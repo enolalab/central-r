@@ -81,6 +81,10 @@ axum = "=0.8.9"
 tower = "=0.5.3"
 tower-http = "=0.7.1"
 rustls = "=0.23.46"
+# central-transport-http's TLS listener (R5 task 14 / B06): the
+# `TlsAcceptor` the application listener terminates with; pinned to the
+# version already in the lockfile via sqlx's rustls chain.
+tokio-rustls = "=0.26.6"
 askama = "=0.16.1"
 
 # central-adapter-postgres only — canonical declaration (workflow §3.4);

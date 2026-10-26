@@ -8,6 +8,11 @@ publish.workspace = true
 
 [dependencies]
 central-adapter-harness = { path = "../../crates/adapters/central-adapter-harness", version = "0.1.0" }
+# Shared audited Linux primitives (R5 task 14, D5): the NSS lookups,
+# `pidfd_send_signal`, and `openat2` resolution live in the adapter's
+# `sys` subtree — the single audited site — instead of this binary's
+# own syscall layer.
+central-adapter-linux = { path = "../../crates/adapters/central-adapter-linux", version = "0.1.0" }
 rustix = { workspace = true, features = ["event", "mount", "pipe", "thread"] }
 # The launcher binaries are one of the two places audited `unsafe` may
 # live (workflow §5.2): libc carries the syscall sites rustix has no safe

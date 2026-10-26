@@ -46,6 +46,9 @@ pub mod policy;
 pub mod ports;
 pub mod rendering;
 pub mod router;
+/// B06: TLS 1.3-only termination for the application listener
+/// (`TlsListener` over the bound loopback `TcpListener`).
+pub mod tls;
 pub mod web;
 
 /// Constant-time string equality (`crypto/subtle.ConstantTimeCompare`
