@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +40,23 @@ use super::compose::{
     durable_service_root, image_reference, load_default_policy, parse_rendered_model,
     policy_digest, postgres_init_script_host_path, render, validate_model,
 };
+use super::prepare::OpDeadline;
+
+/// `phaseOpDeadline` — the domain's wall-clock phase deadline
+/// (upstream's `context.WithDeadline(ctx, now+phaseBudget)`) as the
+/// monotonic `Instant` the bounded compose executor polls. `None` is
+/// upstream's `context.Background()`; an already-past instant clamps
+/// to now, so the first poll kills the child — exactly as a `ctx`
+/// that is already done fails the first `ctx.Err()` check.
+fn phase_op_deadline(deadline: Option<OffsetDateTime>) -> OpDeadline {
+    let Some(at) = deadline else {
+        return OpDeadline::NONE;
+    };
+    let remaining: std::time::Duration = (at - OffsetDateTime::now_utc())
+        .try_into()
+        .unwrap_or_default();
+    OpDeadline(Some(Instant::now() + remaining))
+}
 
 /// `block_on` — the house pattern: drives the domain service's async
 /// state machine from the helper's synchronous lifecycle arm. Every
@@ -114,8 +131,8 @@ pub const MINIO_CREDENTIAL_PURPOSE_RUNTIME: &str = "minio_runtime_v1";
 /// `minioProvisionBucket` — the fixed canonical artifact bucket.
 pub const MINIO_PROVISION_BUCKET: &str = "central-artifacts-v1";
 /// `requestDeadline` — the per-request deadline the provisioner
-/// enforces independently.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// enforces independently (upstream `2 * time.Minute`).
+const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 
 /// `secretbootstrap.MinioRuntimeKeyScope()` — the canonical MinIO
 /// runtime key scope rendered as the single scope string.
@@ -379,14 +396,22 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
     /// materializes a credential — but it does re-render, which is
     /// what lets `down` work after a reboot wiped the runtime root's
     /// in-memory cache.
-    fn file(&self, binding: &LifecycleBinding, materialize: bool) -> Result<RenderedFile, Failure> {
+    /// `deadline` bounds every compose subprocess this render may
+    /// spawn (the prior-topology-stopped check inside the materialize
+    /// window).
+    fn file(
+        &self,
+        binding: &LifecycleBinding,
+        materialize: bool,
+        deadline: OpDeadline,
+    ) -> Result<RenderedFile, Failure> {
         let _g = self
             .mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let set = self.active_dependency_set(binding)?;
         if materialize {
-            self.materialize_bootstrap_locked(binding)?;
+            self.materialize_bootstrap_locked(binding, deadline)?;
         }
         let mut f = render(binding, &set, &self.policy)
             .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: render: {e}")))?;
@@ -430,7 +455,11 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
     /// cached — a `record_handoff` failure cleans the materialized file
     /// so a crash can never leave a handoff whose binding record does
     /// not exist.
-    fn materialize_bootstrap_locked(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
+    fn materialize_bootstrap_locked(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: OpDeadline,
+    ) -> Result<(), Failure> {
         let key = binding_key(binding);
         if self
             .proofs
@@ -453,7 +482,7 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
             || evidence.mount_release_proof.is_empty()
             || evidence.binding_evidence.is_empty()
         {
-            evidence = self.establish_b04_lifecycle_proof_locked(binding, evidence)?;
+            evidence = self.establish_b04_lifecycle_proof_locked(binding, evidence, deadline)?;
         }
         evidence.validate().map_err(|e| {
             Failure::internal("TOPOLOGY", format!("topology: B04 lifecycle evidence: {e}"))
@@ -552,13 +581,14 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
         &self,
         binding: &LifecycleBinding,
         mut evidence: central_infra::domain::B04LifecycleEvidence,
+        deadline: OpDeadline,
     ) -> Result<central_infra::domain::B04LifecycleEvidence, Failure> {
         if let Some(f) = self.existing_file_locked(binding)? {
             let services: Vec<String> = REQUIRED_SERVICE_MODES
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect();
-            self.runner.stopped(&f, &services).map_err(|e| {
+            self.runner.stopped(&f, &services, deadline).map_err(|e| {
                 Failure::internal(
                     "TOPOLOGY",
                     format!("topology: prior topology is not stopped: {e}"),
@@ -827,10 +857,11 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
         &self,
         binding: &LifecycleBinding,
         f: &RenderedFile,
+        deadline: OpDeadline,
     ) -> Result<TopologySnapshot, Failure> {
-        let containers = self
-            .runner
-            .containers(f, &["postgres".to_owned(), "minio".to_owned()])?;
+        let containers =
+            self.runner
+                .containers(f, &["postgres".to_owned(), "minio".to_owned()], deadline)?;
         let mut services = BTreeMap::new();
         for (service, mode) in [
             ("postgres", ServiceMode::Postgres),
@@ -948,20 +979,34 @@ fn hex(b: &[u8]) -> String {
 }
 
 impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topology<B> {
-    async fn validate(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
+    async fn validate(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        // The binding is validated before any receipt lookup, render,
+        // or compose subprocess — the caller-known half of the request
+        // is refused before it costs work.
+        binding.validate()?;
+        let dl = phase_op_deadline(deadline);
         // Receipt binding is authoritative; the rendered file must exist
         // and parse+validate through the real compose config model.
         let _set = self.active_dependency_set(binding)?;
-        let f = self.file(binding, true)?;
+        let f = self.file(binding, true, dl)?;
         let _model = self
             .runner
-            .config(&f)
+            .config(&f, dl)
             .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: compose config: {e}")))?;
         Ok(())
     }
 
-    async fn init(&self, op: &LifecycleOperation) -> Result<(), Failure> {
-        let f = self.file(&op.binding, true)?;
+    async fn init(
+        &self,
+        op: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        let dl = phase_op_deadline(deadline);
+        let f = self.file(&op.binding, true, dl)?;
         let set = self.active_dependency_set(&op.binding)?;
         for (service, root_id, mode) in [
             ("postgres-fs-init", "postgres", ServiceMode::PostgresFsInit),
@@ -979,7 +1024,13 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
                 })?;
             let exit_code = self
                 .runner
-                .run_with_input(&f, service, &[REQUEST_MODE_FS_INIT.to_owned()], &payload)
+                .run_with_input(
+                    &f,
+                    service,
+                    &[REQUEST_MODE_FS_INIT.to_owned()],
+                    &payload,
+                    dl,
+                )
                 .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: {service}: {e}")))?;
             if exit_code != 0 {
                 return Err(Failure::internal(
@@ -991,16 +1042,26 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
         Ok(())
     }
 
-    async fn start_daemons(&self, op: &LifecycleOperation) -> Result<Observation, Failure> {
-        let f = self.file(&op.binding, true)?;
+    async fn start_daemons(
+        &self,
+        op: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<Observation, Failure> {
+        let dl = phase_op_deadline(deadline);
+        let f = self.file(&op.binding, true, dl)?;
         self.runner
-            .up(&f, &["postgres".to_owned(), "minio".to_owned()])
+            .up(&f, &["postgres".to_owned(), "minio".to_owned()], dl)
             .map_err(|e| Failure::internal("TOPOLOGY", e.to_string()))?;
         Ok(Observation::default())
     }
 
-    async fn provision_minio(&self, op: &LifecycleOperation) -> Result<SemanticReceipt, Failure> {
-        let f = self.file(&op.binding, true)?;
+    async fn provision_minio(
+        &self,
+        op: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<SemanticReceipt, Failure> {
+        let dl = phase_op_deadline(deadline);
+        let f = self.file(&op.binding, true, dl)?;
         let set = self.active_dependency_set(&op.binding)?;
         let payload = self
             .minio_provision_request_payload(op, &set)
@@ -1033,6 +1094,7 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
                 "minio-provision",
                 &[REQUEST_MODE_MINIO_PROVISION.to_owned()],
                 &payload,
+                dl,
             )
             .map_err(|e| {
                 Failure::internal("TOPOLOGY", format!("topology: minio-provision: {e}"))
@@ -1051,7 +1113,12 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
         Ok(receipt)
     }
 
-    async fn inspect(&self, binding: &LifecycleBinding) -> Result<TopologySnapshot, Failure> {
+    async fn inspect(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<TopologySnapshot, Failure> {
+        let dl = phase_op_deadline(deadline);
         // Status has no receipt binding: inspect only what exists —
         // never read a receipt, never render, never materialize.
         if binding.receipt_id.is_empty() {
@@ -1067,31 +1134,41 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
                 .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: {e}")))?;
             validate_model(&model)
                 .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: {e}")))?;
-            return self.inspect_rendered(binding, &f);
+            return self.inspect_rendered(binding, &f, dl);
         }
-        TopologyPort::validate(self, binding).await?;
-        let f = self.file(binding, false)?;
-        self.inspect_rendered(binding, &f)
+        TopologyPort::validate(self, binding, deadline).await?;
+        let f = self.file(binding, false, dl)?;
+        self.inspect_rendered(binding, &f, dl)
     }
 
-    async fn down(&self, op: &LifecycleOperation) -> Result<(), Failure> {
+    async fn down(
+        &self,
+        op: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        let dl = phase_op_deadline(deadline);
         // Teardown-only: a helper restart must never materialize a new
         // credential merely to render the file `compose down` needs.
-        let f = self.file(&op.binding, false)?;
+        let f = self.file(&op.binding, false, dl)?;
         self.runner
-            .down(&f)
+            .down(&f, dl)
             .map_err(|e| Failure::internal("TOPOLOGY", e.to_string()))
     }
 
-    async fn teardown_verified(&self, op: &LifecycleOperation) -> Result<(), Failure> {
-        self.down(op).await?;
+    async fn teardown_verified(
+        &self,
+        op: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        let dl = phase_op_deadline(deadline);
+        TopologyPort::down(self, op, deadline).await?;
         if let Some(f) = self.existing_file(&op.binding)? {
             let services: Vec<String> = REQUIRED_SERVICE_MODES
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect();
             self.runner
-                .stopped(&f, &services)
+                .stopped(&f, &services, dl)
                 .map_err(|e| Failure::internal("TOPOLOGY", e.to_string()))?;
         }
         self.mark_teardown_verified(&op.binding);
@@ -1159,13 +1236,23 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
 // ---------------------------------------------------------------------------
 
 /// `journalState` — one operation's current state as upstream stores
-/// it: the last event's projection, never a rewritten record.
+/// it: the last event's projection, never a rewritten record. Go's
+/// `infralifecycle.Operation` carries no JSON tags, so it marshals
+/// PascalCase; `alias` keeps journals Rust wrote before the wire fix
+/// decodable.
 #[derive(Serialize, Deserialize, Clone)]
 struct JournalOperationRecord {
+    #[serde(rename = "ID", alias = "id")]
     id: String,
+    #[serde(rename = "LinkedOperationID", alias = "linked_operation_id")]
     linked_operation_id: String,
+    #[serde(rename = "Phase", alias = "phase")]
     phase: String,
+    #[serde(rename = "Binding", alias = "binding")]
     binding: JournalBinding,
+    #[serde(rename = "Observation", default)]
+    observation: JournalObservation,
+    #[serde(rename = "CreatedAt", alias = "created_at")]
     created_at: String,
 }
 
@@ -1183,22 +1270,97 @@ struct JournalEvent {
     state: JournalState,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct JournalBinding {
-    instance_id: String,
-    config_binding: String,
-    admission_id: String,
-    receipt_id: String,
-    model_digest: String,
-    payload_epoch: String,
-    b04_operation_id: String,
-    b04_fencing_token: u64,
+/// `infralifecycle.Observation` — untagged Go struct → PascalCase.
+/// `ContainerStartIDs` keys are `ServiceMode` strings upstream; they
+/// stay plain strings here so a Go-written mode Rust does not know
+/// still decodes (Go's map key type never rejects a string either).
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct JournalObservation {
+    #[serde(rename = "BootID", default)]
+    boot_id: String,
+    #[serde(rename = "ContainerStartIDs", default, deserialize_with = "null_map")]
+    container_start_ids: BTreeMap<String, String>,
 }
 
+/// `infralifecycle.B04LifecycleEvidence` — untagged Go struct →
+/// PascalCase. Go's `time.Time` marshals unconditionally, so a missing
+/// or zero `ExpiresAt` decodes to `""`/`"0001-01-01T00:00:00Z"`, both
+/// mapped back to `None`.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct JournalB04 {
+    #[serde(rename = "InstanceID", default)]
+    instance_id: String,
+    #[serde(rename = "OperationID", default)]
+    operation_id: String,
+    #[serde(rename = "FencingToken", default)]
+    fencing_token: u64,
+    #[serde(rename = "StoppedTopologyProof", default)]
+    stopped_topology_proof: String,
+    #[serde(rename = "MountReleaseProof", default)]
+    mount_release_proof: String,
+    #[serde(rename = "BindingEvidence", default)]
+    binding_evidence: String,
+    #[serde(rename = "ExpiresAt", default)]
+    expires_at: String,
+}
+
+/// `infralifecycle.Binding` — untagged Go struct → PascalCase.
+/// `b04_operation_id`/`b04_fencing_token` are the flat fields Rust
+/// journals carried before the wire fix: deserialized for backward
+/// compatibility, never written again.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct JournalBinding {
+    #[serde(rename = "InstanceID", alias = "instance_id")]
+    instance_id: String,
+    #[serde(rename = "ConfigBinding", alias = "config_binding")]
+    config_binding: String,
+    #[serde(rename = "AdmissionID", alias = "admission_id")]
+    admission_id: String,
+    #[serde(rename = "ReceiptID", alias = "receipt_id")]
+    receipt_id: String,
+    #[serde(rename = "ModelDigest", alias = "model_digest")]
+    model_digest: String,
+    #[serde(rename = "PayloadEpoch", alias = "payload_epoch")]
+    payload_epoch: String,
+    #[serde(
+        rename = "BootstrapFingerprints",
+        default,
+        deserialize_with = "null_vec"
+    )]
+    bootstrap_fingerprints: Vec<String>,
+    #[serde(rename = "B04", default)]
+    b04: JournalB04,
+    #[serde(rename = "b04_operation_id", default, skip_serializing)]
+    legacy_b04_operation_id: String,
+    #[serde(rename = "b04_fencing_token", default, skip_serializing)]
+    legacy_b04_fencing_token: u64,
+}
+
+/// `dependencyprepare.Receipt` — untagged Go struct → PascalCase.
+/// `DependencyReceiptJson`'s old `id`/`set` fields are accepted as
+/// aliases so Rust journals from before the wire fix still decode.
 #[derive(Serialize, Deserialize, Clone)]
 struct DependencyReceiptJson {
+    #[serde(rename = "ID", alias = "id")]
     id: String,
-    set: PreparedDependencySet,
+    #[serde(rename = "ManifestDigest", default)]
+    manifest_digest: String,
+    #[serde(rename = "OperationID", default)]
+    operation_id: String,
+    #[serde(rename = "SelectorGeneration", default)]
+    selector_generation: String,
+    #[serde(rename = "DependencySet", alias = "set")]
+    dependency_set: PreparedDependencySet,
+}
+
+/// Go emits `null` for a nil slice; decode it as empty.
+fn null_vec<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Go emits `null` for a nil map; decode it as empty.
+fn null_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+    Ok(Option::<BTreeMap<String, String>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// `path(b)` — upstream `FileJournal.path`: the binding's operations
@@ -1214,6 +1376,16 @@ fn record_to_op(r: &JournalOperationRecord) -> LifecycleOperation {
         &time::format_description::well_known::Rfc3339,
     )
     .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let b04 = &r.binding.b04;
+    // Go's `time.Time.IsZero()`: only the exact zero instant —
+    // `0001-01-01T00:00:00Z` — maps back to `None`.
+    const GO_ZERO: OffsetDateTime = time::macros::datetime!(1-01-01 0:00:00 UTC);
+    let expires_at = OffsetDateTime::parse(
+        &b04.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()
+    .filter(|t| *t != GO_ZERO);
     LifecycleOperation {
         id: r.id.clone(),
         linked_operation_id: r.linked_operation_id.clone(),
@@ -1225,14 +1397,36 @@ fn record_to_op(r: &JournalOperationRecord) -> LifecycleOperation {
             receipt_id: r.binding.receipt_id.clone(),
             model_digest: r.binding.model_digest.clone(),
             payload_epoch: r.binding.payload_epoch.clone(),
-            bootstrap_fingerprints: Vec::new(),
+            bootstrap_fingerprints: r.binding.bootstrap_fingerprints.clone(),
             b04: central_infra::domain::B04LifecycleEvidence {
-                operation_id: r.binding.b04_operation_id.clone(),
-                fencing_token: r.binding.b04_fencing_token,
-                ..Default::default()
+                instance_id: b04.instance_id.clone(),
+                // A Rust journal from before the wire fix carried the
+                // B04 identity only in the flat legacy fields.
+                operation_id: if b04.operation_id.is_empty() {
+                    r.binding.legacy_b04_operation_id.clone()
+                } else {
+                    b04.operation_id.clone()
+                },
+                fencing_token: if b04.fencing_token == 0 {
+                    r.binding.legacy_b04_fencing_token
+                } else {
+                    b04.fencing_token
+                },
+                stopped_topology_proof: b04.stopped_topology_proof.clone(),
+                mount_release_proof: b04.mount_release_proof.clone(),
+                binding_evidence: b04.binding_evidence.clone(),
+                expires_at,
             },
         },
-        observation: Observation::default(),
+        observation: Observation {
+            boot_id: r.observation.boot_id.clone(),
+            container_start_ids: r
+                .observation
+                .container_start_ids
+                .iter()
+                .filter_map(|(mode, id)| mode.parse::<ServiceMode>().ok().map(|m| (m, id.clone())))
+                .collect(),
+        },
         created_at,
     }
 }
@@ -1362,6 +1556,10 @@ impl FileJournal {
     }
 
     /// `statesLocked` — every operation's folded state for the binding.
+    /// Upstream iterates `os.ReadDir`, which returns names sorted;
+    /// `std::fs::read_dir` does not, so the names are sorted here to
+    /// keep unsettled-operation and active-receipt selection (both
+    /// "last one wins" scans) deterministic.
     fn states(&self, binding: &LifecycleBinding) -> Result<Vec<JournalState>, Failure> {
         let dir = binding_journal_dir(&self.root, binding);
         let mut out = Vec::new();
@@ -1370,11 +1568,13 @@ impl FileJournal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(Failure::internal("JOURNAL", format!("journal: list: {e}"))),
         };
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let op_id = entry.file_name().to_string_lossy().to_string();
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        for op_id in names {
             out.push(self.read_op(binding, &op_id)?);
         }
         Ok(out)
@@ -1438,19 +1638,13 @@ impl FileJournal {
 }
 
 fn record_binding(r: &JournalOperationRecord) -> LifecycleBinding {
-    LifecycleBinding {
-        instance_id: r.binding.instance_id.clone(),
-        config_binding: r.binding.config_binding.clone(),
-        admission_id: r.binding.admission_id.clone(),
-        receipt_id: r.binding.receipt_id.clone(),
-        model_digest: r.binding.model_digest.clone(),
-        payload_epoch: r.binding.payload_epoch.clone(),
-        bootstrap_fingerprints: Vec::new(),
-        b04: Default::default(),
-    }
+    // Only the instance/config halves feed `binding_key`, but the
+    // full decode costs nothing and keeps the helper honest.
+    record_to_op(r).binding
 }
 
 fn op_to_record(op: &LifecycleOperation) -> JournalOperationRecord {
+    let b04 = &op.binding.b04;
     JournalOperationRecord {
         id: op.id.clone(),
         linked_operation_id: op.linked_operation_id.clone(),
@@ -1462,8 +1656,30 @@ fn op_to_record(op: &LifecycleOperation) -> JournalOperationRecord {
             receipt_id: op.binding.receipt_id.clone(),
             model_digest: op.binding.model_digest.clone(),
             payload_epoch: op.binding.payload_epoch.clone(),
-            b04_operation_id: op.binding.b04.operation_id.clone(),
-            b04_fencing_token: op.binding.b04.fencing_token,
+            bootstrap_fingerprints: op.binding.bootstrap_fingerprints.clone(),
+            b04: JournalB04 {
+                instance_id: b04.instance_id.clone(),
+                operation_id: b04.operation_id.clone(),
+                fencing_token: b04.fencing_token,
+                stopped_topology_proof: b04.stopped_topology_proof.clone(),
+                mount_release_proof: b04.mount_release_proof.clone(),
+                binding_evidence: b04.binding_evidence.clone(),
+                // Go marshals the zero `time.Time` unconditionally.
+                expires_at: b04
+                    .expires_at
+                    .map_or_else(|| "0001-01-01T00:00:00Z".to_owned(), rfc3339),
+            },
+            legacy_b04_operation_id: String::new(),
+            legacy_b04_fencing_token: 0,
+        },
+        observation: JournalObservation {
+            boot_id: op.observation.boot_id.clone(),
+            container_start_ids: op
+                .observation
+                .container_start_ids
+                .iter()
+                .map(|(mode, id)| (mode.as_str().to_owned(), id.clone()))
+                .collect(),
         },
         created_at: rfc3339(op.created_at),
     }
@@ -1558,7 +1774,10 @@ impl LifecyclePort for FileJournal {
         }
         state.receipt = Some(DependencyReceiptJson {
             id: receipt.id.clone(),
-            set: receipt.dependency_set.clone(),
+            manifest_digest: receipt.manifest_digest.clone(),
+            operation_id: receipt.operation_id.clone(),
+            selector_generation: receipt.selector_generation.clone(),
+            dependency_set: receipt.dependency_set.clone(),
         });
         self.append(&state)
     }
@@ -1631,8 +1850,10 @@ impl FileJournal {
         };
         Ok(DependencyReceipt {
             id: receipt.id,
-            dependency_set: receipt.set,
-            ..DependencyReceipt::default()
+            manifest_digest: receipt.manifest_digest,
+            operation_id: receipt.operation_id,
+            selector_generation: receipt.selector_generation,
+            dependency_set: receipt.dependency_set,
         })
     }
 }
@@ -1724,8 +1945,11 @@ impl<V: DeadOwnerVerifier> FileLocker<V> {
             .filter(|e| e.path().is_file())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| {
-                n.len() >= LOCK_SEQUENCE_WIDTH
-                    && n[..LOCK_SEQUENCE_WIDTH].chars().all(|c| c.is_ascii_digit())
+                // `get(..)` rather than `[..]`: a multibyte name whose
+                // 20th byte is not a char boundary must be skipped,
+                // never panic the locker.
+                n.get(..LOCK_SEQUENCE_WIDTH)
+                    .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()))
                     && std::path::Path::new(n)
                         .extension()
                         .is_some_and(|x| x == "json")
@@ -1762,10 +1986,13 @@ impl<V: DeadOwnerVerifier> FileLocker<V> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.len() < LOCK_SEQUENCE_WIDTH {
+            // `get(..)` rather than `[..]`: a multibyte name whose
+            // 20th byte is not a char boundary is skipped, never
+            // panics the locker.
+            let Some(prefix) = name.get(..LOCK_SEQUENCE_WIDTH) else {
                 continue;
-            }
-            if let Ok(seq) = name[..LOCK_SEQUENCE_WIDTH].parse::<u64>() {
+            };
+            if let Ok(seq) = prefix.parse::<u64>() {
                 max = max.max(seq);
             }
         }
@@ -1880,7 +2107,12 @@ impl<V: DeadOwnerVerifier + Sync> LifecycleLocker for FileLocker<V> {
             // Expiry alone never authorizes takeover — the expired
             // owner must be broker-verified dead, and the proof must
             // name this exact lock record: same id, same owner pid,
-            // `dead`, and a nonzero verification timestamp.
+            // `dead`, and a nonzero verification timestamp. The
+            // verifier's reason text intentionally need not match
+            // upstream byte-for-byte: only the denial semantics are
+            // load-bearing (a live or unverifiable owner refuses
+            // takeover), so a differently worded reason is acceptable
+            // divergence.
             let proof = self
                 .verifier
                 .verify_dead_owner(&old.id, old.owner_pid)
@@ -2034,8 +2266,13 @@ impl LifecycleCapacity for FilesystemCapacity {
     async fn admit(
         &self,
         binding: &LifecycleBinding,
-        _set: &PreparedDependencySet,
+        set: &PreparedDependencySet,
     ) -> Result<LifecycleReservation, Failure> {
+        // Upstream validates both halves of the request before the
+        // statfs: the binding the caller supplied and the B03 set the
+        // operation will run under.
+        binding.validate()?;
+        set.validate_b03()?;
         let available = statfs_available(&self.root).map_err(|e| {
             Failure::internal(
                 "CAPACITY",
@@ -2159,13 +2396,12 @@ impl DockerReceiptInspector {
         Self {
             docker_path: docker_path.to_owned(),
             exec: exec.unwrap_or_else(|| {
-                Box::new(|name, args, env| {
-                    let output = std::process::Command::new(name)
-                        .args(args)
+                Box::new(|name, args, env, deadline| {
+                    let mut cmd = std::process::Command::new(name);
+                    cmd.args(args)
                         .env_clear()
-                        .envs(env.iter().filter_map(|e| e.split_once('=')))
-                        .output()
-                        .map_err(|e| e.to_string())?;
+                        .envs(env.iter().filter_map(|e| e.split_once('=')));
+                    let output = super::compose::run_compose_bounded(deadline, &mut cmd, None)?;
                     if !output.status.success() {
                         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
                     }
@@ -2198,6 +2434,11 @@ impl ReceiptInspector for DockerReceiptInspector {
                     reference,
                 ],
                 &closed_docker_environment(),
+                // The admission path carries no phase deadline in the
+                // Rust port shape (upstream threads the admission ctx);
+                // a hung `docker image inspect` is refused by docker's
+                // own daemon timeouts, so `NONE` preserves semantics.
+                OpDeadline::NONE,
             );
             match output {
                 Ok(out) if !out.is_empty() => {}
@@ -2231,7 +2472,10 @@ pub struct FileBootstrap<B> {
     root: PathBuf,
     clock: Arc<dyn LifecycleClock>,
     b04: B,
-    mu: Mutex<()>,
+    /// `b.mu` — `tokio::sync::Mutex` so `materialize` may hold the
+    /// guard across the broker `await` (upstream holds `b.mu` for the
+    /// whole `Materialize`; a `std` guard is not `Send`).
+    mu: tokio::sync::Mutex<()>,
     used: Mutex<BTreeMap<String, bool>>,
 }
 
@@ -2272,7 +2516,7 @@ impl<B: B04Bootstrap> FileBootstrap<B> {
             root,
             clock,
             b04,
-            mu: Mutex::new(()),
+            mu: tokio::sync::Mutex::new(()),
             used: Mutex::new(BTreeMap::new()),
         }
     }
@@ -2379,6 +2623,9 @@ impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
         purpose: BootstrapPurpose,
     ) -> Result<BootstrapGeneration, Failure> {
         binding.validate()?;
+        // Upstream `b.mu`: the generation check-then-write must be
+        // serialized against a concurrent `ensure`/`materialize`.
+        let _g = self.mu.lock().await;
         std::fs::create_dir_all(&self.root)
             .map_err(|e| Failure::internal("BOOTSTRAP", format!("bootstrap: create root: {e}")))?;
         set_mode(&self.root.to_string_lossy(), 0o700)
@@ -2459,6 +2706,9 @@ impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
                 "bootstrap: handoff is outside the fixed service destination",
             ));
         }
+        // Upstream `b.mu`: the broker authority call and the `used`
+        // registration are serialized with `ensure`/`cleanup`.
+        let _g = self.mu.lock().await;
         // The credential material itself never transits this process
         // in plaintext: the broker writes it under the sealed handoff
         // and this call returns only the mount proof.
@@ -2478,7 +2728,12 @@ impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
 
     /// `Cleanup` — upstream's single-use rule: only a mount path this
     /// process materialized (`used[path] == false`) may be removed,
-    /// exactly once; a second call or a foreign path is refused.
+    /// exactly once; a second call or a foreign path is refused. The
+    /// `used` mark lands only after the removal attempt succeeds —
+    /// upstream's `os.Remove`-then-mark order — so a failed cleanup
+    /// stays retryable instead of leaking a permanently consumed proof.
+    /// A path already gone counts as removed (the record the broker
+    /// wrote may have been cleaned by a prior lifecycle).
     async fn cleanup(&self, proof: MountProof) -> Result<(), Failure> {
         if !proof.confirmed || proof.mount_path.is_empty() {
             return Err(Failure::invalid(
@@ -2486,31 +2741,32 @@ impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
                 "bootstrap: invalid mount proof",
             ));
         }
-        {
-            let mut used = self
-                .used
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match used.get(&proof.mount_path) {
-                Some(false) => {
-                    used.insert(proof.mount_path.clone(), true);
-                }
-                _ => {
-                    return Err(Failure::invalid(
-                        "BOOTSTRAP",
-                        "bootstrap: mount proof already consumed",
-                    ));
-                }
+        let _g = self.mu.lock().await;
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match used.get(&proof.mount_path) {
+            Some(false) => {}
+            _ => {
+                return Err(Failure::invalid(
+                    "BOOTSTRAP",
+                    "bootstrap: mount proof already consumed",
+                ));
             }
         }
-        match std::fs::remove_file(&proof.mount_path) {
+        let result = match std::fs::remove_file(&proof.mount_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Failure::internal(
                 "BOOTSTRAP",
                 format!("bootstrap: cleanup: {e}"),
             )),
+        };
+        if result.is_ok() {
+            used.insert(proof.mount_path.clone(), true);
         }
+        result
     }
 
     /// `RecordHandoff` — persists only the fixed path of a confirmed
@@ -2527,10 +2783,7 @@ impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
                 "bootstrap: invalid mount proof",
             ));
         }
-        let _g = self
-            .mu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = self.mu.lock().await;
         self.write_handoff_record(
             binding,
             &DurableHandoffRecord {
@@ -2546,10 +2799,7 @@ impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
     /// cleanup without the in-process `used` map.
     async fn cleanup_binding(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
         binding.validate()?;
-        let _g = self
-            .mu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = self.mu.lock().await;
         let mut record = match self.read_handoff_record(binding)? {
             Some(r) if !r.removed => r,
             _ => return Ok(()),
@@ -2989,7 +3239,7 @@ mod tests {
     use crate::infra::compose::{ComposeError, ContainerInspection, RenderedModel};
     use central_infra::domain::{B03_REQUIRED_SERVICE_MODES, OciInventory, PreparedMode};
     use central_infra::port::DeadOwnerProof;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -3127,7 +3377,19 @@ mod tests {
     #[test]
     fn file_journal_creates_linked_down_without_overwriting_unsettled_up() {
         let root = tmpdir("journal-linked");
-        let journal = FileJournal::new(root, Arc::new(TestClock)).unwrap();
+        // A monotonically ticking clock: `statesLocked` iterates op
+        // dirs in sorted name order and keeps the first on a
+        // `CreatedAt` tie (upstream's `Before` check), so the linked
+        // down's "newest" status is only deterministic when its
+        // timestamp is strictly later than the up's.
+        struct SeqClock(AtomicU64);
+        impl LifecycleClock for SeqClock {
+            fn now(&self) -> OffsetDateTime {
+                OffsetDateTime::UNIX_EPOCH
+                    + Duration::from_secs(1000 + self.0.fetch_add(1, Ordering::SeqCst))
+            }
+        }
+        let journal = FileJournal::new(root, Arc::new(SeqClock(AtomicU64::new(0)))).unwrap();
         let up = block_on(journal.begin(binding(), Observation::default())).unwrap();
         block_on(journal.record(&up, LifecyclePhase::DaemonsStarted)).unwrap();
         let down =
@@ -3256,10 +3518,10 @@ mod tests {
         exit_code: i32,
     }
     impl ComposeRunner for CapturingRunner {
-        fn config(&self, _f: &RenderedFile) -> Result<RenderedModel, ComposeError> {
+        fn config(&self, _f: &RenderedFile, _d: OpDeadline) -> Result<RenderedModel, ComposeError> {
             Ok(RenderedModel::default())
         }
-        fn up(&self, _f: &RenderedFile, _s: &[String]) -> Result<(), ComposeError> {
+        fn up(&self, _f: &RenderedFile, _s: &[String], _d: OpDeadline) -> Result<(), ComposeError> {
             Ok(())
         }
         fn run_with_input(
@@ -3268,6 +3530,7 @@ mod tests {
             service: &str,
             args: &[String],
             stdin: &[u8],
+            _d: OpDeadline,
         ) -> Result<i32, ComposeError> {
             self.run_calls
                 .lock()
@@ -3281,26 +3544,33 @@ mod tests {
             _s: &str,
             _a: &[String],
             _i: &[u8],
+            _d: OpDeadline,
         ) -> Result<(Vec<u8>, i32), ComposeError> {
             Ok((Vec::new(), self.exit_code))
         }
-        fn down(&self, _f: &RenderedFile) -> Result<(), ComposeError> {
+        fn down(&self, _f: &RenderedFile, _d: OpDeadline) -> Result<(), ComposeError> {
             Ok(())
         }
-        fn inspect(&self, _id: &str) -> Result<ContainerInspection, ComposeError> {
+        fn inspect(&self, _id: &str, _d: OpDeadline) -> Result<ContainerInspection, ComposeError> {
             Ok(ContainerInspection::default())
         }
         fn containers(
             &self,
             _f: &RenderedFile,
             services: &[String],
+            _d: OpDeadline,
         ) -> Result<BTreeMap<String, ContainerInspection>, ComposeError> {
             Ok(services
                 .iter()
                 .map(|s| (s.clone(), ContainerInspection::default()))
                 .collect())
         }
-        fn stopped(&self, _f: &RenderedFile, _s: &[String]) -> Result<(), ComposeError> {
+        fn stopped(
+            &self,
+            _f: &RenderedFile,
+            _s: &[String],
+            _d: OpDeadline,
+        ) -> Result<(), ComposeError> {
             Ok(())
         }
     }
@@ -3472,7 +3742,7 @@ mod tests {
             return; // Non-root CI: the denial is still covered by the unit check below.
         }
         let _ = dir;
-        let result = block_on(topology.provision_minio(&op));
+        let result = block_on(topology.provision_minio(&op, None));
         match result {
             Err(e) => assert!(
                 e.to_string().contains("rendezvous")
@@ -3650,6 +3920,77 @@ mod tests {
         // The folded state is the LAST event's projection.
         let resumed = block_on(journal.unsettled(&binding())).unwrap().unwrap();
         assert_eq!(resumed.phase, LifecyclePhase::FsInitialized);
+    }
+
+    /// The on-disk event is upstream's Go `journalEvent` — PascalCase
+    /// `infralifecycle.Operation` fields, nested `B04`, `Observation`,
+    /// `BootstrapFingerprints` — and both a Go-written event and a
+    /// pre-fix Rust event (flat snake_case aliases) decode.
+    #[test]
+    fn journal_event_wire_shape_matches_go_and_decodes_both_writers() {
+        let root = tmpdir("journal-wire");
+        let journal = FileJournal::new(root.clone(), Arc::new(TestClock)).unwrap();
+        let obs = Observation {
+            boot_id: "boot-1".to_owned(),
+            container_start_ids: BTreeMap::from([(ServiceMode::Postgres, "ctr-1".to_owned())]),
+        };
+        let op = block_on(journal.begin(binding(), obs)).unwrap();
+        let ops_dir = root.join("operations").join(binding_key(&binding()));
+        let event: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(ops_dir.join(&op.id).join("00000000000000000001.json")).unwrap(),
+        )
+        .unwrap();
+        let state = &event["state"];
+        assert_eq!(state["operation"]["ID"], op.id);
+        assert_eq!(state["operation"]["Phase"], "started");
+        assert_eq!(state["operation"]["LinkedOperationID"], "");
+        assert_eq!(state["operation"]["Observation"]["BootID"], "boot-1");
+        assert_eq!(
+            state["operation"]["Observation"]["ContainerStartIDs"]["postgres"],
+            "ctr-1"
+        );
+        assert_eq!(state["operation"]["Binding"]["InstanceID"], "inst-1");
+        assert!(
+            state["operation"]["Binding"].get("B04").is_some()
+                && state["operation"]["Binding"]
+                    .get("BootstrapFingerprints")
+                    .is_some(),
+            "Go binding shape: {event}"
+        );
+        assert_eq!(state["active"], false);
+
+        // A Go-written event — nested B04, full binding, observed
+        // containers — decodes and wins `unsettled` on CreatedAt.
+        let go_event = r#"{"state":{"operation":{"ID":"life-go","LinkedOperationID":"","Phase":"verified","Binding":{"InstanceID":"inst-1","ConfigBinding":"cfg-1","AdmissionID":"adm-1","ReceiptID":"receipt-1","ModelDigest":"sha256:model","PayloadEpoch":"epoch-1","BootstrapFingerprints":["sha256:fp1"],"B04":{"InstanceID":"inst-1","OperationID":"life-go","FencingToken":7,"StoppedTopologyProof":"p1","MountReleaseProof":"p2","BindingEvidence":"p3","ExpiresAt":"2026-01-01T00:00:00Z"}},"Observation":{"BootID":"boot-9","ContainerStartIDs":{"minio":"ctr-9"}},"CreatedAt":"2026-01-01T00:00:01Z"},"receipt":{"ID":"receipt-1","ManifestDigest":"sha256:m1","OperationID":"life-go","SelectorGeneration":"gen-1","DependencySet":{"Modes":[{"Mode":"postgres","Inventory":{"index_digest":"sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55","manifest_digest":"sha256:c95fd5346040eba2de3c435e14874af18f5d681fb5848d4f081dbead0878af28","config_digest":"sha256:67d1da22f4037b29cdd93e03d870a4a1c4d079358367d0cbc56459e52cde205e","layers":[{"Digest":"sha256:aa","MediaType":"mt","Size":3,"Annotations":null}]}}]}},"active":false}}"#;
+        let go_dir = ops_dir.join("life-go");
+        std::fs::create_dir_all(&go_dir).unwrap();
+        std::fs::write(go_dir.join("00000000000000000001.json"), go_event).unwrap();
+        let resumed = block_on(journal.unsettled(&binding())).unwrap().unwrap();
+        assert_eq!(resumed.id, "life-go");
+        assert_eq!(
+            resumed.binding.bootstrap_fingerprints,
+            vec!["sha256:fp1".to_owned()]
+        );
+        assert_eq!(resumed.binding.b04.operation_id, "life-go");
+        assert_eq!(resumed.binding.b04.fencing_token, 7);
+        assert_eq!(resumed.binding.b04.stopped_topology_proof, "p1");
+        assert!(resumed.binding.b04.expires_at.is_some());
+        assert_eq!(resumed.observation.boot_id, "boot-9");
+        assert_eq!(
+            resumed.observation.container_start_ids[&ServiceMode::Minio],
+            "ctr-9"
+        );
+
+        // A pre-fix Rust event — flat snake_case B04 fields — still
+        // decodes and projects the same durable state.
+        let legacy = r#"{"state":{"operation":{"id":"life-legacy","linked_operation_id":"","phase":"verified","binding":{"instance_id":"inst-1","config_binding":"cfg-1","admission_id":"adm-1","receipt_id":"receipt-1","model_digest":"sha256:model","payload_epoch":"epoch-1","b04_operation_id":"op-legacy","b04_fencing_token":9},"created_at":"2027-01-01T00:00:00Z"},"active":false}}"#;
+        let legacy_dir = ops_dir.join("life-legacy");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("00000000000000000001.json"), legacy).unwrap();
+        let resumed = block_on(journal.unsettled(&binding())).unwrap().unwrap();
+        assert_eq!(resumed.id, "life-legacy");
+        assert_eq!(resumed.binding.b04.operation_id, "op-legacy");
+        assert_eq!(resumed.binding.b04.fencing_token, 9);
     }
 
     /// `Begin` refuses while an unsettled operation exists — the
@@ -3927,7 +4268,7 @@ mod tests {
         // under /run/central-infra — is the same durable output `down`
         // re-renders from.
         let t1 = make_topology();
-        t1.file(&binding(), false).unwrap();
+        t1.file(&binding(), false, OpDeadline::NONE).unwrap();
         assert!(compose_path.exists(), "rendered compose file exists");
         // Reboot: the tmpfs runtime root is wiped; the restart's
         // topology has no in-process proof or file cache.
@@ -3941,7 +4282,7 @@ mod tests {
             observation: Observation::default(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
-        block_on(TopologyPort::down(&t2, &op)).unwrap();
+        block_on(TopologyPort::down(&t2, &op, None)).unwrap();
         assert!(
             compose_path.exists(),
             "down re-rendered the compose file after restart"
@@ -3974,7 +4315,7 @@ mod tests {
         // `file(false)` — the materialize path additionally writes the
         // init script under /run/central-infra, which needs root; the
         // render path is what owns these modes.
-        topology.file(&binding(), false).unwrap();
+        topology.file(&binding(), false, OpDeadline::NONE).unwrap();
         let dir = runtime.join("inst-1");
         assert_eq!(mode_of(&dir), 0o700);
         assert_eq!(mode_of(&dir.join("docker-compose.yaml")), 0o600);

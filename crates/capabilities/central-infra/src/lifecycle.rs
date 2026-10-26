@@ -186,7 +186,9 @@ where
     ) -> LifecycleResult {
         let deadline = op.created_at + PROVISION_DEADLINE;
         if self.clock.now() > deadline {
-            return self.settle_fail(&op, "DEADLINE_EXCEEDED".to_owned()).await;
+            return self
+                .settle_fail(&op, cancel_at, "DEADLINE_EXCEEDED".to_owned())
+                .await;
         }
 
         let mut phase = op.phase;
@@ -201,22 +203,27 @@ where
             // Upstream's `select ctx.Done()` arm: the caller's deadline —
             // the helper verb budget — cancels the operation into a
             // settled `cancelled` before the phase work begins.
-            if let Some(cancel_at) = cancel_at
-                && self.clock.now() >= cancel_at
+            if let Some(at) = cancel_at
+                && self.clock.now() >= at
             {
                 return self
-                    .settle_cancel(&op, "CANCELLED: context deadline exceeded".to_owned())
+                    .settle_cancel(
+                        &op,
+                        cancel_at,
+                        "CANCELLED: context deadline exceeded".to_owned(),
+                    )
                     .await;
             }
             if self.clock.now() > deadline {
-                return self.settle_fail(&op, "DEADLINE_EXCEEDED".to_owned()).await;
+                return self
+                    .settle_fail(&op, cancel_at, "DEADLINE_EXCEEDED".to_owned())
+                    .await;
             }
 
             // Upstream's `phaseDeadline` context: the phase's own budget
-            // bounds every I/O call inside this iteration. The only
-            // in-service loop the budget can interrupt is
-            // `wait_for_healthy`; the synchronous port calls inherit the
-            // operation deadline at the loop head above.
+            // bounds every I/O call inside this iteration — including
+            // every Compose subprocess, which receives the same
+            // `min(cancel_at, now+phaseBudget)` instant as `deadline`.
             let phase_deadline_at = cancel_at
                 .map(|d| d.min(self.clock.now() + phase_deadline(phase)))
                 .unwrap_or_else(|| self.clock.now() + phase_deadline(phase));
@@ -225,17 +232,21 @@ where
                 LifecyclePhase::Started => {
                     let admitted = match self.verify_admission(&binding).await {
                         Ok(set) => set,
-                        Err(reason) => return self.settle_fail(&op, reason).await,
+                        Err(reason) => return self.settle_fail(&op, cancel_at, reason).await,
                     };
                     if let Some(capacity) = &self.capacity
                         && let Err(e) = capacity.admit(&binding, &admitted).await
                     {
-                        return self.settle_fail(&op, format!("CAPACITY_DENIED: {e}")).await;
+                        return self
+                            .settle_fail(&op, cancel_at, format!("CAPACITY_DENIED: {e}"))
+                            .await;
                     }
                     if let Some(barrier) = &self.barrier
                         && let Err(e) = barrier.validate_writable_start(&binding).await
                     {
-                        return self.settle_fail(&op, format!("BARRIER_DENIED: {e}")).await;
+                        return self
+                            .settle_fail(&op, cancel_at, format!("BARRIER_DENIED: {e}"))
+                            .await;
                     }
                     if let Err(e) = self
                         .bootstrap
@@ -243,24 +254,36 @@ where
                         .await
                     {
                         return self
-                            .settle_fail(&op, format!("BOOTSTRAP_ENSURE_FAILED: {e}"))
+                            .settle_fail(&op, cancel_at, format!("BOOTSTRAP_ENSURE_FAILED: {e}"))
                             .await;
                     }
                     LifecyclePhase::Verified
                 }
                 LifecyclePhase::Verified => {
-                    if let Err(e) = self.topology.validate(&binding).await {
-                        return self.settle_fail(&op, format!("VALIDATE_FAILED: {e}")).await;
+                    if let Err(e) = self
+                        .topology
+                        .validate(&binding, Some(phase_deadline_at))
+                        .await
+                    {
+                        return self
+                            .settle_fail(&op, cancel_at, format!("VALIDATE_FAILED: {e}"))
+                            .await;
                     }
-                    if let Err(e) = self.topology.init(&op).await {
-                        return self.settle_fail(&op, format!("INIT_FAILED: {e}")).await;
+                    if let Err(e) = self.topology.init(&op, Some(phase_deadline_at)).await {
+                        return self
+                            .settle_fail(&op, cancel_at, format!("INIT_FAILED: {e}"))
+                            .await;
                     }
                     LifecyclePhase::FsInitialized
                 }
                 LifecyclePhase::FsInitialized => {
-                    if let Err(e) = self.topology.start_daemons(&op).await {
+                    if let Err(e) = self
+                        .topology
+                        .start_daemons(&op, Some(phase_deadline_at))
+                        .await
+                    {
                         return self
-                            .settle_fail(&op, format!("START_DAEMONS_FAILED: {e}"))
+                            .settle_fail(&op, cancel_at, format!("START_DAEMONS_FAILED: {e}"))
                             .await;
                     }
                     LifecyclePhase::DaemonsStarted
@@ -268,7 +291,7 @@ where
                 LifecyclePhase::DaemonsStarted => {
                     if let Err(e) = self.wait_for_healthy(&binding, phase_deadline_at).await {
                         return self
-                            .settle_fail(&op, format!("CONTAINER_HEALTH_FAILED: {e}"))
+                            .settle_fail(&op, cancel_at, format!("CONTAINER_HEALTH_FAILED: {e}"))
                             .await;
                     }
                     LifecyclePhase::ContainersHealthy
@@ -284,10 +307,14 @@ where
                     // provisioning operation so the fence token is real.
                     let mut provisioning_op = op.clone();
                     provisioning_op.binding = binding.clone();
-                    match self.topology.provision_minio(&provisioning_op).await {
+                    match self
+                        .topology
+                        .provision_minio(&provisioning_op, Some(phase_deadline_at))
+                        .await
+                    {
                         Err(e) => {
                             return self
-                                .settle_fail(&op, format!("PROVISION_MINIO_FAILED: {e}"))
+                                .settle_fail(&op, cancel_at, format!("PROVISION_MINIO_FAILED: {e}"))
                                 .await;
                         }
                         Ok(sr) => {
@@ -295,6 +322,7 @@ where
                                 return self
                                     .settle_fail(
                                         &op,
+                                        cancel_at,
                                         format!("MINIO_SEMANTIC_VERIFICATION_FAILED: {e}"),
                                     )
                                     .await;
@@ -315,7 +343,7 @@ where
                                 "ADMISSION_REINSPECTION_FAILED",
                                 1,
                             );
-                            return self.settle_fail(&op, reason).await;
+                            return self.settle_fail(&op, cancel_at, reason).await;
                         }
                     }
                     let receipt = DependencyReceipt {
@@ -325,15 +353,19 @@ where
                     };
                     if let Err(e) = self.journal.prepare_receipt(&op, &receipt).await {
                         return self
-                            .settle_fail(&op, format!("PREPARE_RECEIPT_FAILED: {e}"))
+                            .settle_fail(&op, cancel_at, format!("PREPARE_RECEIPT_FAILED: {e}"))
                             .await;
                     }
                     LifecyclePhase::ReceiptPrepared
                 }
                 LifecyclePhase::ReceiptPrepared => {
-                    if let Err(e) = self.topology.inspect(&binding).await {
+                    if let Err(e) = self
+                        .topology
+                        .inspect(&binding, Some(phase_deadline_at))
+                        .await
+                    {
                         return self
-                            .settle_fail(&op, format!("REINSPECT_FAILED: {e}"))
+                            .settle_fail(&op, cancel_at, format!("REINSPECT_FAILED: {e}"))
                             .await;
                     }
                     if let Err(e) = self.journal.switch_receipt(&op).await {
@@ -341,6 +373,7 @@ where
                         return self
                             .settle_at(
                                 &op,
+                                cancel_at,
                                 LifecyclePhase::ReceiptPrepared,
                                 format!("SWITCH_RECEIPT_FAILED: {e}"),
                                 1,
@@ -353,7 +386,9 @@ where
                     // The MinIO server-scoped handoff stays mounted for
                     // the daemon's lifetime; Down owns cleanup.
                     if let Err(e) = self.journal.settle(&op, LifecyclePhase::Completed).await {
-                        return self.settle_fail(&op, format!("SETTLE_FAILED: {e}")).await;
+                        return self
+                            .settle_fail(&op, cancel_at, format!("SETTLE_FAILED: {e}"))
+                            .await;
                     }
                     LifecyclePhase::Completed
                 }
@@ -368,7 +403,7 @@ where
                 }
                 other => {
                     return self
-                        .settle_fail(&op, format!("UNKNOWN_PHASE: {}", other.as_str()))
+                        .settle_fail(&op, cancel_at, format!("UNKNOWN_PHASE: {}", other.as_str()))
                         .await;
                 }
             };
@@ -378,13 +413,16 @@ where
                     return self
                         .settle_at(
                             &op,
+                            cancel_at,
                             LifecyclePhase::ReceiptPrepared,
                             format!("RECORD_FAILED_AFTER_SWITCH: {e}"),
                             1,
                         )
                         .await;
                 }
-                return self.settle_fail(&op, format!("RECORD_FAILED: {e}")).await;
+                return self
+                    .settle_fail(&op, cancel_at, format!("RECORD_FAILED: {e}"))
+                    .await;
             }
             op.phase = next;
             phase = next;
@@ -424,7 +462,7 @@ where
         deadline: OffsetDateTime,
     ) -> Result<(), Failure> {
         loop {
-            let snapshot = self.topology.inspect(binding).await?;
+            let snapshot = self.topology.inspect(binding, Some(deadline)).await?;
             if snapshot.healthy {
                 return Ok(());
             }
@@ -534,7 +572,7 @@ where
 
         if let Err(e) = self.journal.record(&op, LifecyclePhase::Started).await {
             return self
-                .settle_fail(&op, format!("DOWN_RECORD_FAILED: {e}"))
+                .settle_fail(&op, cancel_at, format!("DOWN_RECORD_FAILED: {e}"))
                 .await;
         }
 
@@ -548,20 +586,25 @@ where
             return self
                 .settle_fail(
                     &op,
+                    cancel_at,
                     "DOWN_TEARDOWN_VERIFICATION_FAILED: deadline exceeded".to_owned(),
                 )
                 .await;
         }
 
-        if let Err(e) = self.topology.teardown_verified(&op).await {
+        if let Err(e) = self.topology.teardown_verified(&op, Some(deadline)).await {
             // Keep the MinIO handoff when stopped proof is unavailable.
             return self
-                .settle_fail(&op, format!("DOWN_TEARDOWN_VERIFICATION_FAILED: {e}"))
+                .settle_fail(
+                    &op,
+                    cancel_at,
+                    format!("DOWN_TEARDOWN_VERIFICATION_FAILED: {e}"),
+                )
                 .await;
         }
         if let Err(e) = self.cleanup_bootstrap(&op).await {
             return self
-                .settle_fail(&op, format!("BOOTSTRAP_CLEANUP_FAILED: {e}"))
+                .settle_fail(&op, cancel_at, format!("BOOTSTRAP_CLEANUP_FAILED: {e}"))
                 .await;
         }
 
@@ -569,13 +612,13 @@ where
             && let Err(e) = self.journal.settle(&linked, LifecyclePhase::Failed).await
         {
             return self
-                .settle_fail(&op, format!("LINKED_SETTLE_FAILED: {e}"))
+                .settle_fail(&op, cancel_at, format!("LINKED_SETTLE_FAILED: {e}"))
                 .await;
         }
 
         if let Err(e) = self.journal.settle(&op, LifecyclePhase::Completed).await {
             return self
-                .settle_fail(&op, format!("DOWN_SETTLE_FAILED: {e}"))
+                .settle_fail(&op, cancel_at, format!("DOWN_SETTLE_FAILED: {e}"))
                 .await;
         }
 
@@ -629,7 +672,7 @@ where
             );
         }
 
-        match self.topology.inspect(&binding).await {
+        match self.topology.inspect(&binding, Some(deadline)).await {
             Err(e) => result_error(
                 "",
                 "",
@@ -660,30 +703,44 @@ where
     // helpers
     // ---------------------------------------------------------------------
 
-    async fn settle_fail(&self, op: &LifecycleOperation, reason: String) -> LifecycleResult {
-        self.settle_at(op, LifecyclePhase::Failed, reason, 1).await
+    async fn settle_fail(
+        &self,
+        op: &LifecycleOperation,
+        cancel_at: Option<OffsetDateTime>,
+        reason: String,
+    ) -> LifecycleResult {
+        self.settle_at(op, cancel_at, LifecyclePhase::Failed, reason, 1)
+            .await
     }
 
     /// `settleCancel` — upstream's terminal `Cancelled` settlement on
     /// caller-context cancellation (exit code 1).
-    async fn settle_cancel(&self, op: &LifecycleOperation, reason: String) -> LifecycleResult {
-        self.settle_at(op, LifecyclePhase::Cancelled, reason, 1)
+    async fn settle_cancel(
+        &self,
+        op: &LifecycleOperation,
+        cancel_at: Option<OffsetDateTime>,
+        reason: String,
+    ) -> LifecycleResult {
+        self.settle_at(op, cancel_at, LifecyclePhase::Cancelled, reason, 1)
             .await
     }
 
     /// `settleAt` — records the settled terminal state; runs verified
     /// teardown before credential cleanup when the settling phase may
-    /// have daemons running.
+    /// have daemons running. Settle-path teardown is bounded only by
+    /// the caller's deadline, exactly as upstream passes the parent
+    /// `ctx` — never a phase-scoped one — into `settleAt`.
     async fn settle_at(
         &self,
         op: &LifecycleOperation,
+        cancel_at: Option<OffsetDateTime>,
         phase: LifecyclePhase,
         reason: String,
         exit_code: i32,
     ) -> LifecycleResult {
         let mut r = result_from_op(op, phase, reason.clone(), exit_code);
         if requires_verified_teardown(op.phase) {
-            if let Err(e) = self.topology.teardown_verified(op).await {
+            if let Err(e) = self.topology.teardown_verified(op, cancel_at).await {
                 r.reason = format!("{}; TEARDOWN_VERIFICATION_FAILED: {e}", r.reason);
             } else if let Err(e) = self.cleanup_bootstrap(op).await {
                 r.reason = format!("{}; BOOTSTRAP_CLEANUP_FAILED: {e}", r.reason);
@@ -707,6 +764,11 @@ where
 
 /// `withB04Evidence` — attaches the operation's real B04 evidence to a
 /// copy of the binding (never written back into `op.binding`).
+/// Upstream assigns the whole struct —
+/// `binding.B04 = B04LifecycleEvidence{…}` — so a resumed operation's
+/// evidence replaces the prior half wholesale: no stale stopped or
+/// mount-release proof survives a rebind (the topology re-establishes
+/// them itself anyway).
 #[must_use]
 pub fn with_b04_evidence(
     binding: &LifecycleBinding,
@@ -714,10 +776,13 @@ pub fn with_b04_evidence(
     lock: &LifecycleLock,
 ) -> LifecycleBinding {
     let mut bound = binding.clone();
-    bound.b04.instance_id = binding.instance_id.clone();
-    bound.b04.operation_id = op.id.clone();
-    bound.b04.fencing_token = lock.fencing_token;
-    bound.b04.expires_at = Some(lock.expires_at);
+    bound.b04 = crate::domain::B04LifecycleEvidence {
+        instance_id: binding.instance_id.clone(),
+        operation_id: op.id.clone(),
+        fencing_token: lock.fencing_token,
+        expires_at: Some(lock.expires_at),
+        ..crate::domain::B04LifecycleEvidence::default()
+    };
     bound
 }
 
@@ -1138,6 +1203,10 @@ mod tests {
         inspect_calls: Mutex<u32>,
         clock: Mutex<Option<Arc<FakeClock>>>,
         advance_per_inspect: Mutex<Duration>,
+        /// The absolute deadline each call received — proves the
+        /// domain threads `min(cancel_at, now+phaseBudget)` into every
+        /// exec-capable port call.
+        deadlines: Mutex<Vec<(String, Option<OffsetDateTime>)>>,
     }
     impl FakeTopology {
         fn new() -> Self {
@@ -1149,6 +1218,7 @@ mod tests {
                 inspect_calls: Mutex::new(0),
                 clock: Mutex::new(None),
                 advance_per_inspect: Mutex::new(Duration::ZERO),
+                deadlines: Mutex::new(Vec::new()),
             }
         }
         fn called(&self, name: &str) -> Result<(), Failure> {
@@ -1161,22 +1231,45 @@ mod tests {
             }
             Ok(())
         }
+        fn record_deadline(&self, name: &str, deadline: Option<OffsetDateTime>) {
+            self.deadlines
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), deadline));
+        }
     }
     impl TopologyPort for FakeTopology {
-        async fn validate(&self, _b: &LifecycleBinding) -> Result<(), Failure> {
+        async fn validate(
+            &self,
+            _b: &LifecycleBinding,
+            deadline: Option<OffsetDateTime>,
+        ) -> Result<(), Failure> {
+            self.record_deadline("validate", deadline);
             self.called("validate")
         }
-        async fn init(&self, _op: &LifecycleOperation) -> Result<(), Failure> {
+        async fn init(
+            &self,
+            _op: &LifecycleOperation,
+            deadline: Option<OffsetDateTime>,
+        ) -> Result<(), Failure> {
+            self.record_deadline("init", deadline);
             self.called("init")
         }
-        async fn start_daemons(&self, _op: &LifecycleOperation) -> Result<Observation, Failure> {
+        async fn start_daemons(
+            &self,
+            _op: &LifecycleOperation,
+            deadline: Option<OffsetDateTime>,
+        ) -> Result<Observation, Failure> {
+            self.record_deadline("start_daemons", deadline);
             self.called("start_daemons")?;
             Ok(Observation::default())
         }
         async fn provision_minio(
             &self,
             op: &LifecycleOperation,
+            deadline: Option<OffsetDateTime>,
         ) -> Result<SemanticReceipt, Failure> {
+            self.record_deadline("provision_minio", deadline);
             self.called("provision_minio")?;
             // SC-DEF-28 pin: the fence token must be the lock's, not zero.
             if op.binding.b04.fencing_token == 0 {
@@ -1188,7 +1281,12 @@ mod tests {
                 verified: true,
             })
         }
-        async fn inspect(&self, _b: &LifecycleBinding) -> Result<TopologySnapshot, Failure> {
+        async fn inspect(
+            &self,
+            _b: &LifecycleBinding,
+            deadline: Option<OffsetDateTime>,
+        ) -> Result<TopologySnapshot, Failure> {
+            self.record_deadline("inspect", deadline);
             *self.inspect_calls.lock().unwrap() += 1;
             self.called("inspect")?;
             let advance = *self.advance_per_inspect.lock().unwrap();
@@ -1203,10 +1301,20 @@ mod tests {
                 ..TopologySnapshot::default()
             })
         }
-        async fn down(&self, _op: &LifecycleOperation) -> Result<(), Failure> {
+        async fn down(
+            &self,
+            _op: &LifecycleOperation,
+            deadline: Option<OffsetDateTime>,
+        ) -> Result<(), Failure> {
+            self.record_deadline("down", deadline);
             self.called("down")
         }
-        async fn teardown_verified(&self, _op: &LifecycleOperation) -> Result<(), Failure> {
+        async fn teardown_verified(
+            &self,
+            _op: &LifecycleOperation,
+            deadline: Option<OffsetDateTime>,
+        ) -> Result<(), Failure> {
+            self.record_deadline("teardown_verified", deadline);
             self.called("teardown_verified")
         }
         async fn cleanup_secrets(&self, _op: &LifecycleOperation) -> Result<(), Failure> {
@@ -1754,6 +1862,60 @@ mod tests {
         assert_eq!(
             phase_deadline(LifecyclePhase::ReceiptPrepared),
             SELECTOR_BUDGET
+        );
+    }
+
+    /// Every exec-capable topology call receives the phase's
+    /// `min(cancel_at, now+phaseBudget)` instant — upstream's
+    /// `context.WithDeadline(ctx, pd)` handed to the port.
+    #[test]
+    fn topology_calls_receive_the_phase_deadline() {
+        let h = harness();
+        let r = block_on(h.service.up(request()));
+        assert_eq!(r.exit_code, 0, "{}", r.reason);
+        let epoch = OffsetDateTime::UNIX_EPOCH;
+        assert_eq!(
+            h.topology.deadlines.lock().unwrap().as_slice(),
+            &[
+                ("validate".to_owned(), Some(epoch + FS_INIT_BUDGET)),
+                ("init".to_owned(), Some(epoch + FS_INIT_BUDGET)),
+                ("start_daemons".to_owned(), Some(epoch + DAEMON_BUDGET)),
+                ("inspect".to_owned(), Some(epoch + DAEMON_BUDGET)),
+                ("provision_minio".to_owned(), Some(epoch + PROVISION_BUDGET)),
+                ("inspect".to_owned(), Some(epoch + SELECTOR_BUDGET)),
+            ]
+        );
+    }
+
+    /// A tighter caller deadline wins over the phase budget —
+    /// upstream's `context.WithDeadline(ctx, pd)` is always the
+    /// earlier of the two.
+    #[test]
+    fn caller_deadline_clamps_the_phase_deadline() {
+        let h = harness();
+        let caller = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1);
+        let _ = block_on(h.service.up_with_deadline(request(), Some(caller)));
+        let deadlines = h.topology.deadlines.lock().unwrap();
+        assert!(
+            deadlines.iter().all(|(_, d)| *d == Some(caller)),
+            "every phase deadline is clamped by the caller deadline: {deadlines:?}"
+        );
+        assert!(!deadlines.is_empty());
+    }
+
+    /// `down`'s teardown window is `min(cancel_at, now+downBudget)` —
+    /// no cancel means the full budget.
+    #[test]
+    fn down_passes_the_down_budget_to_teardown_verified() {
+        let h = harness();
+        let r = block_on(h.service.down(request()));
+        assert_eq!(r.exit_code, 0, "{}", r.reason);
+        assert_eq!(
+            h.topology.deadlines.lock().unwrap().as_slice(),
+            &[(
+                "teardown_verified".to_owned(),
+                Some(OffsetDateTime::UNIX_EPOCH + DOWN_BUDGET)
+            )]
         );
     }
 }

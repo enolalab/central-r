@@ -103,19 +103,25 @@ impl WaylandSeat for SystemWaylandSeat {
         if !meta.file_type().is_socket() {
             return Err(denied());
         }
-        let conn = dial_unix_bounded(&path)?;
+        let conn = dial_unix_bounded(&path, Duration::from_secs(1))?;
         drop(conn);
         Ok(())
     }
 }
 
-/// `net.Dialer{Timeout: time.Second}.DialContext(ctx, "unix", path)` —
-/// a nonblocking `connect` bounded to one second: `poll` waits for
+/// `net.Dialer{Timeout: …}.DialContext(ctx, "unix", path)` — a
+/// nonblocking `connect` bounded to `timeout`: `poll` waits for
 /// writability, `SO_ERROR` surfaces the pending connection's verdict,
 /// and the finished stream goes back to blocking mode like the conn
 /// upstream's dialer returns. Every failure — refused, timed out, or
 /// malformed — collapses to the same `ErrDenied` a dial error produces.
-fn dial_unix_bounded(path: &std::path::Path) -> Result<std::os::unix::net::UnixStream, Failure> {
+/// The browser boundary passes one second (upstream `browser.go`);
+/// the helper clients pass their `DIAL_TIMEOUT` (upstream's
+/// `net.Dialer{Timeout: 5 * time.Second}`).
+pub(crate) fn dial_unix_bounded(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Result<std::os::unix::net::UnixStream, Failure> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use rustix::io::Errno;
     use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
@@ -130,9 +136,9 @@ fn dial_unix_bounded(path: &std::path::Path) -> Result<std::os::unix::net::UnixS
     match net::connect(&fd, &addr) {
         Ok(()) => {}
         Err(Errno::INPROGRESS) | Err(Errno::AGAIN) => {
-            // One second of budget across EINTR retries — upstream's
+            // `timeout` of budget across EINTR retries — upstream's
             // fixed dialer timeout, not a per-poll slice.
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + timeout;
             let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
@@ -693,14 +699,14 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let sock = dir.join("wayland-9");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let conn = dial_unix_bounded(&sock).unwrap();
+        let conn = dial_unix_bounded(&sock, Duration::from_secs(1)).unwrap();
         // Connected: no pending SO_ERROR on the finished stream.
         assert!(conn.take_error().unwrap().is_none());
         drop(conn);
         // Nobody accepts; drop the listener and the path is a stale
         // socket — connect refuses immediately, no 1s wait needed.
         drop(listener);
-        assert!(dial_unix_bounded(&sock).is_err());
+        assert!(dial_unix_bounded(&sock, Duration::from_secs(1)).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

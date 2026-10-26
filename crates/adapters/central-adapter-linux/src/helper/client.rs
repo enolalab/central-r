@@ -53,7 +53,13 @@ impl LifecycleClient {
         req: &LifecycleRequest,
     ) -> (LifecycleResult, Option<String>) {
         let transport = |result: LifecycleResult, message: String| (result, Some(message));
-        let mut conn = match std::os::unix::net::UnixStream::connect(&self.socket_path) {
+        // Upstream `net.Dialer{Timeout: 5 * time.Second}` — the same
+        // bounded connect the browser boundary uses, with the helper
+        // client's own five-second dial budget.
+        let mut conn = match super::browser::dial_unix_bounded(
+            std::path::Path::new(&self.socket_path),
+            DIAL_TIMEOUT,
+        ) {
             Ok(conn) => conn,
             Err(e) => {
                 return transport(LifecycleResult::default(), format!("helper: dial: {e}"));
@@ -209,7 +215,10 @@ impl PrepareClient {
     /// transport/denial error; `None` means the helper reported a
     /// successful operation.
     pub fn prepare(&self, req: &PrepareRequest) -> (PrepareResult, Option<String>) {
-        let mut conn = match std::os::unix::net::UnixStream::connect(&self.socket_path) {
+        let mut conn = match super::browser::dial_unix_bounded(
+            std::path::Path::new(&self.socket_path),
+            DIAL_TIMEOUT,
+        ) {
             Ok(conn) => conn,
             Err(e) => {
                 return (PrepareResult::default(), Some(format!("helper: dial: {e}")));

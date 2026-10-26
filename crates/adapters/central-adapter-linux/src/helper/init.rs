@@ -7,7 +7,7 @@ use super::PeerIdentity;
 use super::protocol::*;
 use central_foundation::failure::Failure;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // The complete init wire-reason vocabulary (init.go's const block).
 pub const INIT_REASON_ALREADY_INITIALIZED: &str = "ALREADY_INITIALIZED";
@@ -211,7 +211,13 @@ impl InitClient {
             e.no_answer = no_answer;
             e
         };
-        let mut conn = match std::os::unix::net::UnixStream::connect(&self.socket_path) {
+        // Upstream `net.Dialer{Timeout: 5 * time.Second}` — bounded
+        // connect rather than a blocking `UnixStream::connect` that
+        // can hold the operator path open on a wedged accept queue.
+        let mut conn = match super::browser::dial_unix_bounded(
+            std::path::Path::new(&self.socket_path),
+            Duration::from_secs(5),
+        ) {
             Ok(c) => c,
             Err(_) => return Err(unanswered(false)),
         };

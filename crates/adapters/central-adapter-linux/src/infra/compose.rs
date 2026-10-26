@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 use central_foundation::failure::Failure;
 use central_infra::domain::{LifecycleBinding, OciInventory, PreparedDependencySet, ServiceMode};
 
+use super::prepare::OpDeadline;
+
 // ---------------------------------------------------------------------------
 // Sentinel errors — upstream's `errors.Is` targets as a closed enum.
 // ---------------------------------------------------------------------------
@@ -220,11 +222,23 @@ pub struct ContainerInspection {
 /// `ComposeRunner` (upstream interface). `run_with_input` returns the
 /// real exit code; an `Err` means the subprocess could not be run at
 /// all, matching upstream's `err != nil` contract.
+///
+/// Every method takes `deadline` — upstream's `ctx` under
+/// `context.WithDeadline(ctx, now+phaseBudget)`: the executor must
+/// SIGKILL and reap a child still running once it lapses, so a hung
+/// `docker compose` can never hold the lifecycle handler thread open.
+/// `OpDeadline::NONE` is upstream's `context.Background()`.
 pub trait ComposeRunner: Send + Sync {
     /// `Config` — `docker compose config --format json`, parsed+validated.
-    fn config(&self, f: &RenderedFile) -> Result<RenderedModel, ComposeError>;
+    fn config(&self, f: &RenderedFile, deadline: OpDeadline)
+    -> Result<RenderedModel, ComposeError>;
     /// `Up` — starts the given services (or all when empty).
-    fn up(&self, f: &RenderedFile, services: &[String]) -> Result<(), ComposeError>;
+    fn up(
+        &self,
+        f: &RenderedFile,
+        services: &[String],
+        deadline: OpDeadline,
+    ) -> Result<(), ComposeError>;
     /// `RunWithInput` — `compose run --rm -T <service> <args...>` with
     /// stdin piped; returns the real exit code.
     fn run_with_input(
@@ -233,6 +247,7 @@ pub trait ComposeRunner: Send + Sync {
         service: &str,
         args: &[String],
         stdin: &[u8],
+        deadline: OpDeadline,
     ) -> Result<i32, ComposeError>;
     /// `RunWithInputOutput` — the receipt-bearing variant returning
     /// capped stdout alongside the exit code.
@@ -242,29 +257,45 @@ pub trait ComposeRunner: Send + Sync {
         service: &str,
         args: &[String],
         stdin: &[u8],
+        deadline: OpDeadline,
     ) -> Result<(Vec<u8>, i32), ComposeError>;
     /// `Down` — `compose down --remove-orphans`.
-    fn down(&self, f: &RenderedFile) -> Result<(), ComposeError>;
+    fn down(&self, f: &RenderedFile, deadline: OpDeadline) -> Result<(), ComposeError>;
     /// `Inspect` — `docker inspect --format {{json .}}` by container ID.
-    fn inspect(&self, container_id: &str) -> Result<ContainerInspection, ComposeError>;
+    fn inspect(
+        &self,
+        container_id: &str,
+        deadline: OpDeadline,
+    ) -> Result<ContainerInspection, ComposeError>;
     /// `Containers` — resolves the exact current container per service.
     fn containers(
         &self,
         f: &RenderedFile,
         services: &[String],
+        deadline: OpDeadline,
     ) -> Result<BTreeMap<String, ContainerInspection>, ComposeError>;
     /// `Stopped` — verifies no current container exists per service.
-    fn stopped(&self, f: &RenderedFile, services: &[String]) -> Result<(), ComposeError>;
+    fn stopped(
+        &self,
+        f: &RenderedFile,
+        services: &[String],
+        deadline: OpDeadline,
+    ) -> Result<(), ComposeError>;
 }
 
-/// `CommandExecutor` — the injectable subprocess boundary.
+/// `CommandExecutor` — the injectable subprocess boundary. The
+/// `OpDeadline` argument bounds the child: implementations kill and
+/// reap it on expiry.
 pub type CommandExecutor =
-    Box<dyn Fn(&str, &[String], &[String]) -> Result<Vec<u8>, String> + Send + Sync>;
+    Box<dyn Fn(&str, &[String], &[String], OpDeadline) -> Result<Vec<u8>, String> + Send + Sync>;
 
 /// `stdinCommandExecutor` — the narrow stdin-piping boundary; reports
 /// the real exit code (nonzero with `Ok` means the process ran).
-pub type StdinCommandExecutor =
-    Box<dyn Fn(&str, &[String], &[String], &[u8]) -> Result<(Vec<u8>, i32), String> + Send + Sync>;
+pub type StdinCommandExecutor = Box<
+    dyn Fn(&str, &[String], &[String], &[u8], OpDeadline) -> Result<(Vec<u8>, i32), String>
+        + Send
+        + Sync,
+>;
 
 /// `CommandComposeRunner` — executes the fixed Docker Compose protocol
 /// using an absolute Docker binary; never a shell wrapper.
@@ -290,7 +321,12 @@ impl CommandComposeRunner {
         }
     }
 
-    fn run(&self, f: &RenderedFile, command: &[String]) -> Result<Vec<u8>, ComposeError> {
+    fn run(
+        &self,
+        f: &RenderedFile,
+        command: &[String],
+        deadline: OpDeadline,
+    ) -> Result<Vec<u8>, ComposeError> {
         let project = compose_project_for_file(f)?;
         let mut args = vec![
             "compose".to_owned(),
@@ -300,18 +336,119 @@ impl CommandComposeRunner {
             f.path.clone(),
         ];
         args.extend(command.iter().cloned());
-        (self.exec)(&self.docker_path, &args, &closed_docker_environment())
-            .map_err(|e| ComposeError::Other(format!("compose: {e}")))
+        (self.exec)(
+            &self.docker_path,
+            &args,
+            &closed_docker_environment(),
+            deadline,
+        )
+        .map_err(|e| ComposeError::Other(format!("compose: {e}")))
     }
 }
 
-/// `executeCommand` — the real subprocess implementation.
-fn execute_command(name: &str, args: &[String], env: &[String]) -> Result<Vec<u8>, String> {
+/// `run_bounded`'s spawn/poll/kill/reap discipline (see
+/// `infra::prepare`) applied to the compose boundary — upstream's
+/// `exec.CommandContext` under the phase deadline. The pipes are
+/// drained on reader threads so a chatty child cannot block the
+/// poller, stdin is written on its own thread so a child that never
+/// reads cannot wedge the writer, and on expiry the child is
+/// SIGKILLed and reaped: a hung `docker compose` can never hold the
+/// lifecycle handler thread open. Shared by the compose runner and
+/// the receipt inspector's docker exec so every spawned child honors
+/// the same deadline discipline.
+pub(crate) fn run_compose_bounded(
+    deadline: OpDeadline,
+    command: &mut Command,
+    stdin: Option<Vec<u8>>,
+) -> Result<std::process::Output, String> {
+    fn drain<P: std::io::Read + Send + 'static>(
+        pipe: Option<P>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let mut child = command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdin_thread = match stdin {
+        Some(bytes) => {
+            let Some(mut writer) = child.stdin.take() else {
+                return Err("compose: stdin pipe unavailable".to_owned());
+            };
+            Some(std::thread::spawn(move || {
+                // A short write to a child that exited early fails
+                // EPIPE — fine; the join only collects the result.
+                let _ = writer.write_all(&bytes);
+            }))
+        }
+        None => None,
+    };
+    let out_thread = drain(child.stdout.take());
+    let err_thread = drain(child.stderr.take());
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if deadline.0.is_some_and(|d| std::time::Instant::now() > d) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_thread.join();
+                    let _ = err_thread.join();
+                    if let Some(t) = stdin_thread.take() {
+                        let _ = t.join();
+                    }
+                    return Err("compose: operation deadline exceeded".to_owned());
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_thread.join();
+                let _ = err_thread.join();
+                if let Some(t) = stdin_thread.take() {
+                    let _ = t.join();
+                }
+                return Err(format!("compose: wait: {e}"));
+            }
+        }
+    };
+    if let Some(t) = stdin_thread {
+        let _ = t.join();
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    })
+}
+
+/// `executeCommand` — the real subprocess implementation, bounded by
+/// the lifecycle phase deadline.
+fn execute_command(
+    name: &str,
+    args: &[String],
+    env: &[String],
+    deadline: OpDeadline,
+) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new(name);
     cmd.args(args)
         .env_clear()
         .envs(env.iter().filter_map(|e| e.split_once('=')));
-    let output = cmd.output().map_err(|e| e.to_string())?;
+    let output = run_compose_bounded(deadline, &mut cmd, None)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
@@ -319,25 +456,21 @@ fn execute_command(name: &str, args: &[String], env: &[String]) -> Result<Vec<u8
 }
 
 /// `executeCommandWithInput` — real subprocess with stdin piped, capped
-/// 64KiB stdout, discarded stderr, real exit code.
+/// 64KiB stdout, discarded stderr, real exit code — bounded by the
+/// lifecycle phase deadline.
 fn execute_command_with_input(
     name: &str,
     args: &[String],
     env: &[String],
     stdin: &[u8],
+    deadline: OpDeadline,
 ) -> Result<(Vec<u8>, i32), String> {
     let mut cmd = Command::new(name);
     cmd.args(args)
         .env_clear()
         .envs(env.iter().filter_map(|e| e.split_once('=')))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    if let Some(mut w) = child.stdin.take() {
-        let _ = w.write_all(stdin);
-    }
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let output = run_compose_bounded(deadline, &mut cmd, Some(stdin.to_vec()))?;
     let code = output.status.code().unwrap_or(-1);
     if output.stdout.len() > 64 * 1024 {
         return Err("compose: subprocess stdout exceeds limit".to_owned());
@@ -346,7 +479,11 @@ fn execute_command_with_input(
 }
 
 impl ComposeRunner for CommandComposeRunner {
-    fn config(&self, f: &RenderedFile) -> Result<RenderedModel, ComposeError> {
+    fn config(
+        &self,
+        f: &RenderedFile,
+        deadline: OpDeadline,
+    ) -> Result<RenderedModel, ComposeError> {
         let output = self
             .run(
                 f,
@@ -355,6 +492,7 @@ impl ComposeRunner for CommandComposeRunner {
                     "--format".to_owned(),
                     "json".to_owned(),
                 ],
+                deadline,
             )
             .map_err(|e| ComposeError::Other(format!("compose: config: {e}")))?;
         let model = parse_rendered_model(&output)?;
@@ -362,7 +500,12 @@ impl ComposeRunner for CommandComposeRunner {
         Ok(model)
     }
 
-    fn up(&self, f: &RenderedFile, services: &[String]) -> Result<(), ComposeError> {
+    fn up(
+        &self,
+        f: &RenderedFile,
+        services: &[String],
+        deadline: OpDeadline,
+    ) -> Result<(), ComposeError> {
         // --wait + --pull never: see upstream's comment on the nonexistent
         // --no-pull flag (2026-08-17).
         let mut args = vec![
@@ -374,7 +517,7 @@ impl ComposeRunner for CommandComposeRunner {
             "never".to_owned(),
         ];
         args.extend(services.iter().cloned());
-        self.run(f, &args)
+        self.run(f, &args, deadline)
             .map_err(|e| ComposeError::Other(format!("compose: up: {e}")))?;
         Ok(())
     }
@@ -385,8 +528,9 @@ impl ComposeRunner for CommandComposeRunner {
         service: &str,
         args: &[String],
         stdin: &[u8],
+        deadline: OpDeadline,
     ) -> Result<i32, ComposeError> {
-        let (_, code) = self.run_with_input_output(f, service, args, stdin)?;
+        let (_, code) = self.run_with_input_output(f, service, args, stdin, deadline)?;
         Ok(code)
     }
 
@@ -396,6 +540,7 @@ impl ComposeRunner for CommandComposeRunner {
         service: &str,
         args: &[String],
         stdin: &[u8],
+        deadline: OpDeadline,
     ) -> Result<(Vec<u8>, i32), ComposeError> {
         let project = compose_project_for_file(f)?;
         let mut compose_args = vec![
@@ -415,18 +560,27 @@ impl ComposeRunner for CommandComposeRunner {
             &compose_args,
             &closed_docker_environment(),
             stdin,
+            deadline,
         )
         .map_err(|e| ComposeError::Other(format!("compose: run: {e}")))?;
         Ok((output, code))
     }
 
-    fn down(&self, f: &RenderedFile) -> Result<(), ComposeError> {
-        self.run(f, &["down".to_owned(), "--remove-orphans".to_owned()])
-            .map_err(|e| ComposeError::Other(format!("compose: down: {e}")))?;
+    fn down(&self, f: &RenderedFile, deadline: OpDeadline) -> Result<(), ComposeError> {
+        self.run(
+            f,
+            &["down".to_owned(), "--remove-orphans".to_owned()],
+            deadline,
+        )
+        .map_err(|e| ComposeError::Other(format!("compose: down: {e}")))?;
         Ok(())
     }
 
-    fn inspect(&self, container_id: &str) -> Result<ContainerInspection, ComposeError> {
+    fn inspect(
+        &self,
+        container_id: &str,
+        deadline: OpDeadline,
+    ) -> Result<ContainerInspection, ComposeError> {
         if container_id.is_empty() || container_id.contains(['/', '\0']) {
             return Err(ComposeError::Other(
                 "compose: invalid container id".to_owned(),
@@ -443,6 +597,7 @@ impl ComposeRunner for CommandComposeRunner {
                 container_id.to_owned(),
             ],
             &closed_docker_environment(),
+            deadline,
         )
         .map_err(|e| ComposeError::Other(format!("compose: inspect: {e}")))?;
         #[derive(Deserialize)]
@@ -480,6 +635,7 @@ impl ComposeRunner for CommandComposeRunner {
         &self,
         f: &RenderedFile,
         services: &[String],
+        deadline: OpDeadline,
     ) -> Result<BTreeMap<String, ContainerInspection>, ComposeError> {
         if services.is_empty() {
             return Err(ComposeError::Other(
@@ -502,6 +658,7 @@ impl ComposeRunner for CommandComposeRunner {
                         "--quiet".to_owned(),
                         service.clone(),
                     ],
+                    deadline,
                 )
                 .map_err(|e| {
                     ComposeError::Other(format!("compose: inspect service {service}: {e}"))
@@ -516,13 +673,18 @@ impl ComposeRunner for CommandComposeRunner {
                     "compose: service {service} has no unique container"
                 )));
             }
-            let inspection = self.inspect(&id)?;
+            let inspection = self.inspect(&id, deadline)?;
             containers.insert(service.clone(), inspection);
         }
         Ok(containers)
     }
 
-    fn stopped(&self, f: &RenderedFile, services: &[String]) -> Result<(), ComposeError> {
+    fn stopped(
+        &self,
+        f: &RenderedFile,
+        services: &[String],
+        deadline: OpDeadline,
+    ) -> Result<(), ComposeError> {
         for service in services {
             let output = self
                 .run(
@@ -533,6 +695,7 @@ impl ComposeRunner for CommandComposeRunner {
                         "--quiet".to_owned(),
                         service.clone(),
                     ],
+                    deadline,
                 )
                 .map_err(|e| {
                     ComposeError::Other(format!("compose: verify stopped service {service}: {e}"))
@@ -598,10 +761,10 @@ pub fn closed_docker_environment() -> Vec<String> {
 pub struct DummyComposeRunner;
 
 impl ComposeRunner for DummyComposeRunner {
-    fn config(&self, _f: &RenderedFile) -> Result<RenderedModel, ComposeError> {
+    fn config(&self, _f: &RenderedFile, _d: OpDeadline) -> Result<RenderedModel, ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
-    fn up(&self, _f: &RenderedFile, _s: &[String]) -> Result<(), ComposeError> {
+    fn up(&self, _f: &RenderedFile, _s: &[String], _d: OpDeadline) -> Result<(), ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
     fn run_with_input(
@@ -610,6 +773,7 @@ impl ComposeRunner for DummyComposeRunner {
         _s: &str,
         _a: &[String],
         _i: &[u8],
+        _d: OpDeadline,
     ) -> Result<i32, ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
@@ -619,23 +783,30 @@ impl ComposeRunner for DummyComposeRunner {
         _s: &str,
         _a: &[String],
         _i: &[u8],
+        _d: OpDeadline,
     ) -> Result<(Vec<u8>, i32), ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
-    fn down(&self, _f: &RenderedFile) -> Result<(), ComposeError> {
+    fn down(&self, _f: &RenderedFile, _d: OpDeadline) -> Result<(), ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
-    fn inspect(&self, _id: &str) -> Result<ContainerInspection, ComposeError> {
+    fn inspect(&self, _id: &str, _d: OpDeadline) -> Result<ContainerInspection, ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
     fn containers(
         &self,
         _f: &RenderedFile,
         _s: &[String],
+        _d: OpDeadline,
     ) -> Result<BTreeMap<String, ContainerInspection>, ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
-    fn stopped(&self, _f: &RenderedFile, _s: &[String]) -> Result<(), ComposeError> {
+    fn stopped(
+        &self,
+        _f: &RenderedFile,
+        _s: &[String],
+        _d: OpDeadline,
+    ) -> Result<(), ComposeError> {
         Err(ComposeError::ExecutionUnavailable)
     }
 }
@@ -2458,7 +2629,7 @@ mod tests {
             let c2 = captured.clone();
             let runner = CommandComposeRunner::new(
                 "/usr/bin/docker",
-                Some(Box::new(move |n, a, e| {
+                Some(Box::new(move |n, a, e, _d| {
                     *c2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                         (n.to_owned(), a.to_vec(), e.to_vec());
                     Ok(Vec::new())
@@ -2472,6 +2643,7 @@ mod tests {
                         content: Vec::new(),
                     },
                     &["postgres".to_owned()],
+                    OpDeadline::NONE,
                 )
                 .unwrap();
             captured
@@ -2499,7 +2671,7 @@ mod tests {
         let runner = CommandComposeRunner::new(
             "/usr/bin/docker",
             None,
-            Some(Box::new(move |_n, a, _e, stdin| {
+            Some(Box::new(move |_n, a, _e, stdin, _d| {
                 *c2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = a.to_vec();
                 *s2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = stdin.to_vec();
                 Ok((Vec::new(), 0))
@@ -2515,6 +2687,7 @@ mod tests {
                 "minio-provision",
                 &["minio-provision".to_owned()],
                 br#"{"mode":"minio-provision"}"#,
+                OpDeadline::NONE,
             )
             .unwrap();
         assert_eq!(code, 0);
@@ -2537,13 +2710,46 @@ mod tests {
     fn dummy_compose_runner_fails_closed() {
         let runner = DummyComposeRunner;
         assert!(matches!(
-            runner.up(&RenderedFile::default(), &[]),
+            runner.up(&RenderedFile::default(), &[], OpDeadline::NONE),
             Err(ComposeError::ExecutionUnavailable)
         ));
         assert!(matches!(
-            runner.run_with_input(&RenderedFile::default(), "s", &[], &[]),
+            runner.run_with_input(&RenderedFile::default(), "s", &[], &[], OpDeadline::NONE),
             Err(ComposeError::ExecutionUnavailable)
         ));
+    }
+
+    /// A hung `compose` child is SIGKILLed and reaped once the phase
+    /// deadline lapses — the executor never waits on it forever.
+    #[test]
+    fn execute_command_kills_a_hung_child_at_the_deadline() {
+        let start = std::time::Instant::now();
+        // `sleep` itself is the child — no `sh -c`, which can fork a
+        // grandchild that keeps the drained pipes open past the kill.
+        let err = execute_command(
+            "/bin/sleep",
+            &["30".to_owned()],
+            &closed_docker_environment(),
+            OpDeadline::after(std::time::Duration::from_millis(100)),
+        )
+        .unwrap_err();
+        assert!(err.contains("deadline"), "{err}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "the child was killed, not waited on"
+        );
+        // A lapsed deadline kills even a just-spawned child.
+        let err = execute_command_with_input(
+            "/bin/sleep",
+            &["30".to_owned()],
+            &closed_docker_environment(),
+            b"{}",
+            OpDeadline(Some(
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            )),
+        )
+        .unwrap_err();
+        assert!(err.contains("deadline"), "{err}");
     }
 
     #[test]

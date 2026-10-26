@@ -770,60 +770,117 @@ impl<A: LifecycleAuthority + ?Sized> LifecycleAuthority for Arc<A> {
 #[trait_variant::make(Send)]
 pub trait TopologyPort: Send + Sync + 'static {
     /// Checks that `binding`'s topology constraints are satisfied.
-    async fn validate(&self, binding: &LifecycleBinding) -> Result<(), Failure>;
+    ///
+    /// Every method that can spawn a Compose subprocess takes
+    /// `deadline` — the absolute wall-clock instant upstream carries
+    /// as `context.WithDeadline(ctx, now+phaseBudget)` (already
+    /// `min(caller_deadline, now+budget)` at the domain call site).
+    /// `None` is upstream's `context.Background()`: no bound.
+    async fn validate(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure>;
     /// Initializes the filesystem for `operation`.
-    async fn init(&self, operation: &LifecycleOperation) -> Result<(), Failure>;
+    async fn init(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure>;
     /// Starts the long-running daemon containers and returns the
     /// runtime observation.
-    async fn start_daemons(&self, operation: &LifecycleOperation) -> Result<Observation, Failure>;
+    async fn start_daemons(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<Observation, Failure>;
     /// Provisions MinIO and returns a semantically verified receipt.
     async fn provision_minio(
         &self,
         operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
     ) -> Result<SemanticReceipt, Failure>;
     /// Returns a point-in-time snapshot of the topology for
     /// `binding`.
-    async fn inspect(&self, binding: &LifecycleBinding) -> Result<TopologySnapshot, Failure>;
+    async fn inspect(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<TopologySnapshot, Failure>;
     /// Tears down the infrastructure for `operation`.
-    async fn down(&self, operation: &LifecycleOperation) -> Result<(), Failure>;
+    async fn down(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure>;
     /// `TeardownVerified` — upstream's optional `verifiedTeardown`
     /// interface assertion. Implementations must prove every daemon
     /// stopped before the domain releases credential cleanup; an
     /// implementation that cannot verify answers the same
     /// "verified teardown is unavailable" failure upstream's
     /// type-assertion produces.
-    async fn teardown_verified(&self, operation: &LifecycleOperation) -> Result<(), Failure>;
+    async fn teardown_verified(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure>;
     /// `CleanupSecrets` — upstream's optional `bootstrapCleaner`
     /// interface assertion: removes the materialized bootstrap secrets
     /// for `operation`. Implementations with no secrets answer `Ok(())`,
     /// matching a topology that does not implement the interface.
+    /// Cannot spawn a subprocess, so it carries no `deadline`.
     async fn cleanup_secrets(&self, operation: &LifecycleOperation) -> Result<(), Failure>;
 }
 
 impl<T: TopologyPort + ?Sized> TopologyPort for Arc<T> {
-    async fn validate(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
-        (**self).validate(binding).await
+    async fn validate(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        (**self).validate(binding, deadline).await
     }
-    async fn init(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
-        (**self).init(operation).await
+    async fn init(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        (**self).init(operation, deadline).await
     }
-    async fn start_daemons(&self, operation: &LifecycleOperation) -> Result<Observation, Failure> {
-        (**self).start_daemons(operation).await
+    async fn start_daemons(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<Observation, Failure> {
+        (**self).start_daemons(operation, deadline).await
     }
     async fn provision_minio(
         &self,
         operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
     ) -> Result<SemanticReceipt, Failure> {
-        (**self).provision_minio(operation).await
+        (**self).provision_minio(operation, deadline).await
     }
-    async fn inspect(&self, binding: &LifecycleBinding) -> Result<TopologySnapshot, Failure> {
-        (**self).inspect(binding).await
+    async fn inspect(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<TopologySnapshot, Failure> {
+        (**self).inspect(binding, deadline).await
     }
-    async fn down(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
-        (**self).down(operation).await
+    async fn down(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        (**self).down(operation, deadline).await
     }
-    async fn teardown_verified(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
-        (**self).teardown_verified(operation).await
+    async fn teardown_verified(
+        &self,
+        operation: &LifecycleOperation,
+        deadline: Option<OffsetDateTime>,
+    ) -> Result<(), Failure> {
+        (**self).teardown_verified(operation, deadline).await
     }
     async fn cleanup_secrets(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
         (**self).cleanup_secrets(operation).await
@@ -1782,36 +1839,52 @@ mod tests {
         }
         struct StubTopology;
         impl TopologyPort for StubTopology {
-            async fn validate(&self, _binding: &LifecycleBinding) -> Result<(), Failure> {
+            async fn validate(
+                &self,
+                _binding: &LifecycleBinding,
+                _deadline: Option<OffsetDateTime>,
+            ) -> Result<(), Failure> {
                 Ok(())
             }
-            async fn init(&self, _operation: &LifecycleOperation) -> Result<(), Failure> {
+            async fn init(
+                &self,
+                _operation: &LifecycleOperation,
+                _deadline: Option<OffsetDateTime>,
+            ) -> Result<(), Failure> {
                 Ok(())
             }
             async fn start_daemons(
                 &self,
                 _operation: &LifecycleOperation,
+                _deadline: Option<OffsetDateTime>,
             ) -> Result<Observation, Failure> {
                 Ok(Observation::default())
             }
             async fn provision_minio(
                 &self,
                 _operation: &LifecycleOperation,
+                _deadline: Option<OffsetDateTime>,
             ) -> Result<SemanticReceipt, Failure> {
                 Ok(SemanticReceipt::default())
             }
             async fn inspect(
                 &self,
                 _binding: &LifecycleBinding,
+                _deadline: Option<OffsetDateTime>,
             ) -> Result<TopologySnapshot, Failure> {
                 Ok(TopologySnapshot::default())
             }
-            async fn down(&self, _operation: &LifecycleOperation) -> Result<(), Failure> {
+            async fn down(
+                &self,
+                _operation: &LifecycleOperation,
+                _deadline: Option<OffsetDateTime>,
+            ) -> Result<(), Failure> {
                 Ok(())
             }
             async fn teardown_verified(
                 &self,
                 _operation: &LifecycleOperation,
+                _deadline: Option<OffsetDateTime>,
             ) -> Result<(), Failure> {
                 Err(Failure::unavailable(
                     "TOPOLOGY_VERIFIED_TEARDOWN_UNAVAILABLE",
