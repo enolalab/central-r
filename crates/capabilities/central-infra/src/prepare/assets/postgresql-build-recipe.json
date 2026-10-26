@@ -1,0 +1,16 @@
+{
+  "schema": "central.postgresql-build-recipe/v1",
+  "source": {
+    "image": "docker.io/library/postgres:16.14-bookworm",
+    "index_sha256": "sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55"
+  },
+  "build": {
+    "db_version": "16.14",
+    "target": "runtime",
+    "entrypoint": ["/usr/local/bin/docker-entrypoint.sh"],
+    "volumes": ["/var/lib/postgresql/data"],
+    "env": {
+      "POSTGRES_HOST_AUTH_METHOD": "scram-sha-256"
+    }
+  }
+}

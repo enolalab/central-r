@@ -1,0 +1,19 @@
+{
+  "schema": "central.minio-build-recipe/v1",
+  "source": {
+    "repository": "https://github.com/minio/minio",
+    "commit": "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a"
+  },
+  "build": {
+    "go_version": "1.24",
+    "target": ".",
+    "tags": [
+      "kqueue",
+      "netgo"
+    ],
+    "ldflags": [
+      "-s",
+      "-w"
+    ]
+  }
+}

@@ -1,0 +1,127 @@
+{
+  "schema": "central.local-dependency-lock/v1",
+  "helper_release_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "fetches": {
+    "postgresql": {
+      "index_sha256": "sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55",
+      "manifest_sha256": "sha256:c95fd5346040eba2de3c435e14874af18f5d681fb5848d4f081dbead0878af28",
+      "config_sha256": "sha256:67d1da22f4037b29cdd93e03d870a4a1c4d079358367d0cbc56459e52cde205e"
+    },
+    "minio": {
+      "commit": "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a",
+      "archive_sha256": "sha256:45521908307306e925c98d629e1c17d78c8b72b6ee242b1bfb1409f7d8ee5841"
+    }
+  },
+  "fetch_capability": {
+    "minio": {
+      "scheme": "https",
+      "host": "github.com",
+      "port": 443,
+      "path_prefix": "/minio/minio/archive/",
+      "redirect_chain": [
+        {
+          "scheme": "https",
+          "host": "codeload.github.com",
+          "port": 443,
+          "path_prefix": "/minio/minio/tar.gz/"
+        }
+      ],
+      "address_policy": "public-unicast",
+      "tls_policy": "system-roots",
+      "max_bytes": 536870912,
+      "deadline_ms": 900000
+    },
+    "gomodules": {
+      "scheme": "https",
+      "host": "proxy.golang.org",
+      "port": 443,
+      "path_prefix": "/",
+      "address_policy": "public-unicast",
+      "tls_policy": "system-roots",
+      "max_bytes": 2147483648,
+      "deadline_ms": 900000
+    }
+  },
+  "buildkit": {
+    "frontend_version": "docker/dockerfile:1.10.0",
+    "exporter_version": "docker/dockerfile:1.10.0",
+    "base_ref": "scratch"
+  },
+  "retry": {
+    "max_attempts": 3,
+    "backoff_ms": [
+      1000,
+      5000,
+      15000
+    ]
+  },
+  "recipe_digest": "sha256:b8441dee2dffaedd1e1ba0db6c48ff21d2b5aed445740623a7d43384cd0962b2",
+  "modes": [
+    {
+      "mode": "postgres-fs-init",
+      "inventory": {
+        "index_digest": "sha256:85d3419616e1971e090fa5653ff50658eb0337a72639d33edf962ff26631d23b",
+        "manifest_digest": "sha256:3930ac40a034eff98b844a500e61c5c4924cb44bdeb45b2efedc18f048c0063b",
+        "config_digest": "sha256:cf270930cbaa93506170f5fc3a3741b953e71a0f3d8bcb20df56f11298b3076d"
+      }
+    },
+    {
+      "mode": "minio-fs-init",
+      "inventory": {
+        "index_digest": "sha256:85d3419616e1971e090fa5653ff50658eb0337a72639d33edf962ff26631d23b",
+        "manifest_digest": "sha256:3930ac40a034eff98b844a500e61c5c4924cb44bdeb45b2efedc18f048c0063b",
+        "config_digest": "sha256:cf270930cbaa93506170f5fc3a3741b953e71a0f3d8bcb20df56f11298b3076d"
+      }
+    },
+    {
+      "mode": "postgres",
+      "inventory": {
+        "index_digest": "sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55",
+        "manifest_digest": "sha256:c95fd5346040eba2de3c435e14874af18f5d681fb5848d4f081dbead0878af28",
+        "config_digest": "sha256:67d1da22f4037b29cdd93e03d870a4a1c4d079358367d0cbc56459e52cde205e"
+      }
+    },
+    {
+      "mode": "minio",
+      "inventory": {
+        "index_digest": "sha256:aa3b98d95e4d2940cb1c293f65b74e285c853f42fbf97aafaf407db01c012777",
+        "manifest_digest": "sha256:5e4a6ac5f4fdb500e5aa9b4317e5ec4b7cfa21cd8d3ac74e931b2b3e7a2ef2c1",
+        "config_digest": "sha256:43c6ad420a3c9b6e38f903427ab174a0e9095d99f635ed4e6b5b553c26c21d07"
+      }
+    },
+    {
+      "mode": "postgres-provision",
+      "inventory": {
+        "index_digest": "sha256:92620daddcd947f8d5ab5ba66e848702fe443d87fed30c4cea8e389fd78dfc55",
+        "manifest_digest": "sha256:c95fd5346040eba2de3c435e14874af18f5d681fb5848d4f081dbead0878af28",
+        "config_digest": "sha256:67d1da22f4037b29cdd93e03d870a4a1c4d079358367d0cbc56459e52cde205e"
+      }
+    },
+    {
+      "mode": "minio-provision",
+      "inventory": {
+        "index_digest": "sha256:85d3419616e1971e090fa5653ff50658eb0337a72639d33edf962ff26631d23b",
+        "manifest_digest": "sha256:3930ac40a034eff98b844a500e61c5c4924cb44bdeb45b2efedc18f048c0063b",
+        "config_digest": "sha256:cf270930cbaa93506170f5fc3a3741b953e71a0f3d8bcb20df56f11298b3076d"
+      }
+    },
+    {
+      "mode": "postgres-throughput-provision",
+      "inventory": {
+        "index_digest": "sha256:85d3419616e1971e090fa5653ff50658eb0337a72639d33edf962ff26631d23b",
+        "manifest_digest": "sha256:3930ac40a034eff98b844a500e61c5c4924cb44bdeb45b2efedc18f048c0063b",
+        "config_digest": "sha256:cf270930cbaa93506170f5fc3a3741b953e71a0f3d8bcb20df56f11298b3076d"
+      }
+    }
+  ],
+  "attestation_trust": {
+    "keys": [
+      {
+        "key_id": "central-dependency-attestation-local/v2",
+        "public_key": "95bf1446040b21139aa1dae2a19d6072f19516bb4b1ed710fac6300ba7521a59",
+        "expires_at": "2027-09-06T00:00:00Z",
+        "revoked": false
+      }
+    ]
+  }
+}

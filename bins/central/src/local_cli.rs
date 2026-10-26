@@ -2,7 +2,8 @@
 //! `internal/command` handlers for the verbs registered this slice:
 //! `doctor` (the host-prerequisite check runs for real — it owns no
 //! backend), `init` (grammar only; the helper side is T6), `prepare`
-//! (flag grammar only; the helper call fails closed), and the
+//! (the real helper call runs — a helper-less host is upstream's
+//! `helper: dial:` transport-failure branch), and the
 //! `up`/`down`/`status` lifecycle trio — the real binary always
 //! installs a lifecycle client, so a helper-less host is upstream's
 //! `helper: dial:` failure branch.
@@ -318,16 +319,73 @@ fn prepare_details(
     details
 }
 
-/// Ports `runPrepare` up to the helper dial: the flag grammar runs
-/// verbatim; with no helper client installed (T6) the prepare call
-/// fails closed exactly where upstream's transport failure lands —
-/// `PREPARE_FAILED` at exit 7 with the error as `remediation`.
+/// `prepareSummary` — carries the helper's measurements onto the CLI
+/// result. The timings and counters are the helper's, not re-derived
+/// here: the CLI never saw the phases and cannot honestly time them.
+/// Field presence matches `cli.PrepareDetails`'s `omitempty` set.
+fn prepare_summary(
+    result: &central_adapter_linux::helper::client::PrepareResult,
+    elapsed_ms: i64,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "phase": result.phase,
+        "resume_required": result.resume_required,
+        "reused": result.reused,
+        "acquired": result.acquired,
+        "elapsed_ms": elapsed_ms,
+    });
+    if !result.operation_id.is_empty() {
+        details["operation_id"] = serde_json::json!(result.operation_id);
+    }
+    if !result.advisory_id.is_empty() {
+        details["advisory_id"] = serde_json::json!(result.advisory_id);
+    }
+    if !result.safe_next_action.is_empty() {
+        details["safe_next_action"] = serde_json::json!(result.safe_next_action);
+    }
+    if result.operation_elapsed_ms != 0 {
+        details["operation_elapsed_ms"] = serde_json::json!(result.operation_elapsed_ms);
+    }
+    if !result.stage_timings.is_empty() {
+        details["stage_timings"] =
+            serde_json::to_value(&result.stage_timings).unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(counters) = &result.resource_counters {
+        details["resource_counters"] =
+            serde_json::to_value(counters).unwrap_or(serde_json::Value::Null);
+    }
+    details
+}
+
+/// The closed `SafeNextAction` wire set: a value outside it is
+/// unspellable and reads as no action at all, which `runPrepare`
+/// upgrades to `TERMINAL_FAILURE` on the error path.
+fn valid_safe_next_action(value: &str) -> bool {
+    matches!(
+        value,
+        "" | "RESUME_REQUIRED" | "PREPARATION_REQUIRED" | "TERMINAL_FAILURE"
+    )
+}
+
+/// Ports `runPrepare` (`internal/command/prepare.go`): the flag
+/// grammar runs verbatim, then the real helper prepare call —
+/// `CENTRAL_HELPER_SOCKET` or the production socket, the helper's own
+/// transport budget inside the client — and the four upstream outcome
+/// branches: transport/denial `PREPARE_FAILED` exit 7 (or
+/// `RESUME_REQUIRED` exit 6 when the denial still names an unsettled
+/// operation), `RESUME_REQUIRED` exit 6, `PREPARATION_REQUIRED`
+/// exit 6, and the `ok` exit 0 completion.
 fn run_prepare(
     command_id: &str,
     tokens: &[String],
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> u8 {
+    use central_adapter_linux::helper::client::{
+        PRODUCTION_SOCKET_PATH, PrepareClient, PrepareResult,
+    };
+    use central_adapter_linux::helper::protocol::PrepareRequest;
+
     let start = Instant::now();
     let elapsed_ms = || i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX);
 
@@ -412,20 +470,127 @@ fn run_prepare(
             )),
         );
     }
-    // The helper client is not composed this slice — the dial failure
-    // is upstream's `PREPARE_FAILED` exit-7 transport outcome.
+    // `defaultPrepareSocket` — the operator-overridable socket, then
+    // the production helper socket.
+    let socket_path = std::env::var("CENTRAL_HELPER_SOCKET")
+        .unwrap_or_else(|_| PRODUCTION_SOCKET_PATH.to_owned());
+    let client = PrepareClient::new(socket_path);
+    let request = PrepareRequest {
+        resume_operation_id: resume,
+        from_release_dir: from,
+        export_release_dir: export,
+        confirmation_claim: None,
+    };
+    let (result, err): (PrepareResult, Option<String>) = client.prepare(&request);
+
+    if let Some(err) = err {
+        let mut details = prepare_summary(&result, elapsed_ms());
+        details["authority_state"] = serde_json::json!("error");
+        details["reason_code"] = serde_json::json!(if result.code.is_empty() {
+            // The helper's reason code is the verdict; PREPARE_FAILED
+            // is the fallback for a denial that carried none.
+            "PREPARE_FAILED".to_owned()
+        } else {
+            result.code.clone()
+        });
+        // A remedy the helper sent says what to do next; the
+        // transport's "denied (reason: X)" line is the fallback, not
+        // the message.
+        details["remediation"] = serde_json::json!(if result.remediation.is_empty() {
+            err
+        } else {
+            result.remediation.clone()
+        });
+        if result.resume_required {
+            details["receipt_id"] = serde_json::json!(result.receipt_id);
+            details["resume_required"] = serde_json::json!(true);
+            details["safe_next_action"] = serde_json::json!("RESUME_REQUIRED");
+            return emit(
+                command_id,
+                stdout,
+                stderr,
+                ExitClass::Terminal,
+                Some("RESUME_REQUIRED"),
+                Some(details),
+            );
+        }
+        // A transport failure is not a verdict on the operation, so
+        // the helper's own safe next action is preferred when it sent
+        // one; only a request that never produced a result is
+        // terminal by default.
+        if !valid_safe_next_action(&result.safe_next_action) || result.safe_next_action.is_empty() {
+            details["safe_next_action"] = serde_json::json!("TERMINAL_FAILURE");
+        }
+        return emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Denied,
+            Some("PREPARE_FAILED"),
+            Some(details),
+        );
+    }
+
+    if result.resume_required {
+        let mut details = prepare_summary(&result, elapsed_ms());
+        details["authority_state"] = serde_json::json!("unsettled");
+        details["reason_code"] = serde_json::json!("RESUME_REQUIRED");
+        details["receipt_id"] = serde_json::json!(result.receipt_id);
+        details["remediation"] = serde_json::json!(
+            "An unsettled prepare operation exists. Run `central prepare --resume` to continue."
+        );
+        details["resume_required"] = serde_json::json!(true);
+        details["safe_next_action"] = serde_json::json!("RESUME_REQUIRED");
+        return emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Terminal,
+            Some("RESUME_REQUIRED"),
+            Some(details),
+        );
+    }
+
+    // A prepare that reports anything other than a prepared
+    // dependency set has not prepared one, whatever the transport
+    // said. The helper names the next action; the CLI does not
+    // second-guess it, and it does not invent one.
+    if result.safe_next_action == "PREPARATION_REQUIRED" {
+        let mut details = prepare_summary(&result, elapsed_ms());
+        details["authority_state"] = serde_json::json!("unprepared");
+        details["reason_code"] = serde_json::json!("PREPARATION_REQUIRED");
+        details["receipt_id"] = serde_json::json!(result.receipt_id);
+        details["remediation"] = serde_json::json!(
+            "Dependencies are not prepared. Run `central local prepare` once the reported condition is resolved."
+        );
+        return emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Terminal,
+            Some("PREPARATION_REQUIRED"),
+            Some(details),
+        );
+    }
+
+    let mut details = prepare_summary(&result, elapsed_ms());
+    details["authority_state"] = serde_json::json!("current");
+    details["reason_code"] = serde_json::json!("OK");
+    details["evidence_id"] = serde_json::json!(result.receipt_id);
+    details["receipt_id"] = serde_json::json!(result.receipt_id);
+    // A completed preparation names no next action — upstream
+    // assigns `SafeNextNone`, which `omitempty` drops from the
+    // envelope entirely.
+    if let Some(map) = details.as_object_mut() {
+        map.remove("safe_next_action");
+    }
     emit(
         command_id,
         stdout,
         stderr,
-        ExitClass::Denied,
-        Some("PREPARE_FAILED"),
-        Some(prepare_details(
-            "PREPARE_FAILED",
-            Some("helper unavailable"),
-            Some("TERMINAL_FAILURE"),
-            elapsed_ms(),
-        )),
+        ExitClass::Success,
+        Some("ok"),
+        Some(details),
     )
 }
 
@@ -602,6 +767,9 @@ mod tests {
 
     #[test]
     fn prepare_without_helper_is_prepare_failed_exit_7() {
+        // A helper-less host is upstream's transport failure: the dial
+        // error is the remediation, no helper verdict arrived, and the
+        // unspellable/absent next action upgrades to TERMINAL_FAILURE.
         let (code, stdout, _) = invoke("local.prepare", &[]);
         assert_eq!(code, 7);
         let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
@@ -611,7 +779,14 @@ mod tests {
         let details = &parsed["details"];
         assert_eq!(details["authority_state"], "error");
         assert_eq!(details["reason_code"], "PREPARE_FAILED");
-        assert_eq!(details["remediation"], "helper unavailable");
+        assert!(
+            details["remediation"]
+                .as_str()
+                .unwrap()
+                .starts_with("helper: dial:"),
+            "remediation carries the dial error: {}",
+            details["remediation"]
+        );
         assert_eq!(details["phase"], "");
         assert_eq!(details["resume_required"], false);
         assert_eq!(details["reused"], 0);

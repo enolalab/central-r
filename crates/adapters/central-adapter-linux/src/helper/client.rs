@@ -158,14 +158,31 @@ impl PrepareClient {
         }
     }
 
-    /// `Prepare` — dial, one prepare request, the wire projection back.
-    pub fn prepare(&self, req: &PrepareRequest) -> Result<PrepareResult, String> {
-        let mut conn = std::os::unix::net::UnixStream::connect(&self.socket_path)
-            .map_err(|e| format!("helper: dial: {e}"))?;
+    /// `Prepare` — dial, one prepare request, the wire projection
+    /// back. Upstream returns `(result, error)`: a denial still
+    /// carries whatever safe projection the helper sent, so the
+    /// caller's outcome mapping sees both halves. The string is the
+    /// transport/denial error; `None` means the helper reported a
+    /// successful operation.
+    pub fn prepare(&self, req: &PrepareRequest) -> (PrepareResult, Option<String>) {
+        let mut conn = match std::os::unix::net::UnixStream::connect(&self.socket_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                return (PrepareResult::default(), Some(format!("helper: dial: {e}")));
+            }
+        };
         let _ = conn.set_read_timeout(Some(super::server::PREPARE_BUDGET));
         let _ = conn.set_write_timeout(Some(DIAL_TIMEOUT));
-        let payload =
-            serde_json::to_vec(req).map_err(|e| format!("helper: marshal prepare request: {e}"))?;
+        let transport = |result: PrepareResult, message: String| (result, Some(message));
+        let payload = match serde_json::to_vec(req) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return transport(
+                    PrepareResult::default(),
+                    format!("helper: marshal prepare request: {e}"),
+                );
+            }
+        };
         let msg = Request {
             operation_id: format!("client-prepare-{}", now_nanos()),
             verb: super::verb::PREPARE.to_owned(),
@@ -174,12 +191,32 @@ impl PrepareClient {
             )
             .ok(),
         };
-        write_request(&mut conn, &msg).map_err(|e| format!("helper: write request: {e}"))?;
-        let resp = read_response(&mut conn).map_err(|e| format!("helper: read response: {e}"))?;
+        if let Err(e) = write_request(&mut conn, &msg) {
+            return transport(
+                PrepareResult::default(),
+                format!("helper: write request: {e}"),
+            );
+        }
+        let resp = match read_response(&mut conn) {
+            Ok(resp) => resp,
+            Err(e) => {
+                return transport(
+                    PrepareResult::default(),
+                    format!("helper: read response: {e}"),
+                );
+            }
+        };
         let mut details = PrepareResultDetails::default();
         if let Some(raw) = &resp.result {
-            details = serde_json::from_str(raw.get())
-                .map_err(|e| format!("helper: parse result: {e}"))?;
+            match serde_json::from_str(raw.get()) {
+                Ok(parsed) => details = parsed,
+                Err(e) => {
+                    return transport(
+                        PrepareResult::default(),
+                        format!("helper: parse result: {e}"),
+                    );
+                }
+            }
         }
         if resp.outcome != "success" {
             let mut result = prepare_result_from(details);
@@ -188,12 +225,15 @@ impl PrepareClient {
                 // details came back — which is most of them.
                 result.code = resp.reason.clone();
             }
-            return Err(format!(
-                "helper: prepare denied: {} (reason: {})",
-                resp.outcome, resp.reason
-            ));
+            return transport(
+                result,
+                format!(
+                    "helper: prepare denied: {} (reason: {})",
+                    resp.outcome, resp.reason
+                ),
+            );
         }
-        Ok(prepare_result_from(details))
+        (prepare_result_from(details), None)
     }
 }
 
