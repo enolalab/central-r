@@ -390,8 +390,11 @@ impl FactError {
 /// `commandRunner` — the exec seam.
 pub trait AdvisoryCommandRunner: Send + Sync {
     /// `Run` — execute `name args...` with an empty environment,
-    /// bounded combined stdout+stderr, and the 5 s deadline.
-    fn run(&self, name: &str, args: &[&str]) -> Result<Vec<u8>, FactError>;
+    /// bounded combined stdout+stderr, killed once `deadline` passes.
+    /// `deadline` is the single budget `Collect` shares across every
+    /// command (upstream's one `context.WithTimeout` per `Collect`):
+    /// each call gets what remains, never a fresh timeout.
+    fn run(&self, deadline: Instant, name: &str, args: &[&str]) -> Result<Vec<u8>, FactError>;
 }
 
 /// `realCommandRunner` — `exec.CommandContext` equivalent: empty env,
@@ -414,7 +417,7 @@ impl Default for RealCommandRunner {
 }
 
 impl AdvisoryCommandRunner for RealCommandRunner {
-    fn run(&self, name: &str, args: &[&str]) -> Result<Vec<u8>, FactError> {
+    fn run(&self, deadline: Instant, name: &str, args: &[&str]) -> Result<Vec<u8>, FactError> {
         let mut child = Command::new(name)
             .args(args)
             .env_clear()
@@ -467,7 +470,6 @@ impl AdvisoryCommandRunner for RealCommandRunner {
             }));
         }
 
-        let start = Instant::now();
         let outcome = loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -480,7 +482,7 @@ impl AdvisoryCommandRunner for RealCommandRunner {
                     break Err(FactError::Malformed);
                 }
                 Ok(None) => {
-                    if start.elapsed() >= HOST_FACTS_COMMAND_TIMEOUT {
+                    if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
                         break Err(FactError::Absent);
@@ -547,13 +549,23 @@ impl<R: AdvisoryCommandRunner> HostFactsCollector<R> {
         })
     }
 
-    fn run_command(&self, name: &str, args: &[&str]) -> Result<String, FactError> {
+    fn run_command(
+        &self,
+        deadline: Instant,
+        name: &str,
+        args: &[&str],
+    ) -> Result<String, FactError> {
         self.runner
-            .run(name, args)
+            .run(deadline, name, args)
             .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
     }
 
     fn collect_facts(&self) -> HostFacts {
+        // `ctx, cancel := context.WithTimeout(ctx, 5s)` upstream: ONE
+        // deadline for the whole collection — the file reads are not
+        // ctx-bound but do consume wall-clock budget, and each command
+        // runs under what remains rather than a fresh 5 s.
+        let deadline = Instant::now() + HOST_FACTS_COMMAND_TIMEOUT;
         let mut facts = HostFacts::default();
         if let Ok(content) = self.read_fact_file(&self.os_release_path)
             && let Ok(ver) = parse_os_release(&content)
@@ -564,18 +576,22 @@ impl<R: AdvisoryCommandRunner> HostFactsCollector<R> {
             facts.kernel = normalize_version(&content, "kernel");
         }
         if let Ok(ver) = self.run_command(
+            deadline,
             "/usr/bin/docker",
             &["version", "--format", "{{.Client.Version}}"],
         ) && !ver.is_empty()
         {
             facts.docker = normalize_version(&ver, "docker");
         }
-        if let Ok(ver) = self.run_command("/usr/bin/docker", &["compose", "version", "--short"])
-            && !ver.is_empty()
+        if let Ok(ver) = self.run_command(
+            deadline,
+            "/usr/bin/docker",
+            &["compose", "version", "--short"],
+        ) && !ver.is_empty()
         {
             facts.compose = normalize_version(&ver, "compose");
         }
-        if let Ok(ver) = self.run_command("/usr/bin/psql", &["--version"])
+        if let Ok(ver) = self.run_command(deadline, "/usr/bin/psql", &["--version"])
             && !ver.is_empty()
         {
             facts.psql = normalize_version(&ver, "psql");
@@ -1116,6 +1132,11 @@ impl<W: AdvisoryJournalWriter> AdvisoryTransitionRecorder<W> {
             state: outcome.state.as_str().to_owned(),
             code: outcome.code.as_str().to_owned(),
             check: outcome.check.clone(),
+            // Upstream stamps `time.Now()` (local offset). The evidence
+            // bytes cross the broker append RPC as an opaque
+            // `json.RawMessage` — decoded for shape only, never
+            // compared byte-wise — so the Z-vs-offset rendering cannot
+            // change any verdict; UTC is kept deliberately.
             evaluation_time: OffsetDateTime::now_utc(),
             policy_version: ADVISORY_POLICY_VERSION.to_owned(),
             time_witness_state: if outcome.state == State::Current {
@@ -1793,6 +1814,7 @@ mod tests {
     struct FakeRunner {
         outputs: HashMap<String, Vec<u8>>,
         errs: HashMap<String, FactError>,
+        deadlines: Mutex<Vec<Instant>>,
     }
 
     impl FakeRunner {
@@ -1802,7 +1824,8 @@ mod tests {
     }
 
     impl AdvisoryCommandRunner for FakeRunner {
-        fn run(&self, name: &str, args: &[&str]) -> Result<Vec<u8>, FactError> {
+        fn run(&self, deadline: Instant, name: &str, args: &[&str]) -> Result<Vec<u8>, FactError> {
+            self.deadlines.lock().unwrap().push(deadline);
             let k = Self::key(name, args);
             if let Some(e) = self.errs.get(&k) {
                 return Err(*e);
@@ -1844,19 +1867,23 @@ mod tests {
             FakeRunner::key("/usr/bin/psql", &["--version"]),
             b"psql (PostgreSQL) 16.1\n".to_vec(),
         );
-        let c = collector_with(
-            FakeRunner {
-                outputs,
-                errs: HashMap::new(),
-            },
-            &dir,
-        );
+        let runner = FakeRunner {
+            outputs,
+            errs: HashMap::new(),
+            deadlines: Mutex::new(Vec::new()),
+        };
+        let c = collector_with(runner, &dir);
         let facts = c.collect_facts();
         assert_eq!(facts.os_release, "24.04");
         assert_eq!(facts.kernel, "6.8.0-31-generic");
         assert_eq!(facts.docker, "24.0.7");
         assert_eq!(facts.compose, "2.23.3");
         assert_eq!(facts.psql, "16.1");
+        // Upstream's one `context.WithTimeout` per `Collect`: every
+        // command ran under the SAME deadline instant, not a fresh 5 s.
+        let deadlines = c.runner.deadlines.lock().unwrap();
+        assert_eq!(deadlines.len(), 3);
+        assert!(deadlines.iter().all(|d| *d == deadlines[0]));
     }
 
     #[test]
@@ -1884,6 +1911,7 @@ mod tests {
             FakeRunner {
                 outputs: HashMap::new(),
                 errs,
+                deadlines: Mutex::new(Vec::new()),
             },
             &dir,
         );
@@ -1924,24 +1952,34 @@ mod tests {
     #[test]
     fn real_runner_live_commands() {
         let r = RealCommandRunner::new();
-        let out = r.run("/bin/echo", &["hello"]).expect("echo");
+        let generous = || Instant::now() + Duration::from_secs(30);
+        let out = r.run(generous(), "/bin/echo", &["hello"]).expect("echo");
         assert_eq!(out, b"hello\n");
         // Absent binary → Absent.
         assert_eq!(
-            r.run("/nonexistent/central-test-binary", &[]),
+            r.run(generous(), "/nonexistent/central-test-binary", &[]),
             Err(FactError::Absent)
         );
         // >16 KiB combined output → OverLimit.
         assert_eq!(
-            r.run("/usr/bin/head", &["-c", "20000", "/dev/zero"]),
+            r.run(generous(), "/usr/bin/head", &["-c", "20000", "/dev/zero"]),
             Err(FactError::OverLimit)
         );
         // Non-zero exit is a raw error (→ empty fact upstream).
-        assert!(r.run("/bin/false", &[]).is_err());
-        // 5 s deadline → Absent (upstream folds deadline into absent).
+        assert!(r.run(generous(), "/bin/false", &[]).is_err());
+        // Deadline → Absent (upstream folds deadline into absent); a
+        // short budget keeps the test fast, an already-expired one
+        // refuses the same way upstream's done-context does.
         let start = Instant::now();
-        assert_eq!(r.run("/bin/sleep", &["30"]), Err(FactError::Absent));
-        assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            r.run(start + Duration::from_millis(200), "/bin/sleep", &["30"]),
+            Err(FactError::Absent)
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            r.run(Instant::now(), "/bin/sleep", &["30"]),
+            Err(FactError::Absent)
+        );
         for (e, want) in [
             (FactError::Absent, "command/file absent"),
             (FactError::Inaccessible, "no permission to execute/read"),

@@ -432,7 +432,8 @@ impl PrepareConfirmationSource {
                 )
             },
         )?;
-        let issued = resolved.now();
+        // `issued := resolved.Now().UTC()` upstream.
+        let issued = resolved.now().to_offset(time::UtcOffset::UTC);
         Ok(ConfirmationBinding {
             request_digest: prepare_request_digest(req, pr),
             resume_operation_id: pr.resume_operation_id.clone(),
@@ -479,8 +480,14 @@ impl ConfirmationBinding {
             format!("boot_id={}", self.boot_id),
             format!("helper_release={}", self.helper_release),
             format!("nonce={}", self.nonce),
-            format!("issued_at={}", format_rfc3339nano(self.issued_at)),
-            format!("expires_at={}", format_rfc3339nano(self.expires_at)),
+            format!(
+                "issued_at={}",
+                format_rfc3339nano(self.issued_at.to_offset(time::UtcOffset::UTC))
+            ),
+            format!(
+                "expires_at={}",
+                format_rfc3339nano(self.expires_at.to_offset(time::UtcOffset::UTC))
+            ),
         ] {
             h.update(format!("{field}\n").as_bytes());
         }

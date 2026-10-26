@@ -1165,17 +1165,37 @@ fn parse_deny_policy(v: &serde_json::Value) -> Result<DenyPolicy, ()> {
     }
 }
 
-/// `ed25519.Verify` — Go's exact refusal shape, mirroring the
-/// `config/view.rs` checks the R5 T2 review pinned:
+/// `ed25519.Verify` — Go's exact refusal shape (Go 1.26
+/// `crypto/internal/fips140/ed25519.verifyWithDom` plus the
+/// `NewPublicKey` decode), mirroring the `config/view.rs` checks the
+/// R5 T2 review pinned:
 ///
 /// - `signature[63] & 0xE0 != 0` — the top three bits of the S scalar
-///   must be clear (Go's first check, before either decode).
-/// - `A` (the public key) must decompress to a curve point —
-///   `VerifyingKey::from_bytes` performs the decode.
-/// - `R` (the first signature half) must decompress to a curve point —
-///   Go's `edwards25519.NewIdentityPoint().SetBytes(sig[:32])`.
-/// - `S < L` canonically — `Signature::from_bytes` + `verify` enforces
-///   it via `Scalar::from_canonical_bytes`.
+///   must be clear (Go's first check, before the message hash).
+/// - `A` (the public key) must decode to a curve point — Go
+///   `edwards25519.Point.SetBytes`, reached through dalek's
+///   `CompressedEdwardsY::decompress` (exposed by
+///   `VerifyingKey::from_bytes`). Both decoders accept the
+///   non-canonical encodings of *valid* points — unreduced field
+///   elements (`y ≥ p`, i.e. `x + p` of a canonical encoding) and
+///   `x = 0` with the sign bit set — so this is a Go-parity decode,
+///   not a canonicality check: adding one would deny encodings
+///   upstream accepts.
+/// - `R` (the first signature half) must decompress — old-Go's
+///   `NewIdentityPoint().SetBytes(sig[:32])`. The FIPS verifier
+///   dropped the explicit decode as redundant: the equation below
+///   byte-compares `sig[:32]` against the *canonical* re-encoding of
+///   the recomputed point (`bytes.Equal(sig[:32], R.Bytes())` — dalek
+///   performs the same compare on `CompressedEdwardsY`), which can
+///   only match a decompressible encoding. Kept here for the
+///   old-Go check order; it is outcome-identical either way, and it
+///   is what refuses non-decompressible `R` bytes before the hash.
+/// - `S < L` canonically — `Scalar::from_canonical_bytes` inside
+///   `verify`, matching `SetCanonicalBytes`.
+///
+/// Non-canonical-but-decompressible `R` (`y ≥ p`) is refused exactly
+/// as upstream refuses it: not by a decode rejection — both decoders
+/// accept it — but by the canonical byte-compare inside `verify`.
 ///
 /// `ed25519-dalek`'s `verify_strict` is deliberately *not* used: it adds
 /// a small-order-R/A rejection Go never performs, which would deny
@@ -1738,6 +1758,35 @@ mod tests {
         for b in &mut sig[..32] {
             *b = 0xFF;
         }
+        snapshot.signature = b64_encode(&sig).into_bytes();
+        let (bundle, outcome) = test_verifier().verify_snapshot(&snapshot);
+        assert!(bundle.is_none());
+        assert_eq!(outcome.code, Code::SignatureInvalid);
+    }
+
+    /// A non-canonical-but-decompressible `R` — `y = p` little-endian
+    /// (`0xED 0xFF…0xFF 0x7F`), which reduces to the valid `y = 0`
+    /// point — must refuse. Both Go's `SetBytes` and dalek's
+    /// `decompress` *accept* the encoding, so the refusal comes from
+    /// the recomputed-R canonical byte-compare inside `verify` —
+    /// upstream's exact mechanism, pinned here so a laxer equation
+    /// check (point equality instead of byte equality) cannot slip in.
+    #[test]
+    fn verify_snapshot_rejects_noncanonical_r_encoding() {
+        let mut noncanonical_r = [0xFFu8; 32];
+        noncanonical_r[0] = 0xED;
+        noncanonical_r[31] = 0x7F;
+        // The premise: `y = p` decompresses (it is a non-canonical
+        // encoding of a valid point, not a non-point), so an
+        // all-0xFF-style test would not isolate the canonicality gap.
+        assert!(
+            VerifyingKey::from_bytes(&noncanonical_r).is_ok(),
+            "y = p must decompress for this test to isolate byte-compare rejection"
+        );
+        let mut snapshot = signed_snapshot_default(VALID_BUNDLE);
+        let mut sig =
+            b64_decode(std::str::from_utf8(&snapshot.signature).expect("utf8")).expect("b64");
+        sig[..32].copy_from_slice(&noncanonical_r);
         snapshot.signature = b64_encode(&sig).into_bytes();
         let (bundle, outcome) = test_verifier().verify_snapshot(&snapshot);
         assert!(bundle.is_none());

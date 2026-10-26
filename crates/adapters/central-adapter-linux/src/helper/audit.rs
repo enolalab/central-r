@@ -101,9 +101,9 @@ pub struct DenySafeState {
     pub trigger_code: String,
     #[serde(default)]
     pub cleanup_done: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rescue_attempts: Vec<RescueAttempt>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub exited_at: String,
 }
 
@@ -316,24 +316,14 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Go's `time.RFC3339Nano` — fraction only when nonzero, trailing
-/// zeros trimmed.
+/// zeros trimmed. Delegates to [`crate::broker::wire::format_rfc3339_nano`],
+/// the crate's canonical Go-parity formatter: `well_known::Rfc3339`
+/// already emits a fractional second when the nanos are nonzero, so a
+/// wrapper that appends another one doubled it (`…00.52.52Z`, and
+/// `…+07:00.52` for non-UTC inputs) and corrupted every signed
+/// manifest/report timestamp it fed.
 pub fn format_rfc3339nano(t: time::OffsetDateTime) -> String {
-    let base = t
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "0001-01-01T00:00:00Z".to_owned());
-    let nanos = t.nanosecond();
-    if nanos == 0 {
-        return base;
-    }
-    let mut frac = format!("{nanos:09}");
-    while frac.ends_with('0') {
-        frac.pop();
-    }
-    // RFC3339 already ends with the Z suffix for UTC.
-    match base.strip_suffix('Z') {
-        Some(stripped) => format!("{stripped}.{frac}Z"),
-        None => format!("{base}.{frac}"),
-    }
+    crate::broker::wire::format_rfc3339_nano(t)
 }
 
 /// `LoadOrMintIdentity` — load, or create exactly once (O_EXCL: a
@@ -889,7 +879,9 @@ pub fn run(input: &RunInput) -> Result<RunOutput, Failure> {
             })
             .map_err(|e| internal("sys_audit_run", format!("audit: audit dir: {e}")))?;
     }
-    let now = format_rfc3339nano(input.now);
+    // `now := input.Now.UTC()` upstream — the timestamp text is
+    // always Z-formed regardless of the caller's offset.
+    let now = format_rfc3339nano(input.now.to_offset(time::UtcOffset::UTC));
     let (identity, _) = load_or_mint_identity(
         &identity_path(&input.roots.audit_dir),
         input.roots.audit_uid,
@@ -1030,7 +1022,8 @@ pub fn repair(
     if removable.is_empty() {
         return Err(internal("sys_audit_repair", "audit: nothing repairable"));
     }
-    let now_text = format_rfc3339nano(now);
+    // `now = now.UTC()` upstream — same UTC normalization as `run`.
+    let now_text = format_rfc3339nano(now.to_offset(time::UtcOffset::UTC));
     let (identity, _) = load_or_mint_identity(
         &identity_path(&roots.audit_dir),
         roots.audit_uid,
@@ -1320,6 +1313,41 @@ mod tests {
                 audit_gid: rustix::process::getegid().as_raw(),
             },
         )
+    }
+
+    /// `time.RFC3339Nano` byte shape: one fraction field — never a
+    /// doubled `.NN.NN` — absent when nanos are zero, `Z` for UTC and
+    /// `±hh:mm` otherwise. `well_known::Rfc3339` already emits the
+    /// fraction; the port's first wrapper layered a second on top.
+    #[test]
+    fn format_rfc3339nano_emits_a_single_fraction() {
+        use time::macros::datetime;
+        // UTC + nonzero nanos: single, trailing-zero-trimmed fraction.
+        assert_eq!(
+            format_rfc3339nano(datetime!(2025-01-01 00:00:00.520000000 UTC)),
+            "2025-01-01T00:00:00.52Z"
+        );
+        // nanos == 0: no fraction field at all — the shape the buggy
+        // wrapper already produced, preserved verbatim.
+        assert_eq!(
+            format_rfc3339nano(datetime!(2025-01-01 00:00:00 UTC)),
+            "2025-01-01T00:00:00Z"
+        );
+        // Non-UTC offset: the fraction belongs inside the offset, not
+        // appended after it (`…+07:00.52` was the doubled bug).
+        assert_eq!(
+            format_rfc3339nano(datetime!(2025-01-01 00:00:00.520000000 +07:00)),
+            "2025-01-01T00:00:00.52+07:00"
+        );
+        assert_eq!(
+            format_rfc3339nano(datetime!(2025-01-01 00:00:00 -05:30)),
+            "2025-01-01T00:00:00-05:30"
+        );
+        // Full nanosecond precision round-trips untrimmed.
+        assert_eq!(
+            format_rfc3339nano(datetime!(2025-01-01 00:00:00.123456789 UTC)),
+            "2025-01-01T00:00:00.123456789Z"
+        );
     }
 
     /// `Run` mints identity + genesis manifest + signed report on the
