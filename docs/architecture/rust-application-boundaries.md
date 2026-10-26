@@ -1053,7 +1053,7 @@ Capability-owned `port.rs` modules own:
 
 ### 8.4 `central-adapter-linux` (protected broker / platform boundary)
 
-- Implements the protected-broker protocol, `memfd_create`, `SCM_RIGHTS` fd passing, `SO_PEERCRED` peer authorization, `openat2`, `pidfd`, PAM/TTY ceremonies, namespaces, and cgroups — through `rustix` safe wrappers inside audited `unsafe` boundaries. This crate is the only place (with the launcher and protected-execution-mode binaries) where `unsafe`/`rustix` is permitted.
+- Implements the protected-broker protocol, `memfd_create`, `SCM_RIGHTS` fd passing, `SO_PEERCRED` peer authorization, `openat2`, `pidfd`, PAM/TTY ceremonies, namespaces, and cgroups — through `rustix` safe wrappers inside audited `unsafe` boundaries. This crate is the only place (with the launcher and protected-execution-mode binaries) where `unsafe`/`rustix` is permitted. Within those sanctioned binaries the rule covers their test code too: a test-only `unsafe` is allowed only as a kernel ABI version probe (no memory touched), and only with the same `// SAFETY:` proof the production sites carry.
 - Implements `central-authorization` protected-use/resolution port traits (the upstream secret-resolver role), `central-infra` platform port traits, and `central-backup` fd-3 helper adapters (`pg_dump`/`pg_restore` fd protocol under `central-backup-launcherd`).
 - The root-owned helper protocol mediates every privileged operation; no capability or CLI calls Docker, Compose, or storage tools directly.
 

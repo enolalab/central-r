@@ -4321,11 +4321,18 @@ fn startup_sweeps_leftover_scopes() {
 
 fn host_landlock_abi() -> i32 {
     // landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION).
+    // Test-only ABI probe inside the launcherd's sanctioned unsafe site
+    // (boundary doc §8.4): the production `sys::landlock_abi` is not
+    // reachable from integration tests, so the identical probe is
+    // repeated here. SAFETY: pure kernel version query — NULL attr
+    // pointer, zero size; no memory is read or written and the result
+    // is a kernel ABI number or errno.
     #[allow(unsafe_code)]
     unsafe extern "C" {
         fn syscall(num: i64, ...) -> i64;
     }
     #[allow(unsafe_code)]
+    // SAFETY: see above — NULL pointer + zero size, no memory touched.
     let abi = unsafe { syscall(444, std::ptr::null::<u8>(), 0usize, 1u32) };
     (abi as i32).max(0)
 }
