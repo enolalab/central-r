@@ -125,7 +125,12 @@ async fn connect_role_from_passfile_value(
         ("lock_timeout", "30000"),
         ("idle_in_transaction_session_timeout", "60000"),
     ]);
-    options.connect().await.map_err(|_| runtime_connection())
+    // sqlx exposes no libpq `connect_timeout`; upstream bounds the
+    // TCP connect at 5s, reproduced here by wrapping the dial.
+    tokio::time::timeout(std::time::Duration::from_secs(5), options.connect())
+        .await
+        .map_err(|_| runtime_connection())?
+        .map_err(|_| runtime_connection())
 }
 
 /// `OpenMigrationConnectionFromSealedPassfile` (post-validation half)

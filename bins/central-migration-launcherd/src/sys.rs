@@ -242,6 +242,7 @@ pub fn dupfd_cloexec(fd: RawFd, min: RawFd) -> Result<OwnedFd, Errno> {
 /// handlers installed by this daemon only set an atomic flag — safe
 /// from a signal context.
 pub fn sigaction_handler(sig: libc::c_int, handler: usize) {
+    // SAFETY: all-zero is a valid `libc::sigaction` representation.
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
     sa.sa_sigaction = handler;
     // SAFETY: empty mask is a plain field write.
