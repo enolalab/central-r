@@ -32,7 +32,11 @@ fn run() -> Result<(), Failure> {
             "must run as central-migrate",
         ));
     }
-    let args: Vec<String> = std::env::args().collect();
+    // `args_os` so non-UTF-8 argv yields the upstream "invalid
+    // migration command" refusal instead of an `env::args` panic.
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let (command, operation_id) = parse_invocation(&args)?;
     let evidence = sys::read_launch_evidence()?;
     // Reapply CLOEXEC on FD4 now, after exec and before descriptor

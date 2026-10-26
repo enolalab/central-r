@@ -864,7 +864,8 @@ where
             ));
         }
 
-        if confirmation.expires_at <= now() {
+        // Upstream `IsExpired` is `now.After(ExpiresAt)` — strict.
+        if confirmation.expires_at < now() {
             return Err(unsupported_failure(
                 "CONFIRMATION_EXPIRED",
                 "request a new reset confirmation",

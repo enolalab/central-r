@@ -228,8 +228,12 @@ impl MigrationClient {
                 migration_error(3, "MIGRATION_HELPER_UNAVAILABLE", next)
             })?;
         if response.outcome != "success" || response.exit_code != 0 {
+            // Upstream propagates the helper's raw exit int; codes
+            // outside the closed {0,3,5,6,7} set fall back to the
+            // operator-failure class rather than clamping into a
+            // false success.
             return Err(migration_error(
-                response.exit_code.clamp(0, 255) as u8,
+                u8::try_from(response.exit_code).unwrap_or(6),
                 "MIGRATION_LAUNCH_DENIED",
                 "REAUTHENTICATE_AND_RUN_CENTRAL_MIGRATE_AGAIN",
             ));
