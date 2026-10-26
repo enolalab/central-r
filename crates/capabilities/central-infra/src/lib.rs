@@ -23,6 +23,7 @@ pub mod app;
 pub mod authority;
 pub mod config;
 pub mod domain;
+pub mod lifecycle;
 pub mod port;
 pub mod prepare;
 pub mod query;

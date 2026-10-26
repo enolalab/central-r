@@ -14,4 +14,7 @@
 //! staging/readers. Its domain counterpart is `central_infra::prepare`.
 
 pub mod advisory_fetch;
+pub mod capacity_roles;
+pub mod compose;
+pub mod lifecycle;
 pub mod prepare;

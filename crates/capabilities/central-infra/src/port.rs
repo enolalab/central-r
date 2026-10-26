@@ -759,6 +759,18 @@ pub trait TopologyPort: Send + Sync + 'static {
     async fn inspect(&self, binding: &LifecycleBinding) -> Result<TopologySnapshot, Failure>;
     /// Tears down the infrastructure for `operation`.
     async fn down(&self, operation: &LifecycleOperation) -> Result<(), Failure>;
+    /// `TeardownVerified` — upstream's optional `verifiedTeardown`
+    /// interface assertion. Implementations must prove every daemon
+    /// stopped before the domain releases credential cleanup; an
+    /// implementation that cannot verify answers the same
+    /// "verified teardown is unavailable" failure upstream's
+    /// type-assertion produces.
+    async fn teardown_verified(&self, operation: &LifecycleOperation) -> Result<(), Failure>;
+    /// `CleanupSecrets` — upstream's optional `bootstrapCleaner`
+    /// interface assertion: removes the materialized bootstrap secrets
+    /// for `operation`. Implementations with no secrets answer `Ok(())`,
+    /// matching a topology that does not implement the interface.
+    async fn cleanup_secrets(&self, operation: &LifecycleOperation) -> Result<(), Failure>;
 }
 
 impl<T: TopologyPort + ?Sized> TopologyPort for Arc<T> {
@@ -782,6 +794,12 @@ impl<T: TopologyPort + ?Sized> TopologyPort for Arc<T> {
     }
     async fn down(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
         (**self).down(operation).await
+    }
+    async fn teardown_verified(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
+        (**self).teardown_verified(operation).await
+    }
+    async fn cleanup_secrets(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
+        (**self).cleanup_secrets(operation).await
     }
 }
 
@@ -1752,6 +1770,21 @@ mod tests {
                 Ok(TopologySnapshot::default())
             }
             async fn down(&self, _operation: &LifecycleOperation) -> Result<(), Failure> {
+                Ok(())
+            }
+            async fn teardown_verified(
+                &self,
+                _operation: &LifecycleOperation,
+            ) -> Result<(), Failure> {
+                Err(Failure::unavailable(
+                    "TOPOLOGY_VERIFIED_TEARDOWN_UNAVAILABLE",
+                    "verified teardown is unavailable",
+                ))
+            }
+            async fn cleanup_secrets(
+                &self,
+                _operation: &LifecycleOperation,
+            ) -> Result<(), Failure> {
                 Ok(())
             }
         }

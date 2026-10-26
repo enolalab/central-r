@@ -1,0 +1,186 @@
+{
+  "schema": "central.compose-policy/v1",
+  "digest": "sha256:5d0a4ba1f6d3c9e8b2a7f4e1d8c3b6a9f0e2d5c8a1b4f7e0d3c6a9b2f5e8d1c4",
+  "resources": {
+    "postgres_daemon": {
+      "cpu": "1.5",
+      "memory": "2GiB",
+      "pids": 256
+    },
+    "minio_daemon": {
+      "cpu": "1.5",
+      "memory": "2GiB",
+      "pids": 256
+    },
+    "fs_initializer": {
+      "cpu": "0.25",
+      "memory": "256MiB",
+      "pids": 64
+    },
+    "provisioner": {
+      "cpu": "0.5",
+      "memory": "512MiB",
+      "pids": 128
+    }
+  },
+  "postgresql_shm_size": "768MiB",
+  "security": {
+    "cap_drop": ["ALL"],
+    "no_new_privileges": true,
+    "readonly_rootfs": true,
+    "seccomp": "default",
+    "apparmor": "",
+    "propagation": "rprivate",
+    "host_devices": false,
+    "host_pid": false,
+    "host_ipc": false,
+    "host_network": false,
+    "host_socket": false,
+    "privileged": false
+  },
+  "network": {
+    "internal": true,
+    "name": "infra"
+  },
+  "ports": {
+    "postgres": ["127.0.0.1:55432:5432"],
+    "minio": ["127.0.0.1:59000:9000"],
+    "console_block": true
+  },
+  "image_pull_policy": "never",
+  "restart_policy": "no",
+  "log": {
+    "driver": "json-file",
+    "max_files": 2,
+    "max_size": "1m"
+  },
+  "services": [
+    {
+      "name": "postgres-fs-init",
+      "role": "fs_initializer",
+      "cap_add": [],
+      "network": "none",
+      "working_dir": "/",
+      "user": "999:999",
+      "tmpfs": [
+        "/dev/shm:size=8m,uid=0,gid=0,mode=01777"
+      ],
+      "volumes": [],
+      "environment": {},
+      "command": [],
+      "healthcheck": null
+    },
+    {
+      "name": "minio-fs-init",
+      "role": "fs_initializer",
+      "cap_add": [],
+      "network": "none",
+      "working_dir": "/",
+      "user": "1000:1000",
+      "tmpfs": [
+        "/dev/shm:size=8m,uid=0,gid=0,mode=01777"
+      ],
+      "volumes": [],
+      "environment": {},
+      "command": [],
+      "healthcheck": null
+    },
+    {
+      "name": "postgres",
+      "role": "postgres_daemon",
+      "cap_add": [],
+      "network": "infra",
+      "working_dir": "",
+      "user": "999:999",
+      "shm_size": "768MiB",
+      "tmpfs": [
+        "/tmp:size=64m,uid=999,gid=999,mode=01770",
+        "/run/postgresql:size=16m,uid=999,gid=999,mode=0750",
+        "/dev/shm:size=768m,uid=999,gid=999,mode=01777"
+      ],
+      "volumes": [],
+      "environment": {
+        "PGDATA": "/var/lib/postgresql/data",
+        "POSTGRES_USER": "central",
+        "POSTGRES_DB": "central",
+        "POSTGRES_PASSWORD_FILE": "/run/secrets/postgres-superuser-passfile"
+      },
+      "command": [],
+      "healthcheck": {
+        "test": ["CMD-SHELL", "pg_isready -U central"],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 5,
+        "start_period": "30s"
+      }
+    },
+    {
+      "name": "minio",
+      "role": "minio_daemon",
+      "cap_add": [],
+      "network": "infra",
+      "working_dir": "",
+      "user": "1000:1000",
+      "shm_size": "",
+      "tmpfs": [
+        "/tmp:size=256m,uid=1000,gid=1000,mode=01770",
+        "/home/minio:size=16m,uid=1000,gid=1000,mode=0700",
+        "/run:size=16m,uid=1000,gid=1000,mode=0750",
+        "/dev/shm:size=64m,uid=1000,gid=1000,mode=01777"
+      ],
+      "volumes": [],
+      "environment": {
+        "HOME": "/home/minio",
+        "MINIO_ROOT_USER": "central",
+        "MINIO_BROWSER": "off",
+        "MINIO_ROOT_PASSWORD_FILE": "/run/secrets/minio-root-password"
+      },
+      "command": ["server", "/data"],
+      "healthcheck": null
+    },
+    {
+      "name": "minio-provision",
+      "role": "provisioner",
+      "cap_add": [],
+      "network": "infra",
+      "working_dir": "",
+      "user": "1000:1000",
+      "shm_size": "",
+      "tmpfs": [
+        "/tmp:size=16m,uid=1000,gid=1000,mode=0700",
+        "/home/minio:size=8m,uid=1000,gid=1000,mode=0700",
+        "/run:size=8m,uid=1000,gid=1000,mode=0750",
+        "/dev/shm:size=8m,uid=1000,gid=1000,mode=01777"
+      ],
+      "volumes": [],
+      "environment": {
+        "HOME": "/home/minio",
+        "MC_CONFIG_DIR": "/tmp/mc",
+        "MINIO_ROOT_PASSWORD_FILE": "/run/secrets/minio-root-password",
+        "CENTRAL_LOCAL_INFRA_BROKER_SOCKET": "/run/broker/minio-provision.sock",
+        "CENTRAL_LOCAL_INFRA_MINIO_ADMIN_ENDPOINT": "minio:9000"
+      },
+      "command": [],
+      "healthcheck": null
+    },
+    {
+      "name": "postgres-throughput-provision",
+      "role": "provisioner",
+      "cap_add": [],
+      "network": "infra",
+      "working_dir": "",
+      "user": "65532:65532",
+      "shm_size": "",
+      "tmpfs": [
+        "/tmp:size=8m,uid=65532,gid=65532,mode=0700",
+        "/run:size=4m,uid=65532,gid=65532,mode=0750"
+      ],
+      "volumes": [],
+      "environment": {
+        "CENTRAL_LOCAL_INFRA_POSTGRES_ADMIN_ENDPOINT": "postgres:5432"
+      },
+      "command": [],
+      "healthcheck": null
+    }
+  ]
+}
