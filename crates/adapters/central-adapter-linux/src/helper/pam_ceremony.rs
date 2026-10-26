@@ -323,6 +323,25 @@ impl super::init::InitConfirmer for PamConfirmer {
     }
 }
 
+/// `preparePAMConfirmer` — the binding-bound confirmation the prepare
+/// handler requires. Both halves already exist as inherent methods:
+/// the token is minted for a `ConfirmationBinding` fingerprint and
+/// consumed only against that same fingerprint.
+impl super::prepare::PreparePamConfirmer for PamConfirmer {
+    fn confirm_prepare(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        op_id: &str,
+        binding: &ConfirmationBinding,
+    ) -> Result<String, Failure> {
+        PamConfirmer::confirm_prepare(self, peer, deadline, op_id, binding)
+    }
+    fn verify_and_consume_prepare(&self, token: &str, binding: &ConfirmationBinding) -> bool {
+        PamConfirmer::verify_and_consume_prepare(self, token, binding)
+    }
+}
+
 macro_rules! destructive_confirms {
     ($($name:ident => ($kind:ident, $tty:ident, $err:literal, $label:literal);)*) => {
         $(

@@ -161,7 +161,13 @@ pub fn run_helper_daemon(
         socket: Some(socket),
         // A host that cannot compose the prepare graph still serves
         // every other verb; it refuses explicitly rather than being
-        // left unset — upstream's `unavailablePrepareHandler`.
+        // left unset — upstream's `unavailablePrepareHandler`. The real
+        // pipeline exists at `infra::prepare::new_prepare_handler`
+        // (service + handler, `PreparePamConfirmer` implemented on
+        // `PamConfirmer`); what this daemon still lacks is a production
+        // `EvaluateService` (advisory evaluation is a later task's
+        // seam), so the handler stays the explicit refusal until that
+        // composition can complete — upstream's rule verbatim.
         prepare: Some(Box::new(UnavailablePrepareHandler)),
         ..Server::new()
     });

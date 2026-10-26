@@ -47,6 +47,14 @@ rand.workspace = true
 rcgen.workspace = true
 x509-parser.workspace = true
 rustls-pki-types.workspace = true
+# Dependency-prepare additions (R5 task 11): verified source-archive
+# extraction and release-tar staging. `flate2` keeps its default
+# `miniz_oxide` backend; both are pinned exact in
+# `[workspace.dependencies]` and consumed only here — the
+# `central-infra` domain owns the archive *policy* (paths, caps, types)
+# but never an archive-format crate.
+tar.workspace = true
+flate2.workspace = true
 # This crate is one of the two places audited `unsafe` may live
 # (workflow §5.2): libc carries the one call site rustix has no safe
 # wrapper for in `sys` — the `seccomp(2)` `SECCOMP_SET_MODE_FILTER`

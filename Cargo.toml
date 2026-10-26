@@ -123,6 +123,14 @@ x509-parser = "=0.18.0"
 # 0.23 pin already in the lockfile.
 rustls-pki-types = "=1.15.1"
 
+# central-adapter-linux's verified-archive staging only (R5 task 11):
+# `tar` reads release/source tarballs entry-by-entry; `flate2` inflates
+# gzip members via its default miniz_oxide backend. Pinned exact, and
+# consumed only by central-adapter-linux — the domain stays
+# archive-format-free.
+tar = "=0.4.46"
+flate2 = "=1.1.10"
+
 # Observability — kernel, observability rendering, operational endpoints
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
