@@ -379,6 +379,16 @@ pub fn validate_tls(material: &ServeTlsMaterial, now: OffsetDateTime) -> Result<
     // IP-SAN name match (the exact-SAN gate is strictly stronger —
     // it also rejects any second SAN identity), validity at `now`,
     // and ServerAuth EKU.
+    //
+    // `x509.Verify` also fails when a certificate carries a critical
+    // extension Go does not recognize (`UnhandledCriticalExtensions`
+    // non-empty); mirror its handled-OID set on both certs so the
+    // same material fails closed here.
+    for ext in leaf.extensions().iter().chain(ca.extensions().iter()) {
+        if ext.critical && !GO_HANDLED_EXTENSION_OIDS.contains(&ext.oid.to_id_string().as_str()) {
+            return Err(tls_invalid());
+        }
+    }
 
     // `fingerprint` — SHA-256 hex of the DER.
     let leaf_fp = fingerprint(leaf_der);
@@ -392,6 +402,28 @@ pub fn validate_tls(material: &ServeTlsMaterial, now: OffsetDateTime) -> Result<
     }
     Ok(())
 }
+
+/// The extension OIDs Go's `x509.ParseCertificate` recognizes — a
+/// critical extension outside this set lands in
+/// `UnhandledCriticalExtensions` and `Verify` fails. The list mirrors
+/// Go's `oidExtension*` table (crypto/x509/parser.go).
+const GO_HANDLED_EXTENSION_OIDS: &[&str] = &[
+    "2.5.29.14",               // subjectKeyIdentifier
+    "2.5.29.15",               // keyUsage
+    "2.5.29.17",               // subjectAltName
+    "2.5.29.18",               // issuerAltName
+    "2.5.29.19",               // basicConstraints
+    "2.5.29.30",               // nameConstraints
+    "2.5.29.31",               // cRLDistributionPoints
+    "2.5.29.32",               // certificatePolicies
+    "2.5.29.33",               // policyMappings
+    "2.5.29.35",               // authorityKeyIdentifier
+    "2.5.29.36",               // policyConstraints
+    "2.5.29.54",               // inhibitAnyPolicy
+    "1.3.6.1.5.5.7.1.1",       // authorityInfoAccess
+    "1.3.6.1.5.5.7.1.11",      // subjectInfoAccess
+    "1.3.6.1.4.1.11129.2.4.2", // signedCertificateTimestampList
+];
 
 /// `hasExactLoopbackSAN` — exactly one SAN, an IP, `127.0.0.1`; any
 /// DNS, e-mail, or URI SAN refuses. (Other `GeneralName` kinds — a
@@ -541,6 +573,27 @@ mod tests {
     fn valid_material_passes() {
         let f = mint(|_| {});
         validate_tls(&material(&f), OffsetDateTime::now_utc()).expect("valid");
+    }
+
+    /// `x509.Verify` parity: a critical extension Go does not
+    /// recognize fails closed — on the leaf and on the CA alike.
+    #[test]
+    fn unhandled_critical_extension_refused() {
+        let f = mint(|p| {
+            let mut ext = rcgen::CustomExtension::from_oid_content(&[1, 2, 3, 4], vec![0x05, 0x00]);
+            ext.set_criticality(true);
+            p.custom_extensions.push(ext);
+        });
+        assert!(validate_tls(&material(&f), OffsetDateTime::now_utc()).is_err());
+        // A non-critical unknown extension is tolerated, as upstream.
+        let f = mint(|p| {
+            p.custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[1, 2, 3, 4],
+                    vec![0x05, 0x00],
+                ));
+        });
+        validate_tls(&material(&f), OffsetDateTime::now_utc()).expect("non-critical tolerated");
     }
 
     /// The upstream `TestValidateTLSRejectsInvalidMaterial` table:

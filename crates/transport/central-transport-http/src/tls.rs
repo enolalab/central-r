@@ -11,24 +11,30 @@
 //! and [`TlsListener`] adapts it onto axum's [`serve::Listener`] seam
 //! so `axum::serve` consumes it exactly like the plain listener.
 
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::serve::Listener;
 use central_foundation::failure::Failure;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
-/// One accept's TLS-handshake budget. [`Listener::accept`] is awaited
-/// serially by `axum::serve`, so the handshake happens inline here;
-/// the bound keeps a deliberately stalled client (a peer that connects
-/// and never answers the ServerHello) from freezing the accept loop —
-/// upstream's lazy per-conn handshake in `tls.NewListener` never
-/// blocks accepts, and this preserves that liveness property with a
-/// bounded inline handshake instead.
+/// The per-connection TLS-handshake budget. Upstream's
+/// `tls.NewListener`-wrapped accept never runs the handshake — each
+/// returned `*tls.Conn` handshakes lazily on its first Read/Write.
+/// The same shape is preserved here: [`Listener::accept`] returns as
+/// soon as the TCP accept completes and [`AcceptedIo`] drives the
+/// handshake on the first `poll_*`, so a peer that connects and never
+/// answers the ServerHello can neither freeze the accept loop nor —
+/// once the connection task starts driving it — stall unbounded.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn tls_invalid(msg: impl Into<String>) -> Failure {
@@ -87,7 +93,7 @@ impl TlsListener {
 }
 
 impl Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = AcceptedIo;
     type Addr = SocketAddr;
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
@@ -97,16 +103,135 @@ impl Listener for TlsListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             // A transient `accept` error retries, exactly like axum's
-            // own `TcpListener` impl; a failed or timed-out handshake
-            // drops the stream and takes the next connection.
+            // own `TcpListener` impl. The handshake deliberately does
+            // NOT run here — `tls.NewListener` semantics — so no peer
+            // can delay the next accept.
             let Ok((stream, addr)) = self.tcp.accept().await else {
                 continue;
             };
-            if let Ok(Ok(tls)) =
-                tokio::time::timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(stream)).await
-            {
-                return (tls, addr);
+            let accept = self.acceptor.accept(stream);
+            return (
+                AcceptedIo::Handshaking(Box::pin(async move {
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, accept).await {
+                        Ok(Ok(tls)) => Ok(tls),
+                        Ok(Err(e)) => Err(e),
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "TLS handshake timed out",
+                        )),
+                    }
+                })),
+                addr,
+            );
+        }
+    }
+}
+
+/// A just-accepted connection whose TLS handshake has not run yet —
+/// the [`TlsListener`]'s `Io`. `axum::serve`'s per-connection task
+/// drives the handshake on the first `poll_read`/`poll_write`
+/// (bounded by [`HANDSHAKE_TIMEOUT`]); a handshake failure surfaces
+/// as an IO error on that connection only, exactly like a `*tls.Conn`
+/// handshake error surfacing on `Read` upstream.
+///
+/// `Failed` is the terminal state after a handshake error has been
+/// reported once: every later poll answers `BrokenPipe`.
+pub enum AcceptedIo {
+    /// The handshake is pending; the boxed future owns the socket and
+    /// the acceptor until it resolves.
+    Handshaking(Pin<Box<dyn Future<Output = io::Result<TlsStream<TcpStream>>> + Send + 'static>>),
+    /// Handshake complete — reads and writes delegate to the stream.
+    /// Boxed so the pending-handshake variant stays pointer-sized.
+    Established(Box<TlsStream<TcpStream>>),
+    /// The handshake already failed and the error was reported.
+    Failed,
+}
+
+impl AcceptedIo {
+    /// One step toward the established stream: drives a pending
+    /// handshake and returns it once ready. `Pending` while the
+    /// handshake waits on the peer.
+    fn poll_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<&mut TlsStream<TcpStream>>> {
+        if let Self::Handshaking(fut) = self {
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(stream)) => *self = Self::Established(Box::new(stream)),
+                Poll::Ready(Err(e)) => {
+                    *self = Self::Failed;
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => return Poll::Pending,
             }
+        }
+        match self {
+            Self::Established(stream) => Poll::Ready(Ok(&mut **stream)),
+            Self::Failed => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TLS handshake failed",
+            ))),
+            Self::Handshaking(_) => unreachable!("handshake future resolved above"),
+        }
+    }
+}
+
+impl AsyncRead for AcceptedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.poll_tls(cx) {
+            Poll::Ready(Ok(stream)) => Pin::new(stream).poll_read(cx, buf),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for AcceptedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_tls(cx) {
+            Poll::Ready(Ok(stream)) => Pin::new(stream).poll_write(cx, buf),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.poll_tls(cx) {
+            Poll::Ready(Ok(stream)) => Pin::new(stream).poll_flush(cx),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.poll_tls(cx) {
+            Poll::Ready(Ok(stream)) => Pin::new(stream).poll_shutdown(cx),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_tls(cx) {
+            Poll::Ready(Ok(stream)) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Established(stream) => (**stream).is_write_vectored(),
+            _ => false,
         }
     }
 }
@@ -210,31 +335,39 @@ mod tests {
         let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = tcp.local_addr().expect("local_addr").port();
         let mut listener = TlsListener::new(tcp, config);
-        let (tx, rx) = tokio::sync::oneshot::channel::<TlsStream<TcpStream>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<AcceptedIo>();
         tokio::spawn(async move {
             let (tls, _addr) = listener.accept().await;
             let _ = tx.send(tls);
             // Keep the port bound for the refused TLS 1.2 probe below
             // (the task — and the listener — outlive this await only
-            // while the test runtime does; the refused handshake loops
-            // back to `tcp.accept`).
+            // while the test runtime does; dropping the lazily
+            // accepted socket refuses the 1.2 handshake below).
             let _ = listener.accept().await;
         });
 
         // TLS 1.3 client → handshake completes and one byte round-trips.
+        // The accepted IO drives the handshake lazily — like axum's
+        // per-connection task, it must be polled concurrently with
+        // the client's `connect`, not after it.
         let stream = TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect");
         let conn = tokio_rustls::TlsConnector::from(client_config(&[&rustls::version::TLS13]));
-        let mut tls = conn
-            .connect(ServerName::IpAddress(Ipv4Addr::LOCALHOST.into()), stream)
-            .await
-            .expect("TLS 1.3 handshake");
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        tls.write_all(b"x").await.expect("write");
         let mut accepted = rx.await.expect("accepted stream");
         let mut byte = [0u8; 1];
-        accepted.read_exact(&mut byte).await.expect("read");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ((), server_read) = tokio::join!(
+            async {
+                let mut tls = conn
+                    .connect(ServerName::IpAddress(Ipv4Addr::LOCALHOST.into()), stream)
+                    .await
+                    .expect("TLS 1.3 handshake");
+                tls.write_all(b"x").await.expect("write");
+            },
+            accepted.read_exact(&mut byte),
+        );
+        server_read.expect("read");
         assert_eq!(byte, *b"x");
 
         // TLS 1.2-only client → the server refuses the handshake.
@@ -249,6 +382,55 @@ mod tests {
             result.is_err(),
             "a TLS 1.2-only client must be refused at the handshake"
         );
+    }
+
+    /// `tls.NewListener` parity: a peer that connects and stalls
+    /// before its ClientHello must not delay the next accept — the
+    /// listener returns each accepted socket lazily.
+    #[tokio::test]
+    async fn stalled_client_does_not_block_accept() {
+        let (certs, key) = fixture();
+        let config = tls13_server_config(certs, key).expect("server config");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = tcp.local_addr().expect("local_addr").port();
+        let mut listener = TlsListener::new(tcp, config);
+        let (tx, rx) = tokio::sync::oneshot::channel::<AcceptedIo>();
+        tokio::spawn(async move {
+            // First accept: the stalled client — returned lazily.
+            let (_stalled, _addr) = listener.accept().await;
+            // Second accept: the real client — must arrive without
+            // waiting on the stalled peer's handshake.
+            let (io, _addr) = listener.accept().await;
+            let _ = tx.send(io);
+        });
+
+        // Stalled: connects and never speaks.
+        let _stalled = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+
+        let stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let conn = tokio_rustls::TlsConnector::from(client_config(&[&rustls::version::TLS13]));
+        let mut accepted = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("stalled client must not block accept")
+            .expect("accepted stream");
+        let mut byte = [0u8; 1];
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ((), server_read) = tokio::join!(
+            async {
+                let mut tls = conn
+                    .connect(ServerName::IpAddress(Ipv4Addr::LOCALHOST.into()), stream)
+                    .await
+                    .expect("TLS 1.3 handshake");
+                tls.write_all(b"x").await.expect("write");
+            },
+            accepted.read_exact(&mut byte),
+        );
+        server_read.expect("read");
+        assert_eq!(byte, *b"x");
     }
 
     /// An empty chain cannot build a server config.
