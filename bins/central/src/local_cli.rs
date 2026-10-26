@@ -290,9 +290,14 @@ fn run_init(tokens: &[String], stdout: &mut impl Write, stderr: &mut impl Write)
             None,
         );
     }
-    let socket_path = std::env::var("CENTRAL_HELPER_SOCKET").unwrap_or_else(|_| {
-        central_adapter_linux::helper::client::PRODUCTION_SOCKET_PATH.to_owned()
-    });
+    // `helperSocketPath` — the override only counts when non-empty,
+    // exactly like upstream's `os.Getenv` + `socket != ""` check.
+    let socket_path = std::env::var("CENTRAL_HELPER_SOCKET")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            central_adapter_linux::helper::client::PRODUCTION_SOCKET_PATH.to_owned()
+        });
     let client = central_adapter_linux::helper::init::InitClient::new(socket_path);
     run_bare_init(&client, stdout, stderr)
 }
@@ -352,7 +357,9 @@ fn run_lifecycle(command_id: &str, stdout: &mut impl Write, stderr: &mut impl Wr
     use central_adapter_linux::helper::protocol::LifecycleRequest;
 
     let socket_path = std::env::var("CENTRAL_HELPER_SOCKET")
-        .unwrap_or_else(|_| PRODUCTION_SOCKET_PATH.to_owned());
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| PRODUCTION_SOCKET_PATH.to_owned());
     let client = LifecycleClient::new(socket_path);
     let req = LifecycleRequest::default();
     let (result, err): (LifecycleResult, Option<String>) = match command_id {
@@ -679,9 +686,11 @@ fn run_prepare(
         );
     }
     // `defaultPrepareSocket` — the operator-overridable socket, then
-    // the production helper socket.
+    // the production helper socket; an empty override is no override.
     let socket_path = std::env::var("CENTRAL_HELPER_SOCKET")
-        .unwrap_or_else(|_| PRODUCTION_SOCKET_PATH.to_owned());
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| PRODUCTION_SOCKET_PATH.to_owned());
     let client = PrepareClient::new(socket_path);
     let request = PrepareRequest {
         resume_operation_id: resume,

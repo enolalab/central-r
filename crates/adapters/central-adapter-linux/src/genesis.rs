@@ -949,7 +949,7 @@ impl GenesisEnv {
             instance_id: instance_id.clone(),
             config_binding_id: ids[1].clone(),
             init_operation_id: ids[2].clone(),
-            created_at: rfc3339_nano((self.now)()),
+            created_at: crate::broker::wire::format_rfc3339_nano((self.now)()),
             ceremony: ceremony.to_owned(),
             grant_nonce: grant_nonce.to_owned(),
         };
@@ -1264,6 +1264,69 @@ pub fn empty_genesis_root_or_missing(path: &Path, uid: u32, gid: u32) -> Result<
     Ok(true)
 }
 
+/// `ensureGenesisInitStore` — creates `dir` (the genesis grant
+/// store) when missing: every existing ancestor must be root-owned
+/// and not group/other-writable, and the protected root itself must
+/// be exactly `root:root` `0700`. A pre-existing store dir is left
+/// untouched — `OpenGrantStore` refuses it below when it is not
+/// exactly right; it is never repaired.
+pub fn ensure_genesis_init_store(env: &GenesisEnv, dir: &Path) -> Result<(), String> {
+    let uid = env.owners.root_uid;
+    let protected = PathBuf::from(&env.roots.protected_root);
+    let parent = protected
+        .parent()
+        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+    genesis_ancestor_missing_or_root_owned(&parent, uid)?;
+    genesis_ancestor_missing_or_root_owned(&protected, uid)?;
+    // The protected root itself, when present, must be exactly
+    // root:root 0700 (fd-based, no path TOCTOU — the same pattern
+    // `emptyGenesisRootOrMissing` uses).
+    match open(
+        &protected,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            if !exact_owned_directory(fd, uid, env.owners.root_gid, 0o700) {
+                return Err(format!(
+                    "grant: {} must be exactly root:root 0700",
+                    env.roots.protected_root
+                ));
+            }
+        }
+        Err(e) if e == Errno::NOENT => {}
+        Err(e) => return Err(format!("grant: protected root: {e}")),
+    }
+    // `MkdirAll` honors umask: enforce the exact mode on what WE
+    // create. `os.Lstat` recorded existence first so only the
+    // entries this call makes are chmodded.
+    let protected_missing = matches!(
+        std::fs::symlink_metadata(&protected),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    let store_missing = matches!(
+        std::fs::symlink_metadata(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("grant: create store: {e}"))?;
+    if protected_missing {
+        std::fs::set_permissions(
+            &protected,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .map_err(|e| format!("grant: create store: {e}"))?;
+    }
+    if store_missing {
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(|e| format!("grant: create store: {e}"))?;
+    }
+    Ok(())
+}
+
 /// `readGenesisRecord` — `O_NONBLOCK` open (a planted FIFO must not
 /// hold the open), the regular-file/single-link/owner/mode/size
 /// `fstat` gate, the strict decode, and every field validation.
@@ -1385,14 +1448,6 @@ pub fn nearest_existing_path(path: &Path) -> PathBuf {
         }
         path = parent;
     }
-}
-
-/// `time.RFC3339Nano` — upstream renders the record's `created_at`
-/// with nanoseconds; the `time` crate's RFC3339 writes them only
-/// when nonzero, matching Go's trim-zeros behavior.
-fn rfc3339_nano(t: time::OffsetDateTime) -> String {
-    t.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 // ---------------------------------------------------------------------------

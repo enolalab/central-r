@@ -987,15 +987,39 @@ mod tests {
             "sandbox: no socket fd (LISTEN_FDS=\"x\")\n"
         );
 
-        // Present but fd 3 is not a live activation socket in this
-        // test process — the fd claim or listener bind fails closed
-        // at the same exit class, still prefixed `sandbox:`.
-        let mut stderr = Vec::new();
-        assert_eq!(sandbox_daemon(env(&[("LISTEN_FDS", "1")]), &mut stderr), 3);
-        assert!(
-            String::from_utf8(stderr).unwrap().starts_with("sandbox: "),
-            "a failure line, never silence"
-        );
+        // Present LISTEN_FDS reaches `socket_activation_fd(0)`, which
+        // CLAIMS fd 3 as an `OwnedFd` and closes it on the way out —
+        // in a shared test process that steals whatever fd 3 a
+        // parallel test happens to hold. The arm only runs when fd 3
+        // can be made a socket this test owns: `into_raw_fd` hands the
+        // daemon a legitimate claim, `serve_launcher` fails accept on
+        // a connected (non-listening) socket, and the only descriptor
+        // destroyed is the sacrificial one. When another thread holds
+        // fd 3 the arm is skipped — there is no safe way to take it.
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+        use std::os::unix::net::UnixStream;
+        let mut held = Vec::new();
+        let mut sacrificial = None;
+        while sacrificial.is_none() && held.len() < 64 {
+            let (a, b) = UnixStream::pair().unwrap();
+            held.push(b);
+            if a.as_raw_fd() == 3 {
+                sacrificial = Some(a);
+            } else {
+                held.push(a);
+            }
+        }
+        if let Some(fd3) = sacrificial {
+            let raw = fd3.into_raw_fd();
+            debug_assert_eq!(raw, 3, "the loop watched it land on fd 3");
+            let mut stderr = Vec::new();
+            assert_eq!(sandbox_daemon(env(&[("LISTEN_FDS", "1")]), &mut stderr), 3);
+            assert!(
+                String::from_utf8(stderr).unwrap().starts_with("sandbox: "),
+                "a failure line, never silence"
+            );
+        }
+        drop(held);
     }
 
     // -- broker serve grammar/checks -----------------------------------

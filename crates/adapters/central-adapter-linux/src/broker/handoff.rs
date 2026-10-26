@@ -313,7 +313,10 @@ mod tests {
         // (same inode); anything else is reuse, not a leaked fd.
         if let Ok(f) = std::fs::File::open(format!("/proc/self/fd/{raw}")) {
             let inode = f.metadata().expect("fd metadata").ino();
-            assert_ne!(inode, orig_inode, "memfd {orig_inode} is still open at fd {raw}");
+            assert_ne!(
+                inode, orig_inode,
+                "memfd {orig_inode} is still open at fd {raw}"
+            );
         }
     }
 

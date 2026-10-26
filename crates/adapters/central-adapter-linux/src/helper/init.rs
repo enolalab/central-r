@@ -565,6 +565,22 @@ fn retained_init_reason(reason: &str) -> String {
     }
 }
 
+/// `unanswered` — the helper went away without an answer, unless the
+/// exchange ended on a transport deadline: upstream
+/// `ctx.Err() == nil && !errors.Is(err, os.ErrDeadlineExceeded)`.
+/// There is no ctx in this client — the socket deadlines carry the
+/// whole budget — so the deadline kinds (`WouldBlock` from
+/// SO_RCVTIMEO/SO_SNDTIMEO, `TimedOut`) are the only
+/// `no_answer = false` cases.
+fn init_transport_unanswered(err: &std::io::Error) -> InitClientError {
+    let mut e = InitClientError::new(3, INIT_REASON_HELPER_UNAVAILABLE);
+    e.no_answer = !matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    );
+    e
+}
+
 /// `linuxInitClient` — dial, one init request, strict result checks.
 pub struct InitClient {
     socket_path: String,
@@ -584,11 +600,6 @@ impl InitClient {
         if self.socket_path.is_empty() || operation_id.is_empty() {
             return Err(InitClientError::new(3, INIT_REASON_HELPER_UNAVAILABLE));
         }
-        let unanswered = |no_answer: bool| {
-            let mut e = InitClientError::new(3, INIT_REASON_HELPER_UNAVAILABLE);
-            e.no_answer = no_answer;
-            e
-        };
         // Upstream `net.Dialer{Timeout: 5 * time.Second}` — bounded
         // connect rather than a blocking `UnixStream::connect` that
         // can hold the operator path open on a wedged accept queue.
@@ -597,7 +608,7 @@ impl InitClient {
             Duration::from_secs(5),
         ) {
             Ok(c) => c,
-            Err(_) => return Err(unanswered(false)),
+            Err(_) => return Err(InitClientError::new(3, INIT_REASON_HELPER_UNAVAILABLE)),
         };
         let _ = conn.set_read_timeout(Some(
             super::server::INIT_BUDGET + super::server::CONN_WRITE_GRACE * 2,
@@ -608,12 +619,12 @@ impl InitClient {
             verb: super::verb::INIT.to_owned(),
             payload: None,
         };
-        if write_request(&mut conn, &request).is_err() {
-            return Err(unanswered(true));
+        if let Err(err) = write_request(&mut conn, &request) {
+            return Err(init_transport_unanswered(&err));
         }
         let response = match read_response(&mut conn) {
             Ok(r) => r,
-            Err(_) => return Err(unanswered(true)),
+            Err(err) => return Err(init_transport_unanswered(&err)),
         };
         if response.outcome != "success" || response.exit_code != 0 {
             return Err(InitClientError::new(response.exit_code, &response.reason));
@@ -1166,5 +1177,34 @@ mod tests {
             ..result.clone()
         };
         assert!(decode_exact_init_result(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+
+    /// `unanswered` — upstream's `ctx.Err() == nil &&
+    /// !errors.Is(err, os.ErrDeadlineExceeded)`: a socket read/write
+    /// deadline is plain `HELPER_UNAVAILABLE` (the start-helper hint
+    /// path), while a severed answer is `no_answer` (the
+    /// closed-connection hint).
+    #[test]
+    fn transport_deadline_is_not_closed_without_answer() {
+        use std::io::ErrorKind;
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            let e = init_transport_unanswered(&std::io::Error::from(kind));
+            assert!(!e.no_answer, "{kind}");
+            assert_eq!(e.exit_code, 3);
+            assert_eq!(e.reason, INIT_REASON_HELPER_UNAVAILABLE);
+        }
+        // On the wire: SO_RCVTIMEO expiry reads WouldBlock.
+        let (quiet, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        quiet
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let err = read_response(&mut &quiet).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+        assert!(!init_transport_unanswered(&err).no_answer);
+        // A helper that hung up mid-answer is the no-answer shape.
+        let (open, gone) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(gone);
+        let err = read_response(&mut &open).unwrap_err();
+        assert!(init_transport_unanswered(&err).no_answer);
     }
 }

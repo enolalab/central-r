@@ -103,24 +103,25 @@ pub fn write_response(writer: &mut impl Write, resp: &Response) -> Result<(), St
     writer.write_all(&b).map_err(|e| e.to_string())
 }
 
-/// `WriteRequest` — an absent payload goes on the wire as `{}`.
-pub fn write_request(writer: &mut impl Write, req: &Request) -> Result<(), String> {
+/// `WriteRequest` — an absent payload goes on the wire as `{}`. The
+/// `io::Error` keeps its `ErrorKind` so callers can tell a transport
+/// deadline (upstream `os.ErrDeadlineExceeded`) from a lost answer.
+pub fn write_request(writer: &mut impl Write, req: &Request) -> Result<(), std::io::Error> {
     let mut req = req.clone();
     if req.payload.is_none() {
         req.payload = RawValue::from_string("{}".to_owned()).ok();
     }
-    let mut b = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+    let mut b = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
     b.push(b'\n');
-    writer.write_all(&b).map_err(|e| e.to_string())
+    writer.write_all(&b)
 }
 
-/// `ReadResponse` — decode the one response object.
-pub fn read_response(reader: &mut impl Read) -> Result<Response, String> {
+/// `ReadResponse` — decode the one response object. The `io::Error`
+/// keeps its `ErrorKind` like `write_request` documents.
+pub fn read_response(reader: &mut impl Read) -> Result<Response, std::io::Error> {
     let mut line = Vec::new();
-    BufReader::new(reader)
-        .read_until(b'\n', &mut line)
-        .map_err(|e| e.to_string())?;
-    serde_json::from_slice(&line).map_err(|e| e.to_string())
+    BufReader::new(reader).read_until(b'\n', &mut line)?;
+    serde_json::from_slice(&line).map_err(std::io::Error::other)
 }
 
 /// The Go `DisallowUnknownFields + second-Decode-is-EOF` pair: decode

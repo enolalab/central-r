@@ -1,7 +1,9 @@
-//! `central grant` — the root-only grant surface skeleton. Ports
+//! `central grant` — the root-only grant surface. Ports
 //! `cmd/central/grant_cli.go`'s dispatch shape (`runGrant` →
-//! `resolveGrantEnvironment` → `grantDispatch`) with closed-failure
-//! bodies; the real ceremony/lock/store machinery is R5 task 8.
+//! `resolveGrantEnvironment` → `grantDispatch`). `issue --kind init`
+//! is the real pre-instance issuance upstream's headless flow
+//! advertises; the instance-scoped kinds keep the closed-failure
+//! bodies — their ceremony/lock/store machinery is R5 task 8.
 //!
 //! Environment resolution runs before dispatch exactly like upstream:
 //! without a resolvable production instance every verb fails at
@@ -11,7 +13,9 @@
 //! itself.
 
 use std::io::Write;
+use std::path::Path;
 
+use central_adapter_linux::genesis::GenesisState;
 use central_foundation::failure::ExitClass;
 
 use crate::modes;
@@ -224,7 +228,7 @@ fn parse_grant_issue_flags(
 fn grant_issue(
     env: &GrantEnv,
     args: &[String],
-    _stdout: &mut impl Write,
+    stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<(), GrantError> {
     let flags = parse_grant_issue_flags(args, stderr).map_err(GrantError::Usage)?;
@@ -237,7 +241,7 @@ fn grant_issue(
         )));
     }
     if flags.kind.trim() == "init" {
-        return grant_issue_init(env, &flags);
+        return grant_issue_init(env, &flags, stdout);
     }
     if flags.replace {
         return Err(GrantError::Other(
@@ -253,79 +257,148 @@ fn grant_issue(
 
 /// Ports `grantIssueInit`: `--operation` is refused (plain error —
 /// exit 7), `--ttl` must sit in `(0, 15m]`, and a non-absent genesis
-/// state is the `refused by host state` class (exit 6). Past the
-/// gate the genesis grant store is T8 work — the skeleton fails
-/// closed rather than minting or mutating anything.
-fn grant_issue_init(env: &GrantEnv, flags: &GrantIssueFlags) -> Result<(), GrantError> {
+/// state is the `refused by host state` class (exit 6). An absent
+/// host gets the genesis store ensured at its upstream path, opened
+/// under the genesis env's owners, issued by `IssueInit` against the
+/// running boot and this process's helper identity, and printed as
+/// upstream's grant JSON.
+fn grant_issue_init(
+    env: &GrantEnv,
+    flags: &GrantIssueFlags,
+    stdout: &mut impl Write,
+) -> Result<(), GrantError> {
     let _ = env;
+    // Exit-class rule (upstream's pinned restore_apply test: a
+    // semantically refused flag combination is exit 7, not usage).
+    // Only flag PARSE failures are usage (exit 2).
     if !flags.operation.is_empty() {
         return Err(GrantError::Other(
             "grant: --operation is refused for --kind init".to_string(),
         ));
     }
     // helper.InitGrantTTL = 15m; unset means the default is used.
-    let ttl = flags.ttl_ns.unwrap_or(15 * 60 * 1_000_000_000);
-    if ttl <= 0 || ttl > 15 * 60 * 1_000_000_000 {
+    let ttl_ns = flags.ttl_ns.unwrap_or(15 * 60 * 1_000_000_000);
+    if ttl_ns <= 0 || ttl_ns > 15 * 60 * 1_000_000_000 {
         return Err(GrantError::Other(format!(
             "grant: init ttl {} is outside (0, 15m]",
-            format_go_duration(ttl)
+            format_go_duration(ttl_ns)
         )));
     }
-    match probe_genesis_state() {
-        GenesisProbe::Absent => Err(GrantError::Other(
-            "init grant issuance is not implemented in this slice".to_string(),
-        )),
-        state => Err(GrantError::StateRefusal(format!(
-            "cannot issue an init grant on a {state} host: refused by host state"
-        ))),
+    // There is no instance yet, so there is no ceremony-mode check:
+    // the genesis state itself gates issuance.
+    let genv = grant_genesis_env();
+    let (state, _, state_err) = genv.state();
+    if state_err.is_some() || state != GenesisState::Absent {
+        return Err(GrantError::StateRefusal(format!(
+            "cannot issue an init grant on a {} host: refused by host state",
+            state.as_str()
+        )));
     }
+    let dir = central_adapter_linux::helper::init::genesis_init_store_dir(&genv.roots);
+    central_adapter_linux::genesis::ensure_genesis_init_store(&genv, Path::new(&dir))
+        .map_err(GrantError::Other)?;
+    let boot_id = grant_boot_id().map_err(GrantError::Other)?;
+    // `OpenGrantStore(dir, genv.owners.RootUID, genv.owners.RootGID)`
+    // — the genesis env's root identity owns the protected tree and
+    // the store it creates; on `sudo central grant issue` that is the
+    // invoking operator's effective identity, not a service account.
+    let store = central_adapter_linux::helper::grant::GrantStore::open(
+        &dir,
+        genv.owners.root_uid,
+        genv.owners.root_gid,
+    )
+    .map_err(|e| GrantError::Other(e.message().to_owned()))?;
+    let grant = store
+        .issue_init(
+            &boot_id,
+            &central_adapter_linux::helper::prepare::helper_release_identity(""),
+            std::time::Duration::from_nanos(ttl_ns as u64),
+            flags.replace,
+        )
+        .map_err(|e| match e.code() {
+            // `ErrInitGrantPending`/`ErrGrantStoreBusy` — the exit-6
+            // refusal class upstream's dispatch keys on.
+            "sys_grant_pending" | "sys_grant_busy" => {
+                GrantError::StateRefusal(e.message().to_owned())
+            }
+            _ => GrantError::Other(e.message().to_owned()),
+        })?;
+    print_grant_json(stdout, &grant)
 }
 
-/// Stand-in for genesis `state()` (`local_init_genesis_linux.go`)
-/// classified like upstream's `genesisState`: absent/present/broken.
-/// Every pre-instance check that needs no instance loader runs
-/// verbatim through the shared `modes` probes — ancestors
-/// missing-or-root-owned-not-writable, the protected root
-/// missing-or-exactly-root:root-0700, each instances root
-/// missing-or-root:root-0700 — plus upstream's consistency rules:
-/// protected-without-state is broken, and a state instance with no
-/// protected counterpart is broken (its `productionBrokerRootAt`
-/// check could never pass).
-///
-/// Residual: a non-empty state root AND a non-empty protected root is
-/// reported `present` where upstream still runs `presentRecord` — the
-/// composition loader, the active dependency receipt, and the genesis
-/// record are T8/T13 machinery. A non-empty-but-unresolvable pair
-/// reads `present` here where upstream says `broken`; both refuse at
-/// exit 6 either way, so only the adjective in the refusal differs.
-enum GenesisProbe {
-    Absent,
-    Present,
-    Broken,
+/// `printGrantJSON` — the MAC stays in the store; what the operator
+/// gets is enough to find the grant in the helper log and the
+/// `ceremony_records` manifest entry. Go's `json.Encoder` emits one
+/// compact object plus a newline in upstream's field order, and
+/// `operation_id` is `omitempty` — absent on an init grant.
+fn print_grant_json(
+    w: &mut impl Write,
+    grant: &central_adapter_linux::helper::grant::Grant,
+) -> Result<(), GrantError> {
+    let esc =
+        |s: &str| serde_json::to_string(s).map_err(|e| GrantError::Other(format!("grant: {e}")));
+    let mut line = String::from("{\"kind\":");
+    line.push_str(&esc(&grant.kind)?);
+    if !grant.operation_id.is_empty() {
+        line.push_str(",\"operation_id\":");
+        line.push_str(&esc(&grant.operation_id)?);
+    }
+    line.push_str(",\"nonce\":");
+    line.push_str(&esc(&grant.nonce)?);
+    line.push_str(",\"issued_at\":");
+    line.push_str(&esc(&grant.issued_at)?);
+    line.push_str(",\"expires_at\":");
+    line.push_str(&esc(&grant.expires_at)?);
+    line.push_str("}\n");
+    w.write_all(line.as_bytes())
+        .map_err(|e| GrantError::Other(format!("grant: {e}")))
 }
 
-impl std::fmt::Display for GenesisProbe {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GenesisProbe::Absent => f.write_str("absent"),
-            GenesisProbe::Present => f.write_str("present"),
-            GenesisProbe::Broken => f.write_str("broken"),
-        }
-    }
+/// Upstream's `env.testGenesis`/`env.bootID` slots — the seams
+/// `grantIssueInit` reads the genesis roots, owners, and boot binding
+/// through. Production resolves them live; tests install a scratch
+/// env and a fixed boot id on the calling thread.
+#[cfg(not(test))]
+fn grant_genesis_env() -> central_adapter_linux::genesis::GenesisEnv {
+    central_adapter_linux::genesis::GenesisEnv::production()
 }
 
-/// The T13 classifier itself — `productionGenesisEnv().state()`
-/// verbatim, replacing the pre-T13 path-shape approximation this
-/// probe used to carry.
-fn probe_genesis_state() -> GenesisProbe {
-    match central_adapter_linux::genesis::GenesisEnv::production()
-        .state()
-        .0
-    {
-        central_adapter_linux::genesis::GenesisState::Absent => GenesisProbe::Absent,
-        central_adapter_linux::genesis::GenesisState::Present => GenesisProbe::Present,
-        central_adapter_linux::genesis::GenesisState::Broken => GenesisProbe::Broken,
-    }
+/// The test half of `env.testGenesis`: the installed scratch env, or
+/// the production env when none is.
+#[cfg(test)]
+fn grant_genesis_env() -> central_adapter_linux::genesis::GenesisEnv {
+    TEST_GENESIS_ENV
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(central_adapter_linux::genesis::GenesisEnv::production)
+}
+
+/// `env.bootID` — `/proc/sys/kernel/random/boot_id`; tests substitute
+/// a fixed id or a failure.
+#[cfg(not(test))]
+fn grant_boot_id() -> Result<String, String> {
+    central_adapter_linux::helper::read_boot_id().map_err(|e| e.message().to_owned())
+}
+
+#[cfg(test)]
+fn grant_boot_id() -> Result<String, String> {
+    TEST_BOOT_ID
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| {
+            central_adapter_linux::helper::read_boot_id().map_err(|e| e.message().to_owned())
+        })
+}
+
+// `grantEnvironment.testGenesis`/`bootID` — the test seams
+// `grantIssueInit` consults. Thread-local so parallel dispatch tests
+// keep their own env; the installer clears both on drop because cargo
+// reuses test threads.
+#[cfg(test)]
+thread_local! {
+    static TEST_GENESIS_ENV: std::cell::RefCell<
+        Option<central_adapter_linux::genesis::GenesisEnv>,
+    > = const { std::cell::RefCell::new(None) };
+    static TEST_BOOT_ID: std::cell::RefCell<Option<Result<String, String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Ports `grantMode`: exactly one `physical_tty|grant` argument —
@@ -405,6 +478,7 @@ fn format_go_duration(ns: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn argv(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
@@ -434,6 +508,81 @@ mod tests {
         )
     }
 
+    /// A private scratch directory per test.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "central-grant-cli-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The `genesisTestEnv` shape upstream's grant tests use: the
+    /// scratch `state`/`protected` roots with every owner set to the
+    /// test's euid — the identity `sudo` would hand a real issuance.
+    fn scratch_genesis_env(base: &Path) -> central_adapter_linux::genesis::GenesisEnv {
+        let mut env = central_adapter_linux::genesis::GenesisEnv::production();
+        env.roots = central_adapter_linux::genesis::GenesisRoots {
+            state_root: base.join("state/v1").to_string_lossy().into_owned(),
+            protected_root: base.join("protected/v1").to_string_lossy().into_owned(),
+        };
+        let (uid, gid) = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        env.owners = central_adapter_linux::genesis::GenesisOwners {
+            root_uid: uid,
+            root_gid: gid,
+            runtime_uid: uid,
+            runtime_gid: gid,
+        };
+        env.lock_wait = std::time::Duration::from_secs(2);
+        env.free_bytes = std::sync::Arc::new(|_| Ok(u64::MAX));
+        env.ensure_identities = std::sync::Arc::new(|| Ok(()));
+        env
+    }
+
+    /// Installs `env.testGenesis` + `env.bootID` on this thread and
+    /// clears both on drop (cargo reuses test threads).
+    struct InitSeams;
+
+    impl InitSeams {
+        fn install(
+            env: central_adapter_linux::genesis::GenesisEnv,
+            boot_id: Result<String, String>,
+        ) -> Self {
+            TEST_GENESIS_ENV.with(|slot| *slot.borrow_mut() = Some(env));
+            TEST_BOOT_ID.with(|slot| *slot.borrow_mut() = Some(boot_id));
+            InitSeams
+        }
+    }
+
+    impl Drop for InitSeams {
+        fn drop(&mut self) {
+            TEST_GENESIS_ENV.with(|slot| *slot.borrow_mut() = None);
+            TEST_BOOT_ID.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// The upstream test's `decode`/`window` pair: stdout must be the
+    /// printed grant JSON, and `expires_at - issued_at` the ttl.
+    fn decode(stdout: &str) -> serde_json::Value {
+        serde_json::from_str(stdout).expect("stdout is not JSON")
+    }
+
+    fn grant_window(v: &serde_json::Value) -> time::Duration {
+        let parse = |key: &str| {
+            time::OffsetDateTime::parse(
+                v[key].as_str().expect("timestamp is a string"),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .expect("timestamp is RFC 3339")
+        };
+        parse("expires_at") - parse("issued_at")
+    }
+
     // -- resolveGrantEnvironment / runGrant -----------------------------
 
     #[test]
@@ -460,29 +609,124 @@ mod tests {
         }
     }
 
+    // -- grantIssueInit (upstream TestGrantIssueInit) -------------------
+
     #[test]
-    fn issue_init_reaches_dispatch_on_pre_instance_env() {
-        // `issue --kind init` is the one env-resolution fallback; past
-        // it the genesis state gates the outcome.
+    fn issue_init_mints_and_prints_the_grant_json() {
+        let base = scratch("basic");
+        let env = scratch_genesis_env(&base);
+        let store_dir = central_adapter_linux::helper::init::genesis_init_store_dir(&env.roots);
+        // `issue --kind init` is the one env-resolution fallback; the
+        // scratch genesis env keeps it off the production roots.
+        let _seams = InitSeams::install(env, Ok("boot-test".to_owned()));
+        let (code, stdout, stderr) = run(&["issue", "--kind", "init"]);
+        assert_eq!(code, 0, "stderr {stderr}");
+        let v = decode(&stdout);
+        assert_eq!(v["kind"], "init");
+        assert!(v["nonce"].as_str().is_some_and(|n| !n.is_empty()));
+        // `operation_id` is omitempty — an init grant carries none.
+        assert!(v.get("operation_id").is_none(), "{stdout}");
+        assert_eq!(v.as_object().unwrap().len(), 4, "{stdout}");
+        // The unset --ttl means the default: helper.InitGrantTTL = 15m.
+        assert_eq!(grant_window(&v), time::Duration::minutes(15));
+        // ensureGenesisInitStore created the store at the upstream
+        // path, exactly 0700.
+        let mode = std::fs::metadata(&store_dir).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(mode.mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn issue_init_pending_refuses_then_replace_reissues() {
+        let base = scratch("replace");
+        let env = scratch_genesis_env(&base);
+        let store_dir = central_adapter_linux::helper::init::genesis_init_store_dir(&env.roots);
+        let _seams = InitSeams::install(env, Ok("boot-test".to_owned()));
+        let (code, stdout, _) = run(&["issue", "--kind", "init"]);
+        assert_eq!(code, 0);
+        let first = decode(&stdout)["nonce"].as_str().unwrap().to_owned();
+        // A second usable init grant is ErrInitGrantPending → exit 6,
+        // naming GRANT_PENDING and --replace.
         let (code, _, stderr) = run(&["issue", "--kind", "init"]);
-        match probe_genesis_state() {
-            GenesisProbe::Absent => {
-                assert_eq!(code, 7);
-                assert_eq!(
-                    stderr,
-                    "grant: init grant issuance is not implemented in this slice\n"
-                );
-            }
-            state => {
-                assert_eq!(code, 6);
-                assert_eq!(
-                    stderr,
-                    format!(
-                        "grant: cannot issue an init grant on a {state} host: refused by host state\n"
-                    )
-                );
-            }
-        }
+        assert_eq!(code, 6);
+        assert_eq!(
+            stderr,
+            "grant: init grant already pending (GRANT_PENDING); use --replace to revoke it and issue a new one\n"
+        );
+        // --replace revokes the pending grant and mints a distinct one.
+        let (code, stdout, stderr) = run(&["issue", "--kind", "init", "--replace"]);
+        assert_eq!(code, 0, "stderr {stderr}");
+        let second = decode(&stdout)["nonce"].as_str().unwrap().to_owned();
+        assert_ne!(first, second);
+        let revoked = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".revoked"))
+            .count();
+        assert_eq!(revoked, 1);
+    }
+
+    #[test]
+    fn issue_init_ttl_flag_sizes_the_window() {
+        let base = scratch("ttl");
+        let env = scratch_genesis_env(&base);
+        let _seams = InitSeams::install(env, Ok("boot-test".to_owned()));
+        let (code, stdout, stderr) = run(&["issue", "--kind", "init", "--ttl", "10m"]);
+        assert_eq!(code, 0, "stderr {stderr}");
+        assert_eq!(grant_window(&decode(&stdout)), time::Duration::minutes(10));
+    }
+
+    #[test]
+    fn issue_init_on_a_present_host_is_refused() {
+        let base = scratch("present");
+        let env = scratch_genesis_env(&base);
+        // mustCreateGenesis — the install makes the host `present`.
+        env.create(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            central_adapter_linux::genesis::GENESIS_CEREMONY_PHYSICAL_TTY,
+            "",
+        )
+        .expect("first genesis");
+        let _seams = InitSeams::install(env, Ok("boot-test".to_owned()));
+        let (code, _, stderr) = run(&["issue", "--kind", "init"]);
+        assert_eq!(code, 6);
+        assert_eq!(
+            stderr,
+            "grant: cannot issue an init grant on a present host: refused by host state\n"
+        );
+    }
+
+    #[test]
+    fn issue_init_with_a_bad_store_mode_refuses() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        let base = scratch("badmode");
+        let env = scratch_genesis_env(&base);
+        let store_dir = central_adapter_linux::helper::init::genesis_init_store_dir(&env.roots);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&store_dir)
+            .unwrap();
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _seams = InitSeams::install(env, Ok("boot-test".to_owned()));
+        // OpenGrantStore refuses the pre-existing 0755 dir — a plain
+        // error (exit 7), never a repair.
+        let (code, _, stderr) = run(&["issue", "--kind", "init"]);
+        assert_eq!(code, 7);
+        assert_eq!(
+            stderr,
+            "grant: grant: store must be a 0700 directory owned by the instance owner\n"
+        );
+    }
+
+    #[test]
+    fn issue_init_boot_id_failure_is_a_plain_error() {
+        let base = scratch("bootid");
+        let env = scratch_genesis_env(&base);
+        let _seams = InitSeams::install(env, Err("helper: read boot id: no such file".to_owned()));
+        let (code, _, stderr) = run(&["issue", "--kind", "init"]);
+        assert_eq!(code, 7);
+        assert_eq!(stderr, "grant: helper: read boot id: no such file\n");
     }
 
     #[test]

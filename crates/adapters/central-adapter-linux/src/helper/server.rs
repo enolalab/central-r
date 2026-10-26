@@ -551,6 +551,21 @@ impl ConnSlots {
     }
 }
 
+/// `inFlight.Wait` — a `sync.WaitGroup` over the held permits:
+/// dropping this guard blocks until every admitted connection has
+/// returned its slot. `serve_genesis` holds one across its accept
+/// loop so it never returns while a connection is in flight.
+struct ConnDrain(std::sync::Arc<ConnSlots>);
+
+impl Drop for ConnDrain {
+    fn drop(&mut self) {
+        let mut n = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        while *n != 0 {
+            n = self.0.freed.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// `Serve` — accept on the systemd-supplied descriptor until `cancel`
 /// becomes readable; each connection runs on its own thread bounded by
 /// `idle_timeout` until its verb's real budget takes over.
@@ -664,11 +679,22 @@ impl GenesisServer {
         self.peer_policy.unwrap_or_else(PeerPolicy::for_process)
     }
 
-    /// Returns `true` when this connection ended genesis serving.
-    pub fn handle_conn(&self, mut conn: UnixStream, deadline: Instant) -> Result<bool, String> {
-        let (peer, req) = admit_helper_conn(&mut conn, self.policy(), || {
+    /// `handleConn` — one connection's whole exchange; the bool is
+    /// `genesisServerStopsAfter(resp)` and travels independently of
+    /// the response write's result, exactly like upstream's
+    /// `(done, err)` pair: a dropped write still reports whether the
+    /// host left `absent`.
+    pub fn handle_conn(
+        &self,
+        mut conn: UnixStream,
+        deadline: Instant,
+    ) -> (bool, Result<(), String>) {
+        let (peer, req) = match admit_helper_conn(&mut conn, self.policy(), || {
             super::init::new_init_denial("unknown", 2, INIT_REASON_INVALID_REQUEST)
-        })?;
+        }) {
+            Ok(pair) => pair,
+            Err(e) => return (false, Err(e)),
+        };
         let identity = PeerIdentity {
             uid: peer.uid.as_raw(),
             gid: peer.gid.as_raw(),
@@ -689,7 +715,7 @@ impl GenesisServer {
                 });
             }
             let _ = write_response(&mut conn, &resp);
-            return Ok(false);
+            return (false, Ok(()));
         }
         let request = match parse_init_request(&req) {
             Ok(r) => r,
@@ -709,7 +735,7 @@ impl GenesisServer {
                     });
                 }
                 let _ = write_response(&mut conn, &resp);
-                return Ok(false);
+                return (false, Ok(()));
             }
         };
         let resp = self.init.init(identity, deadline, request);
@@ -725,9 +751,10 @@ impl GenesisServer {
                 reason: resp.reason.clone(),
             });
         }
-        let write_result = write_response(&mut conn, &resp);
-        let stops = Self::stops_after(&resp);
-        write_result.map(|_| stops)
+        // `return genesisServerStopsAfter(resp), WriteResponse(conn,
+        // resp)` — the stop decision is returned even when the write
+        // fails; a wedged client cannot hide the host's transition.
+        (Self::stops_after(&resp), write_response(&mut conn, &resp))
     }
 }
 
@@ -756,6 +783,10 @@ pub fn serve_genesis(
         state: std::sync::Mutex::new(0),
         freed: std::sync::Condvar::new(),
     });
+    // `defer inFlight.Wait()` — the genesis server does not return
+    // while a connection it admitted is still being served, on every
+    // exit path including accept errors and cancellation.
+    let _drain = ConnDrain(slots.clone());
     loop {
         if stopping.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
@@ -780,10 +811,14 @@ pub fn serve_genesis(
         let srv = srv.clone();
         std::thread::spawn(move || {
             let _permit = permit;
-            match srv.handle_conn(conn, deadline) {
-                Ok(true) => flag.store(true, std::sync::atomic::Ordering::SeqCst),
-                Ok(false) => {}
-                Err(e) => eprintln!("helper: genesis connection error: {e}"),
+            // `(done, err)` — the write error is journaled, the stop
+            // decision honored regardless.
+            let (done, result) = srv.handle_conn(conn, deadline);
+            if let Err(e) = result {
+                eprintln!("helper: genesis connection error: {e}");
+            }
+            if done {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
     }
@@ -945,5 +980,152 @@ mod tests {
         for r in records.iter() {
             assert!(r.admitted);
         }
+    }
+
+    /// The operator arm a same-process socketpair can exercise.
+    fn self_operator_policy() -> PeerPolicy {
+        PeerPolicy {
+            daemon_uid: u32::MAX - 2,
+            operator_uid: rustix::process::geteuid().as_raw(),
+            operator_gid: rustix::process::getegid().as_raw(),
+        }
+    }
+
+    /// `(done, err)` — upstream returns `genesisServerStopsAfter(resp)`
+    /// independently of the response write: a client that hangs up
+    /// before the answer lands still stops genesis serving.
+    #[test]
+    fn genesis_handle_conn_reports_done_despite_a_failed_write() {
+        struct StopInit;
+        impl crate::helper::init::InitHandler for StopInit {
+            fn init(
+                &self,
+                _peer: PeerIdentity,
+                _deadline: Instant,
+                request: crate::helper::init::InitRequest,
+            ) -> Response {
+                Response {
+                    operation_id: request.operation_id,
+                    outcome: "success".to_owned(),
+                    exit_code: 0,
+                    reason: String::new(),
+                    result: None,
+                }
+            }
+        }
+        let srv = GenesisServer {
+            peer_policy: Some(self_operator_policy()),
+            socket: None,
+            init: Box::new(StopInit),
+            auditor: None,
+        };
+        let (mut client, server_end) = pair();
+        let req = Request {
+            operation_id: "op-1".to_owned(),
+            verb: verb::INIT.to_owned(),
+            payload: None,
+        };
+        write_request(&mut client, &req).unwrap();
+        // Hung up before the answer is written — the write errors
+        // EPIPE but the success answer still means stop. Shutdown is
+        // the explicit half of the hang-up: RCV_SHUTDOWN lands on the
+        // live peer before close, so the server's write cannot land
+        // even if close teardown were deferred past it.
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(client);
+        let (done, result) = srv.handle_conn(server_end, Instant::now() + Duration::from_secs(30));
+        assert!(
+            done,
+            "a success answer stops genesis even when its write fails"
+        );
+        assert!(result.is_err());
+    }
+
+    /// `defer inFlight.Wait()` — a cancelled accept loop still waits
+    /// for the connection it admitted to drain before returning.
+    #[test]
+    fn serve_genesis_drains_the_in_flight_connection_on_cancel() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
+
+        struct BlockingInit {
+            release: std::sync::Mutex<Receiver<()>>,
+            started: SyncSender<()>,
+        }
+        impl crate::helper::init::InitHandler for BlockingInit {
+            fn init(
+                &self,
+                _peer: PeerIdentity,
+                _deadline: Instant,
+                request: crate::helper::init::InitRequest,
+            ) -> Response {
+                let _ = self.started.send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .recv();
+                Response {
+                    operation_id: request.operation_id,
+                    outcome: "denied".to_owned(),
+                    exit_code: 7,
+                    reason: "AUTHORITY_DENIED".to_owned(),
+                    result: None,
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "central-serve-genesis-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("helper.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let listen_fd: OwnedFd = listener.into();
+        let (cancel_read, mut cancel_write) = UnixStream::pair().unwrap();
+        let (release_tx, release_rx) = channel::<()>();
+        let (started_tx, started_rx) = sync_channel::<()>(1);
+        let srv = std::sync::Arc::new(GenesisServer {
+            peer_policy: Some(self_operator_policy()),
+            socket: None,
+            init: Box::new(BlockingInit {
+                release: std::sync::Mutex::new(release_rx),
+                started: started_tx,
+            }),
+            auditor: None,
+        });
+        let returned = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = returned.clone();
+        let srv_ref = srv.clone();
+        let serve = std::thread::spawn(move || {
+            let _ = serve_genesis(listen_fd, &srv_ref, Duration::from_secs(60), cancel_read);
+            seen.store(true, Ordering::SeqCst);
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        let req = Request {
+            operation_id: "op-1".to_owned(),
+            verb: verb::INIT.to_owned(),
+            payload: None,
+        };
+        write_request(&mut client, &req).unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the init handler is in flight");
+        // Cancel the accept loop — it cannot return while the
+        // admitted connection still holds its slot.
+        cancel_write.write_all(b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "serve_genesis returned with a connection in flight"
+        );
+        let _ = release_tx.send(());
+        serve.join().expect("serve thread");
+        assert!(returned.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
