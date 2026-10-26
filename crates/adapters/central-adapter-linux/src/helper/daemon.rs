@@ -24,6 +24,7 @@ use super::browser_runtime::{
     remove_browser_approval, runtime_generation_path,
 };
 use super::client::PRODUCTION_SOCKET_PATH;
+use super::grant::CeremonyScope;
 use super::init::{GenesisInitHandler, PresentInitHandler};
 use super::pam_ceremony::PamConfirmer;
 use super::prepare::UnavailablePrepareHandler;
@@ -267,6 +268,29 @@ pub fn run_helper_daemon(
         // policy arm above.
         browser: browser_slot,
         bootstrap_show: bootstrap_show_slot,
+        // `newProductionMigrationLaunchHandler` — the physical-TTY
+        // confirmer, the broker evidence issuer over the configured
+        // socket, and the native CML1 launcher. The reset scope is
+        // composition identity, never request input.
+        migration: {
+            let mut handler = super::migration_launch::MigrationLaunchHandler::new(
+                Box::new(PamConfirmer::new()),
+                Box::new(super::migration_launch::BrokerLaunchEvidenceIssuer::new(
+                    broker_socket_path(env),
+                )),
+                Box::new(super::migration_launch::NativeMigrationProcessLauncher::new()),
+            );
+            handler.set_reset_scope(CeremonyScope {
+                instance_id: "default".to_owned(),
+                target_id: "postgres:central".to_owned(),
+            });
+            Some(Box::new(handler) as Box<dyn super::migration_launch::MigrationLauncher>)
+        },
+        // `newProductionMigrationOutcomeReader` — the broker read
+        // proxy the operator's own CLI cannot perform (SC-DEF-41).
+        migration_outcome: Some(Box::new(
+            super::migration_launch::ProductionMigrationOutcomeReader::new(broker_socket_path(env)),
+        )),
         // `lifecycle` stays unset for the same dependency-chain reason,
         // one link deeper: `infra::lifecycle::new_production_service`
         // needs (1) the B01 advisory evaluator — the same deferred seam

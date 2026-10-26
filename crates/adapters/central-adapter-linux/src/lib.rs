@@ -49,6 +49,8 @@ pub mod infra;
 pub mod launcher_client;
 #[forbid(unsafe_code)]
 pub mod lifecycle_watch;
+
+pub mod migration_launcher;
 #[forbid(unsafe_code)]
 pub mod sandbox;
 pub mod sys;

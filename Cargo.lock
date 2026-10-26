@@ -1029,6 +1029,11 @@ dependencies = [
 [[package]]
 name = "central-migration-launcherd"
 version = "0.1.0"
+dependencies = [
+ "central-adapter-linux",
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "central-restore"

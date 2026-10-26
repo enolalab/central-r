@@ -118,7 +118,6 @@ fn helper_matrix_defers_unimplemented_operator_verbs_exact() {
         verb::PREPARE,
         verb::SECURITY_UPDATE,
         verb::TRUST_INSTALL,
-        verb::MIGRATE_LAUNCH,
         verb::BACKUP_CREATE,
         verb::BACKUP_VERIFY,
         verb::BACKUP_STATUS,
@@ -134,7 +133,6 @@ fn helper_matrix_defers_unimplemented_operator_verbs_exact() {
         verb::SECURITY_RESCUE,
         verb::MAINTENANCE_PLAN,
         verb::MAINTENANCE_APPLY,
-        verb::MIGRATE_READ_OUTCOME,
     ] {
         let resp = helper_request(&server, &req("op-d", v));
         assert_eq!(resp.outcome, "deferred", "verb {v}");
@@ -205,6 +203,18 @@ fn helper_dispatch_implemented_but_handlerless_verbs() {
         assert_eq!(resp.outcome, "denied", "verb {v}");
         assert_eq!(resp.exit_code, 7);
         assert_eq!(resp.reason, "AUTHORITY_DENIED", "verb {v}");
+    }
+    // The R6 task-2 verbs are implemented arms: with no handler
+    // injected each defers with its own upstream reason — never the
+    // closed-slice `UNSUPPORTED_IN_THIS_SLICE`.
+    for (v, reason) in [
+        (verb::MIGRATE_LAUNCH, "MIGRATION_LAUNCH_UNAVAILABLE"),
+        (verb::MIGRATE_READ_OUTCOME, "MIGRATION_OUTCOME_UNAVAILABLE"),
+    ] {
+        let resp = helper_request(&server, &req("op-m", v));
+        assert_eq!(resp.outcome, "deferred", "verb {v}");
+        assert_eq!(resp.exit_code, 5, "verb {v}");
+        assert_eq!(resp.reason, reason, "verb {v}");
     }
 }
 

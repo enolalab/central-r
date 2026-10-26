@@ -35,6 +35,8 @@ pub mod handoff;
 pub mod journal;
 pub mod lifecycle;
 pub mod lifecycle_client;
+pub mod migration_client;
+pub mod migration_launch;
 pub mod payload_epoch;
 pub mod proof;
 pub mod protected_file;

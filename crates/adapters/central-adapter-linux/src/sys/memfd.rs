@@ -187,6 +187,66 @@ pub fn validate_destination(fd: impl AsFd, owner: Uid) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `validateMigrationPassfileDescriptor` + the read half of
+/// `OpenMigrationConnectionFromSealedPassfile` — the *unsealed*
+/// migration passfile shape (upstream: "central-migrate's B05
+/// WriteValueToDescriptor path never applies F_ADD_SEALS, so this
+/// validates shape — regular file, tmpfs, CLOEXEC, bounded size —
+/// instead of seals"). Returns the descriptor's full content, seeks
+/// to 0 first exactly like upstream's `unix.Seek(fd, 0, SeekStart)`.
+///
+/// The returned bytes are `Zeroizing` — the credential line clears
+/// itself on drop exactly like upstream's `defer
+/// zeroRuntimeCredential(value)`.
+///
+/// # Errors
+/// `sys_memfd_denied` on any shape violation; `sys_memfd_os` on the
+/// fcntl/fstat/fstatfs/seek/read failures.
+pub fn read_migration_passfile(fd: impl AsFd) -> Result<zeroize::Zeroizing<Vec<u8>>, Failure> {
+    let fd = fd.as_fd();
+    let flags = rustix::io::fcntl_getfd(fd).map_err(|e| os_failure("fcntl(F_GETFD)", e))?;
+    if !flags.contains(rustix::io::FdFlags::CLOEXEC) {
+        return Err(denied("fd lacks CLOEXEC"));
+    }
+    let st = fstat(fd).map_err(|e| os_failure("fstat", e))?;
+    if !rustix::fs::FileType::from_raw_mode(st.st_mode).is_file() {
+        return Err(denied(format!(
+            "fd is not a regular file (mode={:o})",
+            st.st_mode
+        )));
+    }
+    if st.st_size <= 0 || st.st_size as u64 > MAX_VALUE_BYTES {
+        return Err(denied("fd size is out of bounds"));
+    }
+    let fs = fstatfs(fd).map_err(|e| os_failure("fstatfs", e))?;
+    if fs.f_type != TMPFS_MAGIC {
+        return Err(denied(format!(
+            "fd is not on tmpfs (type={:#x})",
+            fs.f_type
+        )));
+    }
+    seek(fd, SeekFrom::Start(0)).map_err(|e| os_failure("seek", e))?;
+    let mut value = Vec::with_capacity(st.st_size as usize);
+    let mut buf = [0u8; 8192];
+    loop {
+        match rustix::io::read(fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if value.len() + n > (MAX_VALUE_BYTES + 1) as usize {
+                    return Err(denied("fd size is out of bounds"));
+                }
+                value.extend_from_slice(&buf[..n]);
+            }
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(os_failure("read", e)),
+        }
+    }
+    if value.is_empty() || value.len() as u64 > MAX_VALUE_BYTES || value.contains(&0) {
+        return Err(denied("passfile content is out of bounds"));
+    }
+    Ok(zeroize::Zeroizing::new(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

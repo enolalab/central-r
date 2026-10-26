@@ -9,7 +9,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use central_foundation::failure::Failure;
 
@@ -105,10 +105,11 @@ pub struct CredentialDescriptor {
 }
 
 impl CredentialDescriptor {
-    /// The descriptor number for the (task-2) materialization seam.
+    /// The borrowed view [`migrate_compose::run_operator`] takes —
+    /// ownership (and the deferred close) stays with this guard.
     #[must_use]
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

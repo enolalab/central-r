@@ -516,7 +516,7 @@ pub(crate) fn replace_json<T: serde::Serialize>(path: &Path, value: &T) -> Resul
 /// Unique temp-path allocation in `dir` with the given prefix — the
 /// `os.CreateTemp(dir, ".recovery-journal-")` shape upstream uses. The
 /// file is not created here; the caller opens it `O_EXCL`.
-fn unique_tmp(dir: &Path, prefix: &str) -> Result<PathBuf, Failure> {
+pub(crate) fn unique_tmp(dir: &Path, prefix: &str) -> Result<PathBuf, Failure> {
     for _ in 0..64 {
         let mut name = [0u8; 8];
         rustix::rand::getrandom(&mut name, rustix::rand::GetRandomFlags::empty())

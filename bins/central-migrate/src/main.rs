@@ -4,10 +4,11 @@
 //! The operator deliberately accepts no DSN, credential path, or
 //! environment fallback: it is launched by the migration launcher with
 //! the launch evidence on the fixed FD3 and the sealed credential
-//! descriptor on FD4, runs the one bound operation through the
-//! kernel-composed migration coordinator, and reports the outcome
-//! durably through the broker authority — the task-2 seam
-//! [`migrate_compose::run_operator`], which today fails closed.
+//! descriptor on FD4, materializes the broker-authorized
+//! `central_migration` credential onto FD4 through the B05 custody
+//! exchange, runs the one bound operation through the kernel-composed
+//! migration coordinator, and reports the outcome durably through the
+//! broker authority.
 
 mod sys;
 
@@ -52,7 +53,7 @@ fn run() -> Result<(), Failure> {
         command,
         operation_id,
         evidence,
-        credential.as_raw_fd(),
+        credential.as_fd(),
     ))?;
     Ok(())
 }

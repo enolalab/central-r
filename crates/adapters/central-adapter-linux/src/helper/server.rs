@@ -182,6 +182,10 @@ pub struct Server {
     pub prepare: Option<Box<dyn PrepareHandler>>,
     pub lifecycle: Option<Box<dyn LifecycleHandler>>,
     pub init: Option<Box<dyn InitHandler>>,
+    /// `Server.Migration` — the `migrate-launch` handler.
+    pub migration: Option<Box<dyn super::migration_launch::MigrationLauncher>>,
+    /// `Server.MigrationOutcome` — the `migrate-read-outcome` proxy.
+    pub migration_outcome: Option<Box<dyn super::migration_launch::MigrationOutcomeReader>>,
     pub browser: Option<super::browser::BrowserHandler>,
     pub bootstrap_show: Option<super::browser::BootstrapShowHandler>,
     /// Arms the deny-safe gate while non-empty.
@@ -199,6 +203,8 @@ impl Server {
             prepare: None,
             lifecycle: None,
             init: None,
+            migration: None,
+            migration_outcome: None,
             browser: None,
             bootstrap_show: None,
             deny_safe_dir: None,
@@ -331,6 +337,26 @@ impl Server {
                 // Prepare's one route is the injection arm; reaching
                 // dispatch directly gets the matrix's own refusal.
                 Response::deferred(&req.operation_id, "UNSUPPORTED_IN_THIS_SLICE")
+            }
+            v if v == verb::MIGRATE_LAUNCH => {
+                let Some(handler) = &self.migration else {
+                    return Response::deferred(&req.operation_id, "MIGRATION_LAUNCH_UNAVAILABLE");
+                };
+                match super::migration_launch::parse_migration_launch_request(req) {
+                    Ok(launch) => handler.launch(launch, &peer),
+                    Err(_) => Response::denied(&req.operation_id, 2, "INVALID_MIGRATION_COMMAND"),
+                }
+            }
+            v if v == verb::MIGRATE_READ_OUTCOME => {
+                let Some(reader) = &self.migration_outcome else {
+                    return Response::deferred(&req.operation_id, "MIGRATION_OUTCOME_UNAVAILABLE");
+                };
+                match super::migration_launch::parse_migration_outcome_read_request(req) {
+                    Ok(read) => reader.read_outcome(&read, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_MIGRATION_OUTCOME_REQUEST")
+                    }
+                }
             }
             v if v == verb::TRUST_INSTALL => {
                 Response::denied(&req.operation_id, 5, "UNSUPPORTED_IN_THIS_SLICE")

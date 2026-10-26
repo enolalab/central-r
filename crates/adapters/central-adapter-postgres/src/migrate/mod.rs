@@ -19,6 +19,7 @@ pub mod inspector;
 pub mod manifest;
 pub mod reset_runner;
 pub mod runner;
+pub mod runtime_connection;
 mod shape_spec;
 pub mod verify_shape;
 

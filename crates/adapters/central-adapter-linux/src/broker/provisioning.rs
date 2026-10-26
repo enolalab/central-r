@@ -217,7 +217,7 @@ impl ProvisioningRecord {
 
 /// `ProvisioningJournalIntent` — the transition intent journaled before
 /// a mutation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisioningJournalIntent {
     /// `OperationID`.
     #[serde(rename = "OperationID")]

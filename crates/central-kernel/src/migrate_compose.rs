@@ -21,15 +21,25 @@
 //!   binds the real client (R6 task 2 lands it), `without_authority`
 //!   binds [`NullMigrationAuthority`] — the fail-closed read surface.
 //!
-//! The production connect path (`MaterializePostgresMigration` →
-//! sealed passfile on the credential descriptor → fixed-role
-//! `central_migration` connect) lands with the broker client in
-//! task 2; [`run_operator`] is the Task-1 seam and fails closed.
+//! The production connect path lands in [`run_operator`]:
+//! `MaterializePostgresMigration` fills the credential descriptor
+//! (B05, `0xb5`), the validated passfile opens the fixed-role
+//! `central_migration` connection, and
+//! [`BrokerMigrationAuthority`] — the `MigrationProvisioningStore` +
+//! `MigrationOperatorInspector` + proof client composite — supplies
+//! `with_authority`'s three erased refs. `without_authority` keeps
+//! the [`NullMigrationAuthority`] fail-closed read surface for the
+//! DSN-gated test seam.
 
 use std::sync::Arc;
 
+use central_adapter_linux::broker::migration_client::{
+    BrokerMigrationAuthority, MigrationAuthorityClient, MigrationClient, broker_socket_path,
+};
+use central_adapter_linux::sys::memfd::read_migration_passfile;
 use central_adapter_postgres::migrate::{
     BaselineInstaller, DynProofService, Inspector, ResetRunner as PgResetRunner, Runner,
+    runtime_connection,
 };
 use central_backup::app::ProvisioningRecordStore;
 use central_backup::app::{
@@ -390,35 +400,134 @@ impl<'a> MigrationOperator<'a> {
     }
 }
 
-/// `run` — the Task-1 operator seam `central-migrate` calls after its
-/// gates: the production path materializes the broker-authorized
-/// `central_migration` credential onto the supplied descriptor and
-/// composes the authority client over the launch evidence
-/// (upstream `broker.NewMigrationAuthorityClient` +
-/// `MaterializePostgresMigration` + `runMigrationWithAuthority`).
+/// `run` — the production operator seam `central-migrate` calls after
+/// its gates, porting `cmd/central-migrate`'s post-`parseInvocation`
+/// flow verbatim:
 ///
-/// Until the migration-launcher daemon and the broker authority client
-/// land (R6 task 2), this fails closed: a missing materialization is a
-/// `dependency unavailable` answer, never an in-process fallback.
+/// 1. `broker.NewMigrationAuthorityClient` bound to the original
+///    operation ID and the consumed launch evidence.
+/// 2. `MaterializePostgresMigration` — the B05 custody exchange that
+///    fills the (still empty) credential descriptor in place; no DSN
+///    or credential path enters the request.
+/// 3. `runMigrationWithAuthority` — `report_started`, then the
+///    sealed-passfile `central_migration` connect, the bound-target
+///    authority composition, `execute`, and the deferred durable
+///    terminal report. A missing authority, materialization, or
+///    descriptor stays a typed refusal — never a local fallback.
+///
+/// `credential_fd` is the borrowed, already-`CLOEXEC` FD4 the
+/// launcher's handoff produced; ownership (and its deferred close)
+/// stays with the caller, exactly like upstream's `defer
+/// unix.Close(credentialDescriptorFD)`.
 ///
 /// # Errors
-/// Always `Unavailable` in task 1.
-#[allow(clippy::unused_async)]
+/// Nil identities, client construction, B05 materialization,
+/// passfile shape, connect, coordinator execution, or the terminal
+/// report itself — all typed `Failure`s.
 pub async fn run_operator(
     command: MigrationCommand,
     operation_id: uuid::Uuid,
     launch_evidence: uuid::Uuid,
-    credential_fd: std::os::fd::RawFd,
+    credential_fd: std::os::fd::BorrowedFd<'_>,
 ) -> Result<MigrationOperatorResult> {
-    let _ = (command, operation_id, launch_evidence, credential_fd);
-    Err(Failure::unavailable(
-        "migration_authority_unavailable",
-        "broker migration authority is unavailable: the migration launcher daemon lands in task 2",
-    ))
+    if operation_id.is_nil() || launch_evidence.is_nil() {
+        return Err(Failure::invalid(
+            "invalid_migration_execution",
+            "invalid migration execution",
+        ));
+    }
+    let socket = broker_socket_path().to_string_lossy().into_owned();
+    let reporter =
+        MigrationAuthorityClient::new(&socket, operation_id, launch_evidence.to_string())
+            .map_err(|e| wrap("compose broker authority client", e))?;
+    let client = MigrationClient::new(&socket);
+    client
+        .materialize_operator_credential(operation_id, &launch_evidence.to_string(), credential_fd)
+        .map_err(|e| wrap("materialize credential", e))?;
+
+    run_with_authority(&reporter, async {
+        let value = read_migration_passfile(credential_fd).map_err(|e| wrap("connect", e))?;
+        let conn = runtime_connection::open_migration_connection(&value)
+            .await
+            .map_err(|e| wrap("connect", e))?;
+        drop(value);
+        let mut session = MigrationSession::new(conn, None);
+        let target = session.target_identity().await;
+        let authority = BrokerMigrationAuthority::new(reporter.clone(), target.clone());
+        session.proofs = Some(Arc::new(authority.clone()));
+        let mut operator = MigrationOperator::with_authority(session, &authority, target);
+        let result = operator
+            .execute(command, operation_id)
+            .await
+            .map_err(|e| wrap("execute", e))?;
+        Ok(result)
+    })
+    .await
+}
+
+/// `runMigrationWithAuthority` — `ReportStarted` gates execution; the
+/// deferred `ReportTerminal` runs on every outcome path and reports
+/// `failed` with the fixed upstream reason when `execute` errs.
+async fn run_with_authority(
+    reporter: &MigrationAuthorityClient,
+    execute: impl std::future::Future<Output = Result<MigrationOperatorResult>>,
+) -> Result<MigrationOperatorResult> {
+    if let Err(start_err) = reporter.report_started() {
+        // `errors.Join(report-start, terminal-report)` — the start
+        // failure stays primary; a second failure appends.
+        let mut failure = Failure::unavailable(
+            "report_migration_start",
+            format!("report migration start: {}", start_err.message()),
+        );
+        if let Err(report_err) = report_terminal(reporter, false, None) {
+            failure = Failure::unavailable(
+                "report_migration_start",
+                format!("{}\n{}", failure.message(), report_err.message()),
+            );
+        }
+        return Err(failure);
+    }
+    let result = execute.await;
+    let succeeded = result.is_ok();
+    if let Err(report_err) = report_terminal(reporter, succeeded, result.as_ref().ok()) {
+        return Err(match result {
+            Err(exec_err) => Failure::unavailable(
+                "migration_execute",
+                format!("{}\n{}", exec_err.message(), report_err.message()),
+            ),
+            Ok(_) => report_err,
+        });
+    }
+    result
+}
+
+/// `reportMigrationTerminal` — the durable terminal mark. Failure is
+/// reported with upstream's fixed operator-safe reason; durable broker
+/// state is recovery evidence, not a diagnostic sink.
+fn report_terminal(
+    reporter: &MigrationAuthorityClient,
+    succeeded: bool,
+    result: Option<&MigrationOperatorResult>,
+) -> Result<()> {
+    let reason = if succeeded {
+        ""
+    } else {
+        "migration operator failed"
+    };
+    reporter
+        .report_terminal(succeeded, reason, result)
+        .map_err(|e| {
+            Failure::unavailable(
+                "report_migration_terminal",
+                format!("report migration terminal outcome: {}", e.message()),
+            )
+        })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsFd;
+
     use central_foundation::failure::FailureKind;
 
     use super::*;
@@ -454,21 +563,30 @@ mod tests {
         }
     }
 
-    /// Task-1 seam: without the launcher daemon + broker authority the
-    /// operator fails closed `unavailable` — never a silent in-process
-    /// fallback, and a nil operation ID still fails closed the same
-    /// way (the gate precedes any coordinator work).
+    /// The nil-identity gate precedes every broker call — a nil
+    /// operation or evidence ID refuses `invalid` before any socket
+    /// is touched.
     #[tokio::test]
-    async fn run_operator_fails_closed_until_the_launcher_lands() {
+    async fn run_operator_refuses_nil_identities() {
+        let fd = std::fs::File::open("/dev/null").expect("/dev/null");
         let err = run_operator(
             MigrationCommand::Status,
+            uuid::Uuid::nil(),
             uuid::Uuid::now_v7(),
-            uuid::Uuid::now_v7(),
-            -1_i32,
+            fd.as_fd(),
         )
         .await
         .unwrap_err();
-        assert_eq!(err.kind(), FailureKind::Unavailable);
-        assert_eq!(err.code(), "migration_authority_unavailable");
+        assert_eq!(err.kind(), FailureKind::Invalid);
+        assert_eq!(err.code(), "invalid_migration_execution");
+        let err = run_operator(
+            MigrationCommand::Status,
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::nil(),
+            fd.as_fd(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid_migration_execution");
     }
 }

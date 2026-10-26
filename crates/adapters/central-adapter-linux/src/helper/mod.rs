@@ -15,6 +15,7 @@ pub mod init;
 pub mod lifecycle;
 pub mod matrix;
 pub mod migration;
+pub mod migration_launch;
 pub mod pam_ceremony;
 pub mod prepare;
 pub mod protocol;

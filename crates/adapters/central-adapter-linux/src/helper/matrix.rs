@@ -65,8 +65,8 @@ impl Matrix {
         register(verb::WIPE, false, true, true);
         register(verb::BOOTSTRAP_SHOW, true, false, false);
         register(verb::SECURITY_RESCUE_CLEANUP, false, true, false);
-        register(verb::MIGRATE_LAUNCH, false, true, false);
-        register(verb::MIGRATE_READ_OUTCOME, false, false, false);
+        register(verb::MIGRATE_LAUNCH, true, true, false);
+        register(verb::MIGRATE_READ_OUTCOME, true, false, false);
         register(verb::BACKUP_CREATE, false, true, false);
         register(verb::BACKUP_VERIFY, false, false, false);
         register(verb::BACKUP_STATUS, false, false, false);
@@ -145,6 +145,8 @@ mod tests {
             verb::STATUS,
             verb::BROWSER_OPEN,
             verb::BOOTSTRAP_SHOW,
+            verb::MIGRATE_LAUNCH,
+            verb::MIGRATE_READ_OUTCOME,
         ];
         expected.sort_unstable();
         assert_eq!(implemented, expected);
@@ -164,8 +166,6 @@ mod tests {
             verb::RESTORE_APPLY,
             verb::RESTORE_RESUME,
             verb::RESTORE_ABANDON,
-            verb::MIGRATE_LAUNCH,
-            verb::MIGRATE_READ_OUTCOME,
             verb::MAINTENANCE_PLAN,
             verb::MAINTENANCE_APPLY,
         ] {

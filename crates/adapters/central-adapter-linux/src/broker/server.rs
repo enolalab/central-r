@@ -26,11 +26,14 @@ use central_foundation::failure::Failure;
 use central_foundation::identity::{HandoffReceiptId, OperationId, SecretBindingId};
 use central_infra::authority::{
     B04AdoptRequest, B04AdoptResult, B04IssueProofRequest, B04MaterializeRequest,
-    B04MaterializeResult, B05MaterializePostgresMigrationRequest, BrokerEvidence, BrokerOutcome,
+    B04MaterializeResult, B05MaterializePostgresMigrationRequest,
+    B05MaterializePostgresMigrationResult, B05MigrationLaunchResult, BrokerEvidence, BrokerOutcome,
     BrokerRequest, BrokerResponse, LifecycleAuthorization, LifecycleAuthorizationRequest,
     ProtectedGeneration,
 };
-use central_infra::domain::{AdoptRequest, HandoffReceipt, HandoffRequest, Purpose};
+use central_infra::domain::{
+    AdoptRequest, HandoffReceipt, HandoffRequest, MigrationLaunchBinding, Purpose,
+};
 use central_infra::port::LeafSignRequest;
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -42,6 +45,7 @@ use super::bootstrap_session::{self, BootstrapSession};
 use super::handoff::{self, HandoffService};
 use super::journal::Journal;
 use super::lifecycle::LifecycleNonceStore;
+use super::migration_launch::{MigrationLaunchOutcomeState, MigrationLaunchStore};
 use super::payload_epoch::PayloadEpochStore;
 use super::proof::{self, ProofService};
 use super::protected_file::ProtectedFileBackend;
@@ -154,6 +158,8 @@ pub struct Service {
     /// The persistent bootstrap-candidate session
     /// (`s.bootstrapSession`).
     pub bootstrap_session: Option<BootstrapSession>,
+    /// The migration launch evidence/outcome store (`s.launches`).
+    pub launches: Option<MigrationLaunchStore>,
     /// The central runtime UID `isRuntimeOrRootPeer` widens to (ADR
     /// 0013).
     pub runtime_uid: u32,
@@ -213,6 +219,7 @@ impl Service {
             &root_path,
             SigningService::from_key(signing.key_copy()),
         )?);
+        let launches = Some(MigrationLaunchStore::new(&root_path, signing.clone())?);
         Ok(Self {
             root_path,
             backend,
@@ -227,6 +234,7 @@ impl Service {
             handoff,
             bootstrap,
             bootstrap_session,
+            launches,
             runtime_uid,
             bootstrap_mu: Mutex::new(ServiceBootstrapState {
                 bootstraps: BTreeMap::new(),
@@ -252,6 +260,7 @@ impl Service {
         handoff: HandoffService,
         bootstrap: Option<SecretBootstrap>,
         bootstrap_session: Option<BootstrapSession>,
+        launches: Option<MigrationLaunchStore>,
         runtime_uid: u32,
     ) -> Self {
         Self {
@@ -268,6 +277,7 @@ impl Service {
             handoff,
             bootstrap,
             bootstrap_session,
+            launches,
             runtime_uid,
             bootstrap_mu: Mutex::new(ServiceBootstrapState {
                 bootstraps: BTreeMap::new(),
@@ -303,9 +313,7 @@ impl Service {
             // `dispatchMigrationOutcome(req, nil)` — `s.launches == nil`
             // is this slice's permanent state, so upstream's first
             // branch is the whole outcome.
-            MIGRATION_READ_OUTCOME_RPC => {
-                migration_denied(&req.operation_id, "migration launch outcomes unavailable")
-            }
+            MIGRATION_READ_OUTCOME_RPC => self.dispatch_migration_outcome(req, None),
             ADOPT_B03_MINIO_BOOTSTRAP_RPC => self.dispatch_b04_adopt(req),
             ISSUE_B04_LIFECYCLE_PROOF_RPC => self.dispatch_b04_issue_proof(req),
             MATERIALIZE_MINIO_ROOT_RPC => migration_denied(
@@ -736,13 +744,171 @@ impl Service {
         {
             return migration_denied(&req.operation_id, format!("{CLASS}invalid launch identity"));
         }
-        // `s.bootstrap.ActiveBindingForPurpose` — no bootstrap session
-        // exists in this slice, so no protected migration binding can
-        // ever be live; upstream emits this same fixed message.
-        migration_denied(
-            &req.operation_id,
-            format!("{CLASS}protected migration binding unavailable"),
-        )
+        // `s.bootstrap.ActiveBindingForPurpose` — the live protected
+        // binding supplies the lease identity the evidence binds to.
+        let Some(bootstrap) = &self.bootstrap else {
+            return migration_denied(
+                &req.operation_id,
+                format!("{CLASS}protected migration binding unavailable"),
+            );
+        };
+        let Ok((protected, lease)) =
+            bootstrap.active_binding_for_purpose(Purpose::PostgresMigration)
+        else {
+            return migration_denied(
+                &req.operation_id,
+                format!("{CLASS}protected migration binding unavailable"),
+            );
+        };
+        let Some(launches) = &self.launches else {
+            return migration_denied(
+                &req.operation_id,
+                "B05_LAUNCH_ERROR: launch evidence store is unavailable",
+            );
+        };
+        let Ok(op_uuid) = uuid::Uuid::parse_str(&issue.operation_id) else {
+            return migration_denied(&req.operation_id, format!("{CLASS}invalid launch identity"));
+        };
+        let issued = launches.issue(MigrationLaunchBinding {
+            launch_evidence_id: String::new(),
+            operation_id: OperationId::from_trusted_db_bytes(*op_uuid.as_bytes()),
+            binding_id: protected.binding_id,
+            fencing_token: lease.fencing_token,
+            nonce: Vec::new(),
+            peer_uid: CENTRAL_MIGRATE_UID,
+            peer_gid: CENTRAL_MIGRATE_GID,
+            peer_pid: issue.pid,
+            executable: issue.executable,
+            mode: issue.mode,
+            process_start: issue.process_start,
+            deadline: issue.expires_at,
+            created_at: OffsetDateTime::now_utc(),
+            hmac: String::new(),
+        });
+        match issued {
+            Ok(b) => success(
+                &req.operation_id,
+                serde_json::to_value(B05MigrationLaunchResult {
+                    operation_id: b.operation_id.to_string(),
+                    launch_evidence_id: b.launch_evidence_id,
+                })
+                .unwrap_or_default(),
+            ),
+            Err(e) => BrokerResponse {
+                operation_id: req.operation_id.clone(),
+                outcome: BrokerOutcome::Error,
+                result: None,
+                evidence: BrokerEvidence {
+                    operation_id: req.operation_id.clone(),
+                    code: String::new(),
+                    message: format!("B05_LAUNCH_ERROR: {}", e.message()),
+                },
+            },
+        }
+    }
+
+    /// `validateMigrationAuthorityLaunch` — every migration-authority
+    /// RPC from a `central-migrate` peer must carry a consumed launch
+    /// evidence bound to the request's operation ID and the peer's
+    /// process identity.
+    fn validate_migration_authority_launch(
+        &self,
+        req: &BrokerRequest,
+        peer: &PeerCred,
+    ) -> Result<(), Failure> {
+        let Some(launches) = &self.launches else {
+            return Err(Failure::denied("broker", "missing launch authority"));
+        };
+        let Some(payload) = &req.payload else {
+            return Err(Failure::denied("broker", "missing launch authority"));
+        };
+        let Some(raw) = payload.get("launch_evidence_id") else {
+            return Err(Failure::denied("broker", "missing launch evidence"));
+        };
+        let evidence_id = match serde_json::from_str::<String>(raw.get()) {
+            Ok(id) if !id.is_empty() => id,
+            _ => return Err(Failure::denied("broker", "invalid launch evidence")),
+        };
+        let binding = launches.load_consumed_and_validate(&evidence_id, peer)?;
+        if binding.operation_id.to_string() != req.operation_id {
+            return Err(Failure::denied("broker", "launch operation mismatch"));
+        }
+        Ok(())
+    }
+
+    /// `dispatchMigrationOutcome` — report/read the durable launch
+    /// outcome. Reads reconcile an unreported consumed launch to
+    /// `ambiguous` when the operator died; reports are accepted only
+    /// from the validated `central-migrate` peer.
+    fn dispatch_migration_outcome(
+        &self,
+        req: &BrokerRequest,
+        peer: Option<&PeerCred>,
+    ) -> BrokerResponse {
+        let Some(launches) = &self.launches else {
+            return migration_denied(&req.operation_id, "migration launch outcomes unavailable");
+        };
+        let Some(payload) = &req.payload else {
+            return migration_denied(&req.operation_id, "migration launch outcomes unavailable");
+        };
+        let Some(raw) = payload.get("request") else {
+            return migration_denied(
+                &req.operation_id,
+                "missing migration launch outcome request",
+            );
+        };
+        #[derive(Deserialize)]
+        struct OutcomeRequest {
+            launch_evidence_id: String,
+            #[serde(default)]
+            state: Option<MigrationLaunchOutcomeState>,
+            #[serde(default)]
+            reason: Option<String>,
+            #[serde(default)]
+            operator_result: Option<central_backup::app::MigrationOperatorResult>,
+        }
+        let request: OutcomeRequest = match serde_json::from_str::<OutcomeRequest>(raw.get()) {
+            Ok(r) if !r.launch_evidence_id.is_empty() => r,
+            _ => {
+                return migration_denied(
+                    &req.operation_id,
+                    "invalid migration launch outcome request",
+                );
+            }
+        };
+        if req.purpose == MIGRATION_READ_OUTCOME_RPC {
+            return match launches
+                .reconcile_unreported(&request.launch_evidence_id, &req.operation_id)
+            {
+                Ok(outcome) => success(
+                    &req.operation_id,
+                    serde_json::to_value(outcome).unwrap_or_default(),
+                ),
+                Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
+            };
+        }
+        let Some(peer) = peer else {
+            return migration_denied(&req.operation_id, "missing migration launch peer");
+        };
+        let Some(state) = request.state else {
+            return migration_denied(&req.operation_id, "invalid reported outcome");
+        };
+        if let Err(e) = launches.report_outcome(
+            &request.launch_evidence_id,
+            peer,
+            state,
+            request.reason.as_deref().unwrap_or(""),
+            request.operator_result,
+        ) {
+            return migration_denied(&req.operation_id, e.message().to_owned());
+        }
+        match launches.read_outcome(&request.launch_evidence_id, &req.operation_id) {
+            Ok(outcome) => success(
+                &req.operation_id,
+                serde_json::to_value(outcome).unwrap_or_default(),
+            ),
+            Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
+        }
     }
 
     /// `dispatchMigrationProof` — the six migration proof RPCs over the
@@ -1356,20 +1522,225 @@ impl Service {
         protocol::write_response(conn, &resp)
     }
 
-    /// `handleB05MaterializeTransport` — no launch evidence store in
-    /// this slice: upstream's exact `s.launches == nil` denial.
+    /// `handleB05MaterializeTransport` — the full postgres_migration
+    /// materialization flow in descriptor-first order, mirroring B04:
+    ///
+    /// 1. Receive and validate the destination FD via `SCM_RIGHTS`
+    /// 2. `ValidateMaterializeRequest` (no plaintext released)
+    /// 3. `StartReserved` + `StartWrite`
+    /// 4. `ResolveCredential` (plaintext only after FD validated)
+    /// 5. `WriteValueToDescriptor` + fsync + close
+    /// 6. `CompleteBrokerWrite` + ACK frame `[0x01|len|986|986|"b05-ok:"+hmac]`
+    /// 7. Helper confirmation `0x03`
+    /// 8. `ConfirmHelperAcknowledged` + `AcknowledgeMaterialization`
+    /// 9. JSON response
+    ///
+    /// B05 adds the launch-evidence gate up front: `LoadAndConsume`
+    /// tombstones the evidence so no second credential can ever be
+    /// disclosed for it, `ValidatePeer` re-verifies the operator's
+    /// process identity, and `FailConsumed` settles the outcome to
+    /// `failed` when any later step cannot complete.
     fn handle_b05_materialize_transport(
         &self,
         conn: &mut super::deadline::DeadlineStream,
         req: &BrokerRequest,
-        _peer: &PeerCred,
+        peer: &PeerCred,
     ) -> Result<(), Failure> {
-        protocol::write_deny(
-            conn,
-            &req.operation_id,
-            "B05_HANDOFF_DENIED: launch evidence store is unavailable",
+        const CLASS: &str = "B05_HANDOFF_DENIED: ";
+        macro_rules! deny {
+            ($msg:expr) => {{
+                protocol::write_deny(conn, &req.operation_id, &format!("{}{}", CLASS, $msg));
+                return Ok(());
+            }};
+        }
+        let Some(raw) = req.payload.as_ref().and_then(|p| p.get("request")) else {
+            deny!("missing request field");
+        };
+        let wire_req: B05MaterializePostgresMigrationRequest = match serde_json::from_str(raw.get())
+        {
+            Ok(w) => w,
+            Err(_) => deny!("invalid request"),
+        };
+        if req.operation_id != wire_req.operation_id {
+            deny!("outer operation mismatch");
+        }
+        if wire_req.service != "central-migrate"
+            || wire_req.target != "scm_rights"
+            || wire_req.uid != CENTRAL_MIGRATE_UID
+            || wire_req.gid != CENTRAL_MIGRATE_GID
+        {
+            deny!("invalid dependency binding");
+        }
+        if wire_req.peer_uid != peer.uid.as_raw() || wire_req.peer_pid != peer.pid.as_raw_pid() {
+            deny!("peer identity mismatch");
+        }
+        let Ok(op_uuid) = uuid::Uuid::parse_str(&wire_req.operation_id) else {
+            deny!("invalid operation id");
+        };
+        let op_id = OperationId::from_trusted_db_bytes(*op_uuid.as_bytes());
+        let Some(launches) = &self.launches else {
+            deny!("launch evidence store is unavailable");
+        };
+        let Some(bootstrap) = &self.bootstrap else {
+            deny!("launch evidence store is unavailable");
+        };
+        let launch_binding = match launches.load_and_consume(&wire_req.launch_evidence_id) {
+            Ok(b) => b,
+            Err(e) => deny!(format!("launch evidence: {}", e.message())),
+        };
+        // From here on, any refusal settles the consumed launch to
+        // `failed` — upstream's deferred `FailConsumed`.
+        macro_rules! deny_settle {
+            ($msg:expr) => {{
+                let _ = launches.fail_consumed(
+                    &launch_binding,
+                    "migration credential materialization failed",
+                );
+                deny!($msg);
+            }};
+        }
+        if launch_binding.operation_id != op_id {
+            deny_settle!("launch evidence operation mismatch");
+        }
+        if (!wire_req.binding_id.is_empty()
+            && wire_req.binding_id != launch_binding.binding_id.to_string())
+            || (wire_req.fencing_token != 0
+                && wire_req.fencing_token != launch_binding.fencing_token)
+        {
+            deny_settle!("caller attempted to replace protected binding");
+        }
+        if let Err(e) = launches.validate_peer(&launch_binding, peer) {
+            deny_settle!(format!("launch evidence: {}", e.message()));
+        }
+
+        let mut handoff_req = HandoffRequest {
+            binding_id: launch_binding.binding_id,
+            operation_id: op_id,
+            receipt_id: HandoffReceiptId::new(),
+            receipt_hmac: String::new(),
+            fencing_token: launch_binding.fencing_token,
+            peer_uid: peer.uid.as_raw(),
+            peer_pid: peer.pid.as_raw_pid(),
+            purpose: Purpose::PostgresMigration,
+            service: wire_req.service,
+            target: wire_req.target,
+            uid: wire_req.uid,
+            gid: wire_req.gid,
+        };
+        handoff_req.receipt_hmac = bootstrap.compute_receipt_hmac(&handoff_req);
+
+        // Step 1: receive and validate the destination descriptor
+        // before any plaintext is read.
+        let fd = match handoff::receive_descriptor(conn) {
+            Ok(fd) => fd,
+            Err(e) => deny_settle!(format!("transport: {}", e.message())),
+        };
+
+        // Step 2: validate the request (no plaintext released).
+        let (receipt, op) = match bootstrap.validate_materialize_request(&handoff_req) {
+            Ok(pair) => pair,
+            Err(e) => deny_settle!(e.message().to_owned()),
+        };
+        if let Some(op) = &op {
+            debug_assert!(
+                op.operation_id == receipt.operation_id,
+                "receipt {} names a different operation than op {}",
+                receipt.receipt_id,
+                op.operation_id
+            );
+        }
+
+        // Step 3: reserved → write_started.
+        if let Err(e) = bootstrap.start_reserved(receipt.operation_id) {
+            deny_settle!(format!("state: {}", e.message()));
+        }
+        if let Err(e) = bootstrap.start_write(receipt.operation_id) {
+            deny_settle!(format!("state: {}", e.message()));
+        }
+
+        // Step 4: resolve the credential — plaintext enters the
+        // process only after the descriptor is validated.
+        let secret = match bootstrap.resolve_credential(&receipt) {
+            Ok(s) => zeroize::Zeroizing::new(s),
+            Err(e) => deny_settle!(format!("resolve: {}", e.message())),
+        };
+
+        // Step 5: write the value into the descriptor (fd consumed).
+        if let Err(e) = handoff::write_value_to_descriptor(fd, &secret) {
+            deny_settle!(format!("write: {}", e.message()));
+        }
+        drop(secret);
+
+        // Step 6: broker write complete → ACK frame.
+        if let Err(e) = bootstrap.complete_broker_write(receipt.operation_id) {
+            deny_settle!(format!("state: {}", e.message()));
+        }
+        // `b05-materialize` fingerprint over the returned receipt —
+        // uid/gid are the migrate identity.
+        let proof_payload = format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            receipt.binding_id,
+            receipt.operation_id,
+            receipt.receipt_id,
+            receipt.purpose.as_str(),
+            receipt.peer_uid,
+            receipt.peer_pid,
+            receipt.service,
+            receipt.target,
+            receipt.uid,
+            receipt.gid
         );
-        Ok(())
+        let receipt_hmac = self
+            .signing
+            .fingerprint("b05-materialize", proof_payload.as_bytes());
+        let mut opaque_proof = Vec::with_capacity("b05-ok:".len() + receipt_hmac.len());
+        opaque_proof.extend_from_slice(b"b05-ok:");
+        opaque_proof.extend_from_slice(receipt_hmac.as_bytes());
+        let mut frame = Vec::with_capacity(7 + opaque_proof.len());
+        frame.push(0x01);
+        frame.extend_from_slice(&(opaque_proof.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&(CENTRAL_MIGRATE_UID as u16).to_be_bytes());
+        frame.extend_from_slice(&(CENTRAL_MIGRATE_GID as u16).to_be_bytes());
+        frame.extend_from_slice(&opaque_proof);
+        if let Err(e) = conn.write_all(&frame) {
+            let _ = launches.fail_consumed(
+                &launch_binding,
+                "migration credential materialization failed",
+            );
+            return Err(Failure::internal(
+                "broker",
+                format!("B05 transport: write ack: {e}"),
+            ));
+        }
+
+        // Step 7: read the helper's ownership confirmation (`0x03`).
+        let mut confirmation = [0u8; 1];
+        if conn.read_exact(&mut confirmation).is_err() || confirmation[0] != 0x03 {
+            deny_settle!("helper did not confirm ownership handoff");
+        }
+
+        // Step 8: helper acknowledged → acknowledged.
+        if let Err(e) = bootstrap.confirm_helper_acknowledged(receipt.operation_id) {
+            deny_settle!(format!("helper ack: {}", e.message()));
+        }
+        if let Err(e) = bootstrap.acknowledge_materialization(receipt.operation_id) {
+            deny_settle!(format!("acknowledge: {}", e.message()));
+        }
+
+        // Step 9: the safe JSON response — identities and the opaque
+        // receipt HMAC only, never plaintext.
+        let resp = success(
+            &req.operation_id,
+            serde_json::to_value(B05MaterializePostgresMigrationResult {
+                operation_id: receipt.operation_id.to_string(),
+                receipt_id: receipt.receipt_id.to_string(),
+                binding_id: receipt.binding_id.to_string(),
+                opaque_token: receipt.hmac.clone(),
+                safe_next_action: String::new(),
+            })
+            .unwrap_or_default(),
+        );
+        protocol::write_response(conn, &resp)
     }
 
     /// `handleB10MinioRuntimeTransport` — the runtime binding store is
@@ -1805,22 +2176,25 @@ fn dispatch_json(
             format!("broker: denied UID {}", peer.uid.as_raw()),
         ));
     }
-    if is_central_migrate_peer(peer) && is_migration_authority_purpose(&req.purpose) {
-        // `validateMigrationAuthorityLaunch` — the launch evidence store
-        // is R6, so every migration launch validation fails closed with
-        // upstream's `s.launches == nil` message.
+    if is_central_migrate_peer(peer)
+        && is_migration_authority_purpose(&req.purpose)
+        && let Err(e) = svc.validate_migration_authority_launch(req, peer)
+    {
         protocol::write_deny(
             conn,
             &req.operation_id,
-            "B05_MIGRATION_AUTHORITY_DENIED: missing launch authority",
+            &format!("B05_MIGRATION_AUTHORITY_DENIED: {}", e.message()),
         );
         return Err(Failure::denied(
             "broker",
-            "broker: migration authority launch validation: missing launch authority",
+            format!(
+                "broker: migration authority launch validation: {}",
+                e.message()
+            ),
         ));
     }
     if req.purpose == MIGRATION_REPORT_OUTCOME_RPC {
-        let resp = migration_denied(&req.operation_id, "migration launch outcomes unavailable");
+        let resp = svc.dispatch_migration_outcome(req, Some(peer));
         let _ = protocol::write_response(conn, &resp);
         return Ok(());
     }
