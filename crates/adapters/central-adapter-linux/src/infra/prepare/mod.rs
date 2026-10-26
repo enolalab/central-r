@@ -28,7 +28,8 @@ pub mod service;
 
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::path::Path;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use central_foundation::failure::Failure;
@@ -133,6 +134,18 @@ impl OpDeadline {
     #[must_use]
     pub fn remaining(&self) -> Option<std::time::Duration> {
         self.0.map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    /// `context.WithTimeout` nested inside the caller's context — the
+    /// earlier of the two deadlines wins, so a capability's own budget
+    /// can bound an acquisition without ever outliving the operation
+    /// deadline the helper set.
+    #[must_use]
+    pub fn bounded_by(self, other: Self) -> Self {
+        match (self.0, other.0) {
+            (Some(a), Some(b)) => Self(Some(a.min(b))),
+            (a, b) => Self(a.or(b)),
+        }
     }
 }
 
@@ -312,4 +325,131 @@ fn split_parent_leaf(name: &str) -> (&str, &str) {
         }
         None => (".", name),
     }
+}
+
+/// `os.MkdirAll(path, mode)` — `fs::create_dir_all` inherits the
+/// umask, and upstream pins a mode on every directory it creates.
+/// The mode applies to each directory the builder creates; existing
+/// ones keep theirs, exactly like `MkdirAll`.
+///
+/// # Errors
+/// `io::Error` from the underlying `mkdir` calls.
+pub(crate) fn mkdir_all(path: &Path, mode: u32) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(mode)
+        .create(path)
+}
+
+/// `filepath.Join` + `strings.HasPrefix(target, root+sep)` — the
+/// lexical half of upstream's `containedPath`. Go's `Join` *cleans*
+/// its result, so a `..` member resolves against `root` before the
+/// prefix question is asked; Rust's `Path::join` keeps `..` verbatim
+/// and `Path::starts_with` compares components verbatim, so
+/// `root/../../x` "starts with" `root` and a verbatim check is a dead
+/// gate. Both sides are normalized lexically here first; a `..` that
+/// pops past the filesystem root cannot be contained, so the answer
+/// fails closed too.
+pub(crate) fn lexically_contained(root: &Path, target: &Path) -> bool {
+    fn normalize(p: &Path) -> Option<PathBuf> {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if !out.pop() {
+                        return None;
+                    }
+                }
+                other => out.push(other.as_os_str()),
+            }
+        }
+        Some(out)
+    }
+    let Some(norm_target) = normalize(target) else {
+        return false;
+    };
+    let norm_root = normalize(root).unwrap_or_else(|| root.to_path_buf());
+    norm_target == norm_root || norm_target.starts_with(&norm_root)
+}
+
+/// `tar.TypeReg` — the raw `'0'` typeflag. The `tar` crate folds `'0'`
+/// and `TypeRegA` (`'\0'`) into `EntryType::Regular`, and upstream's
+/// switches distinguish them (the fetch and OCI-layout extractors
+/// accept only `TypeReg`; the release extractor accepts both), so the
+/// raw header byte is what the closed policy checks.
+pub(crate) fn raw_type_is_reg(header: &tar::Header) -> bool {
+    header.as_bytes().get(156) == Some(&b'0')
+}
+
+/// `exec.CommandContext` — spawn + poll instead of `.output()`'s
+/// uninterruptible wait: when `deadline` lapses the child is killed
+/// and reaped and the cancelled failure is returned, so a bounded
+/// operation cannot be held open by a child that ignores its budget.
+/// The pipes are drained on reader threads so a chatty child cannot
+/// block on a full pipe while the loop polls.
+///
+/// Deliberately not used for best-effort cleanup (upstream's plain
+/// `exec.Command` sites, e.g. `remove_isolated_daemon`): teardown must
+/// outlive the operation deadline, not die with it.
+///
+/// # Errors
+/// `cancelled` once `deadline` lapses (the child is SIGKILLed and
+/// reaped first); `internal` `code` on spawn/wait failures.
+pub(crate) fn run_bounded(
+    deadline: OpDeadline,
+    command: &mut std::process::Command,
+    code: &'static str,
+    what: &str,
+) -> Result<std::process::Output, Failure> {
+    fn drain<P: std::io::Read + Send + 'static>(
+        pipe: Option<P>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| Failure::internal(code, format!("dependencyprepare: {what}: {e}")))?;
+    let out_thread = drain(child.stdout.take());
+    let err_thread = drain(child.stderr.take());
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if let Err(failed) = deadline.check() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_thread.join();
+                    let _ = err_thread.join();
+                    return Err(failed);
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_thread.join();
+                let _ = err_thread.join();
+                return Err(Failure::internal(
+                    code,
+                    format!("dependencyprepare: {what}: wait: {e}"),
+                ));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    })
 }

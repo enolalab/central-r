@@ -28,7 +28,10 @@ use flate2::read::GzDecoder;
 use sha2::{Digest as _, Sha256};
 
 use super::module_cache::{self, ModuleAcquirer};
-use super::{OpDeadline, hex_lower, prepare_fetch_codes as fc};
+use super::{
+    OpDeadline, hex_lower, lexically_contained, mkdir_all, prepare_fetch_codes as fc,
+    raw_type_is_reg,
+};
 
 /// `allowlistedHeaders` — the only request headers that may reach the
 /// wire. An `Authorization` header is the shape a `.netrc`- or
@@ -166,26 +169,20 @@ impl FetchError {
     }
 }
 
-/// `isTransientFetchError` — what a retry may be spent on. A digest
-/// mismatch, a size overrun, a redirect off the locked chain, a
-/// disallowed address, a credential, a cookie, a client cert, or a
-/// non-allowlisted header are all statements about the request or the
-/// content and are terminal. 429 and 5xx are the only statuses worth
-/// another attempt; a transport failure retries only on timeout.
+/// `isTransientFetchError` — what a retry may be spent on. Only the
+/// two classes upstream names as transient may spend an attempt: a
+/// refused status retries on 429 or 5xx (`fetchStatusError.transient`),
+/// and a transport failure retries on timeout (`netErr.Timeout()`).
+/// Everything else — the sentinel policy refusals (digest, size,
+/// redirect, address, cookie, credential, client certificate,
+/// non-allowlist header) and every *unrecognized* failure — is
+/// non-transient: upstream's switch falls through to `return false`
+/// for anything it does not name, and `Terminal` is exactly that
+/// default arm here.
 #[must_use]
 pub fn is_transient_fetch_error(err: &FetchError) -> bool {
-    const TERMINAL_CODES: [&str; 8] = [
-        fc::FETCH_DIGEST,
-        fc::FETCH_SIZE_EXCEEDED,
-        fc::FETCH_REDIRECT,
-        fc::FETCH_ADDRESS,
-        fc::FETCH_COOKIE,
-        fc::FETCH_CREDENTIAL,
-        fc::FETCH_CLIENT_CERT,
-        fc::FETCH_NON_ALLOWLIST_HEADER,
-    ];
     match err {
-        FetchError::Terminal(f) => !TERMINAL_CODES.contains(&f.code()),
+        FetchError::Terminal(_) => false,
         FetchError::Status(status) => *status == 429 || *status >= 500,
         FetchError::Transport(t) => t.timed_out,
     }
@@ -323,6 +320,12 @@ impl Fetcher {
 
         let client = self.client_for(&capability)?;
 
+        // `context.WithTimeout(ctx, capability.Deadline())` — the
+        // capability's own budget bounds the whole acquisition: every
+        // attempt and every backoff between them, and never longer
+        // than the operation deadline the caller passed.
+        let acquisition = deadline.bounded_by(OpDeadline::after(capability.deadline()));
+
         let retry = &lock.retry;
         retry.validate().map_err(|e| {
             Failure::invalid(
@@ -333,12 +336,15 @@ impl Fetcher {
 
         let mut last_err: Option<FetchError> = None;
         for attempt in 1..=retry.max_attempts {
-            deadline.check()?;
+            acquisition.check()?;
             let wait = retry.backoff(attempt);
             if !wait.is_zero() {
-                std::thread::sleep(wait);
+                // `<-ctx.Done()` during the wait aborts the fetch: an
+                // uninterruptible `thread::sleep` would overrun the
+                // capability budget by the whole backoff.
+                sleep_bounded(acquisition, wait)?;
             }
-            match self.attempt(deadline, &client, &url, &capability, &art) {
+            match self.attempt(acquisition, &client, &url, &capability, &art) {
                 Ok(written) => {
                     return Ok(Candidate {
                         selector: selector.to_owned(),
@@ -484,12 +490,20 @@ impl Fetcher {
             p
         };
         let cleanup = scopeguard(&tmp_path);
-        let mut tmp_file = File::create(&tmp_path).map_err(|e| {
-            FetchError::Terminal(Failure::internal(
-                fc::FETCH_TRANSPORT,
-                format!("dependencyprepare: create temp file: {e}"),
-            ))
-        })?;
+        // `os.CreateTemp` — 0600 like upstream's; `File::create` would
+        // inherit the umask.
+        let mut tmp_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| {
+                FetchError::Terminal(Failure::internal(
+                    fc::FETCH_TRANSPORT,
+                    format!("dependencyprepare: create temp file: {e}"),
+                ))
+            })?;
         let mut hasher = Sha256::new();
         let written =
             io::copy(&mut limited, &mut tee(&mut tmp_file, &mut hasher)).map_err(|e| {
@@ -624,7 +638,7 @@ impl Fetcher {
                 ));
             }
         }
-        fs::create_dir_all(dest_dir).map_err(|e| {
+        mkdir_all(dest_dir, 0o700).map_err(|e| {
             Failure::internal(
                 "FETCH_STAGE",
                 format!("dependencyprepare: create build context: {e}"),
@@ -783,6 +797,13 @@ pub fn fetch_url(
 /// wins outright; a relative one resolves against the URL that
 /// redirected. Only the pieces the redirect walker checks matter —
 /// scheme, host, port, path.
+///
+/// This is a hand-rolled subset of RFC 3986 reference resolution —
+/// dot-segment, query, and fragment handling diverge from
+/// `url.Parse`. The divergence is fail-closed: a name this subset
+/// resolves differently than `url.Parse` still has to match the
+/// locked chain's scheme/host/port/path-prefix in
+/// `check_redirect_hop`, and a mismatch there refuses the hop.
 fn resolve_url(base: &str, location: &str) -> Result<String, String> {
     let loc = location.trim();
     if loc.starts_with("https://") || loc.starts_with("http://") {
@@ -1031,7 +1052,7 @@ pub fn extract_archive(
 
         match header_type {
             tar::EntryType::Directory => {
-                fs::create_dir_all(&target).map_err(|e| {
+                mkdir_all(&target, 0o700).map_err(|e| {
                     Failure::internal(
                         "FETCH_EXTRACT",
                         format!("dependencyprepare: create {relative}: {e}"),
@@ -1048,7 +1069,7 @@ pub fn extract_archive(
                     ));
                 }
                 if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
+                    mkdir_all(parent, 0o700).map_err(|e| {
                         Failure::internal(
                             "FETCH_EXTRACT",
                             format!("dependencyprepare: create {relative}: {e}"),
@@ -1121,7 +1142,7 @@ pub fn extract_archive(
                     )
                 })?;
                 if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
+                    mkdir_all(parent, 0o700).map_err(|e| {
                         Failure::internal(
                             "FETCH_EXTRACT",
                             format!("dependencyprepare: create {relative}: {e}"),
@@ -1147,14 +1168,6 @@ pub fn extract_archive(
         }
     }
     Ok(())
-}
-
-/// `raw_type_is_reg` — upstream's `case tar.TypeReg` accepts only the
-/// raw `'0'` typeflag, not `'\0'` (`TypeRegA`). The `tar` crate folds
-/// both into `EntryType::Regular`, so the raw header byte is checked
-/// here for parity.
-fn raw_type_is_reg(header: &tar::Header) -> bool {
-    header.as_bytes().get(156) == Some(&b'0')
 }
 
 /// `archiveEntryPath` — validate one entry's name and strip the
@@ -1265,43 +1278,36 @@ pub fn contained_path(root: &Path, relative: &str) -> Result<PathBuf, Failure> {
 }
 
 /// The containment half of `containedPath`, shared with the symlink
-/// check which joins a link target onto a different base.
-///
-/// Both sides are normalized lexically first: `Path::starts_with`
-/// compares components verbatim, so `root/../../etc` "starts with"
-/// `root` — the join has to be resolved like `filepath.Clean` before
-/// the prefix question is even asked. A `..` that pops past the
-/// filesystem root cannot be contained, so it fails closed too.
+/// check which joins a link target onto a different base. Both sides
+/// are normalized lexically inside [`lexically_contained`] first:
+/// `Path::starts_with` compares components verbatim, so
+/// `root/../../etc` "starts with" `root` — the join has to be
+/// resolved like `filepath.Clean` before the prefix question is even
+/// asked.
 fn contained_path_check(root: &Path, target: &Path) -> Result<(), Failure> {
-    fn normalize(p: &Path) -> Option<PathBuf> {
-        let mut out = PathBuf::new();
-        for c in p.components() {
-            match c {
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir => {
-                    if !out.pop() {
-                        return None;
-                    }
-                }
-                other => out.push(other.as_os_str()),
-            }
-        }
-        Some(out)
-    }
-    let norm_target = normalize(target).ok_or_else(|| {
-        Failure::invalid(
-            fc::FETCH_POLICY,
-            "dependencyprepare: fetch policy violation: path escapes the build context",
-        )
-    })?;
-    let norm_root = normalize(root).unwrap_or_else(|| root.to_path_buf());
-    if norm_target != norm_root && !norm_target.starts_with(&norm_root) {
+    if !lexically_contained(root, target) {
         return Err(Failure::invalid(
             fc::FETCH_POLICY,
             "dependencyprepare: fetch policy violation: path escapes the build context",
         ));
     }
     Ok(())
+}
+
+/// `select { case <-ctx.Done(): return ctx.Err(); case <-timer.C: }` —
+/// the retry backoff is slept in short slices so a lapsed deadline
+/// aborts the wait instead of the sleep overrunning the capability
+/// budget by the whole backoff.
+fn sleep_bounded(deadline: OpDeadline, wait: Duration) -> Result<(), Failure> {
+    const SLICE: Duration = Duration::from_millis(10);
+    let mut remaining = wait;
+    while !remaining.is_zero() {
+        deadline.check()?;
+        let slice = remaining.min(SLICE);
+        std::thread::sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+    deadline.check()
 }
 
 /// `HttpTransport` — the production transport placeholder. The
@@ -1641,6 +1647,12 @@ mod tests {
                 "{code} must be terminal"
             );
         }
+        // A Terminal failure whose code is not on the sentinel list is
+        // still non-transient — upstream's default arm retries nothing
+        // it does not recognize.
+        assert!(!is_transient_fetch_error(&FetchError::Terminal(
+            Failure::invalid("FETCH_NOT_A_SENTINEL", "x")
+        )));
         // 429 + 5xx retry; 4xx does not.
         assert!(is_transient_fetch_error(&FetchError::Status(429)));
         assert!(is_transient_fetch_error(&FetchError::Status(503)));
@@ -2275,6 +2287,41 @@ mod tests {
         assert_eq!(candidate.phase, Some(PreparePhase::Acquiring));
         assert_eq!(candidate.source_bytes, body.len() as i64);
         assert!(base.join("minio.tar.gz").is_file());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// `context.WithTimeout(ctx, capability.Deadline())` — the whole
+    /// acquisition is bounded by the capability deadline, so a backoff
+    /// that would outrun it aborts the fetch instead of sleeping
+    /// through the budget.
+    #[test]
+    fn fetch_aborts_backoff_at_capability_deadline() {
+        let base = tempdir("capdeadline");
+        let transport = FakeTransport {
+            responses: Mutex::new(vec![FakeResponse {
+                status: 503,
+                headers: vec![],
+                body: vec![],
+            }]),
+            requests: Mutex::new(Vec::new()),
+        };
+        let mut capability = test_capability();
+        capability.deadline_ms = 50;
+        let lock = lock_with_retry(
+            capability,
+            RetryPolicy {
+                max_attempts: 3,
+                backoff_ms: vec![60_000, 60_000],
+            },
+        );
+        let f = Fetcher::new(&lock, &base).with_transport(Box::new(transport));
+        let started = std::time::Instant::now();
+        let err = f.fetch(OpDeadline::NONE, "minio").unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the backoff slept through the capability deadline"
+        );
+        assert_eq!(err.code(), "OPERATION_DEADLINE");
         fs::remove_dir_all(&base).ok();
     }
 

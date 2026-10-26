@@ -13,14 +13,15 @@ pub struct LockAdapter {
 }
 
 impl LockAdapter {
-    /// `NewLockAdapter` — loads the embedded lock and verifies every
-    /// identity it ships (upstream `LoadLock`, which runs the full
-    /// verification suite at parse).
+    /// `NewLockAdapter` — loads the embedded lock (upstream `LoadLock`:
+    /// schema, strict-parse, and capability validation at load; the
+    /// lock digest and pinned identities are separate calls the
+    /// consuming stages make, not part of loading).
     ///
     /// # Errors
-    /// Any lock verification failure — schema, digest, identities,
-    /// capability shapes — refuses construction rather than handing a
-    /// questionable lock to a later stage.
+    /// Any lock-load failure — schema, parse, mode table, recipe
+    /// digest, capability shapes — refuses construction rather than
+    /// handing a questionable lock to a later stage.
     pub fn new() -> Result<Self, Failure> {
         Ok(Self {
             lock: prepare::load_lock()?,

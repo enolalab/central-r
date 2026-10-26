@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use central_foundation::failure::Failure;
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 use super::buildkit::inventory_from_oci_layout;
-use super::{OpDeadline, ReleaseRoot, hex_lower};
+use super::{OpDeadline, ReleaseRoot, hex_lower, lexically_contained, mkdir_all};
 
 /// `ReleasePaths`'s fixed entry set: every entry known, every entry
 /// bounded. `want` maps each staged relative name to its cap.
@@ -80,25 +80,15 @@ pub fn stage_release_dir(
     })?;
     let staged = {
         // `os.MkdirTemp(workdir, "release-")` — a fresh, uniquely named
-        // staging dir, mode 0700.
+        // staging dir created mode 0700 atomically; `fs::create_dir`
+        // would inherit the umask and a post-create chmod would leave
+        // a looser-mode window.
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             let candidate = workdir.join(format!("release-{}-{}", std::process::id(), attempt));
-            match fs::create_dir(&candidate) {
-                Ok(()) => {
-                    fs::set_permissions(
-                        &candidate,
-                        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-                    )
-                    .map_err(|e| {
-                        Failure::invalid(
-                            prepare_codes::RELEASE_UNREADABLE,
-                            format!("dependencyprepare: release unreadable: stage dir: {e}"),
-                        )
-                    })?;
-                    break candidate;
-                }
+            match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => break candidate,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 64 => {
                     continue;
                 }
@@ -294,7 +284,7 @@ fn stage_one_file(
         ));
     }
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
+        mkdir_all(parent, 0o700).map_err(|e| {
             Failure::invalid(
                 prepare_codes::RELEASE_UNREADABLE,
                 format!("dependencyprepare: release unreadable: stage {name}: {e}"),
@@ -369,7 +359,7 @@ pub fn extract_release_tar(
             ),
         )
     })?;
-    fs::create_dir_all(dest_dir).map_err(|e| {
+    mkdir_all(dest_dir, 0o700).map_err(|e| {
         Failure::invalid(
             prepare_codes::RELEASE_UNREADABLE,
             format!("dependencyprepare: release unreadable: extract dir: {e}"),
@@ -425,7 +415,7 @@ pub fn extract_release_tar(
             ));
         }
         let target = dest_dir.join(&name);
-        if target != dest_dir && !target.starts_with(dest_dir) {
+        if !lexically_contained(dest_dir, &target) {
             return Err(Failure::invalid(
                 prepare_codes::RELEASE_INVALID,
                 format!(
@@ -436,7 +426,7 @@ pub fn extract_release_tar(
         }
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
-                fs::create_dir_all(&target).map_err(|e| {
+                mkdir_all(&target, 0o700).map_err(|e| {
                     Failure::invalid(
                         prepare_codes::RELEASE_UNREADABLE,
                         format!("dependencyprepare: release unreadable: create {name}: {e}"),
@@ -448,7 +438,7 @@ pub fn extract_release_tar(
             // host, which writes both; upstream accepts both here.
             tar::EntryType::Regular => {
                 if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
+                    mkdir_all(parent, 0o700).map_err(|e| {
                         Failure::invalid(
                             prepare_codes::RELEASE_UNREADABLE,
                             format!("dependencyprepare: release unreadable: create {name}: {e}"),
@@ -620,8 +610,15 @@ pub fn read_infra_save_manifest(
                 ),
             ));
         }
+        // `containedPath(dir, cfgName)` — the containment question is
+        // asked of the *normalized join*: Go's `filepath.Join` cleans
+        // its result so `..` resolves against `dir`, while `Path::join`
+        // keeps it verbatim and `starts_with` compares components
+        // verbatim — `dir/../x` "starts with" `dir`, which would make
+        // this a dead gate (the kernel read would then escape, just
+        // reported under the wrong refusal class).
         let cfg_path = dir.join(&cfg_name);
-        if cfg_path != dir && !cfg_path.starts_with(&dir) {
+        if !lexically_contained(&dir, &cfg_path) {
             return Err(Failure::invalid(
                 prepare_codes::RELEASE_INVALID,
                 format!(
@@ -660,11 +657,12 @@ struct InfraSaveEntry {
     layers: Vec<String>,
 }
 
-/// `os.MkdirTemp(tmpdir, prefix)` — a fresh scratch dir.
+/// `os.MkdirTemp(tmpdir, prefix)` — a fresh scratch dir, created mode
+/// 0700 atomically (`fs::create_dir` would inherit the umask).
 fn scratch_dir(tmpdir: &Path, prefix: &str) -> Result<PathBuf, Failure> {
     for attempt in 0u32..64 {
         let candidate = tmpdir.join(format!("{prefix}{}-{}", std::process::id(), attempt));
-        match fs::create_dir(&candidate) {
+        match fs::DirBuilder::new().mode(0o700).create(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
@@ -939,6 +937,35 @@ mod tests {
         assert_eq!(config, digest);
         assert_eq!(tags, ["test:latest"]);
         fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A manifest `Config` of `../escape` is refused by the lexical
+    /// containment check itself — the joined path is normalized before
+    /// the component-prefix compare, so `scratch/../escape` cannot
+    /// pass even when the escape target exists and is readable
+    /// (upstream `filepath.Join` cleans; Rust's `Path::join` does
+    /// not, which is what made the verbatim `starts_with` a dead
+    /// gate).
+    #[test]
+    fn infra_save_manifest_refuses_traversal_config_lexically() {
+        let dir = tempdir("cfgtrav");
+        let tmp = tempdir("cfgtrav-tmp");
+        // The escape target exists: without the normalized-join check
+        // the verbatim prefix compare would pass and this file's
+        // bytes would be digested as the config rather than refused.
+        fs::write(tmp.join("escape"), b"escaped-bytes").expect("escape file");
+        let tar_path = dir.join("infra.tar");
+        write_tar(
+            &tar_path,
+            &Map::from([(
+                "manifest.json".to_owned(),
+                br#"[{"Config":"../escape","RepoTags":["test:latest"],"Layers":[]}]"#.to_vec(),
+            )]),
+        );
+        let err = read_infra_save_manifest(&tar_path, &tmp).unwrap_err();
+        assert_eq!(err.code(), prepare_codes::RELEASE_INVALID);
+        fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&tmp).ok();
     }
 

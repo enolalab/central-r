@@ -20,7 +20,7 @@ use central_foundation::failure::Failure;
 use central_infra::prepare::{FetchCapability, Lock};
 
 use super::buildkit::{self, BuildRecipe};
-use super::{OpDeadline, prepare_fetch_codes as fc};
+use super::{OpDeadline, mkdir_all, prepare_fetch_codes as fc, run_bounded};
 
 /// `ModuleCacheCapabilityKey` — the lock's fetch capability for the Go
 /// module proxy. It is not a selector: one capability serves every Go
@@ -120,7 +120,7 @@ pub(crate) fn stage_module_cache(
             )
         })?;
     }
-    fs::create_dir_all(&staged).map_err(|e| {
+    mkdir_all(&staged, 0o700).map_err(|e| {
         Failure::internal(
             "MODULE_STAGE",
             format!("dependencyprepare: create staged module cache: {e}"),
@@ -146,7 +146,7 @@ pub(crate) fn stage_module_cache(
     // construction rather than by copy.
     let target = staged.join(MODULE_DOWNLOAD_DIR);
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
+        mkdir_all(parent, 0o700).map_err(|e| {
             Failure::internal(
                 "MODULE_STAGE",
                 format!("dependencyprepare: create staged download cache: {e}"),
@@ -154,28 +154,34 @@ pub(crate) fn stage_module_cache(
         })?;
     }
     deadline.check()?;
-    let output = Command::new("cp")
-        .args(["-al"])
-        .arg(&source)
-        .arg(&target)
-        .output()
-        .map_err(|e| {
-            Failure::internal(
-                "MODULE_STAGE",
-                format!("dependencyprepare: stage module cache: {e}"),
-            )
-        })?;
+    // `exec.CommandContext(ctx, "cp", ...)` — the child is killed and
+    // reaped when the operation deadline lapses rather than waited
+    // out; `CombinedOutput` is what the refusal reports.
+    let output = run_bounded(
+        deadline,
+        Command::new("cp").args(["-al"]).arg(&source).arg(&target),
+        "MODULE_STAGE",
+        "stage module cache",
+    )?;
     if !output.status.success() {
         return Err(Failure::internal(
             "MODULE_STAGE",
             format!(
                 "dependencyprepare: stage module cache: exit {}: {}",
                 output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
+                String::from_utf8_lossy(&combined_output(&output)).trim()
             ),
         ));
     }
     Ok(())
+}
+
+/// `CombinedOutput` — stdout followed by stderr, the merged child
+/// output upstream prints on a command failure.
+fn combined_output(output: &std::process::Output) -> Vec<u8> {
+    let mut combined = output.stdout.clone();
+    combined.extend_from_slice(&output.stderr);
+    combined
 }
 
 /// `populateModuleCache` — download the module graph if the cache is
@@ -202,7 +208,7 @@ fn populate_module_cache(
             )
         })?;
     }
-    fs::create_dir_all(cache_root).map_err(|e| {
+    mkdir_all(cache_root, 0o700).map_err(|e| {
         Failure::internal(
             "MODULE_CACHE",
             format!("dependencyprepare: create module cache: {e}"),
@@ -221,7 +227,7 @@ fn populate_module_cache(
         if dir.exists() {
             fs::remove_dir_all(&dir).ok();
         }
-        fs::create_dir_all(&dir).map_err(|e| {
+        mkdir_all(&dir, 0o700).map_err(|e| {
             Failure::internal(
                 "MODULE_CACHE",
                 format!("dependencyprepare: module manifest dir: {e}"),
@@ -284,12 +290,20 @@ fn populate_module_cache(
     }
 
     let marker = cache_root.join(MODULE_CACHE_READY_MARKER);
-    fs::write(&marker, b"").map_err(|e| {
-        Failure::internal(
-            "MODULE_CACHE",
-            format!("dependencyprepare: mark module cache complete: {e}"),
-        )
-    })?;
+    // `os.WriteFile(marker, nil, 0600)` — pinned at creation like
+    // upstream; `fs::write` would inherit the umask.
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&marker)
+        .map_err(|e| {
+            Failure::internal(
+                "MODULE_CACHE",
+                format!("dependencyprepare: mark module cache complete: {e}"),
+            )
+        })?;
     Ok(())
 }
 
@@ -424,8 +438,13 @@ impl ModuleAcquirer for DockerModuleAcquirer {
         // fallback. GOSUMDB is off because go.sum is inside an archive
         // the lock already pins by sha256, so every module hash is
         // transitively pinned by the lock already. See ADR 0027.
-        let output = Command::new("docker")
-            .args([
+        // `exec.CommandContext(ctx, "docker", "run", ...)` — a lapsed
+        // operation deadline kills and reaps the child rather than
+        // waiting out `go mod download`; upstream's `ctx.Err()` branch
+        // is the cancelled failure `run_bounded` returns.
+        let output = run_bounded(
+            deadline,
+            Command::new("docker").args([
                 "run",
                 "--rm",
                 "--network",
@@ -448,14 +467,10 @@ impl ModuleAcquirer for DockerModuleAcquirer {
                 "go",
                 "mod",
                 "download",
-            ])
-            .output()
-            .map_err(|e| {
-                Failure::internal(
-                    "MODULE_ACQUIRE",
-                    format!("dependencyprepare: acquire Go modules: {e}"),
-                )
-            })?;
+            ]),
+            "MODULE_ACQUIRE",
+            "acquire Go modules",
+        )?;
         deadline.check()?;
         if !output.status.success() {
             return Err(Failure::internal(
@@ -463,7 +478,7 @@ impl ModuleAcquirer for DockerModuleAcquirer {
                 format!(
                     "dependencyprepare: acquire Go modules: exit {}: {}",
                     output.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&output.stdout).trim()
+                    String::from_utf8_lossy(&combined_output(&output)).trim()
                 ),
             ));
         }
@@ -781,5 +796,25 @@ mod tests {
         fs::write(dir.join("sub").join("b"), vec![0u8; 5]).expect("b");
         assert_eq!(tree_bytes(&dir).expect("tree"), 15);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `exec.CommandContext` parity — a lapsed operation deadline
+    /// kills and reaps the child rather than waiting it out, so the
+    /// acquisition cannot hold the operation past its budget.
+    #[test]
+    fn run_bounded_kills_child_at_deadline() {
+        let started = std::time::Instant::now();
+        let err = run_bounded(
+            OpDeadline::after(std::time::Duration::from_millis(50)),
+            Command::new("sleep").arg("30"),
+            "TEST_BOUND",
+            "sleep",
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the child was waited out instead of killed at the deadline"
+        );
+        assert_eq!(err.code(), "OPERATION_DEADLINE");
     }
 }

@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,7 +23,7 @@ use central_infra::prepare::{BuildRequest, prepare_codes};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use super::{OpDeadline, hex_lower};
+use super::{OpDeadline, hex_lower, mkdir_all, raw_type_is_reg, run_bounded};
 
 /// `buildKitDaemonImage` — the pinned daemon image hosting each
 /// hermetic build. A fresh container is started per `Build` call so no
@@ -167,13 +168,13 @@ impl BuildKit {
             }
         }
 
-        fs::create_dir_all(&req.root_a).map_err(|e| {
+        mkdir_all(Path::new(&req.root_a), 0o700).map_err(|e| {
             Failure::internal(
                 "BUILD_ROOT",
                 format!("dependencyprepare: create builder root A: {e}"),
             )
         })?;
-        fs::create_dir_all(&req.root_b).map_err(|e| {
+        mkdir_all(Path::new(&req.root_b), 0o700).map_err(|e| {
             Failure::internal(
                 "BUILD_ROOT",
                 format!("dependencyprepare: create builder root B: {e}"),
@@ -390,7 +391,21 @@ LABEL org.opencontainers.image.revision=${SOURCE_COMMIT}
 ENTRYPOINT ["/app"]
 "#;
     let path = context_dir.join("Dockerfile");
-    fs::write(&path, DOCKERFILE.as_bytes()).map_err(|e| {
+    // `os.WriteFile(path, dockerfile, 0644)` — the mode upstream pins;
+    // `fs::write` would inherit the umask.
+    let mut out = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o644)
+        .open(&path)
+        .map_err(|e| {
+            Failure::internal(
+                "BUILD_DOCKERFILE",
+                format!("dependencyprepare: write generated Dockerfile: {e}"),
+            )
+        })?;
+    io::Write::write_all(&mut out, DOCKERFILE.as_bytes()).map_err(|e| {
         Failure::internal(
             "BUILD_DOCKERFILE",
             format!("dependencyprepare: write generated Dockerfile: {e}"),
@@ -413,8 +428,11 @@ pub fn short_root_digest(root: &str) -> String {
 fn start_isolated_daemon(deadline: OpDeadline, name: &str, data_root: &str) -> Result<(), Failure> {
     deadline.check()?;
     remove_isolated_daemon(name, data_root);
-    let output = Command::new("docker")
-        .args([
+    // `exec.CommandContext` — a lapsed deadline kills the `docker run`
+    // client rather than waiting it out.
+    let output = run_bounded(
+        deadline,
+        Command::new("docker").args([
             "run",
             "-d",
             "--name",
@@ -423,14 +441,10 @@ fn start_isolated_daemon(deadline: OpDeadline, name: &str, data_root: &str) -> R
             "-v",
             &format!("{data_root}:/var/lib/buildkit"),
             BUILD_KIT_DAEMON_IMAGE,
-        ])
-        .output()
-        .map_err(|e| {
-            Failure::internal(
-                "BUILD_DAEMON",
-                format!("dependencyprepare: start isolated BuildKit daemon: {e}"),
-            )
-        })?;
+        ]),
+        "BUILD_DAEMON",
+        "start isolated BuildKit daemon",
+    )?;
     if !output.status.success() {
         return Err(Failure::internal(
             "BUILD_DAEMON",
@@ -550,12 +564,14 @@ fn run_hermetic_build(
 ) -> Result<(), Failure> {
     deadline.check()?;
     let args = hermetic_build_args(daemon_name, context_dir, oci_tar_path, recipe);
-    let output = Command::new("buildctl").args(&args).output().map_err(|e| {
-        Failure::internal(
-            "BUILD_HERMETIC",
-            format!("dependencyprepare: hermetic build failed: {e}"),
-        )
-    })?;
+    // `exec.CommandContext` — the build client is killed when the
+    // operation deadline lapses rather than waited out.
+    let output = run_bounded(
+        deadline,
+        Command::new("buildctl").args(&args),
+        "BUILD_HERMETIC",
+        "hermetic build failed",
+    )?;
     if !output.status.success() {
         return Err(Failure::internal(
             "BUILD_HERMETIC",
@@ -574,7 +590,7 @@ fn run_hermetic_build(
 /// upstream's `switch` with no default; paths are cleaned beneath
 /// `dest_dir` via the `"/"+name` join.
 fn extract_oci_tar(tar_path: &Path, dest_dir: &Path) -> Result<(), Failure> {
-    fs::create_dir_all(dest_dir).map_err(|e| {
+    mkdir_all(dest_dir, 0o700).map_err(|e| {
         Failure::internal(
             "BUILD_OCI_TAR",
             format!("dependencyprepare: create OCI layout dir: {e}"),
@@ -625,28 +641,39 @@ fn extract_oci_tar(tar_path: &Path, dest_dir: &Path) -> Result<(), Failure> {
         let target = dest_dir.join(&cleaned);
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
-                fs::create_dir_all(&target).map_err(|e| {
+                mkdir_all(&target, 0o755).map_err(|e| {
                     Failure::internal(
                         "BUILD_OCI_TAR",
                         format!("dependencyprepare: create {}: {e}", target.display()),
                     )
                 })?;
             }
-            tar::EntryType::Regular => {
+            // `case tar.TypeReg` — the raw `'0'` typeflag only. The
+            // `tar` crate folds `TypeRegA` (`'\0'`) into
+            // `EntryType::Regular`, but upstream's switch has no arm
+            // for it, so it falls through to the same skip every
+            // other member type gets here.
+            tar::EntryType::Regular if raw_type_is_reg(entry.header()) => {
                 if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
+                    mkdir_all(parent, 0o755).map_err(|e| {
                         Failure::internal(
                             "BUILD_OCI_TAR",
                             format!("dependencyprepare: create {}: {e}", parent.display()),
                         )
                     })?;
                 }
-                let mut out = fs::File::create(&target).map_err(|e| {
-                    Failure::internal(
-                        "BUILD_OCI_TAR",
-                        format!("dependencyprepare: create {}: {e}", target.display()),
-                    )
-                })?;
+                let mut out = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .mode(0o644)
+                    .open(&target)
+                    .map_err(|e| {
+                        Failure::internal(
+                            "BUILD_OCI_TAR",
+                            format!("dependencyprepare: create {}: {e}", target.display()),
+                        )
+                    })?;
                 io::copy(&mut entry, &mut out).map_err(|e| {
                     Failure::internal(
                         "BUILD_OCI_TAR",
@@ -1109,6 +1136,50 @@ mod tests {
         let out = dir.join("layout");
         extract_oci_tar(&tar_path, &out).expect("extract");
         assert_eq!(fs::read(out.join("index.json")).expect("member"), b"abc");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `tar.TypeRegA` (`'\0'`) is not `tar.TypeReg` (`'0'`) — upstream's
+    /// switch accepts only `TypeReg`, so a `TypeRegA` member is skipped
+    /// like every other non-dir, non-reg member rather than written.
+    /// The `tar` crate folds both into `EntryType::Regular`, so the raw
+    /// typeflag byte is what the test exercises.
+    #[test]
+    fn extract_oci_tar_skips_type_rega() {
+        let dir = tempdir();
+        let tar_path = dir.join("out.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut builder = tar::Builder::new(file);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            {
+                let gnu = header.as_gnu_mut().expect("gnu header");
+                let name = b"rega.txt";
+                gnu.name[..name.len()].copy_from_slice(name);
+            }
+            // `TypeRegA` — write the raw typeflag byte then re-cksum.
+            header.as_mut_bytes()[156] = 0;
+            header.set_cksum();
+            builder.append(&header, b"data".as_slice()).expect("member");
+            // A real `TypeReg` member still extracts.
+            let mut regular = tar::Header::new_gnu();
+            regular.set_entry_type(tar::EntryType::Regular);
+            regular.set_size(3);
+            regular.set_mode(0o644);
+            regular.set_cksum();
+            builder
+                .append_data(&mut regular, "kept.txt", b"abc".as_slice())
+                .expect("member");
+            builder.finish().expect("finish");
+        }
+        let out = dir.join("layout");
+        extract_oci_tar(&tar_path, &out).expect("extract");
+        assert!(
+            !out.join("rega.txt").exists(),
+            "a TypeRegA member was written to the layout"
+        );
+        assert_eq!(fs::read(out.join("kept.txt")).expect("member"), b"abc");
         fs::remove_dir_all(&dir).ok();
     }
 

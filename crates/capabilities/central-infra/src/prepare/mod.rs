@@ -602,10 +602,14 @@ const ALLOWED_LOCK_KEYS: [&str; 9] = [
 // lock.go — loading and verification
 // ===========================================================================
 
-/// `LoadLock` — parses the embedded lock and applies every check
-/// upstream runs before the lock may be trusted: strict JSON, mode
-/// table validity, embedded-recipe digest, shipped fetch postures, and
-/// the retry bound.
+/// `LoadLock` — parses the embedded lock and applies the shape and
+/// capability checks upstream runs at load: strict JSON, the declared
+/// schema and closed key set, mode table validity, the
+/// embedded-recipe digest, shipped fetch postures, and the retry
+/// bound. The lock's own JCS digest (`Lock::verify_digest`) and the
+/// pinned fetch identities (`Lock::verify_identities`) are *separate*
+/// calls the consuming stages make against their own expectations —
+/// loading is not identity verification.
 pub fn load_lock() -> Result<Lock, Failure> {
     let lock = parse_lock(LOCKED_ASSETS_JSON)?;
     lock.validate_b03_modes()?;
