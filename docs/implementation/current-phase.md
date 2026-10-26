@@ -1,10 +1,33 @@
 # Current Phase
 
-## Active slice: Phase R5 — Host Authority, Broker & Compose Topology
+## Active slice: Phase R6 — Backup, Restore, Maintenance & Launcher Daemons
 
-`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R5 is the active implementation slice**; Phases R1–R4 are complete (see below) — R4 delivered the Phase 2 orchestration core: workflow graph + event journal, scheduler/retry, run submission and run views, subtree checkpoints, kernel composition, and the 23-scenario recovery acceptance matrix.
+`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R6 is the active implementation slice**; Phases R1–R5 are complete (see below) — R5 delivered the host-authority stack: protected broker custody, the audited `central-adapter-linux` OS boundary, the six-service Compose lifecycle, `central local init|prepare` ceremonies, TLS-hardened `central serve`, and the A07 denial suite.
 
-Verification for every R5 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+Verification for every R6 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+
+## Completed: Phase R5 — Host Authority, Broker & Compose Topology
+
+Phase R5 delivered, per roadmap §8 and the [R5 plan](../internal/superpowers/plans/2026-10-23-phase-r5-host-authority-broker-compose.md):
+
+- `bins/central`: the upstream command census — every verb/mode registered with Go-compatible flag parsing and the protected-mode skeleton; `central protected-*` entries refuse `UNSUPPORTED_IN_THIS_SLICE` fail-closed outside their composed paths.
+- `central-foundation`: RFC 8785 JCS canonicalization (sorted UTF-16 keys, ECMAScript numbers, minimal escaping) verified against upstream fixtures; `central-infra::config`: strict `central.config/v1` parsing.
+- `central-infra`: the host-authority domain — authority state, ports, wire contracts (`central.*` envelope digests byte-exact via `RawValue` payloads), and the app skeleton shared by broker/helper/lifecycle.
+- `central-adapter-linux` audited OS boundary (`sys::`): sealed `memfd`, `SCM_RIGHTS` descriptor transport with peer-credential checks, `openat2` confinement (`BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV`), `pidfd`, cgroup/namespace primitives, the upstream 64-syscall seccomp allowlist with `SECCOMP_RET_KILL_PROCESS` default, and the hardening sequence — all `unsafe` confined to `sys/audited.rs` with `// SAFETY:` proofs.
+- PAM + TTY physical-console boundary: hand-written `libpam` FFI (`pam_start` → `pam_authenticate` → `pam_end`), echo-off-only conversation, physical-console TTY checks (`/dev/tty*` predicate, `TIOCEXCL`, `TCIFLUSH`, echo suppression, fixed confirmation phrase, zeroized buffers).
+- The protected broker: `0xB1`/`0xC1` protocol frames, `SO_PEERCRED` admission gates, the append-only authority journal with HMAC fingerprinting over exact raw bytes, `protected_file_v1`, provisioning, payload epochs, durable state, and Ed25519 signing.
+- Broker custody: the TLS authority (rcgen CA + leaf issuance/persistence), sealed-memfd secret bootstrap over `SCM_RIGHTS`, bootstrap sessions, handoff, and export-token signing/verification.
+- The root helper: closed denial matrix (out-of-slice ops refuse with exact upstream codes), init/prepare/up/down/status/doctor/grant ceremonies, flock'd grant store with TTL + consume-once, and PAM/TTY confirmation.
+- The sandbox launcher and protected-mode entrypoints on the hardened syscall surface; `bins/central-harness-launcherd` moved onto shared `sys::` primitives (only clone3/mount/landlock remain daemon-local).
+- The release-advisory consumer: Ed25519-over-JCS verification, admission gating, and audit records.
+- `central local prepare`: the verified dependency lock (JCS + digest pinning), archive fetch/staging with symlink/traversal refusal, OCI/BuildKit identity checks, and bounded subprocesses — stopping intentionally at `PREPARE_PROMOTION_UNAVAILABLE` pending R6 promotion.
+- `central local up|down|status`: the six-service Compose lifecycle — digest-pinned rendering, phase machine, durable lock/journal/barrier, capacity admission, receipt inspection, and the B04 durable credential handoff to `/run/central-infra/<instance>/secrets`.
+- `central local init`: instance genesis — absent/present/broken classification, capacity checks, descriptor-relative installation ordering, owner/mode enforcement, locked identities, version-zero receipt, atomic `RENAME_NOREPLACE` config commit, idempotent `ALREADY_INITIALIZED`, and `grant issue --kind init` issuance.
+- `central serve` hardening (B06): bind fixed `127.0.0.1:8080`, TLS 1.3-only with the instance certificate from the broker/file authority, `validate_tls` reproducing every upstream check (including the unhandled-critical-extension gate), lazy `tls.NewListener`-parity handshake, broker `ProtectedBootstrap` session bootstrap (`CENTRAL_LOCALEXEC=1` dev gate), and `WorkspaceSealer` port injection keeping `central-adapter-harness` free of `central-adapter-linux`.
+- `tests/a07_*`: the host-authority denial suite — same-UID peer denial, descriptor smuggling, TTY spoofing, `openat2` path races, broker crash mid-transition, and the full denial ladder; portable tier green locally, Tier 3 legs gated (`CENTRAL_TIER3=1` + root + pinned reference host).
+- Committed `.sqlx/` offline query metadata for every new checked statement; the §7 fail-fast pipeline is green (`phase2_recovery_matrix` remains `CENTRAL_TEST_DSN`-gated by design).
+
+Documented slice boundaries deferred to R6: broker-backed restore-barrier RPC for `central serve` production preflight (fail-closed `RESTORE_BARRIER_UNAVAILABLE` until composed), broker-backed lifecycle composition in the helper daemon, `local browser open` client verb, promotion/attestation for `local prepare`, and backup/restore/wipe/maintenance operations.
 
 ## Completed: Phase R4 — Multi-Agent Workflow Orchestration
 
@@ -82,5 +105,5 @@ Two upstream decisions shape everything below: [ADR 0035](../adr/0035-freeze-b09
 | R2 | Verified artifact lifecycle, `central-adapter-s3` | **Complete** |
 | R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | **Complete** |
 | R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | **Complete** |
-| R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | **Active** |
-| R6 | Backup, restore, wipe, maintenance, launcher daemons | Pending |
+| R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | **Complete** |
+| R6 | Backup, restore, wipe, maintenance, launcher daemons | **Active** |
