@@ -41,6 +41,8 @@ pub mod dispatch_provision;
 pub mod group_signals;
 pub mod helper;
 #[forbid(unsafe_code)]
+pub mod infra;
+#[forbid(unsafe_code)]
 pub mod launcher_client;
 #[forbid(unsafe_code)]
 pub mod lifecycle_watch;

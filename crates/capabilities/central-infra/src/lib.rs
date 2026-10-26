@@ -18,6 +18,7 @@
 //! orchestration layer; `query` is a documented stub until the B01–B03
 //! read-side projections land.
 
+pub mod advisory;
 pub mod app;
 pub mod authority;
 pub mod config;

@@ -403,8 +403,10 @@ impl LifecycleClient {
     }
 
     /// `call` — `time.Now().UnixNano()` operation identity, like
-    /// upstream's default.
-    fn call<R: serde::Serialize, T: serde::de::DeserializeOwned>(
+    /// upstream's default. `pub(crate)` so the B01 advisory-evaluation
+    /// journal client (`crate::infra::advisory_fetch`) can reuse the
+    /// same protected-socket RPC plumbing every other helper verb uses.
+    pub(crate) fn call<R: serde::Serialize, T: serde::de::DeserializeOwned>(
         &self,
         purpose: &str,
         payload: &R,

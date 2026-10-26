@@ -1122,6 +1122,133 @@ impl<D: DependencyStore + ?Sized> DependencyStore for Arc<D> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Advisory consumer ports — upstream `internal/advisory/port/advisory_port.go`
+// ---------------------------------------------------------------------------
+
+/// `port.ActiveBundleSource` — loads the installed active advisory
+/// snapshot (`advisories/active.json` → `generations/<id>/envelope.json`).
+/// `Err` means the source could not produce a snapshot; the evaluation
+/// service maps it to `Denied`/`SourceUnavailable`.
+#[trait_variant::make(Send)]
+pub trait ActiveBundleSource: Send + Sync + 'static {
+    /// `LoadActive`.
+    async fn load_active(&self) -> Result<crate::advisory::Snapshot, Failure>;
+}
+
+impl<S: ActiveBundleSource + ?Sized> ActiveBundleSource for Arc<S> {
+    async fn load_active(&self) -> Result<crate::advisory::Snapshot, Failure> {
+        (**self).load_active().await
+    }
+}
+
+/// `port.HostFactsCollector` — collects the host environment versions
+/// the compatibility matrix compares against. `Err` means collection
+/// failed; the service substitutes the zero facts.
+#[trait_variant::make(Send)]
+pub trait HostFactsCollector: Send + Sync + 'static {
+    /// `Collect`.
+    async fn collect(&self) -> Result<crate::advisory::HostFacts, Failure>;
+}
+
+impl<C: HostFactsCollector + ?Sized> HostFactsCollector for Arc<C> {
+    async fn collect(&self) -> Result<crate::advisory::HostFacts, Failure> {
+        (**self).collect().await
+    }
+}
+
+/// `port.Clock` — the evaluation-time wall clock. Upstream's interface
+/// is synchronous, so this port is too (it is not a suspension point).
+pub trait AdvisoryClock: Send + Sync + 'static {
+    /// `Now`.
+    fn now(&self) -> OffsetDateTime;
+}
+
+impl<C: AdvisoryClock + ?Sized> AdvisoryClock for Arc<C> {
+    fn now(&self) -> OffsetDateTime {
+        (**self).now()
+    }
+}
+
+/// `port.TimeWitnessStore` — reads and durably advances the root-owned
+/// anti-rollback witness.
+///
+/// `load` returns [`crate::advisory::WITNESS_NOT_FOUND_CODE`] (a
+/// `NotFound` failure) for a legitimately absent witness — no bundle has
+/// ever been durably accepted, so there is nothing to protect a rollback
+/// to. Every other error means a witness that exists but cannot be
+/// trusted (corrupt, wrong owner, unparseable); the service treats it as
+/// a denial, never as a zero witness.
+///
+/// `advance` is called only after an evaluation accepts a bundle as
+/// `current`, with the accepted bundle's own `issued_at` — never the
+/// wall clock — so re-evaluating an unchanged bundle stays stable.
+#[trait_variant::make(Send)]
+pub trait TimeWitnessStore: Send + Sync + 'static {
+    /// `Load`.
+    async fn load(&self) -> Result<crate::advisory::TimeWitness, Failure>;
+    /// `Advance` — durably replace the witness.
+    async fn advance(&self, witness: &crate::advisory::TimeWitness) -> Result<(), Failure>;
+}
+
+impl<W: TimeWitnessStore + ?Sized> TimeWitnessStore for Arc<W> {
+    async fn load(&self) -> Result<crate::advisory::TimeWitness, Failure> {
+        (**self).load().await
+    }
+    async fn advance(&self, witness: &crate::advisory::TimeWitness) -> Result<(), Failure> {
+        (**self).advance(witness).await
+    }
+}
+
+/// `port.TransitionRecorder` — atomically appends the outcome of one
+/// advisory evaluation to the authority-transition journal. `bundle` is
+/// `None` when evaluation stopped before a bundle verified (source
+/// unavailable, signature/schema failure); `facts` is the zero value
+/// when host facts were never collected. Implementations persist only
+/// allowlisted evidence (`authority::AdvisoryAdmissionEvidence`) and
+/// must never persist raw bundle bytes or signature material.
+#[trait_variant::make(Send)]
+pub trait TransitionRecorder: Send + Sync + 'static {
+    /// `Record` — returns the journaled receipt the admission binds.
+    async fn record(
+        &self,
+        outcome: &crate::advisory::Outcome,
+        bundle: Option<&crate::advisory::VerifiedBundle>,
+        facts: &crate::advisory::HostFacts,
+    ) -> Result<crate::advisory::Receipt, Failure>;
+}
+
+impl<R: TransitionRecorder + ?Sized> TransitionRecorder for Arc<R> {
+    async fn record(
+        &self,
+        outcome: &crate::advisory::Outcome,
+        bundle: Option<&crate::advisory::VerifiedBundle>,
+        facts: &crate::advisory::HostFacts,
+    ) -> Result<crate::advisory::Receipt, Failure> {
+        (**self).record(outcome, bundle, facts).await
+    }
+}
+
+/// The deny-safe write seam upstream's `Service.DenySafeDir` +
+/// `advisory.EnterDenySafe` provide. The domain cannot touch the
+/// filesystem, so the adapter's file store carries the directory and
+/// uid/gid. The service calls `enter` best-effort on `hard_expired`
+/// outcomes only — the refusal itself is the primary protection and a
+/// state-file failure must never turn an evaluation error into an
+/// admission.
+#[trait_variant::make(Send)]
+pub trait DenySafeStore: Send + Sync + 'static {
+    /// `EnterDenySafe` — record mode entry; an already-active record is
+    /// returned untouched (entry keeps the original trigger and time).
+    async fn enter(&self, trigger_code: &str, now: OffsetDateTime) -> Result<(), Failure>;
+}
+
+impl<S: DenySafeStore + ?Sized> DenySafeStore for Arc<S> {
+    async fn enter(&self, trigger_code: &str, now: OffsetDateTime) -> Result<(), Failure> {
+        (**self).enter(trigger_code, now).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
