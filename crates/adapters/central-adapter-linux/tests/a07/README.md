@@ -38,7 +38,7 @@ they are skipped evidence, never hidden passes.
   console lease.
 - **T23** (state/audit forgery below root-owned parents):
   `a07_paths`, `a07_journal`, `a07_tier3` — `openat2`
-  `BENEATH|NO_SYMLINKS|NO_MAGICLINKS|IN_ROOT` refusals, root-owned
+  `BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV` refusals, root-owned
   `0700`/`0600` record shape, trailing-JSON rejection, workspace-seal
   confinement, journal corruption/exactness/settlement, foreign-owner
   traversal.
