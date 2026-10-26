@@ -39,9 +39,7 @@ pub(crate) fn local(
     match command_id {
         "local.doctor.prerequisites" => run_doctor(stdout, stderr),
         "local.init" => run_init(tokens, stdout, stderr),
-        "local.up" | "local.down" | "local.status" => {
-            run_lifecycle_dial_failure(command_id, stdout, stderr)
-        }
+        "local.up" | "local.down" | "local.status" => run_lifecycle(command_id, stdout, stderr),
         "local.prepare" => run_prepare(command_id, tokens, stdout, stderr),
         _ => emit(
             command_id,
@@ -217,32 +215,120 @@ fn run_init(tokens: &[String], stdout: &mut impl Write, stderr: &mut impl Write)
 
 // -- `local up|down|status` ----------------------------------------------
 
-/// Ports the observable `runLifecycle` outcome on a helper-less host
-/// (`internal/command/lifecycle.go`). Upstream's real binary installs
-/// a lifecycle client unconditionally (`deferredModeComposition`), so
-/// the nil-client `LIFECYCLE_SERVICE_UNAVAILABLE` branch is
-/// unreachable there: the helper socket dial fails with
-/// `helper: dial: …`, which `lifecycleSafeNextAction` maps to
-/// `START_CENTRAL_HELPER` under `LIFECYCLE_EXECUTION_FAILED` at exit
-/// 5 — the pair `cli_exit_status_test.go` pins for "local status
-/// without a helper". The failed call's zero-valued result fields
-/// (operation/receipt/phase/state/reason_code) stay omitted, exactly
-/// like upstream's `omitempty` details.
-fn run_lifecycle_dial_failure(
-    command_id: &str,
-    stdout: &mut impl Write,
-    stderr: &mut impl Write,
-) -> u8 {
-    emit(
-        command_id,
-        stdout,
-        stderr,
-        ExitClass::Incompatible,
-        Some("LIFECYCLE_EXECUTION_FAILED"),
-        Some(serde_json::json!({
-            "safe_next_action": "START_CENTRAL_HELPER",
-        })),
-    )
+/// Ports `runLifecycle` (`internal/command/lifecycle.go`): the real
+/// binary installs a lifecycle client unconditionally, so the
+/// nil-client `LIFECYCLE_SERVICE_UNAVAILABLE` branch is unreachable —
+/// the helper dial is always attempted first (`CENTRAL_HELPER_SOCKET`
+/// override, then the production socket), and a helper-less host is
+/// the `helper: dial: …` transport-failure branch
+/// `lifecycleSafeNextAction` maps to `START_CENTRAL_HELPER` under
+/// `LIFECYCLE_EXECUTION_FAILED` at exit 5.
+fn run_lifecycle(command_id: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
+    use central_adapter_linux::helper::client::{
+        LifecycleClient, LifecycleResult, PRODUCTION_SOCKET_PATH,
+    };
+    use central_adapter_linux::helper::protocol::LifecycleRequest;
+
+    let socket_path = std::env::var("CENTRAL_HELPER_SOCKET")
+        .unwrap_or_else(|_| PRODUCTION_SOCKET_PATH.to_owned());
+    let client = LifecycleClient::new(socket_path);
+    let req = LifecycleRequest::default();
+    let (result, err): (LifecycleResult, Option<String>) = match command_id {
+        "local.up" => client.up(&req),
+        "local.down" => client.down(&req),
+        _ => client.status(&req),
+    };
+    match err {
+        None => emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Success,
+            Some(&result.state),
+            Some(lifecycle_details(&result, "", "")),
+        ),
+        Some(err) => emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Incompatible,
+            Some("LIFECYCLE_EXECUTION_FAILED"),
+            Some(lifecycle_details(
+                &result,
+                &lifecycle_failure_code(&result.reason_code),
+                &lifecycle_safe_next_action(&result, &err),
+            )),
+        ),
+    }
+}
+
+/// `lifecycleFailureCode` — reduces a lifecycle failure's reason to
+/// the closed-vocabulary code it starts with; a reason that is not a
+/// code names no code.
+fn lifecycle_failure_code(reason: &str) -> String {
+    let code = reason.split(':').next().unwrap_or_default().trim();
+    if code
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        code.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// `lifecycleSafeNextAction` — the codes with a known remedy map to
+/// the one safe thing an operator can do next; everything else keeps
+/// the status check.
+fn lifecycle_safe_next_action(
+    result: &central_adapter_linux::helper::client::LifecycleResult,
+    err: &str,
+) -> String {
+    match lifecycle_failure_code(&result.reason_code).as_str() {
+        "AUTHORITY_DENIED"
+        | "LIFECYCLE_AUTHORIZATION_REQUIRED"
+        | "LIFECYCLE_AUTHORIZATION_DENIED"
+        | "LIFECYCLE_AUTHORIZATION_REJECTED" => "RUN_CENTRAL_GRANT_ISSUE".to_owned(),
+        "ADMISSION_FAILED" | "ADMISSION_REINSPECTION_FAILED" => {
+            "RUN_CENTRAL_LOCAL_PREPARE".to_owned()
+        }
+        _ => {
+            if err.starts_with("helper: dial:") {
+                "START_CENTRAL_HELPER".to_owned()
+            } else {
+                "CHECK_LIFECYCLE_STATUS".to_owned()
+            }
+        }
+    }
+}
+
+/// `cli.LifecycleDetails`'s `omitempty` set for the lifecycle verbs —
+/// the zero-valued fields upstream's failed call leaves out.
+fn lifecycle_details(
+    result: &central_adapter_linux::helper::client::LifecycleResult,
+    reason_code: &str,
+    safe_next_action: &str,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({});
+    if !result.operation_id.is_empty() {
+        details["operation_id"] = serde_json::json!(result.operation_id);
+    }
+    if !result.receipt_id.is_empty() {
+        details["receipt_id"] = serde_json::json!(result.receipt_id);
+    }
+    if !result.phase.is_empty() {
+        details["phase"] = serde_json::json!(result.phase);
+    }
+    if !result.state.is_empty() {
+        details["state"] = serde_json::json!(result.state);
+    }
+    if !reason_code.is_empty() {
+        details["reason_code"] = serde_json::json!(reason_code);
+    }
+    if !safe_next_action.is_empty() {
+        details["safe_next_action"] = serde_json::json!(safe_next_action);
+    }
+    details
 }
 
 // -- `local prepare` ------------------------------------------------------
@@ -722,6 +808,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `lifecycleFailureCode` reduces a reason to its leading
+    /// closed-vocabulary code; prose names no code.
+    #[test]
+    fn lifecycle_failure_code_extracts_leading_code() {
+        for (reason, code) in [
+            (
+                "ADMISSION_FAILED: receipt binding mismatch",
+                "ADMISSION_FAILED",
+            ),
+            ("AUTHORITY_DENIED", "AUTHORITY_DENIED"),
+            ("DOWN_SETTLE_FAILED: journal write", "DOWN_SETTLE_FAILED"),
+            ("not a code", ""),
+            ("", ""),
+        ] {
+            assert_eq!(lifecycle_failure_code(reason), code, "reason {reason:?}");
+        }
+    }
+
+    /// `lifecycleSafeNextAction` — the closed remedy mapping: denied
+    /// authority → grant-issue, admission → local prepare, a dial
+    /// transport failure → start the helper, everything else → status.
+    #[test]
+    fn lifecycle_safe_next_action_closed_mapping() {
+        use central_adapter_linux::helper::client::LifecycleResult;
+        let result_with = |code: &str| LifecycleResult {
+            reason_code: code.to_owned(),
+            ..LifecycleResult::default()
+        };
+        for code in [
+            "AUTHORITY_DENIED",
+            "LIFECYCLE_AUTHORIZATION_REQUIRED",
+            "LIFECYCLE_AUTHORIZATION_DENIED",
+            "LIFECYCLE_AUTHORIZATION_REJECTED",
+        ] {
+            assert_eq!(
+                lifecycle_safe_next_action(&result_with(code), "helper: some err"),
+                "RUN_CENTRAL_GRANT_ISSUE",
+                "code {code}"
+            );
+        }
+        for code in ["ADMISSION_FAILED", "ADMISSION_REINSPECTION_FAILED"] {
+            assert_eq!(
+                lifecycle_safe_next_action(&result_with(code), "helper: some err"),
+                "RUN_CENTRAL_LOCAL_PREPARE",
+                "code {code}"
+            );
+        }
+        // A dial failure wins over an empty reason code.
+        assert_eq!(
+            lifecycle_safe_next_action(&result_with(""), "helper: dial: refused"),
+            "START_CENTRAL_HELPER"
+        );
+        // Any other helper-side failure keeps the status check.
+        assert_eq!(
+            lifecycle_safe_next_action(
+                &result_with("DOWN_SETTLE_FAILED"),
+                "helper: lifecycle down denied: denied"
+            ),
+            "CHECK_LIFECYCLE_STATUS"
+        );
     }
 
     // -- prepare -----------------------------------------------------------

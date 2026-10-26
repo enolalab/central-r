@@ -10,6 +10,8 @@
 
 use std::time::Duration;
 
+use time::OffsetDateTime;
+
 use crate::domain::{
     DependencyReceipt, LifecycleBinding, LifecycleOperation, LifecyclePhase, LifecycleRequest,
     LifecycleResult, LifecycleStatusRequest, Observation, PreparedDependencySet, SemanticReceipt,
@@ -94,6 +96,19 @@ where
     /// upstream's phase machine exactly, recovering the most recent
     /// unsettled operation for the binding on resume.
     pub async fn up(&self, req: LifecycleRequest) -> LifecycleResult {
+        self.up_with_deadline(req, None).await
+    }
+
+    /// `Up(ctx, req)` — `cancel_at` is upstream's caller context
+    /// deadline: the helper computes it from the verb budget before
+    /// driving the state machine, and the loop arm checks it each
+    /// iteration exactly where upstream's `select ctx.Done()` sits.
+    /// `None` is upstream's `context.Background()`.
+    pub async fn up_with_deadline(
+        &self,
+        req: LifecycleRequest,
+        cancel_at: Option<OffsetDateTime>,
+    ) -> LifecycleResult {
         let binding = binding_from_request(&req);
 
         let lock = match self.locker.acquire(&binding).await {
@@ -108,7 +123,7 @@ where
                 );
             }
         };
-        let mut result = self.up_locked(&binding, &lock).await;
+        let mut result = self.up_locked(&binding, &lock, cancel_at).await;
         if let Err(e) = self.locker.release(&binding, lock).await {
             if result.exit_code == 0 {
                 result = result_error(
@@ -125,7 +140,12 @@ where
         result
     }
 
-    async fn up_locked(&self, binding: &LifecycleBinding, lock: &LifecycleLock) -> LifecycleResult {
+    async fn up_locked(
+        &self,
+        binding: &LifecycleBinding,
+        lock: &LifecycleLock,
+        cancel_at: Option<OffsetDateTime>,
+    ) -> LifecycleResult {
         match self.journal.unsettled(binding).await {
             Err(e) => result_error(
                 "",
@@ -136,7 +156,7 @@ where
             ),
             Ok(Some(existing)) => {
                 let bound = with_b04_evidence(binding, &existing, lock);
-                self.up_execute(existing, bound).await
+                self.up_execute(existing, bound, cancel_at).await
             }
             Ok(None) => match self
                 .journal
@@ -152,7 +172,7 @@ where
                 ),
                 Ok(op) => {
                     let bound = with_b04_evidence(binding, &op, lock);
-                    self.up_execute(op, bound).await
+                    self.up_execute(op, bound, cancel_at).await
                 }
             },
         }
@@ -162,6 +182,7 @@ where
         &self,
         mut op: LifecycleOperation,
         binding: LifecycleBinding,
+        cancel_at: Option<OffsetDateTime>,
     ) -> LifecycleResult {
         let deadline = op.created_at + PROVISION_DEADLINE;
         if self.clock.now() > deadline {
@@ -177,9 +198,28 @@ where
         }
 
         loop {
+            // Upstream's `select ctx.Done()` arm: the caller's deadline —
+            // the helper verb budget — cancels the operation into a
+            // settled `cancelled` before the phase work begins.
+            if let Some(cancel_at) = cancel_at
+                && self.clock.now() >= cancel_at
+            {
+                return self
+                    .settle_cancel(&op, "CANCELLED: context deadline exceeded".to_owned())
+                    .await;
+            }
             if self.clock.now() > deadline {
                 return self.settle_fail(&op, "DEADLINE_EXCEEDED".to_owned()).await;
             }
+
+            // Upstream's `phaseDeadline` context: the phase's own budget
+            // bounds every I/O call inside this iteration. The only
+            // in-service loop the budget can interrupt is
+            // `wait_for_healthy`; the synchronous port calls inherit the
+            // operation deadline at the loop head above.
+            let phase_deadline_at = cancel_at
+                .map(|d| d.min(self.clock.now() + phase_deadline(phase)))
+                .unwrap_or_else(|| self.clock.now() + phase_deadline(phase));
 
             let next = match phase {
                 LifecyclePhase::Started => {
@@ -226,7 +266,7 @@ where
                     LifecyclePhase::DaemonsStarted
                 }
                 LifecyclePhase::DaemonsStarted => {
-                    if let Err(e) = self.wait_for_healthy(&binding).await {
+                    if let Err(e) = self.wait_for_healthy(&binding, phase_deadline_at).await {
                         return self
                             .settle_fail(&op, format!("CONTAINER_HEALTH_FAILED: {e}"))
                             .await;
@@ -375,14 +415,27 @@ where
         Ok(adm.prepared)
     }
 
-    async fn wait_for_healthy(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
+    /// `waitForHealthy` — polls topology health every 250 ms until the
+    /// phase deadline (`min(daemonHealthBudget, caller deadline)`,
+    /// upstream's `select ctx.Done() / time.After(250ms)`).
+    async fn wait_for_healthy(
+        &self,
+        binding: &LifecycleBinding,
+        deadline: OffsetDateTime,
+    ) -> Result<(), Failure> {
         loop {
             let snapshot = self.topology.inspect(binding).await?;
             if snapshot.healthy {
                 return Ok(());
             }
-            // Upstream waits on ctx deadline or 250ms; future-drop is
-            // the cancellation and the journal deadline bounds the loop.
+            if self.clock.now() >= deadline {
+                // Upstream surfaces `context.DeadlineExceeded` here; the
+                // Cancelled kind is the failure taxonomy's deadline class.
+                return Err(Failure::cancelled(
+                    "deadline_exceeded",
+                    "container health wait: deadline exceeded",
+                ));
+            }
             std::thread::sleep(Duration::from_millis(250));
         }
     }
@@ -394,6 +447,17 @@ where
     /// `Down` — tears down the infrastructure: linked stop-settlement,
     /// verified teardown, then credential cleanup, then settle.
     pub async fn down(&self, req: LifecycleRequest) -> LifecycleResult {
+        self.down_with_deadline(req, None).await
+    }
+
+    /// `Down(ctx, req)` — `cancel_at` is the caller's deadline; the
+    /// teardown work is further bounded by `DOWN_BUDGET` exactly as
+    /// upstream's `context.WithDeadline(ctx, now+downBudget)`.
+    pub async fn down_with_deadline(
+        &self,
+        req: LifecycleRequest,
+        cancel_at: Option<OffsetDateTime>,
+    ) -> LifecycleResult {
         let binding = binding_from_request(&req);
 
         let lock = match self.locker.acquire(&binding).await {
@@ -408,7 +472,7 @@ where
                 );
             }
         };
-        let mut result = self.down_locked(&binding).await;
+        let mut result = self.down_locked(&binding, cancel_at).await;
         if let Err(e) = self.locker.release(&binding, lock).await {
             if result.exit_code == 0 {
                 result = result_error(
@@ -425,7 +489,11 @@ where
         result
     }
 
-    async fn down_locked(&self, binding: &LifecycleBinding) -> LifecycleResult {
+    async fn down_locked(
+        &self,
+        binding: &LifecycleBinding,
+        cancel_at: Option<OffsetDateTime>,
+    ) -> LifecycleResult {
         let linked_op = match self.journal.unsettled(binding).await {
             Err(e) => {
                 return result_error(
@@ -470,6 +538,21 @@ where
                 .await;
         }
 
+        // Upstream: `teardownCtx = context.WithDeadline(ctx,
+        // now+downBudget)` — the teardown window is bounded by the
+        // earlier of the caller's deadline and the down budget.
+        let deadline = cancel_at
+            .map(|d| d.min(self.clock.now() + DOWN_BUDGET))
+            .unwrap_or_else(|| self.clock.now() + DOWN_BUDGET);
+        if self.clock.now() >= deadline {
+            return self
+                .settle_fail(
+                    &op,
+                    "DOWN_TEARDOWN_VERIFICATION_FAILED: deadline exceeded".to_owned(),
+                )
+                .await;
+        }
+
         if let Err(e) = self.topology.teardown_verified(&op).await {
             // Keep the MinIO handoff when stopped proof is unavailable.
             return self
@@ -510,6 +593,18 @@ where
 
     /// `Status` — strictly read-only topology inspection.
     pub async fn status(&self, req: LifecycleStatusRequest) -> LifecycleResult {
+        self.status_with_deadline(req, None).await
+    }
+
+    /// `Status(ctx, req)` — upstream wraps the inspect in
+    /// `context.WithDeadline(ctx, now+statusBudget)`; the port's
+    /// synchronous inspect cannot be interrupted mid-call, so the
+    /// budget check runs before the call begins.
+    pub async fn status_with_deadline(
+        &self,
+        req: LifecycleStatusRequest,
+        cancel_at: Option<OffsetDateTime>,
+    ) -> LifecycleResult {
         let binding = LifecycleBinding {
             instance_id: req.instance_id,
             config_binding: req.config_binding,
@@ -520,6 +615,19 @@ where
             bootstrap_fingerprints: Vec::new(),
             b04: crate::domain::B04LifecycleEvidence::default(),
         };
+
+        let deadline = cancel_at
+            .map(|d| d.min(self.clock.now() + STATUS_BUDGET))
+            .unwrap_or_else(|| self.clock.now() + STATUS_BUDGET);
+        if self.clock.now() >= deadline {
+            return result_error(
+                "",
+                "",
+                "INSPECT_FAILED: deadline exceeded",
+                LifecyclePhase::Failed,
+                1,
+            );
+        }
 
         match self.topology.inspect(&binding).await {
             Err(e) => result_error(
@@ -554,6 +662,13 @@ where
 
     async fn settle_fail(&self, op: &LifecycleOperation, reason: String) -> LifecycleResult {
         self.settle_at(op, LifecyclePhase::Failed, reason, 1).await
+    }
+
+    /// `settleCancel` — upstream's terminal `Cancelled` settlement on
+    /// caller-context cancellation (exit code 1).
+    async fn settle_cancel(&self, op: &LifecycleOperation, reason: String) -> LifecycleResult {
+        self.settle_at(op, LifecyclePhase::Cancelled, reason, 1)
+            .await
     }
 
     /// `settleAt` — records the settled terminal state; runs verified
@@ -795,6 +910,16 @@ mod tests {
         async fn cleanup(&self, _p: MountProof) -> Result<(), Failure> {
             Ok(())
         }
+        async fn record_handoff(
+            &self,
+            _b: &LifecycleBinding,
+            _p: &MountProof,
+        ) -> Result<(), Failure> {
+            Ok(())
+        }
+        async fn cleanup_binding(&self, _b: &LifecycleBinding) -> Result<(), Failure> {
+            Ok(())
+        }
     }
 
     struct FakeCapacity {
@@ -1003,12 +1128,16 @@ mod tests {
 
     /// Scriptable topology: records call order, fails a named call once,
     /// reports scripted health, and records teardown/cleanup order.
+    /// `clock`/`advance_per_inspect` let the health-wait deadline tests
+    /// move the fake clock forward on each poll without a real sleep.
     struct FakeTopology {
         calls: Mutex<Vec<String>>,
         fail_at: Mutex<Option<(String, u32)>>, // (call name, nth occurrence) to fail once
         call_counts: Mutex<std::collections::BTreeMap<String, u32>>,
         healthy: Mutex<bool>,
         inspect_calls: Mutex<u32>,
+        clock: Mutex<Option<Arc<FakeClock>>>,
+        advance_per_inspect: Mutex<Duration>,
     }
     impl FakeTopology {
         fn new() -> Self {
@@ -1018,6 +1147,8 @@ mod tests {
                 call_counts: Mutex::new(std::collections::BTreeMap::new()),
                 healthy: Mutex::new(true),
                 inspect_calls: Mutex::new(0),
+                clock: Mutex::new(None),
+                advance_per_inspect: Mutex::new(Duration::ZERO),
             }
         }
         fn called(&self, name: &str) -> Result<(), Failure> {
@@ -1060,6 +1191,12 @@ mod tests {
         async fn inspect(&self, _b: &LifecycleBinding) -> Result<TopologySnapshot, Failure> {
             *self.inspect_calls.lock().unwrap() += 1;
             self.called("inspect")?;
+            let advance = *self.advance_per_inspect.lock().unwrap();
+            if advance > Duration::ZERO
+                && let Some(clock) = self.clock.lock().unwrap().as_ref()
+            {
+                *clock.0.lock().unwrap() += advance;
+            }
             Ok(TopologySnapshot {
                 healthy: *self.healthy.lock().unwrap(),
                 description: "fake-topology".to_owned(),
@@ -1124,7 +1261,9 @@ mod tests {
 
     fn harness() -> Harness {
         let journal = Arc::new(FakeJournal::new());
+        let clock = Arc::new(FakeClock(Mutex::new(OffsetDateTime::UNIX_EPOCH)));
         let topology = Arc::new(FakeTopology::new());
+        *topology.clock.lock().unwrap() = Some(clock.clone());
         let admission = Arc::new(FakeAdmission {
             set: prepared_set(),
             err: Mutex::new(None),
@@ -1144,7 +1283,6 @@ mod tests {
             acquire_err: Mutex::new(None),
             release_err: Mutex::new(None),
         });
-        let clock = Arc::new(FakeClock(Mutex::new(OffsetDateTime::UNIX_EPOCH)));
         let service = LifecycleService {
             admission: admission.clone(),
             bootstrap: bootstrap.clone(),
@@ -1359,6 +1497,86 @@ mod tests {
         // Only settle-path cleanup may run; no init/daemon/provision
         // work executes past the deadline.
         assert_eq!(calls(&h), vec!["cleanup_secrets"]);
+    }
+
+    /// Upstream's `select ctx.Done()` arm: a caller deadline in the
+    /// past settles the operation `Cancelled` — never a silent drop.
+    #[test]
+    fn up_caller_cancellation_settles_cancelled() {
+        let h = harness();
+        let r = block_on(h.service.up_with_deadline(
+            request(),
+            Some(OffsetDateTime::UNIX_EPOCH - Duration::from_secs(1)),
+        ));
+        assert_eq!(r.exit_code, 1);
+        assert_eq!(r.phase, LifecyclePhase::Cancelled);
+        assert!(r.reason.starts_with("CANCELLED:"), "reason: {}", r.reason);
+        // The terminal settle is durably recorded, and only
+        // settle-path cleanup ran.
+        assert_eq!(
+            *h.journal.settled.lock().unwrap(),
+            vec![("op-1".to_owned(), LifecyclePhase::Cancelled)]
+        );
+        assert_eq!(calls(&h), vec!["cleanup_secrets"]);
+    }
+
+    /// The health poll honours `min(caller, daemonHealthBudget)`: an
+    /// inspect that pushes the clock past the deadline settles
+    /// `CONTAINER_HEALTH_FAILED` instead of polling forever.
+    #[test]
+    fn up_health_wait_deadline_settles_container_health_failed() {
+        let h = harness();
+        *h.topology.healthy.lock().unwrap() = false;
+        *h.topology.advance_per_inspect.lock().unwrap() = Duration::from_secs(200);
+        let r = block_on(h.service.up(request()));
+        assert_eq!(r.phase, LifecyclePhase::Failed);
+        assert!(
+            r.reason.starts_with("CONTAINER_HEALTH_FAILED:"),
+            "reason: {}",
+            r.reason
+        );
+        assert!(r.reason.contains("deadline"), "reason: {}", r.reason);
+        // One poll proved the deadline; no busy loop ran.
+        assert_eq!(*h.topology.inspect_calls.lock().unwrap(), 1);
+    }
+
+    /// `down` with an already-elapsed caller deadline fails fast —
+    /// `DOWN_BUDGET` is further bounded by `ctx`, exactly as
+    /// upstream's `context.WithDeadline(ctx, now+downBudget)`.
+    #[test]
+    fn down_deadline_fails_before_teardown() {
+        let h = harness();
+        let r = block_on(h.service.down_with_deadline(
+            request(),
+            Some(OffsetDateTime::UNIX_EPOCH - Duration::from_secs(1)),
+        ));
+        assert_eq!(r.exit_code, 1);
+        assert!(
+            r.reason
+                .starts_with("DOWN_TEARDOWN_VERIFICATION_FAILED: deadline exceeded"),
+            "reason: {}",
+            r.reason
+        );
+        // No teardown was attempted; settle-path cleanup ran.
+        assert_eq!(calls(&h), vec!["cleanup_secrets"]);
+    }
+
+    /// `status` with an elapsed caller deadline refuses before the
+    /// read-only inspect runs (upstream `context.WithDeadline(ctx,
+    /// now+statusBudget)`).
+    #[test]
+    fn status_deadline_expired_refuses_before_inspect() {
+        let h = harness();
+        let r = block_on(h.service.status_with_deadline(
+            LifecycleStatusRequest {
+                instance_id: "inst-1".to_owned(),
+                config_binding: "cfg-1".to_owned(),
+            },
+            Some(OffsetDateTime::UNIX_EPOCH - Duration::from_secs(1)),
+        ));
+        assert_eq!(r.exit_code, 1);
+        assert_eq!(r.reason, "INSPECT_FAILED: deadline exceeded");
+        assert_eq!(calls(&h), Vec::<String>::new());
     }
 
     // -- teardown/cleanup ordering (SC-DEF-25 contract) ----------------------

@@ -169,6 +169,22 @@ pub fn run_helper_daemon(
         // seam), so the handler stays the explicit refusal until that
         // composition can complete — upstream's rule verbatim.
         prepare: Some(Box::new(UnavailablePrepareHandler)),
+        // `lifecycle` stays unset for the same dependency-chain reason,
+        // one link deeper: `infra::lifecycle::new_production_service`
+        // needs (1) the B01 advisory evaluator — the same deferred seam
+        // as prepare — (2) the B02 active-receipt reader, (3) the OCI
+        // receipt inspector, (4) a `ComposeRunner`, (5) the typed B04
+        // broker authority (SCM_RIGHTS custody path), (6) the broker
+        // rendezvous for the minio-provision socket, and (7) the
+        // dead-owner verifier the lock takeover consults. The port of
+        // upstream's handler exists — `infra::lifecycle`'s
+        // `LifecycleApplicationBridge` + `production_lifecycle_handler`
+        // — but installing it without the full chain would be a
+        // made-up success, so the matrix's `LIFECYCLE_SERVICE_UNAVAILABLE`
+        // answer stands until the evaluator link lands. This is
+        // upstream's production status verbatim, not dead code: the
+        // bridge drives the domain service synchronously and maps its
+        // result onto the wire shape once composed.
         ..Server::new()
     });
     if let Err(e) = serve(listen, &srv, IDLE_TIMEOUT, cancel) {

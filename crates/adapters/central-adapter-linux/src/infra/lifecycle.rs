@@ -29,9 +29,9 @@ use central_infra::domain::{
 use central_infra::lifecycle::LifecycleService;
 use central_infra::port::{
     AdmissionRequest, AdmissionResult, B04Bootstrap, BootstrapGeneration, BootstrapHandoff,
-    BootstrapPurpose, DeadOwnerVerifier, LifecycleAdmission, LifecycleBarrier, LifecycleBootstrap,
-    LifecycleCapacity, LifecycleClock, LifecycleLock, LifecycleLocker, LifecyclePort,
-    LifecycleReservation, MountProof, TopologyPort,
+    BootstrapPurpose, DeadOwnerVerifier, HandoffLifetime, LifecycleAdmission, LifecycleBarrier,
+    LifecycleBootstrap, LifecycleCapacity, LifecycleClock, LifecycleLock, LifecycleLocker,
+    LifecyclePort, LifecycleReservation, MountProof, TopologyPort,
 };
 
 use super::compose::{
@@ -268,6 +268,9 @@ pub struct Topology<B> {
     rendezvous: Option<Arc<dyn BrokerRendezvous>>,
     bind_waiter: Option<Arc<dyn MinioBindWaiter>>,
     minio_ready: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// `t.mu` — serializes `file()`'s materialize-then-render window
+    /// exactly as upstream's `t.mu` does.
+    mu: Mutex<()>,
     /// binding keys whose teardown was verified this process lifetime —
     /// upstream's `t.teardowns` map.
     teardowns: Mutex<BTreeSet<String>>,
@@ -276,11 +279,14 @@ pub struct Topology<B> {
     proofs: Mutex<BTreeMap<String, Vec<MountProof>>>,
 }
 
+/// `bindingKey` — upstream's shared binding hash:
+/// `sha256hex(instance_id + "\x00" + config_binding)`. Every durable
+/// path scoped to a binding (journal operations dir, lock dir,
+/// barrier file, bootstrap generation/handoff records, capacity id)
+/// and the in-process proof/teardown maps use this one identity.
 fn binding_key(b: &LifecycleBinding) -> String {
-    format!(
-        "{}|{}|{}|{}|{}",
-        b.instance_id, b.config_binding, b.receipt_id, b.model_digest, b.payload_epoch
-    )
+    let digest = Sha256::digest(format!("{}\0{}", b.instance_id, b.config_binding).as_bytes());
+    hex(&digest)
 }
 
 impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
@@ -301,6 +307,7 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
             rendezvous: None,
             bind_waiter: None,
             minio_ready: None,
+            mu: Mutex::new(()),
             teardowns: Mutex::new(BTreeSet::new()),
             proofs: Mutex::new(BTreeMap::new()),
         }
@@ -332,8 +339,23 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
             .to_string()
     }
 
-    /// `existingFile` — the rendered file on disk, if present.
+    /// `existingFile` — the rendered file on disk, if present, guarded
+    /// by `t.mu` (upstream's outer `existingFile`).
     fn existing_file(&self, binding: &LifecycleBinding) -> Result<Option<RenderedFile>, Failure> {
+        let _g = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.existing_file_locked(binding)
+    }
+
+    /// `existingFileLocked` — `existing_file`'s body, split out so
+    /// `establish_b04_lifecycle_proof_locked` can call it while
+    /// `file()`'s `mu` is held (upstream's same split).
+    fn existing_file_locked(
+        &self,
+        binding: &LifecycleBinding,
+    ) -> Result<Option<RenderedFile>, Failure> {
         let path = self.rendered_path(&binding.instance_id);
         match std::fs::read(&path) {
             Ok(content) => Ok(Some(RenderedFile { path, content })),
@@ -345,25 +367,32 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
         }
     }
 
-    /// `file` — the rendered file; when `materialize` is set the file is
-    /// rendered and written (with the init script and the B04 handoff)
-    /// when absent. A `false` caller (down/status) never materializes.
+    /// `file` — upstream's exact ordering under `t.mu`: resolve the
+    /// active receipt's set (even for a `false` caller, so a down/status
+    /// re-render still binds to the selector), run the materialize
+    /// window when asked, then render and durably write the compose
+    /// file 0600 under a 0700 directory. There is no in-memory
+    /// `t.files` hit path: re-rendering is deterministic, and a fresh
+    /// topology after a helper restart must recover the compose file
+    /// from durable inputs alone (upstream's `files` map is only a
+    /// cache, never evidence). A `false` caller (down/status) never
+    /// materializes a credential — but it does re-render, which is
+    /// what lets `down` work after a reboot wiped the runtime root's
+    /// in-memory cache.
     fn file(&self, binding: &LifecycleBinding, materialize: bool) -> Result<RenderedFile, Failure> {
-        if let Some(f) = self.existing_file(binding)? {
-            return Ok(f);
+        let _g = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let set = self.active_dependency_set(binding)?;
+        if materialize {
+            self.materialize_bootstrap_locked(binding)?;
         }
-        if !materialize {
-            return Err(Failure::not_found(
-                "TOPOLOGY",
-                "topology: rendered compose file is absent",
-            ));
-        }
-        let receipt = self
-            .receipts
-            .active()
-            .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: active receipt: {e}")))?;
-        let f = render(binding, &receipt.dependency_set, &self.policy)
+        let mut f = render(binding, &set, &self.policy)
             .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: render: {e}")))?;
+        // `t.root != ""` overrides the renderer's hardcoded anchor —
+        // upstream `file`'s identical conditional.
+        f.path = self.rendered_path(&binding.instance_id);
         let dir = Path::new(&f.path)
             .parent()
             .map(Path::to_path_buf)
@@ -371,31 +400,37 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
         std::fs::create_dir_all(&dir).map_err(|e| {
             Failure::internal("TOPOLOGY", format!("topology: create runtime dir: {e}"))
         })?;
-        // The init-script mount source must exist before `compose up`, or
-        // Docker auto-creates it as an empty directory and initdb aborts.
-        let init_path = postgres_init_script_host_path("", &binding.instance_id);
-        if let Some(init_dir) = Path::new(&init_path).parent() {
-            std::fs::create_dir_all(init_dir).map_err(|e| {
-                Failure::internal("TOPOLOGY", format!("topology: create init dir: {e}"))
-            })?;
-        }
-        std::fs::write(&init_path, POSTGRES_INIT_SCRIPT_SQL).map_err(|e| {
-            Failure::internal("TOPOLOGY", format!("topology: write init script: {e}"))
+        set_mode(&dir.to_string_lossy(), 0o700).map_err(|e| {
+            Failure::internal("TOPOLOGY", format!("topology: runtime dir mode: {e}"))
         })?;
         std::fs::write(&f.path, &f.content).map_err(|e| {
             Failure::internal("TOPOLOGY", format!("topology: write rendered file: {e}"))
         })?;
-        self.materialize_handoff(binding)?;
+        set_mode(&f.path, 0o600).map_err(|e| {
+            Failure::internal("TOPOLOGY", format!("topology: rendered file mode: {e}"))
+        })?;
+        // ADR 0019 §3's first-boot role-topology script is NOT written
+        // here: its bind-mount source is the hardcoded instance-scoped
+        // `/run/central-infra` anchor, materialized through the
+        // bootstrap seam before the daemons come up — the same step
+        // that carries the credential handoff — never by this renderer
+        // (upstream's comment verbatim, `postgresFirstBootBootstrap`
+        // being upstream's injectable seam).
         Ok(f)
     }
 
-    /// The B04 credential handoff: issue the lifecycle proof, adopt the
-    /// legacy B03 bootstrap, then materialize the MinIO root credential
-    /// under the bound handoff — recording the mount proof for
-    /// `cleanup_secrets`. Delegates every authority step to the injected
-    /// `B04Bootstrap` port (the broker custody path: sealed `memfd`
-    /// over `SCM_RIGHTS`); this adapter never sees credential material.
-    fn materialize_handoff(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
+    /// `materializeBootstrapLocked` — the B04 credential handoff, under
+    /// `file()`'s `mu`. Upstream's order: skip when a proof for this
+    /// binding already exists in-process; establish the B04 lifecycle
+    /// evidence (prior-topology-stopped observation minted into opaque
+    /// broker-signed proofs); validate the complete evidence; adopt the
+    /// B03 bootstrap; write the first-boot init script (the
+    /// `postgresFirstBootBootstrap` seam's half); materialize the MinIO
+    /// root handoff; durably record the handoff before the proof is
+    /// cached — a `record_handoff` failure cleans the materialized file
+    /// so a crash can never leave a handoff whose binding record does
+    /// not exist.
+    fn materialize_bootstrap_locked(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
         let key = binding_key(binding);
         if self
             .proofs
@@ -406,35 +441,95 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
         {
             return Ok(());
         }
-        let evidence = binding.b04.clone();
-        block_on(self.bootstrap.issue_lifecycle_proof(evidence.clone())).map_err(|e| {
-            Failure::internal("TOPOLOGY", format!("topology: B04 issue proof: {e}"))
+        // SC-DEF-12 (upstream): the caller-known half of B04 evidence
+        // (instance/operation id, fencing token, expiry) says nothing
+        // about whether any prior topology for this binding actually
+        // stopped and released its mounts. That half is this Topology's
+        // own to establish — it is the one thing here that can observe
+        // it — so it is filled in here rather than required of every
+        // caller that constructs a Binding.
+        let mut evidence = binding.b04.clone();
+        if evidence.stopped_topology_proof.is_empty()
+            || evidence.mount_release_proof.is_empty()
+            || evidence.binding_evidence.is_empty()
+        {
+            evidence = self.establish_b04_lifecycle_proof_locked(binding, evidence)?;
+        }
+        evidence.validate().map_err(|e| {
+            Failure::internal("TOPOLOGY", format!("topology: B04 lifecycle evidence: {e}"))
         })?;
-        block_on(self.bootstrap.adopt_b03_minio(evidence.clone()))
-            .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: B04 adoption: {e}")))?;
+        block_on(self.bootstrap.adopt_b03_minio(evidence.clone())).map_err(|e| {
+            Failure::internal(
+                "TOPOLOGY",
+                format!("topology: B04 secret bootstrap adoption failed: {e}"),
+            )
+        })?;
+        // The init-script mount source must exist before `compose up`,
+        // or Docker auto-creates it as an empty directory and initdb
+        // aborts. Upstream's `postgresFirstBootBootstrap` performs this
+        // write inside `Materialize`, before delegating to the file
+        // bootstrap — the same pre-up window, on the same hardcoded
+        // instance anchor.
+        let init_path = postgres_init_script_host_path("", &binding.instance_id);
+        if let Some(init_dir) = Path::new(&init_path).parent() {
+            std::fs::create_dir_all(init_dir).map_err(|e| {
+                Failure::internal("TOPOLOGY", format!("topology: create init dir: {e}"))
+            })?;
+            set_mode(&init_dir.to_string_lossy(), 0o700).map_err(|e| {
+                Failure::internal("TOPOLOGY", format!("topology: init dir mode: {e}"))
+            })?;
+        }
+        std::fs::write(&init_path, POSTGRES_INIT_SCRIPT_SQL).map_err(|e| {
+            Failure::internal("TOPOLOGY", format!("topology: write init script: {e}"))
+        })?;
+        set_mode(&init_path, 0o600).map_err(|e| {
+            Failure::internal("TOPOLOGY", format!("topology: init script mode: {e}"))
+        })?;
         let handoff = BootstrapHandoff {
             instance_id: binding.instance_id.clone(),
             purpose: BootstrapPurpose::FirstSetup,
             service: ServiceMode::Minio,
-            target: format!(
-                "/run/central-infra/{}/secrets/minio-root-password",
-                binding.instance_id
-            ),
+            // The fixed destination is the secrets DIRECTORY — the
+            // broker-side ceremony names `minio-root-password` inside it
+            // (upstream `port.BootstrapHandoff.Target`).
+            target: format!("/run/central-infra/{}/secrets", binding.instance_id),
             uid: 1000,
             gid: 1000,
-            lifetime: Default::default(),
+            // Upstream sets only `Expires` — `time.Now().Add(400s)`;
+            // `Duration` stays zero.
+            lifetime: HandoffLifetime {
+                expires: OffsetDateTime::now_utc() + time::Duration::seconds(400),
+                ..HandoffLifetime::default()
+            },
             container_id: String::new(),
             b04_operation_id: evidence.operation_id.clone(),
-            b04_binding_id: String::new(),
-            b04_receipt_id: String::new(),
+            b04_binding_id: evidence.binding_evidence.clone(),
+            b04_receipt_id: binding.receipt_id.clone(),
             b04_fencing_token: evidence.fencing_token,
             b04_stopped_topology_proof: evidence.stopped_topology_proof.clone(),
             b04_mount_release_proof: evidence.mount_release_proof.clone(),
             b04_binding_evidence: evidence.binding_evidence.clone(),
         };
-        let proof = block_on(self.bootstrap.materialize_minio_root(handoff)).map_err(|e| {
-            Failure::internal("TOPOLOGY", format!("topology: B04 materialize: {e}"))
+        let proof = block_on(self.bootstrap.materialize(handoff)).map_err(|e| {
+            Failure::internal(
+                "TOPOLOGY",
+                format!("topology: secure credential handoff: {e}"),
+            )
         })?;
+        // `RecordHandoff` — upstream's optional interface assertion,
+        // here the trait method on the shared bootstrap port. A record
+        // failure removes the materialized handoff: the durable record
+        // must never lag the file it binds.
+        if let Err(e) = block_on(self.bootstrap.record_handoff(binding, &proof)) {
+            let joined = match block_on(self.bootstrap.cleanup(proof.clone())) {
+                Ok(()) => format!("{e}"),
+                Err(cleanup_err) => format!("{e}; bootstrap cleanup failed: {cleanup_err}"),
+            };
+            return Err(Failure::internal(
+                "TOPOLOGY",
+                format!("topology: persist credential handoff: {joined}"),
+            ));
+        }
         self.proofs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -444,7 +539,48 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
         Ok(())
     }
 
+    /// `establishB04LifecycleProofLocked` — observes whether any
+    /// topology this host has ever rendered a compose file for is still
+    /// running, then asks the broker to durably sign that observation
+    /// into a lifecycle proof. For a binding with no rendered file on
+    /// disk — the ordinary first boot — there is nothing to have
+    /// stopped, and the observation is unconditionally satisfied
+    /// without shelling out to the compose runner. Otherwise it defers
+    /// to the exact check `teardown_verified` already trusts for `down`:
+    /// every required service mode stopped. Called with `mu` held.
+    fn establish_b04_lifecycle_proof_locked(
+        &self,
+        binding: &LifecycleBinding,
+        mut evidence: central_infra::domain::B04LifecycleEvidence,
+    ) -> Result<central_infra::domain::B04LifecycleEvidence, Failure> {
+        if let Some(f) = self.existing_file_locked(binding)? {
+            let services: Vec<String> = REQUIRED_SERVICE_MODES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            self.runner.stopped(&f, &services).map_err(|e| {
+                Failure::internal(
+                    "TOPOLOGY",
+                    format!("topology: prior topology is not stopped: {e}"),
+                )
+            })?;
+        }
+        evidence.stopped_topology_proof = uuid::Uuid::now_v7().to_string();
+        evidence.mount_release_proof = uuid::Uuid::now_v7().to_string();
+        evidence.binding_evidence = uuid::Uuid::now_v7().to_string();
+        block_on(self.bootstrap.issue_lifecycle_proof(evidence.clone())).map_err(|e| {
+            Failure::internal(
+                "TOPOLOGY",
+                format!("topology: B04 issuing lifecycle proof: {e}"),
+            )
+        })?;
+        Ok(evidence)
+    }
+
     /// `activeDependencySet` — the receipt's prepared set, validated.
+    /// The receipt id match is enforced only when the binding carries
+    /// one (upstream `binding.ReceiptID != ""` guard): `status`/`down`
+    /// inspect calls bind loosely.
     fn active_dependency_set(
         &self,
         binding: &LifecycleBinding,
@@ -453,10 +589,10 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
             .receipts
             .active()
             .map_err(|e| Failure::internal("TOPOLOGY", format!("topology: active receipt: {e}")))?;
-        if receipt.id != binding.receipt_id {
+        if !binding.receipt_id.is_empty() && receipt.id != binding.receipt_id {
             return Err(Failure::denied(
                 "TOPOLOGY",
-                "topology: active receipt does not match binding",
+                "topology: active B02 receipt does not match binding",
             ));
         }
         receipt
@@ -963,27 +1099,55 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
     }
 
     async fn cleanup_secrets(&self, op: &LifecycleOperation) -> Result<(), Failure> {
+        // Upstream `CleanupSecrets`: the teardown gate and the proof
+        // copy run under `t.mu`; the bootstrap cleanup calls run
+        // unlocked; the map entries are dropped under `t.mu` only after
+        // every cleanup succeeds.
         let key = binding_key(&op.binding);
-        if !self
-            .teardowns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&key)
-        {
-            return Err(Failure::denied(
-                "TOPOLOGY",
-                "topology: teardown must be verified before credential cleanup",
-            ));
-        }
-        let proofs = self
-            .proofs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
+        let proofs = {
+            let _g = self
+                .mu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self
+                .teardowns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key)
+            {
+                return Err(Failure::denied(
+                    "TOPOLOGY",
+                    "topology: teardown must be verified before credential cleanup",
+                ));
+            }
+            self.proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned()
+                .unwrap_or_default()
+        };
         for proof in proofs {
             self.bootstrap.cleanup(proof).await?;
+        }
+        // `CleanupBinding` — upstream's optional interface assertion on
+        // `FileBootstrap`: resumes the durable handoff record's cleanup
+        // after a helper restart, when the in-process `proofs` map was
+        // empty. The trait method is the port of that seam.
+        self.bootstrap.cleanup_binding(&op.binding).await?;
+        {
+            let _g = self
+                .mu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            self.teardowns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
         }
         Ok(())
     }
@@ -994,16 +1158,29 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
 // owner (receipt activation only after a durably prepared receipt).
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
-struct JournalRecord {
+/// `journalState` — one operation's current state as upstream stores
+/// it: the last event's projection, never a rewritten record.
+#[derive(Serialize, Deserialize, Clone)]
+struct JournalOperationRecord {
     id: String,
     linked_operation_id: String,
     phase: String,
-    terminal: bool,
     binding: JournalBinding,
     created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct JournalState {
+    operation: JournalOperationRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
     receipt: Option<DependencyReceiptJson>,
     active: bool,
+}
+
+/// `journalEvent` — upstream's envelope: `{"state": …}`.
+#[derive(Serialize, Deserialize)]
+struct JournalEvent {
+    state: JournalState,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1018,18 +1195,20 @@ struct JournalBinding {
     b04_fencing_token: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct DependencyReceiptJson {
     id: String,
     set: PreparedDependencySet,
 }
 
+/// `path(b)` — upstream `FileJournal.path`: the binding's operations
+/// root under `root/operations/<bindingKey>`, `bindingKey` being the
+/// full `sha256hex(instance_id + "\x00" + config_binding)`.
 fn binding_journal_dir(root: &Path, binding: &LifecycleBinding) -> PathBuf {
-    let digest = Sha256::digest(binding_key(binding).as_bytes());
-    root.join(format!("b{}", hex(&digest[..8])))
+    root.join("operations").join(binding_key(binding))
 }
 
-fn record_to_op(r: &JournalRecord) -> LifecycleOperation {
+fn record_to_op(r: &JournalOperationRecord) -> LifecycleOperation {
     let created_at = OffsetDateTime::parse(
         &r.created_at,
         &time::format_description::well_known::Rfc3339,
@@ -1067,14 +1246,23 @@ fn phase_from_str(s: &str) -> LifecyclePhase {
     LifecyclePhase::Started
 }
 
-/// `FileJournal` — immutable operation records under `root`; current
-/// state derives from the final record. Operation evidence is never
-/// replaced.
+/// `syncDirectory` — upstream `syncDirectory`: `fsync` the containing
+/// directory so the just-appended entry name is durable.
+fn sync_directory(path: &Path) -> Result<(), Failure> {
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| Failure::internal("JOURNAL", format!("sync directory: {e}")))
+}
+
+/// `FileJournal` stores immutable operation events. It is
+/// intentionally a selector owner: receipt activation cannot happen
+/// until a validated receipt has first been durably prepared for that
+/// operation. Current state is derived from the final event; operation
+/// evidence is never replaced.
 pub struct FileJournal {
     root: PathBuf,
     clock: Arc<dyn LifecycleClock>,
     mu: Mutex<()>,
-    seq: Mutex<u64>,
 }
 
 impl FileJournal {
@@ -1092,59 +1280,89 @@ impl FileJournal {
             root,
             clock,
             mu: Mutex::new(()),
-            seq: Mutex::new(0),
         })
     }
 
-    fn next_op_id(&self) -> String {
-        let mut seq = self
-            .seq
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *seq += 1;
-        format!(
-            "op-{}-{:06}",
-            self.clock.now().unix_timestamp_nanos() / 1000,
-            *seq
-        )
-    }
-
-    fn write(&self, rec: &JournalRecord) -> Result<(), Failure> {
-        let dir = binding_journal_dir(
-            &self.root,
-            &LifecycleBinding {
-                instance_id: rec.binding.instance_id.clone(),
-                config_binding: rec.binding.config_binding.clone(),
-                admission_id: rec.binding.admission_id.clone(),
-                receipt_id: rec.binding.receipt_id.clone(),
-                model_digest: rec.binding.model_digest.clone(),
-                payload_epoch: rec.binding.payload_epoch.clone(),
-                bootstrap_fingerprints: Vec::new(),
-                b04: Default::default(),
-            },
-        );
-        std::fs::create_dir_all(&dir)
+    /// `appendLocked` — upstream's exclusive sequence write:
+    /// `{op_dir}/{seq:020}.json` created `O_WRONLY|O_CREATE|O_EXCL`
+    /// mode 0600, written, `fsync`'d, closed, then the operation
+    /// directory is `fsync`'d. The first free sequence wins, so a
+    /// crashed earlier attempt's partial file is never reused.
+    fn append(&self, state: &JournalState) -> Result<(), Failure> {
+        let binding = record_binding(&state.operation);
+        let op_dir = binding_journal_dir(&self.root, &binding).join(&state.operation.id);
+        std::fs::create_dir_all(&op_dir)
             .map_err(|e| Failure::internal("JOURNAL", format!("journal: dir: {e}")))?;
-        let tmp = dir.join(format!("{}.tmp", rec.id));
-        let final_path = dir.join(format!("{}.json", rec.id));
-        let bytes = serde_json::to_vec(rec)
-            .map_err(|e| Failure::internal("JOURNAL", format!("journal: encode: {e}")))?;
-        std::fs::write(&tmp, &bytes)
-            .map_err(|e| Failure::internal("JOURNAL", format!("journal: write: {e}")))?;
-        std::fs::rename(&tmp, &final_path)
-            .map_err(|e| Failure::internal("JOURNAL", format!("journal: rename: {e}")))?;
-        Ok(())
+        for level in [
+            self.root.join("operations"),
+            binding_journal_dir(&self.root, &binding),
+            op_dir.clone(),
+        ] {
+            set_mode(&level.to_string_lossy(), 0o700)
+                .map_err(|e| Failure::internal("JOURNAL", format!("journal: dir mode: {e}")))?;
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        let data = serde_json::to_vec(&JournalEvent {
+            state: state.clone(),
+        })
+        .map_err(|e| Failure::internal("JOURNAL", format!("journal: encode: {e}")))?;
+        let mut sequence = 1u64;
+        loop {
+            let path = op_dir.join(format!("{sequence:020}.json"));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    sequence += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Failure::internal("JOURNAL", format!("journal: open: {e}")));
+                }
+            };
+            use std::io::Write;
+            file.write_all(&data)
+                .map_err(|e| Failure::internal("JOURNAL", format!("journal: write: {e}")))?;
+            file.sync_all()
+                .map_err(|e| Failure::internal("JOURNAL", format!("journal: sync: {e}")))?;
+            drop(file);
+            return sync_directory(&op_dir);
+        }
     }
 
-    fn load(&self, binding: &LifecycleBinding, op_id: &str) -> Result<JournalRecord, Failure> {
-        let path = binding_journal_dir(&self.root, binding).join(format!("{op_id}.json"));
-        let bytes = std::fs::read(&path)
+    /// `readOperationLocked` — folds an operation directory: sort the
+    /// event names, take the last, decode its state.
+    fn read_op(&self, binding: &LifecycleBinding, op_id: &str) -> Result<JournalState, Failure> {
+        let dir = binding_journal_dir(&self.root, binding).join(op_id);
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| Failure::internal("JOURNAL", format!("journal: read operation: {e}")))?;
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| {
+                std::path::Path::new(n)
+                    .extension()
+                    .is_some_and(|x| x == "json")
+            })
+            .collect();
+        if names.is_empty() {
+            return Err(Failure::not_found("JOURNAL", "journal: operation absent"));
+        }
+        names.sort();
+        let data = std::fs::read(dir.join(names.pop().unwrap_or_default()))
             .map_err(|e| Failure::internal("JOURNAL", format!("journal: read: {e}")))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| Failure::internal("JOURNAL", format!("journal: decode: {e}")))
+        let event: JournalEvent = serde_json::from_slice(&data)
+            .map_err(|e| Failure::internal("JOURNAL", format!("journal: decode: {e}")))?;
+        Ok(event.state)
     }
 
-    fn all_records(&self, binding: &LifecycleBinding) -> Result<Vec<JournalRecord>, Failure> {
+    /// `statesLocked` — every operation's folded state for the binding.
+    fn states(&self, binding: &LifecycleBinding) -> Result<Vec<JournalState>, Failure> {
         let dir = binding_journal_dir(&self.root, binding);
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&dir) {
@@ -1153,46 +1371,101 @@ impl FileJournal {
             Err(e) => return Err(Failure::internal("JOURNAL", format!("journal: list: {e}"))),
         };
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".json") {
+            if !entry.path().is_dir() {
                 continue;
             }
-            let bytes = std::fs::read(entry.path())
-                .map_err(|e| Failure::internal("JOURNAL", format!("journal: read: {e}")))?;
-            out.push(
-                serde_json::from_slice(&bytes)
-                    .map_err(|e| Failure::internal("JOURNAL", format!("journal: decode: {e}")))?,
-            );
+            let op_id = entry.file_name().to_string_lossy().to_string();
+            out.push(self.read_op(binding, &op_id)?);
         }
-        out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
     }
 
-    fn to_record(
+    /// `unsettledLocked` — the newest non-terminal operation by
+    /// `CreatedAt`, scanning operation dirs in name order and keeping
+    /// the first when timestamps tie (upstream's `Before` comparison).
+    fn unsettled_locked(
         &self,
-        op: &LifecycleOperation,
-        receipt: Option<DependencyReceiptJson>,
-        active: bool,
-    ) -> JournalRecord {
-        JournalRecord {
-            id: op.id.clone(),
-            linked_operation_id: op.linked_operation_id.clone(),
-            phase: op.phase.as_str().to_owned(),
-            terminal: op.phase.is_terminal(),
-            binding: JournalBinding {
-                instance_id: op.binding.instance_id.clone(),
-                config_binding: op.binding.config_binding.clone(),
-                admission_id: op.binding.admission_id.clone(),
-                receipt_id: op.binding.receipt_id.clone(),
-                model_digest: op.binding.model_digest.clone(),
-                payload_epoch: op.binding.payload_epoch.clone(),
-                b04_operation_id: op.binding.b04.operation_id.clone(),
-                b04_fencing_token: op.binding.b04.fencing_token,
-            },
-            created_at: rfc3339(op.created_at),
-            receipt,
-            active,
+        binding: &LifecycleBinding,
+    ) -> Result<Option<LifecycleOperation>, Failure> {
+        let mut newest: Option<LifecycleOperation> = None;
+        for state in self.states(binding)? {
+            let op = record_to_op(&state.operation);
+            if op.phase.is_terminal() {
+                continue;
+            }
+            let replace = match &newest {
+                None => true,
+                Some(current) => current.created_at < op.created_at,
+            };
+            if replace {
+                newest = Some(op);
+            }
         }
+        Ok(newest)
+    }
+
+    /// `beginLocked` — the shared body of `begin`/`begin_linked_down`;
+    /// an unlinked begin still refuses when an unsettled operation
+    /// exists (upstream's double-check). `linked_id` is `""` for an
+    /// ordinary begin.
+    fn begin_locked(
+        &self,
+        binding: LifecycleBinding,
+        observation: Observation,
+        linked_id: &str,
+    ) -> Result<LifecycleOperation, Failure> {
+        if linked_id.is_empty() && self.unsettled_locked(&binding)?.is_some() {
+            return Err(Failure::conflict(
+                "JOURNAL",
+                "lifecycle journal: unsettled operation exists",
+            ));
+        }
+        let op = LifecycleOperation {
+            id: format!("life-{}", uuid::Uuid::new_v4()),
+            linked_operation_id: linked_id.to_owned(),
+            phase: LifecyclePhase::Started,
+            binding,
+            observation,
+            created_at: self.clock.now(),
+        };
+        self.append(&JournalState {
+            operation: op_to_record(&op),
+            receipt: None,
+            active: false,
+        })?;
+        Ok(op)
+    }
+}
+
+fn record_binding(r: &JournalOperationRecord) -> LifecycleBinding {
+    LifecycleBinding {
+        instance_id: r.binding.instance_id.clone(),
+        config_binding: r.binding.config_binding.clone(),
+        admission_id: r.binding.admission_id.clone(),
+        receipt_id: r.binding.receipt_id.clone(),
+        model_digest: r.binding.model_digest.clone(),
+        payload_epoch: r.binding.payload_epoch.clone(),
+        bootstrap_fingerprints: Vec::new(),
+        b04: Default::default(),
+    }
+}
+
+fn op_to_record(op: &LifecycleOperation) -> JournalOperationRecord {
+    JournalOperationRecord {
+        id: op.id.clone(),
+        linked_operation_id: op.linked_operation_id.clone(),
+        phase: op.phase.as_str().to_owned(),
+        binding: JournalBinding {
+            instance_id: op.binding.instance_id.clone(),
+            config_binding: op.binding.config_binding.clone(),
+            admission_id: op.binding.admission_id.clone(),
+            receipt_id: op.binding.receipt_id.clone(),
+            model_digest: op.binding.model_digest.clone(),
+            payload_epoch: op.binding.payload_epoch.clone(),
+            b04_operation_id: op.binding.b04.operation_id.clone(),
+            b04_fencing_token: op.binding.b04.fencing_token,
+        },
+        created_at: rfc3339(op.created_at),
     }
 }
 
@@ -1207,17 +1480,7 @@ impl LifecyclePort for FileJournal {
             .mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let op = LifecycleOperation {
-            id: self.next_op_id(),
-            linked_operation_id: String::new(),
-            phase: LifecyclePhase::Started,
-            binding,
-            observation,
-            created_at: self.clock.now(),
-        };
-        let rec = self.to_record(&op, None, false);
-        self.write(&rec)?;
-        Ok(op)
+        self.begin_locked(binding, observation, "")
     }
 
     async fn begin_linked_down(
@@ -1227,21 +1490,24 @@ impl LifecyclePort for FileJournal {
         linked: &LifecycleOperation,
     ) -> Result<LifecycleOperation, Failure> {
         binding.validate()?;
+        // Upstream: the linked operation must be a live unsettled up
+        // for the same binding — id present, same instance+config,
+        // non-terminal.
+        if linked.id.is_empty()
+            || linked.binding.instance_id != binding.instance_id
+            || linked.binding.config_binding != binding.config_binding
+            || linked.phase.is_terminal()
+        {
+            return Err(Failure::invalid(
+                "JOURNAL",
+                "lifecycle journal: invalid linked unsettled operation",
+            ));
+        }
         let _g = self
             .mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let op = LifecycleOperation {
-            id: self.next_op_id(),
-            linked_operation_id: linked.id.clone(),
-            phase: LifecyclePhase::Started,
-            binding,
-            observation,
-            created_at: self.clock.now(),
-        };
-        let rec = self.to_record(&op, None, false);
-        self.write(&rec)?;
-        Ok(op)
+        self.begin_locked(binding, observation, &linked.id)
     }
 
     async fn record(
@@ -1253,10 +1519,15 @@ impl LifecyclePort for FileJournal {
             .mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rec = self.load(&operation.binding, &operation.id)?;
-        rec.phase = phase.as_str().to_owned();
-        rec.terminal = phase.is_terminal();
-        self.write(&rec)
+        let mut state = self.read_op(&operation.binding, &operation.id)?;
+        if state.operation.id != operation.id {
+            return Err(Failure::invalid(
+                "JOURNAL",
+                "lifecycle journal: operation mismatch",
+            ));
+        }
+        state.operation.phase = phase.as_str().to_owned();
+        self.append(&state)
     }
 
     async fn prepare_receipt(
@@ -1264,16 +1535,32 @@ impl LifecyclePort for FileJournal {
         operation: &LifecycleOperation,
         receipt: &DependencyReceipt,
     ) -> Result<(), Failure> {
+        // Upstream: the prepared receipt must be the binding's own and
+        // must carry a complete B03 dependency set before it is made
+        // durable — selector switching later trusts this gate.
+        if receipt.id != operation.binding.receipt_id {
+            return Err(Failure::invalid(
+                "JOURNAL",
+                "lifecycle journal: receipt does not match binding",
+            ));
+        }
+        receipt.validate_b03()?;
         let _g = self
             .mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rec = self.load(&operation.binding, &operation.id)?;
-        rec.receipt = Some(DependencyReceiptJson {
+        let mut state = self.read_op(&operation.binding, &operation.id)?;
+        if state.operation.id != operation.id {
+            return Err(Failure::invalid(
+                "JOURNAL",
+                "lifecycle journal: operation mismatch",
+            ));
+        }
+        state.receipt = Some(DependencyReceiptJson {
             id: receipt.id.clone(),
             set: receipt.dependency_set.clone(),
         });
-        self.write(&rec)
+        self.append(&state)
     }
 
     async fn switch_receipt(&self, operation: &LifecycleOperation) -> Result<(), Failure> {
@@ -1281,15 +1568,15 @@ impl LifecyclePort for FileJournal {
             .mu
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rec = self.load(&operation.binding, &operation.id)?;
-        if rec.receipt.is_none() {
+        let mut state = self.read_op(&operation.binding, &operation.id)?;
+        if state.operation.id != operation.id || state.receipt.is_none() {
             return Err(Failure::invalid(
                 "JOURNAL",
-                "journal: receipt switch requires a prepared receipt",
+                "lifecycle journal: receipt was not prepared",
             ));
         }
-        rec.active = true;
-        self.write(&rec)
+        state.active = true;
+        self.append(&state)
     }
 
     async fn settle(
@@ -1297,22 +1584,56 @@ impl LifecyclePort for FileJournal {
         operation: &LifecycleOperation,
         phase: LifecyclePhase,
     ) -> Result<(), Failure> {
-        let _g = self
-            .mu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rec = self.load(&operation.binding, &operation.id)?;
-        rec.phase = phase.as_str().to_owned();
-        rec.terminal = true;
-        self.write(&rec)
+        if !phase.is_terminal() {
+            return Err(Failure::invalid(
+                "JOURNAL",
+                "lifecycle journal: settlement must be terminal",
+            ));
+        }
+        self.record(operation, phase).await
     }
 
     async fn unsettled(
         &self,
         binding: &LifecycleBinding,
     ) -> Result<Option<LifecycleOperation>, Failure> {
-        let records = self.all_records(binding)?;
-        Ok(records.iter().rev().find(|r| !r.terminal).map(record_to_op))
+        let _g = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.unsettled_locked(binding)
+    }
+}
+
+impl FileJournal {
+    /// `ActiveReceipt` — the binding's active selector receipt: the
+    /// last operation's prepared receipt marked active. Generic
+    /// (unbound) lookup is refused upstream — the selector is always
+    /// binding-scoped.
+    pub fn active_receipt(&self, binding: &LifecycleBinding) -> Result<DependencyReceipt, Failure> {
+        let _g = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut active: Option<DependencyReceiptJson> = None;
+        for state in self.states(binding)? {
+            if state.active
+                && let Some(receipt) = state.receipt
+            {
+                active = Some(receipt);
+            }
+        }
+        let Some(receipt) = active else {
+            return Err(Failure::not_found(
+                "JOURNAL",
+                "lifecycle journal: no active receipt",
+            ));
+        };
+        Ok(DependencyReceipt {
+            id: receipt.id,
+            dependency_set: receipt.set,
+            ..DependencyReceipt::default()
+        })
     }
 }
 
@@ -1321,124 +1642,276 @@ impl LifecyclePort for FileJournal {
 // authorizes takeover (dead-owner proof required).
 // ---------------------------------------------------------------------------
 
-/// `FileLocker`.
+/// `FileLocker` — upstream's append-only lock directory per binding:
+/// acquire records `{seq:020}.json`, release records
+/// `{seq:020}.released.json`, both `O_EXCL` mode 0600 with file+dir
+/// fsync. Sequence numbers order the record stream because lock ids
+/// are random `lock-<uuid>`s — lexicographic id order says nothing
+/// about chronology.
 pub struct FileLocker<V> {
-    dir: PathBuf,
+    root: PathBuf,
     lifetime: Duration,
     clock: Arc<dyn LifecycleClock>,
     verifier: V,
+    /// `tokio::sync::Mutex` so the guard may be held across the
+    /// dead-owner verification `await` (upstream holds `l.mu` for the
+    /// whole `Acquire`; a `std` guard is not `Send`).
+    mu: tokio::sync::Mutex<()>,
 }
 
+/// `lockRecord` — upstream's on-disk shape (`released` omitempty).
 #[derive(Serialize, Deserialize)]
-struct LockFile {
+struct LockRecord {
     id: String,
     owner_pid: i32,
+    sequence: u64,
     expires_at: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    released: bool,
     fencing_token: u64,
 }
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// `lockSequenceWidth` — upstream's fixed-width zero-padded decimal;
+/// equal-width names sort lexicographically in numeric order, which is
+/// the property `latest`'s name sort relies on.
+const LOCK_SEQUENCE_WIDTH: usize = 20;
 
 impl<V: DeadOwnerVerifier> FileLocker<V> {
     /// `NewFileLocker`.
     pub fn new(
-        dir: PathBuf,
+        root: PathBuf,
         lifetime: Duration,
         clock: Arc<dyn LifecycleClock>,
         verifier: V,
     ) -> Self {
         Self {
-            dir,
+            root,
             lifetime,
             clock,
             verifier,
+            mu: tokio::sync::Mutex::new(()),
         }
     }
 
+    /// `lockPath` — the per-binding lock DIRECTORY,
+    /// `root/lock-<bindingKey>`.
     fn lock_path(&self, binding: &LifecycleBinding) -> PathBuf {
-        let digest = Sha256::digest(binding_key(binding).as_bytes());
-        self.dir.join(format!("l{}.lock", hex(&digest[..8])))
+        self.root.join(format!("lock-{}", binding_key(binding)))
     }
 
-    fn fencing(&self) -> u64 {
-        let now = self.clock.now().unix_timestamp_nanos();
-        (now as u64) | 1
+    /// `latestLocked` — the chronologically newest record: every
+    /// `.json` entry whose `LOCK_SEQUENCE_WIDTH`-digit prefix parses
+    /// (stale UUID-named records from before the sequence scheme take
+    /// no part), sorted by name, last element decoded.
+    fn latest(&self, binding: &LifecycleBinding) -> Result<Option<LockRecord>, Failure> {
+        let dir = self.lock_path(binding);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Failure::internal(
+                    "LOCK",
+                    format!("lifecycle lock: list: {e}"),
+                ));
+            }
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| {
+                n.len() >= LOCK_SEQUENCE_WIDTH
+                    && n[..LOCK_SEQUENCE_WIDTH].chars().all(|c| c.is_ascii_digit())
+                    && std::path::Path::new(n)
+                        .extension()
+                        .is_some_and(|x| x == "json")
+            })
+            .collect();
+        if names.is_empty() {
+            return Ok(None);
+        }
+        names.sort();
+        let data = std::fs::read(dir.join(names.pop().unwrap_or_default()))
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: read: {e}")))?;
+        let record: LockRecord = serde_json::from_slice(&data)
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: decode: {e}")))?;
+        Ok(Some(record))
+    }
+
+    /// `nextSequenceLocked` — one past the highest sequence present;
+    /// entries without a `LOCK_SEQUENCE_WIDTH`-digit prefix are
+    /// ignored, matching upstream's guard for pre-sequence files.
+    fn next_sequence(&self, dir: &Path) -> Result<u64, Failure> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+            Err(e) => {
+                return Err(Failure::internal(
+                    "LOCK",
+                    format!("lifecycle lock: sequence scan: {e}"),
+                ));
+            }
+        };
+        let mut max = 0u64;
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.len() < LOCK_SEQUENCE_WIDTH {
+                continue;
+            }
+            if let Ok(seq) = name[..LOCK_SEQUENCE_WIDTH].parse::<u64>() {
+                max = max.max(seq);
+            }
+        }
+        Ok(max + 1)
+    }
+
+    /// `appendLocked` — the exclusive sequence write for an acquire
+    /// record (same `O_EXCL` + fsync + dir-sync discipline as the
+    /// journal's `appendLocked`).
+    fn append(&self, binding: &LifecycleBinding, record: &LockRecord) -> Result<(), Failure> {
+        let dir = self.lock_path(binding);
+        self.write_lock_file(
+            &dir,
+            &format!(
+                "{:0width$}.json",
+                record.sequence,
+                width = LOCK_SEQUENCE_WIDTH
+            ),
+            record,
+        )
+    }
+
+    /// `appendReleaseLocked` — the release reuses the acquire record's
+    /// own sequence with the `.released.json` suffix: `"<seq>.json"`
+    /// sorts immediately before `"<seq>.released.json"` (matching
+    /// zero-padded prefix, then `"json" < "released.json"`), so
+    /// `latest` returns the released state once this file exists, and
+    /// a later lock's higher sequence still sorts after both.
+    fn append_release(
+        &self,
+        binding: &LifecycleBinding,
+        record: &LockRecord,
+    ) -> Result<(), Failure> {
+        let dir = self.lock_path(binding);
+        self.write_lock_file(
+            &dir,
+            &format!(
+                "{:0width$}.released.json",
+                record.sequence,
+                width = LOCK_SEQUENCE_WIDTH
+            ),
+            record,
+        )
+    }
+
+    fn write_lock_file(&self, dir: &Path, name: &str, record: &LockRecord) -> Result<(), Failure> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: dir: {e}")))?;
+        set_mode(&dir.to_string_lossy(), 0o700)
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: dir mode: {e}")))?;
+        let data = serde_json::to_vec(record)
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: encode: {e}")))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(name))
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: append: {e}")))?;
+        file.write_all(&data)
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: write: {e}")))?;
+        file.sync_all()
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: sync: {e}")))?;
+        drop(file);
+        std::fs::File::open(dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: dir sync: {e}")))
+    }
+
+    /// `fencing` — crypto-random u64 like upstream's
+    /// `binary.Read(rand.Reader, …)`; zero is refused, never masked
+    /// into validity.
+    fn fencing() -> Result<u64, Failure> {
+        let token = u64::from_be_bytes(
+            uuid::Uuid::new_v4().into_bytes()[..8]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        if token == 0 {
+            return Err(Failure::internal(
+                "LOCK",
+                "lifecycle lock: zero fencing token",
+            ));
+        }
+        Ok(token)
     }
 }
 
 impl<V: DeadOwnerVerifier + Sync> LifecycleLocker for FileLocker<V> {
     async fn acquire(&self, binding: &LifecycleBinding) -> Result<LifecycleLock, Failure> {
-        std::fs::create_dir_all(&self.dir)
+        binding.validate()?;
+        if self.lifetime <= Duration::ZERO {
+            return Err(Failure::invalid("LOCK", "lifecycle lock: invalid lifetime"));
+        }
+        let _g = self.mu.lock().await;
+        std::fs::create_dir_all(&self.root)
             .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: create dir: {e}")))?;
-        let path = self.lock_path(binding);
-        let expires = self.clock.now() + self.lifetime;
-        let file = LockFile {
-            id: format!(
-                "lock-{}",
-                hex(&Sha256::digest(path.to_string_lossy().as_bytes())[..8])
-            ),
-            owner_pid: std::process::id() as i32,
-            expires_at: rfc3339(expires),
-            fencing_token: self.fencing(),
-        };
-        let bytes = serde_json::to_vec(&file)
-            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: encode: {e}")))?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        set_mode(&self.root.to_string_lossy(), 0o700)
+            .map_err(|e| Failure::internal("LOCK", format!("lifecycle lock: mode: {e}")))?;
+        if let Some(old) = self.latest(binding)?
+            && !old.released
         {
-            Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(&bytes).map_err(|e| {
-                    Failure::internal("LOCK", format!("lifecycle lock: write: {e}"))
-                })?;
+            let expires_at = OffsetDateTime::parse(
+                &old.expires_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            if self.clock.now() < expires_at {
+                return Err(Failure::denied("LOCK", "lifecycle lock: already held"));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Lock held: expiry alone never authorizes takeover —
-                // require the broker's dead-owner proof.
-                let existing: LockFile =
-                    serde_json::from_slice(&std::fs::read(&path).map_err(|e2| {
-                        Failure::internal("LOCK", format!("lifecycle lock: read: {e2}"))
-                    })?)
-                    .map_err(|e2| {
-                        Failure::internal("LOCK", format!("lifecycle lock: decode: {e2}"))
-                    })?;
-                let expires_at = OffsetDateTime::parse(
-                    &existing.expires_at,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-                if expires_at > self.clock.now() {
-                    return Err(Failure::denied(
-                        "LOCK_CONTENTION",
-                        "lifecycle lock: already held",
-                    ));
-                }
-                let proof = self
-                    .verifier
-                    .verify_dead_owner(&existing.id, existing.owner_pid)
-                    .await?;
-                if !proof.dead {
-                    return Err(Failure::denied(
-                        "LOCK_CONTENTION",
-                        "lifecycle lock: owner still alive",
-                    ));
-                }
-                std::fs::write(&path, &bytes).map_err(|e2| {
-                    Failure::internal("LOCK", format!("lifecycle lock: takeover: {e2}"))
-                })?;
-            }
-            Err(e) => {
-                return Err(Failure::internal(
+            // Expiry alone never authorizes takeover — the expired
+            // owner must be broker-verified dead, and the proof must
+            // name this exact lock record: same id, same owner pid,
+            // `dead`, and a nonzero verification timestamp.
+            let proof = self
+                .verifier
+                .verify_dead_owner(&old.id, old.owner_pid)
+                .await?;
+            if !proof.dead
+                || proof.lock_id != old.id
+                || proof.owner_pid != old.owner_pid
+                || proof.verified_at == OffsetDateTime::UNIX_EPOCH
+            {
+                return Err(Failure::denied(
                     "LOCK",
-                    format!("lifecycle lock: create: {e}"),
+                    "lifecycle lock: expired owner was not broker-verified dead",
                 ));
             }
         }
+        let expires = self.clock.now() + self.lifetime;
+        let seq = self.next_sequence(&self.lock_path(binding))?;
+        let record = LockRecord {
+            id: format!("lock-{}", uuid::Uuid::new_v4()),
+            owner_pid: std::process::id() as i32,
+            sequence: seq,
+            expires_at: rfc3339(expires),
+            released: false,
+            fencing_token: Self::fencing()?,
+        };
+        self.append(binding, &record)?;
         Ok(LifecycleLock {
-            id: file.id,
+            id: record.id,
             acquired: true,
             expires_at: expires,
-            fencing_token: file.fencing_token,
+            fencing_token: record.fencing_token,
         })
     }
 
@@ -1447,15 +1920,28 @@ impl<V: DeadOwnerVerifier + Sync> LifecycleLocker for FileLocker<V> {
         binding: &LifecycleBinding,
         lock: LifecycleLock,
     ) -> Result<(), Failure> {
-        let path = self.lock_path(binding);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Failure::internal(
-                "LOCK",
-                format!("lifecycle lock: release {}: {e}", lock.id),
-            )),
+        binding.validate()?;
+        if !lock.acquired || lock.id.is_empty() {
+            return Err(Failure::invalid("LOCK", "lifecycle lock: invalid release"));
         }
+        let _g = self.mu.lock().await;
+        let mut latest = match self.latest(binding)? {
+            Some(l) => l,
+            None => {
+                return Err(Failure::denied(
+                    "LOCK",
+                    "lifecycle lock: release does not own current lock",
+                ));
+            }
+        };
+        if latest.released || latest.id != lock.id {
+            return Err(Failure::denied(
+                "LOCK",
+                "lifecycle lock: release does not own current lock",
+            ));
+        }
+        latest.released = true;
+        self.append_release(binding, &latest)
     }
 }
 
@@ -1463,28 +1949,68 @@ impl<V: DeadOwnerVerifier + Sync> LifecycleLocker for FileLocker<V> {
 // FileBarrier + FilesystemCapacity + receiptAdmission + inspector
 // ---------------------------------------------------------------------------
 
-/// `FileBarrier` — denies a writable start while a conflicting
-/// lifecycle operation is unsettled for the binding.
+/// `FileBarrier` — an explicit external-writer veto file, upstream's
+/// `FileBarrier`. Lifecycle locks are intentionally not barriers: the
+/// service acquires its own lifecycle lock before consulting this
+/// port, and a barrier exists only because a non-lifecycle writer (a
+/// restore, an operator safety latch) durably claimed the binding.
 pub struct FileBarrier {
-    journal: Arc<FileJournal>,
+    root: PathBuf,
 }
 
 impl FileBarrier {
-    /// `NewFileBarrier` — the barrier consults the durable journal.
-    pub fn new(journal: Arc<FileJournal>) -> Self {
-        Self { journal }
+    /// `NewFileBarrier(root)`.
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// `barrierPath` — `root/barrier-<bindingKey>.txt`.
+    fn barrier_path(&self, binding: &LifecycleBinding) -> PathBuf {
+        self.root
+            .join(format!("barrier-{}.txt", binding_key(binding)))
+    }
+
+    /// `Block` — records a durable veto for `binding`; the written
+    /// bytes are the denial's reason, replayed verbatim by
+    /// `validate_writable_start`. An empty reason is refused so a veto
+    /// can never be created with no explanation.
+    pub fn block(&self, binding: &LifecycleBinding, reason: &str) -> Result<(), Failure> {
+        if reason.is_empty() {
+            return Err(Failure::invalid(
+                "BARRIER",
+                "lifecycle barrier: empty reason",
+            ));
+        }
+        std::fs::create_dir_all(&self.root).map_err(|e| {
+            Failure::internal("BARRIER", format!("lifecycle barrier: create root: {e}"))
+        })?;
+        set_mode(&self.root.to_string_lossy(), 0o700).map_err(|e| {
+            Failure::internal("BARRIER", format!("lifecycle barrier: root mode: {e}"))
+        })?;
+        let path = self.barrier_path(binding);
+        std::fs::write(&path, reason.as_bytes())
+            .map_err(|e| Failure::internal("BARRIER", format!("lifecycle barrier: write: {e}")))?;
+        set_mode(&path.to_string_lossy(), 0o600)
+            .map_err(|e| Failure::internal("BARRIER", format!("lifecycle barrier: file mode: {e}")))
     }
 }
 
 impl LifecycleBarrier for FileBarrier {
     async fn validate_writable_start(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
-        if self.journal.unsettled(binding).await?.is_some() {
-            return Err(Failure::denied(
+        match std::fs::read(self.barrier_path(binding)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Failure::internal(
+                "BARRIER",
+                format!("lifecycle barrier: read: {e}"),
+            )),
+            Ok(data) => Err(Failure::denied(
                 "BARRIER_CONFLICT",
-                "lifecycle barrier: a conflicting operation is in progress",
-            ));
+                format!(
+                    "lifecycle barrier: writable operation blocked: {}",
+                    String::from_utf8_lossy(&data)
+                ),
+            )),
         }
-        Ok(())
     }
 }
 
@@ -1526,10 +2052,7 @@ impl LifecycleCapacity for FilesystemCapacity {
             ));
         }
         Ok(LifecycleReservation {
-            id: format!(
-                "cap-{}",
-                hex(&Sha256::digest(binding_key(binding).as_bytes())[..8])
-            ),
+            id: format!("capacity-{}", &binding_key(binding)[..16]),
             allocated: self.required_bytes,
             bound: true,
         })
@@ -1700,22 +2223,349 @@ impl ReceiptInspector for DockerReceiptInspector {
 
 /// `FileBootstrap` — `ensure` records the generation; `materialize` and
 /// `cleanup` operate on the materialized handoff artifact the broker
-/// produced (an opaque `MountProof`); `as_b04` exposes the typed B04
-/// authority `Topology::materialize_handoff` requires.
+/// produced (an opaque `MountProof`); the typed B04 authority delegates
+/// straight through, matching upstream's interface assertion on the
+/// bootstrap. `used` is upstream's mount-consumption map; `mu` orders
+/// the durable handoff record writes.
 pub struct FileBootstrap<B> {
     root: PathBuf,
+    clock: Arc<dyn LifecycleClock>,
     b04: B,
-    files: Mutex<BTreeMap<String, PathBuf>>,
+    mu: Mutex<()>,
+    used: Mutex<BTreeMap<String, bool>>,
+}
+
+/// `durableHandoffRecord` is intentionally nonsecret. It binds the
+/// fixed handoff path to a lifecycle binding so a restarted helper can
+/// remove the path only when the lifecycle has verified teardown. It
+/// never records credential bytes or their digest; the record remains
+/// after removal as durable evidence that a restarted helper must not
+/// retry cleanup blindly.
+#[derive(Serialize, Deserialize)]
+struct DurableHandoffRecord {
+    mount_path: String,
+    #[serde(default)]
+    removed: bool,
+}
+
+/// `fixedBootstrapDestination` — upstream's table; MinIO is the only
+/// fixed service destination (`minio-root-password`, uid/gid 1000).
+fn fixed_bootstrap_destination(service: ServiceMode) -> Option<(&'static str, u32, u32)> {
+    match service {
+        ServiceMode::Minio => Some(("minio-root-password", 1000, 1000)),
+        _ => None,
+    }
+}
+
+fn bootstrap_purpose_str(purpose: BootstrapPurpose) -> &'static str {
+    match purpose {
+        BootstrapPurpose::FirstSetup => "first-setup",
+        BootstrapPurpose::Reconcile => "reconcile",
+        BootstrapPurpose::Recovery => "recovery",
+    }
 }
 
 impl<B: B04Bootstrap> FileBootstrap<B> {
     /// `NewFileBootstrap`.
-    pub fn new(root: PathBuf, _clock: Arc<dyn LifecycleClock>, b04: B) -> Self {
+    pub fn new(root: PathBuf, clock: Arc<dyn LifecycleClock>, b04: B) -> Self {
         Self {
             root,
+            clock,
             b04,
-            files: Mutex::new(BTreeMap::new()),
+            mu: Mutex::new(()),
+            used: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// `handoffRecordPath` — `root/<bindingKey>.handoff.json`.
+    fn handoff_record_path(&self, binding: &LifecycleBinding) -> PathBuf {
+        self.root
+            .join(format!("{}.handoff.json", binding_key(binding)))
+    }
+
+    /// `readHandoffRecordLocked` — `(record, exists)`; a corrupt record
+    /// or an empty mount path is an error, never silently absent.
+    fn read_handoff_record(
+        &self,
+        binding: &LifecycleBinding,
+    ) -> Result<Option<DurableHandoffRecord>, Failure> {
+        let data = match std::fs::read(self.handoff_record_path(binding)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Failure::internal(
+                    "BOOTSTRAP",
+                    format!("bootstrap: read handoff record: {e}"),
+                ));
+            }
+            Ok(d) => d,
+        };
+        let record: DurableHandoffRecord = serde_json::from_slice(&data).map_err(|e| {
+            Failure::internal(
+                "BOOTSTRAP",
+                format!("bootstrap: invalid durable handoff record: {e}"),
+            )
+        })?;
+        if record.mount_path.is_empty() {
+            return Err(Failure::internal(
+                "BOOTSTRAP",
+                "bootstrap: invalid durable handoff record",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// `writeHandoffRecordLocked` — temp file in `root`, chmod 0600,
+    /// write, fsync, close, rename over the record path, fsync `root`.
+    /// The record is never written before the materialized handoff it
+    /// binds exists (upstream's `Materialize` → `RecordHandoff` order).
+    fn write_handoff_record(
+        &self,
+        binding: &LifecycleBinding,
+        record: &DurableHandoffRecord,
+    ) -> Result<(), Failure> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| Failure::internal("BOOTSTRAP", format!("bootstrap: create root: {e}")))?;
+        set_mode(&self.root.to_string_lossy(), 0o700)
+            .map_err(|e| Failure::internal("BOOTSTRAP", format!("bootstrap: root mode: {e}")))?;
+        let data = serde_json::to_vec(record).map_err(|e| {
+            Failure::internal(
+                "BOOTSTRAP",
+                format!("bootstrap: encode handoff record: {e}"),
+            )
+        })?;
+        let tmp = self
+            .root
+            .join(format!(".handoff-{}.tmp", uuid::Uuid::new_v4().as_simple()));
+        let result = (|| -> Result<(), Failure> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| {
+                    Failure::internal("BOOTSTRAP", format!("bootstrap: record temp: {e}"))
+                })?;
+            file.write_all(&data).map_err(|e| {
+                Failure::internal("BOOTSTRAP", format!("bootstrap: record write: {e}"))
+            })?;
+            file.sync_all().map_err(|e| {
+                Failure::internal("BOOTSTRAP", format!("bootstrap: record sync: {e}"))
+            })?;
+            drop(file);
+            std::fs::rename(&tmp, self.handoff_record_path(binding)).map_err(|e| {
+                Failure::internal("BOOTSTRAP", format!("bootstrap: record rename: {e}"))
+            })?;
+            std::fs::File::open(&self.root)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| {
+                    Failure::internal("BOOTSTRAP", format!("bootstrap: record dir sync: {e}"))
+                })
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result
+    }
+}
+
+impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
+    /// `Ensure` — upstream: mkdir `root` 0700; the generation file is
+    /// `<bindingKey>-<purpose>.generation`, re-read if present;
+    /// otherwise 32 crypto-random bytes hashed `sha256:<hex>` are
+    /// written `{"Generation":1,"Digest":"…"}` mode 0600.
+    async fn ensure(
+        &self,
+        binding: &LifecycleBinding,
+        purpose: BootstrapPurpose,
+    ) -> Result<BootstrapGeneration, Failure> {
+        binding.validate()?;
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| Failure::internal("BOOTSTRAP", format!("bootstrap: create root: {e}")))?;
+        set_mode(&self.root.to_string_lossy(), 0o700)
+            .map_err(|e| Failure::internal("BOOTSTRAP", format!("bootstrap: root mode: {e}")))?;
+        let path = self.root.join(format!(
+            "{}-{}.generation",
+            binding_key(binding),
+            bootstrap_purpose_str(purpose)
+        ));
+        #[derive(Serialize, Deserialize)]
+        struct GenerationFile {
+            #[serde(rename = "Generation")]
+            generation: u32,
+            #[serde(rename = "Digest")]
+            digest: String,
+        }
+        if let Ok(data) = std::fs::read(&path)
+            && let Ok(g) = serde_json::from_slice::<GenerationFile>(&data)
+        {
+            return Ok(BootstrapGeneration {
+                generation: g.generation,
+                digest: g.digest,
+            });
+        }
+        let mut random = [0u8; 32];
+        random[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        random[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let sum = Sha256::digest(random);
+        let generation = BootstrapGeneration {
+            generation: 1,
+            digest: format!("sha256:{}", hex(&sum)),
+        };
+        let data = serde_json::to_vec(&GenerationFile {
+            generation: generation.generation,
+            digest: generation.digest.clone(),
+        })
+        .map_err(|e| {
+            Failure::internal("BOOTSTRAP", format!("bootstrap: encode generation: {e}"))
+        })?;
+        std::fs::write(&path, &data).map_err(|e| {
+            Failure::internal("BOOTSTRAP", format!("bootstrap: write generation: {e}"))
+        })?;
+        set_mode(&path.to_string_lossy(), 0o600).map_err(|e| {
+            Failure::internal("BOOTSTRAP", format!("bootstrap: generation mode: {e}"))
+        })?;
+        Ok(generation)
+    }
+
+    /// `Materialize` — upstream's exact validation window: required
+    /// fields and an unexpired lifetime; the fixed MinIO secrets
+    /// destination (`/run/central-infra/<id>/secrets`, uid/gid 1000);
+    /// then the typed B04 broker authority — mandatory, never
+    /// bypassed — and a confirmed mount proof with a nonempty path is
+    /// registered in `used`.
+    async fn materialize(&self, handoff: BootstrapHandoff) -> Result<MountProof, Failure> {
+        if handoff.instance_id.is_empty()
+            || handoff.target.is_empty()
+            || (handoff.lifetime.expires != OffsetDateTime::UNIX_EPOCH
+                && self.clock.now() >= handoff.lifetime.expires)
+        {
+            return Err(Failure::invalid(
+                "BOOTSTRAP",
+                "bootstrap: invalid or expired handoff",
+            ));
+        }
+        let Some((_name, uid, gid)) = fixed_bootstrap_destination(handoff.service) else {
+            return Err(Failure::invalid(
+                "BOOTSTRAP",
+                "bootstrap: handoff is outside the fixed service destination",
+            ));
+        };
+        if handoff.target != format!("/run/central-infra/{}/secrets", handoff.instance_id)
+            || handoff.uid != uid
+            || handoff.gid != gid
+        {
+            return Err(Failure::invalid(
+                "BOOTSTRAP",
+                "bootstrap: handoff is outside the fixed service destination",
+            ));
+        }
+        // The credential material itself never transits this process
+        // in plaintext: the broker writes it under the sealed handoff
+        // and this call returns only the mount proof.
+        let proof = self.b04.materialize_minio_root(handoff).await?;
+        if !proof.confirmed || proof.mount_path.is_empty() {
+            return Err(Failure::internal(
+                "BOOTSTRAP",
+                "bootstrap: broker returned invalid mount proof",
+            ));
+        }
+        self.used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(proof.mount_path.clone(), false);
+        Ok(proof)
+    }
+
+    /// `Cleanup` — upstream's single-use rule: only a mount path this
+    /// process materialized (`used[path] == false`) may be removed,
+    /// exactly once; a second call or a foreign path is refused.
+    async fn cleanup(&self, proof: MountProof) -> Result<(), Failure> {
+        if !proof.confirmed || proof.mount_path.is_empty() {
+            return Err(Failure::invalid(
+                "BOOTSTRAP",
+                "bootstrap: invalid mount proof",
+            ));
+        }
+        {
+            let mut used = self
+                .used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match used.get(&proof.mount_path) {
+                Some(false) => {
+                    used.insert(proof.mount_path.clone(), true);
+                }
+                _ => {
+                    return Err(Failure::invalid(
+                        "BOOTSTRAP",
+                        "bootstrap: mount proof already consumed",
+                    ));
+                }
+            }
+        }
+        match std::fs::remove_file(&proof.mount_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Failure::internal(
+                "BOOTSTRAP",
+                format!("bootstrap: cleanup: {e}"),
+            )),
+        }
+    }
+
+    /// `RecordHandoff` — persists only the fixed path of a confirmed
+    /// handoff; the durable record never carries credential bytes.
+    async fn record_handoff(
+        &self,
+        binding: &LifecycleBinding,
+        proof: &MountProof,
+    ) -> Result<(), Failure> {
+        binding.validate()?;
+        if !proof.confirmed || proof.mount_path.is_empty() {
+            return Err(Failure::invalid(
+                "BOOTSTRAP",
+                "bootstrap: invalid mount proof",
+            ));
+        }
+        let _g = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.write_handoff_record(
+            binding,
+            &DurableHandoffRecord {
+                mount_path: proof.mount_path.clone(),
+                removed: false,
+            },
+        )
+    }
+
+    /// `CleanupBinding` — resumes cleanup after a helper crash: the
+    /// durable record's mount path is removed idempotently and the
+    /// record rewritten `removed`, so a restarted helper can finish
+    /// cleanup without the in-process `used` map.
+    async fn cleanup_binding(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
+        binding.validate()?;
+        let _g = self
+            .mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut record = match self.read_handoff_record(binding)? {
+            Some(r) if !r.removed => r,
+            _ => return Ok(()),
+        };
+        match std::fs::remove_file(&record.mount_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Failure::internal(
+                    "BOOTSTRAP",
+                    format!("bootstrap: cleanup binding: {e}"),
+                ));
+            }
+        }
+        record.removed = true;
+        self.write_handoff_record(binding, &record)
     }
 }
 
@@ -1740,58 +2590,6 @@ impl<B: B04Bootstrap> B04Bootstrap for FileBootstrap<B> {
         evidence: central_infra::domain::B04LifecycleEvidence,
     ) -> Result<(), Failure> {
         self.b04.issue_lifecycle_proof(evidence).await
-    }
-}
-
-impl<B: B04Bootstrap> LifecycleBootstrap for FileBootstrap<B> {
-    async fn ensure(
-        &self,
-        binding: &LifecycleBinding,
-        purpose: BootstrapPurpose,
-    ) -> Result<BootstrapGeneration, Failure> {
-        binding.validate()?;
-        let key = format!("{:?}-{}", purpose, binding.instance_id);
-        let digest = Sha256::digest(key.as_bytes());
-        let path = self.root.join(format!("{}.generation", hex(&digest[..8])));
-        if !path.exists() {
-            std::fs::create_dir_all(&self.root).map_err(|e| {
-                Failure::internal("BOOTSTRAP", format!("bootstrap: create root: {e}"))
-            })?;
-            std::fs::write(&path, digest).map_err(|e| {
-                Failure::internal("BOOTSTRAP", format!("bootstrap: write generation: {e}"))
-            })?;
-            set_mode(&path.to_string_lossy(), 0o600)
-                .map_err(|e| Failure::internal("BOOTSTRAP", format!("bootstrap: mode: {e}")))?;
-        }
-        self.files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.clone(), path);
-        Ok(BootstrapGeneration {
-            generation: 1,
-            digest: format!("sha256:{}", hex(&digest)),
-        })
-    }
-
-    async fn materialize(&self, handoff: BootstrapHandoff) -> Result<MountProof, Failure> {
-        // The credential material itself never transits this process in
-        // plaintext: the broker writes it under the sealed handoff and
-        // this call returns only the mount proof.
-        self.b04.materialize_minio_root(handoff).await
-    }
-
-    async fn cleanup(&self, proof: MountProof) -> Result<(), Failure> {
-        if proof.mount_path.is_empty() {
-            return Ok(());
-        }
-        match std::fs::remove_file(&proof.mount_path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Failure::internal(
-                "BOOTSTRAP",
-                format!("bootstrap: cleanup: {e}"),
-            )),
-        }
     }
 }
 
@@ -1820,6 +2618,16 @@ impl<B: B04Bootstrap> LifecycleBootstrap for SharedBootstrap<B> {
     }
     async fn cleanup(&self, proof: MountProof) -> Result<(), Failure> {
         self.0.cleanup(proof).await
+    }
+    async fn record_handoff(
+        &self,
+        binding: &LifecycleBinding,
+        proof: &MountProof,
+    ) -> Result<(), Failure> {
+        self.0.record_handoff(binding, proof).await
+    }
+    async fn cleanup_binding(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
+        self.0.cleanup_binding(binding).await
     }
 }
 
@@ -1947,7 +2755,9 @@ pub fn new_production_service<B: B04Bootstrap, V: DeadOwnerVerifier>(
             cfg.capacity_root,
             2 * 1024 * 1024 * 1024,
         ))),
-        barrier: Some(Arc::new(FileBarrier::new(journal))),
+        barrier: Some(Arc::new(FileBarrier::new(
+            cfg.journal_root.join("barriers"),
+        ))),
         locker: Arc::new(FileLocker::new(
             cfg.journal_root.join("locks"),
             cfg.lock_lifetime.unwrap_or(Duration::from_secs(600)),
@@ -1973,10 +2783,19 @@ impl<S> LifecycleApplicationBridge<S> {
         Self { service, binding }
     }
 
-    fn request(&self) -> LifecycleRequest {
+    /// The upstream `infralifecycle.Request` for one resolved
+    /// operation: the resolver's instance/config values lead (upstream
+    /// passes `operation` straight into `service.Up`), and the
+    /// composed binding supplies the fields the narrowed helper seam
+    /// does not carry (admission, receipt, model digest, payload
+    /// epoch, bootstrap fingerprints).
+    fn request(
+        &self,
+        operation: &crate::helper::lifecycle::LifecycleOperation,
+    ) -> LifecycleRequest {
         LifecycleRequest {
-            instance_id: self.binding.instance_id.clone(),
-            config_binding: self.binding.config_binding.clone(),
+            instance_id: operation.instance_id.clone(),
+            config_binding: operation.config_binding.clone(),
             admission_id: self.binding.admission_id.clone(),
             receipt_id: self.binding.receipt_id.clone(),
             model_digest: self.binding.model_digest.clone(),
@@ -1997,22 +2816,45 @@ where
     L: LifecycleLocker,
     K: LifecycleClock,
 {
-    /// `up` — drives the domain service synchronously for the helper.
-    pub fn up(&self) -> LifecycleResult {
-        block_on(self.service.up(self.request()))
+    /// `up` — drives the domain service synchronously for the helper,
+    /// propagating the helper verb deadline into the domain loop's
+    /// cancellation arm.
+    pub fn up(
+        &self,
+        deadline: Option<OffsetDateTime>,
+        operation: &crate::helper::lifecycle::LifecycleOperation,
+    ) -> LifecycleResult {
+        block_on(
+            self.service
+                .up_with_deadline(self.request(operation), deadline),
+        )
     }
 
     /// `down`.
-    pub fn down(&self) -> LifecycleResult {
-        block_on(self.service.down(self.request()))
+    pub fn down(
+        &self,
+        deadline: Option<OffsetDateTime>,
+        operation: &crate::helper::lifecycle::LifecycleOperation,
+    ) -> LifecycleResult {
+        block_on(
+            self.service
+                .down_with_deadline(self.request(operation), deadline),
+        )
     }
 
     /// `status` — read-only.
-    pub fn status(&self) -> LifecycleResult {
-        block_on(self.service.status(LifecycleStatusRequest {
-            instance_id: self.binding.instance_id.clone(),
-            config_binding: self.binding.config_binding.clone(),
-        }))
+    pub fn status(
+        &self,
+        deadline: Option<OffsetDateTime>,
+        operation: &crate::helper::lifecycle::LifecycleOperation,
+    ) -> LifecycleResult {
+        block_on(self.service.status_with_deadline(
+            LifecycleStatusRequest {
+                instance_id: operation.instance_id.clone(),
+                config_binding: operation.config_binding.clone(),
+            },
+            deadline,
+        ))
     }
 
     /// The domain `LifecycleResult` as the wire `LifecycleServiceResult`
@@ -2044,27 +2886,50 @@ where
 {
     fn up(
         &self,
-        _deadline: std::time::Instant,
-        _operation: crate::helper::lifecycle::LifecycleOperation,
+        deadline: std::time::Instant,
+        operation: crate::helper::lifecycle::LifecycleOperation,
     ) -> crate::helper::lifecycle::LifecycleServiceResult {
-        Self::to_service_result(LifecycleApplicationBridge::up(self))
+        Self::to_service_result(LifecycleApplicationBridge::up(
+            self,
+            Some(instant_to_deadline(deadline)),
+            &operation,
+        ))
     }
 
     fn down(
         &self,
-        _deadline: std::time::Instant,
-        _operation: crate::helper::lifecycle::LifecycleOperation,
+        deadline: std::time::Instant,
+        operation: crate::helper::lifecycle::LifecycleOperation,
     ) -> crate::helper::lifecycle::LifecycleServiceResult {
-        Self::to_service_result(LifecycleApplicationBridge::down(self))
+        Self::to_service_result(LifecycleApplicationBridge::down(
+            self,
+            Some(instant_to_deadline(deadline)),
+            &operation,
+        ))
     }
 
     fn status(
         &self,
-        _deadline: std::time::Instant,
-        _operation: crate::helper::lifecycle::LifecycleOperation,
+        deadline: std::time::Instant,
+        operation: crate::helper::lifecycle::LifecycleOperation,
     ) -> crate::helper::lifecycle::LifecycleServiceResult {
-        Self::to_service_result(LifecycleApplicationBridge::status(self))
+        Self::to_service_result(LifecycleApplicationBridge::status(
+            self,
+            Some(instant_to_deadline(deadline)),
+            &operation,
+        ))
     }
+}
+
+/// `instant_to_deadline` — the helper's monotonic verb deadline
+/// translated to the wall clock the domain `LifecycleClock` compares
+/// against: `now_utc + remaining`. An already-elapsed `Instant`
+/// collapses to now (an immediately-cancelled deadline).
+fn instant_to_deadline(instant: std::time::Instant) -> OffsetDateTime {
+    let remaining = instant
+        .checked_duration_since(std::time::Instant::now())
+        .unwrap_or_default();
+    OffsetDateTime::now_utc() + time::Duration::try_from(remaining).unwrap_or(time::Duration::MAX)
 }
 
 /// `production_lifecycle_handler` — the helper's lifecycle arm over the
@@ -2184,7 +3049,28 @@ mod tests {
                 lock_id: lock_id.to_owned(),
                 owner_pid,
                 dead: true,
-                verified_at: OffsetDateTime::UNIX_EPOCH,
+                // A nonzero verification timestamp — the strict
+                // takeover check refuses a zero one.
+                verified_at: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1000),
+            })
+        }
+    }
+
+    /// A proof whose identity does not match the stale record — the
+    /// takeover must refuse it even though `dead` is set.
+    struct WrongOwnerProof;
+    impl DeadOwnerVerifier for WrongOwnerProof {
+        async fn verify_dead_owner(
+            &self,
+            lock_id: &str,
+            owner_pid: i32,
+        ) -> Result<DeadOwnerProof, Failure> {
+            let _ = owner_pid;
+            Ok(DeadOwnerProof {
+                lock_id: format!("{lock_id}-other"),
+                owner_pid: owner_pid + 1,
+                dead: true,
+                verified_at: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1000),
             })
         }
     }
@@ -2258,24 +3144,28 @@ mod tests {
     fn file_locker_rejects_conflicting_operation() {
         let dir = tmpdir("lock");
         let locker = FileLocker::new(
-            dir,
+            dir.clone(),
             Duration::from_secs(600),
             Arc::new(TestClock),
             Arc::new(NoDeadOwner),
         );
         let lock = block_on(locker.acquire(&binding())).unwrap();
         assert!(lock.acquired);
+        assert_ne!(lock.fencing_token, 0);
         // A second acquire while held is denied.
         let locker2 = FileLocker::new(
-            locker.dir.clone(),
+            dir,
             Duration::from_secs(600),
             Arc::new(TestClock),
             Arc::new(NoDeadOwner),
         );
         assert!(block_on(locker2.acquire(&binding())).is_err());
         block_on(locker.release(&binding(), lock)).unwrap();
-        // Released: the exact binding is acquirable again.
-        assert!(block_on(locker2.acquire(&binding())).unwrap().acquired);
+        // Released: the exact binding is acquirable again, with a fresh
+        // nonzero fencing token.
+        let reacquired = block_on(locker2.acquire(&binding())).unwrap();
+        assert!(reacquired.acquired);
+        assert_ne!(reacquired.fencing_token, 0);
     }
 
     #[test]
@@ -2289,38 +3179,72 @@ mod tests {
             Arc::new(TestClock),
             Arc::new(NoDeadOwner),
         );
-        let stale = LockFile {
+        let stale = LockRecord {
             id: "lock-stale".to_owned(),
             owner_pid: 999_999,
+            sequence: 1,
             expires_at: "1970-01-01T00:00:01Z".to_owned(),
+            released: false,
             fencing_token: 7,
         };
         let path = locker.lock_path(&binding());
-        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("00000000000000000001.json"),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
         // Expired but owner unproven dead → denied.
         assert!(block_on(locker.acquire(&binding())).is_err());
-        // Broker-verified dead owner → takeover succeeds.
+        // A dead proof naming a different lock/owner is also refused.
+        let locker_wrong = FileLocker::new(
+            dir.clone(),
+            Duration::from_secs(1),
+            Arc::new(TestClock),
+            Arc::new(WrongOwnerProof),
+        );
+        assert!(block_on(locker_wrong.acquire(&binding())).is_err());
+        // Broker-verified dead owner → takeover succeeds, appending a
+        // higher sequence record.
         let locker_dead = FileLocker::new(
             dir,
             Duration::from_secs(1),
             Arc::new(TestClock),
             Arc::new(DeadOwner),
         );
-        assert!(block_on(locker_dead.acquire(&binding())).unwrap().acquired);
+        let lock = block_on(locker_dead.acquire(&binding())).unwrap();
+        assert!(lock.acquired);
+        assert_ne!(lock.fencing_token, 0);
     }
 
     // -- FileBarrier ------------------------------------------------------------
 
     #[test]
-    fn file_barrier_rejects_conflicting_writable_start() {
+    fn file_barrier_external_veto_denies_writable_start() {
         let root = tmpdir("barrier");
-        let journal = Arc::new(FileJournal::new(root, Arc::new(TestClock)).unwrap());
-        let barrier = FileBarrier::new(journal.clone());
+        let barrier = FileBarrier::new(root.clone());
         block_on(barrier.validate_writable_start(&binding())).unwrap();
-        let op = block_on(journal.begin(binding(), Observation::default())).unwrap();
-        assert!(block_on(barrier.validate_writable_start(&binding())).is_err());
-        block_on(journal.settle(&op, LifecyclePhase::Completed)).unwrap();
+        // An external writer records its veto; the reason is replayed.
+        barrier.block(&binding(), "restore in progress").unwrap();
+        let err = block_on(barrier.validate_writable_start(&binding())).unwrap_err();
+        assert!(err.to_string().contains("restore in progress"));
+        // Lifecycle lock files are NOT barriers: a lifecycle lock for
+        // the same binding under the same root does not veto anything.
+        let _ = std::fs::remove_file(root.join(format!("barrier-{}.txt", binding_key(&binding()))));
+        let locker = FileLocker::new(
+            root,
+            Duration::from_secs(600),
+            Arc::new(TestClock),
+            Arc::new(NoDeadOwner),
+        );
+        block_on(locker.acquire(&binding())).unwrap();
         block_on(barrier.validate_writable_start(&binding())).unwrap();
+    }
+
+    #[test]
+    fn file_barrier_block_refuses_empty_reason() {
+        let barrier = FileBarrier::new(tmpdir("barrier-empty"));
+        assert!(barrier.block(&binding(), "").is_err());
     }
 
     // -- Topology (payload contract + provision receipt) -------------------------
@@ -2428,6 +3352,16 @@ mod tests {
             self.cleaned.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        async fn record_handoff(
+            &self,
+            _b: &LifecycleBinding,
+            _p: &MountProof,
+        ) -> Result<(), Failure> {
+            Ok(())
+        }
+        async fn cleanup_binding(&self, _b: &LifecycleBinding) -> Result<(), Failure> {
+            Ok(())
+        }
     }
     fn test_dependency_set() -> PreparedDependencySet {
         let inv = OciInventory {
@@ -2442,6 +3376,9 @@ mod tests {
         PreparedDependencySet {
             modes: B03_REQUIRED_SERVICE_MODES
                 .iter()
+                .chain(std::iter::once(
+                    &central_infra::domain::ServiceMode::PostgresThroughputProvision,
+                ))
                 .map(|mode| PreparedMode {
                     mode: *mode,
                     inventory: inv.clone(),
@@ -2665,5 +3602,381 @@ mod tests {
         for key in ["root_password", "secret_key", "credential_value"] {
             assert!(json.get(key).is_none(), "unexpected credential field {key}");
         }
+    }
+
+    // -- FileJournal durability (append-only, exclusive, refuse rules) --------
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().mode() & 0o777
+    }
+
+    /// The event log is append-only sequence files under
+    /// `operations/<bindingKey>/<opId>/`, each `O_EXCL` 0600; every
+    /// directory level is 0700.
+    #[test]
+    fn file_journal_appends_immutable_sequence_events_with_strict_modes() {
+        let root = tmpdir("journal-durable");
+        let journal = FileJournal::new(root.clone(), Arc::new(TestClock)).unwrap();
+        let op = block_on(journal.begin(binding(), Observation::default())).unwrap();
+        assert!(op.id.starts_with("life-"), "life-<uuid> op id: {}", op.id);
+        block_on(journal.record(&op, LifecyclePhase::Verified)).unwrap();
+        block_on(journal.record(&op, LifecyclePhase::FsInitialized)).unwrap();
+        let op_dir = root
+            .join("operations")
+            .join(binding_key(&binding()))
+            .join(&op.id);
+        let mut events: Vec<_> = std::fs::read_dir(&op_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        events.sort();
+        assert_eq!(events.len(), 3, "one event per journal write");
+        assert_eq!(
+            events[0].file_name().unwrap().to_string_lossy(),
+            "00000000000000000001.json"
+        );
+        for event in events {
+            assert_eq!(mode_of(&event), 0o600, "event mode");
+        }
+        for dir in [
+            root.join("operations"),
+            root.join("operations").join(binding_key(&binding())),
+            op_dir,
+        ] {
+            assert_eq!(mode_of(&dir), 0o700, "dir mode: {dir:?}");
+        }
+        // The folded state is the LAST event's projection.
+        let resumed = block_on(journal.unsettled(&binding())).unwrap().unwrap();
+        assert_eq!(resumed.phase, LifecyclePhase::FsInitialized);
+    }
+
+    /// `Begin` refuses while an unsettled operation exists — the
+    /// durable record, not an in-process flag, is the check (a second
+    /// journal over the same root denies too).
+    #[test]
+    fn file_journal_begin_refuses_while_unsettled_across_restart() {
+        let root = tmpdir("journal-unsettled");
+        let journal = FileJournal::new(root.clone(), Arc::new(TestClock)).unwrap();
+        let op = block_on(journal.begin(binding(), Observation::default())).unwrap();
+        assert!(block_on(journal.begin(binding(), Observation::default())).is_err());
+        // A fresh journal instance sees the same durable refusal.
+        let journal2 = FileJournal::new(root, Arc::new(TestClock)).unwrap();
+        assert!(block_on(journal2.begin(binding(), Observation::default())).is_err());
+        block_on(journal.settle(&op, LifecyclePhase::Failed)).unwrap();
+        assert!(block_on(journal2.begin(binding(), Observation::default())).is_ok());
+    }
+
+    /// `settle` accepts only terminal phases; `begin_linked_down`
+    /// requires a live unsettled up for the same binding;
+    /// `prepare_receipt` binds to the binding's own receipt id.
+    #[test]
+    fn file_journal_refusal_rules() {
+        let root = tmpdir("journal-rules");
+        let journal = FileJournal::new(root, Arc::new(TestClock)).unwrap();
+        let op = block_on(journal.begin(binding(), Observation::default())).unwrap();
+        // Non-terminal settle refused.
+        assert!(block_on(journal.settle(&op, LifecyclePhase::Verified)).is_err());
+        // A terminal linked op is not a valid link target.
+        let mut linked = op.clone();
+        linked.phase = LifecyclePhase::Completed;
+        assert!(
+            block_on(journal.begin_linked_down(binding(), Observation::default(), &linked))
+                .is_err()
+        );
+        // A linked op for a different binding is refused.
+        let mut foreign = op.clone();
+        foreign.phase = LifecyclePhase::Started;
+        foreign.binding.config_binding = "cfg-other".to_owned();
+        assert!(
+            block_on(journal.begin_linked_down(binding(), Observation::default(), &foreign))
+                .is_err()
+        );
+        // A receipt that is not the binding's own is refused.
+        let receipt = DependencyReceipt {
+            id: "receipt-other".to_owned(),
+            dependency_set: test_dependency_set(),
+            ..DependencyReceipt::default()
+        };
+        assert!(block_on(journal.prepare_receipt(&op, &receipt)).is_err());
+    }
+
+    /// `ActiveReceipt` — the selector-visible receipt exists only
+    /// after prepare + switch, and survives a journal restart.
+    #[test]
+    fn file_journal_active_receipt_requires_switch_and_survives_restart() {
+        let root = tmpdir("journal-active");
+        let journal = FileJournal::new(root.clone(), Arc::new(TestClock)).unwrap();
+        let op = block_on(journal.begin(binding(), Observation::default())).unwrap();
+        assert!(journal.active_receipt(&binding()).is_err());
+        let receipt = DependencyReceipt {
+            id: "receipt-1".to_owned(),
+            dependency_set: test_dependency_set(),
+            ..DependencyReceipt::default()
+        };
+        block_on(journal.prepare_receipt(&op, &receipt)).unwrap();
+        // Prepared but not switched — still not active.
+        assert!(journal.active_receipt(&binding()).is_err());
+        block_on(journal.switch_receipt(&op)).unwrap();
+        assert_eq!(journal.active_receipt(&binding()).unwrap().id, "receipt-1");
+        let journal2 = FileJournal::new(root, Arc::new(TestClock)).unwrap();
+        assert_eq!(journal2.active_receipt(&binding()).unwrap().id, "receipt-1");
+    }
+
+    // -- FileLocker owner checks ---------------------------------------------
+
+    /// `release` requires the caller's exact lock id — a stale or
+    /// foreign id is refused and the live lock survives.
+    #[test]
+    fn file_locker_release_requires_exact_owner() {
+        let dir = tmpdir("lock-owner");
+        let locker = FileLocker::new(
+            dir,
+            Duration::from_secs(600),
+            Arc::new(TestClock),
+            Arc::new(NoDeadOwner),
+        );
+        let lock = block_on(locker.acquire(&binding())).unwrap();
+        let foreign = LifecycleLock {
+            id: "lock-foreign".to_owned(),
+            acquired: true,
+            expires_at: lock.expires_at,
+            fencing_token: 1,
+        };
+        assert!(block_on(locker.release(&binding(), foreign)).is_err());
+        // The live record is still held — a second acquire denies.
+        assert!(block_on(locker.acquire(&binding())).is_err());
+        block_on(locker.release(&binding(), lock)).unwrap();
+    }
+
+    // -- FileBootstrap durable handoff record ---------------------------------
+
+    /// A fake B04 authority whose materialize returns a scripted
+    /// proof; the mount file is a real temp file so cleanup is
+    /// observable.
+    struct ScriptedB04 {
+        proof: MountProof,
+    }
+    impl B04Bootstrap for ScriptedB04 {
+        async fn adopt_b03_minio(
+            &self,
+            _e: central_infra::domain::B04LifecycleEvidence,
+        ) -> Result<(), Failure> {
+            Ok(())
+        }
+        async fn materialize_minio_root(
+            &self,
+            _h: BootstrapHandoff,
+        ) -> Result<MountProof, Failure> {
+            Ok(self.proof.clone())
+        }
+        async fn issue_lifecycle_proof(
+            &self,
+            _e: central_infra::domain::B04LifecycleEvidence,
+        ) -> Result<(), Failure> {
+            Ok(())
+        }
+    }
+
+    /// `RecordHandoff` writes the nonsecret durable record (`0600`),
+    /// `CleanupBinding` removes the mount and rewrites the record
+    /// `removed`, and a restarted bootstrap over the same root resumes
+    /// the record — the C3 crash window.
+    #[test]
+    fn file_bootstrap_durable_handoff_record_survives_restart() {
+        let root = tmpdir("bootstrap-record");
+        let mount_dir = tmpdir("bootstrap-mount");
+        let mount_path = mount_dir.join("minio-root-password");
+        std::fs::write(&mount_path, b"not-a-real-secret").unwrap();
+        let bootstrap = FileBootstrap::new(
+            root.clone(),
+            Arc::new(TestClock),
+            ScriptedB04 {
+                proof: MountProof {
+                    handoff_digest: "sha256:proof".to_owned(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    confirmed: true,
+                },
+            },
+        );
+        let proof = MountProof {
+            handoff_digest: "sha256:proof".to_owned(),
+            mount_path: mount_path.to_string_lossy().to_string(),
+            confirmed: true,
+        };
+        block_on(bootstrap.record_handoff(&binding(), &proof)).unwrap();
+        let record_path = root.join(format!("{}.handoff.json", binding_key(&binding())));
+        assert_eq!(mode_of(&record_path), 0o600);
+        let record_text = std::fs::read_to_string(&record_path).unwrap();
+        assert!(record_text.contains(&mount_path.to_string_lossy().to_string()));
+        // The record never carries credential material.
+        assert!(!record_text.contains("not-a-real-secret"));
+
+        // A restarted bootstrap resumes cleanup from the record alone.
+        let bootstrap2 = FileBootstrap::new(
+            root.clone(),
+            Arc::new(TestClock),
+            ScriptedB04 {
+                proof: MountProof::default(),
+            },
+        );
+        block_on(bootstrap2.cleanup_binding(&binding())).unwrap();
+        assert!(!mount_path.exists(), "mount removed by cleanup_binding");
+        // The record stays as durable `removed` evidence; a second
+        // cleanup is a no-op, not an error.
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(record["removed"], true);
+        block_on(bootstrap2.cleanup_binding(&binding())).unwrap();
+    }
+
+    /// `Materialize` refuses a handoff outside the fixed MinIO secrets
+    /// destination, an expired lifetime, and an unconfirmed broker
+    /// proof; `Cleanup` is single-use (upstream's `used` map).
+    #[test]
+    fn file_bootstrap_refusal_rules() {
+        let root = tmpdir("bootstrap-rules");
+        let mount_dir = tmpdir("bootstrap-mount2");
+        let mount_path = mount_dir.join("minio-root-password");
+        std::fs::write(&mount_path, b"x").unwrap();
+        let bootstrap = FileBootstrap::new(
+            root,
+            Arc::new(TestClock),
+            ScriptedB04 {
+                proof: MountProof {
+                    handoff_digest: String::new(),
+                    mount_path: mount_path.to_string_lossy().to_string(),
+                    confirmed: true,
+                },
+            },
+        );
+        let handoff = BootstrapHandoff {
+            instance_id: binding().instance_id.clone(),
+            purpose: BootstrapPurpose::FirstSetup,
+            service: ServiceMode::Minio,
+            target: format!("/run/central-infra/{}/secrets", binding().instance_id),
+            uid: 1000,
+            gid: 1000,
+            lifetime: HandoffLifetime {
+                expires: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(2000),
+                ..HandoffLifetime::default()
+            },
+            container_id: String::new(),
+            b04_operation_id: String::new(),
+            b04_binding_id: String::new(),
+            b04_receipt_id: String::new(),
+            b04_fencing_token: 0,
+            b04_stopped_topology_proof: String::new(),
+            b04_mount_release_proof: String::new(),
+            b04_binding_evidence: String::new(),
+        };
+        // Wrong target — refused before the broker is consulted.
+        let mut bad = handoff.clone();
+        bad.target = "/tmp/elsewhere".to_owned();
+        assert!(block_on(bootstrap.materialize(bad)).is_err());
+        // Wrong owner — refused.
+        let mut bad = handoff.clone();
+        bad.uid = 0;
+        assert!(block_on(bootstrap.materialize(bad)).is_err());
+        // Expired lifetime — refused.
+        let mut bad = handoff.clone();
+        bad.lifetime.expires = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert!(block_on(bootstrap.materialize(bad)).is_err());
+        // A valid handoff materializes; cleanup consumes the proof
+        // exactly once.
+        let proof = block_on(bootstrap.materialize(handoff)).unwrap();
+        block_on(bootstrap.cleanup(proof.clone())).unwrap();
+        assert!(block_on(bootstrap.cleanup(proof)).is_err());
+    }
+
+    // -- Down re-render after restart (H3) ------------------------------------
+
+    /// A fresh `Topology` over the same runtime root — the post-reboot
+    /// helper — re-renders the compose file for `down` from durable
+    /// inputs alone, without materializing a credential.
+    #[test]
+    fn down_rerenders_compose_file_after_helper_restart() {
+        let runtime = tmpdir("topo-reboot");
+        let receipts = || {
+            Arc::new(StaticReceipts {
+                receipt: DependencyReceipt {
+                    id: "receipt-1".to_owned(),
+                    dependency_set: test_dependency_set(),
+                    ..DependencyReceipt::default()
+                },
+            }) as Arc<dyn ActiveReceiptReader>
+        };
+        let make_topology = || {
+            Topology::new(
+                Arc::new(CapturingRunner {
+                    run_calls: Mutex::new(Vec::new()),
+                    exit_code: 0,
+                }),
+                receipts(),
+                load_default_policy().unwrap(),
+                runtime.clone(),
+                RecordingBootstrap {
+                    cleaned: AtomicU32::new(0),
+                },
+            )
+        };
+        let compose_path = runtime.join("inst-1").join("docker-compose.yaml");
+        // The first boot's topology renders the file. `file(false)` —
+        // the render path without the root-only materialize write
+        // under /run/central-infra — is the same durable output `down`
+        // re-renders from.
+        let t1 = make_topology();
+        t1.file(&binding(), false).unwrap();
+        assert!(compose_path.exists(), "rendered compose file exists");
+        // Reboot: the tmpfs runtime root is wiped; the restart's
+        // topology has no in-process proof or file cache.
+        std::fs::remove_file(&compose_path).unwrap();
+        let t2 = make_topology();
+        let op = LifecycleOperation {
+            id: "op-down".to_owned(),
+            linked_operation_id: String::new(),
+            phase: LifecyclePhase::Started,
+            binding: binding(),
+            observation: Observation::default(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        block_on(TopologyPort::down(&t2, &op)).unwrap();
+        assert!(
+            compose_path.exists(),
+            "down re-rendered the compose file after restart"
+        );
+    }
+
+    /// `file()` persists the rendered compose file mode 0600 under a
+    /// 0700 instance directory.
+    #[test]
+    fn rendered_compose_file_and_dir_modes() {
+        let runtime = tmpdir("topo-modes");
+        let topology = Topology::new(
+            Arc::new(CapturingRunner {
+                run_calls: Mutex::new(Vec::new()),
+                exit_code: 0,
+            }),
+            Arc::new(StaticReceipts {
+                receipt: DependencyReceipt {
+                    id: "receipt-1".to_owned(),
+                    dependency_set: test_dependency_set(),
+                    ..DependencyReceipt::default()
+                },
+            }),
+            load_default_policy().unwrap(),
+            runtime.clone(),
+            RecordingBootstrap {
+                cleaned: AtomicU32::new(0),
+            },
+        );
+        // `file(false)` — the materialize path additionally writes the
+        // init script under /run/central-infra, which needs root; the
+        // render path is what owns these modes.
+        topology.file(&binding(), false).unwrap();
+        let dir = runtime.join("inst-1");
+        assert_eq!(mode_of(&dir), 0o700);
+        assert_eq!(mode_of(&dir.join("docker-compose.yaml")), 0o600);
     }
 }

@@ -626,6 +626,23 @@ pub trait LifecycleBootstrap: Send + Sync + 'static {
     async fn materialize(&self, handoff: BootstrapHandoff) -> Result<MountProof, Failure>;
     /// Cleans up a mount proof's artifacts.
     async fn cleanup(&self, proof: MountProof) -> Result<(), Failure>;
+    /// `RecordHandoff` — upstream's optional interface assertion on the
+    /// concrete `FileBootstrap`: persists the nonsecret mount path for
+    /// `binding` so a restarted helper can finish cleanup after a
+    /// verified teardown. Implementations with no durable handoff
+    /// record answer `Ok(())`, which is upstream's
+    /// "interface not implemented" branch — the caller skips the record
+    /// rather than fabricating one.
+    async fn record_handoff(
+        &self,
+        binding: &LifecycleBinding,
+        proof: &MountProof,
+    ) -> Result<(), Failure>;
+    /// `CleanupBinding` — upstream's optional interface assertion:
+    /// resumes credential cleanup from the durable handoff record for
+    /// `binding` after a helper restart. Same default rule as
+    /// [`Self::record_handoff`].
+    async fn cleanup_binding(&self, binding: &LifecycleBinding) -> Result<(), Failure>;
 }
 
 impl<B: LifecycleBootstrap + ?Sized> LifecycleBootstrap for Arc<B> {
@@ -641,6 +658,16 @@ impl<B: LifecycleBootstrap + ?Sized> LifecycleBootstrap for Arc<B> {
     }
     async fn cleanup(&self, proof: MountProof) -> Result<(), Failure> {
         (**self).cleanup(proof).await
+    }
+    async fn record_handoff(
+        &self,
+        binding: &LifecycleBinding,
+        proof: &MountProof,
+    ) -> Result<(), Failure> {
+        (**self).record_handoff(binding, proof).await
+    }
+    async fn cleanup_binding(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
+        (**self).cleanup_binding(binding).await
     }
 }
 
@@ -1704,6 +1731,16 @@ mod tests {
                 Ok(MountProof::default())
             }
             async fn cleanup(&self, _proof: MountProof) -> Result<(), Failure> {
+                Ok(())
+            }
+            async fn record_handoff(
+                &self,
+                _binding: &LifecycleBinding,
+                _proof: &MountProof,
+            ) -> Result<(), Failure> {
+                Ok(())
+            }
+            async fn cleanup_binding(&self, _binding: &LifecycleBinding) -> Result<(), Failure> {
                 Ok(())
             }
         }
