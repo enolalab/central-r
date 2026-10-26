@@ -867,6 +867,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "time",
+ "tokio",
  "trait-variant",
  "uuid",
 ]
@@ -1010,12 +1011,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "x509-parser",
 ]
 
 [[package]]
 name = "central-migrate"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "central-kernel",
+ "rustix",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "central-migration-launcherd"

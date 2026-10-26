@@ -55,15 +55,19 @@ pub type Result<T> = core::result::Result<T, Failure>;
 /// cannot alias the one real workspace.
 pub const SENTINEL_WORKSPACE_ID: &str = "019fdc8d-e33a-76ed-9ef0-a0d9fe92e54a";
 
-pub(crate) type BoxFuture<'a, T> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+/// `Send` boxed future the adapters' erased proof surface returns —
+/// the coordinator-facing `central_backup::port::BoxFuture` is a
+/// separate, non-`Send` erase (see its docs).
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Object-safe erase of [`BrokerProofService`] for the runners' stored
 /// `Arc<dyn …>` — `#[trait_variant::make(Send)]` keeps async methods as
 /// return-position `impl Future`, which cannot build a vtable. Runners
 /// only consume proofs, so the erased surface is exactly the two
-/// consume-verified calls.
-pub(crate) trait DynProofService: Send + Sync {
+/// consume-verified calls. `pub` so the kernel's `MigrationSession`
+/// can share one erased `Arc` across the per-call runner
+/// constructions.
+pub trait DynProofService: Send + Sync {
     /// Verify + consume `proof` once against `target`.
     fn consume_verified_empty_target<'a>(
         &'a self,
@@ -98,5 +102,57 @@ impl<T: BrokerProofService + Send + Sync> DynProofService for T {
             target,
             confirmation,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `central_backup::port` erased-trait impls on the concrete adapters.
+// The coordinator is generic over one session type implementing all
+// three object-safe contracts; these impls let a `&mut Runner`/
+// `Inspector`/`ResetRunner` satisfy them directly (and the kernel's
+// `MigrationSession` delegates per call over its owned connection).
+// ---------------------------------------------------------------------------
+
+impl central_backup::port::MigrationRunner for Runner<'_> {
+    fn prepare_up<'a>(
+        &'a mut self,
+        req: &'a PrepareUpRequest,
+    ) -> central_backup::port::BoxFuture<'a, Result<PrepareUpResult>> {
+        Box::pin(async move { Runner::prepare_up(&mut *self, req).await })
+    }
+    fn commit_up<'a>(
+        &'a mut self,
+        req: &'a CommitUpRequest,
+    ) -> central_backup::port::BoxFuture<'a, Result<UpResult>> {
+        Box::pin(async move { Runner::commit_up(&mut *self, req).await })
+    }
+    fn up<'a>(
+        &'a mut self,
+        req: &'a UpRequest,
+    ) -> central_backup::port::BoxFuture<'a, Result<UpResult>> {
+        Box::pin(async move { Runner::up(&mut *self, req).await })
+    }
+    fn resume<'a>(
+        &'a mut self,
+        req: &'a ResumeRequest,
+    ) -> central_backup::port::BoxFuture<'a, Result<ResumeResult>> {
+        Box::pin(async move { Runner::resume(&mut *self, req).await })
+    }
+}
+
+impl central_backup::port::MigrationInspector for Inspector<'_> {
+    fn inspect<'a>(
+        &'a mut self,
+    ) -> central_backup::port::BoxFuture<'a, Result<PostgresMigrationFacts>> {
+        Box::pin(async move { Inspector::inspect(&mut *self).await })
+    }
+}
+
+impl central_backup::port::ResetRunner for ResetRunner<'_> {
+    fn delete_schema<'a>(
+        &'a mut self,
+        req: &'a ResetRequest,
+    ) -> central_backup::port::BoxFuture<'a, Result<()>> {
+        Box::pin(async move { ResetRunner::delete_schema(&mut *self, req).await })
     }
 }

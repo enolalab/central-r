@@ -15,5 +15,11 @@ time.workspace = true
 trait-variant.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# Coordinator matrix tests drive the async ports through a
+# current-thread runtime — the same workspace pin the rest of the
+# workspace uses.
+tokio.workspace = true
+
 [lints]
 workspace = true

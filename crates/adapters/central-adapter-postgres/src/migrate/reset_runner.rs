@@ -40,6 +40,19 @@ impl<'a> ResetRunner<'a> {
         }
     }
 
+    /// `NewResetRunner` over the already-erased proof seam — see
+    /// [`Runner::new_dyn`](super::Runner::new_dyn).
+    #[must_use]
+    pub fn new_dyn(
+        conn: &'a mut PgConnection,
+        proof_service: Option<std::sync::Arc<dyn super::DynProofService>>,
+    ) -> Self {
+        Self {
+            conn,
+            proof_service,
+        }
+    }
+
     /// `DeleteSchema` — the locked, version-zero-only reset.
     ///
     /// # Errors

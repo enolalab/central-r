@@ -26,6 +26,7 @@ pub mod artifact_reconcile;
 pub mod checkpoint_compose;
 pub mod harness_compose;
 pub mod lifecycle;
+pub mod migrate_compose;
 pub mod readiness;
 pub mod readyproof;
 pub mod retry_compose;

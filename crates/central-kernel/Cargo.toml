@@ -62,6 +62,9 @@ time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+# `migrate_compose` — operation/launch-evidence identities are
+# `uuid::Uuid` (the migration operator's own wire vocabulary).
+uuid.workspace = true
 
 [dev-dependencies]
 # Test-only CA/leaf minting for `serve_tls` and TLS-listener fixtures.

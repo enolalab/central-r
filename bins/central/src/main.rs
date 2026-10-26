@@ -36,6 +36,7 @@ mod checkpoint_cli;
 mod grant_cli;
 mod harness_cli;
 mod local_cli;
+mod migrate_cli;
 mod modes;
 mod node_cli;
 mod run_cli;
@@ -193,6 +194,9 @@ fn dispatch(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -
     if command_id.starts_with("local.") {
         return local_cli::local(command_id, tokens, stdout, stderr);
     }
+    if command_id.starts_with("migrate-") {
+        return migrate_cli::migrate(command_id, tokens, stdout, stderr);
+    }
     let result = LocalResult::unsupported(command_id);
     match result.write_json_line(stdout) {
         Ok(()) => result.exit_code,
@@ -325,11 +329,6 @@ mod tests {
                 &["local", "dependency", "upgrade", "apply"],
                 "local.dependency-upgrade-plan",
             ),
-            (&["migrate", "up"], "migrate-up"),
-            (&["migrate", "verify"], "migrate-verify"),
-            (&["migrate", "status"], "migrate-status"),
-            (&["migrate", "resume", "--operation=x"], "migrate-resume"),
-            (&["migrate", "reset"], "migrate-reset"),
             (&["backup", "create"], "backup.create"),
             (&["backup", "verify", "id"], "backup.verify"),
             (&["backup", "status"], "backup.status"),
@@ -357,6 +356,94 @@ mod tests {
             assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
             assert!(parsed["timestamp"].is_string());
             assert!(parsed.get("details").is_none());
+        }
+
+        // R6 `migrate *` (task 1): every verb is activated — it
+        // delegates to the helper socket, which is absent in this
+        // test environment, so the fail-closed seam surfaces
+        // `MIGRATION_HELPER_UNAVAILABLE` at exit 3 and the flag
+        // grammar gates at exit 2. Never `UNSUPPORTED_IN_THIS_SLICE`,
+        // never an in-process fallback.
+        // The socket is pinned to a guaranteed-absent path so a
+        // developer shell's `CENTRAL_HELPER_SOCKET` cannot leak into
+        // the assertions (env mutation is unsafe under Rust 2024).
+        *migrate_cli::TEST_SOCKET_OVERRIDE.lock().unwrap() =
+            Some("/nonexistent/central-test/helper.sock".to_owned());
+        for argv in [
+            &["migrate", "up"][..],
+            &["migrate", "status"][..],
+            &["migrate", "verify"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 3, "argv {argv:?}");
+            assert_eq!(parsed["exit_code"], 3);
+            assert_eq!(parsed["reason"], "MIGRATION_HELPER_UNAVAILABLE");
+            assert_eq!(
+                parsed["details"]["safe_next_action"],
+                "START_OR_REPAIR_THE_CENTRAL_HELPER"
+            );
+        }
+        for (argv, want_id) in [
+            (&["migrate", "up"][..], "migrate-up"),
+            (&["migrate", "status"][..], "migrate-status"),
+            (&["migrate", "verify"][..], "migrate-verify"),
+        ] {
+            let (_, stdout, _) = invoke(argv);
+            assert_eq!(parse_envelope(&stdout)["command_id"], want_id);
+        }
+        for (argv, want_reason, want_next) in [
+            (
+                &["migrate", "resume"][..],
+                "MISSING_OPERATION_FLAG",
+                "PROVIDE_OPERATION_ID",
+            ),
+            (
+                &["migrate", "resume", "--operation=not-a-uuid"][..],
+                "INVALID_OPERATION_FLAG",
+                "PROVIDE_A_VALID_OPERATION_ID",
+            ),
+            (
+                &["migrate", "resume", "--operation="][..],
+                "INVALID_OPERATION_FLAG",
+                "CHECK_OPERATION_ID_FORMAT",
+            ),
+            (
+                &["migrate", "reset"][..],
+                "MISSING_OPERATION_FLAG",
+                "PROVIDE_OPERATION_ID",
+            ),
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 2, "argv {argv:?}");
+            assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
+            assert_eq!(
+                parsed["details"]["safe_next_action"], want_next,
+                "argv {argv:?}"
+            );
+        }
+        // A well-formed operation ID passes the flag grammar and
+        // reaches the helper seam — which fails closed here.
+        let valid_op = uuid::Uuid::now_v7().to_string();
+        for argv in [
+            vec![
+                "migrate".to_owned(),
+                "resume".to_owned(),
+                format!("--operation={valid_op}"),
+            ],
+            vec![
+                "migrate".to_owned(),
+                "reset".to_owned(),
+                format!("--operation={valid_op}"),
+                "--confirm=tok".to_owned(),
+            ],
+        ] {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let (code, stdout, _) = invoke(&refs);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 3, "argv {argv:?}");
+            assert_eq!(parsed["reason"], "MIGRATION_HELPER_UNAVAILABLE");
         }
 
         // R5 local skeletons.

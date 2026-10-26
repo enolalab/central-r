@@ -6,5 +6,30 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[dependencies]
+# The operator composes ONLY through the kernel's `migrate_compose`
+# root — it never assembles adapters itself (upstream
+# `cmd/central-migrate` wiring parity), and never takes a DSN from
+# argv/environment.
+central-kernel = { path = "../../crates/central-kernel", version = "0.1.0" }
+central-foundation = { path = "../../crates/central-foundation", version = "0.1.0" }
+# Audited descriptor syscalls — fixed FD3 launch-evidence read, the
+# FD4 `FD_CLOEXEC` reapply, and the UID/GID gate (launcher-binary
+# carve-out, upstream `unix.FcntlInt`/`os.Geteuid`).
+rustix.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+
+# The operator binaries are the audited `unsafe` sites (workflow §5.2):
+# `sys.rs` opts back in per module, so this crate lists the workspace
+# lints by hand (it cannot both inherit and override `unsafe_code`) with
+# `unsafe_code` at "deny" instead of "forbid".
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"

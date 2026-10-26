@@ -14,6 +14,7 @@ pub mod grant;
 pub mod init;
 pub mod lifecycle;
 pub mod matrix;
+pub mod migration;
 pub mod pam_ceremony;
 pub mod prepare;
 pub mod protocol;

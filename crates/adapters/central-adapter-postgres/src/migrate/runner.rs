@@ -124,6 +124,21 @@ impl<'a> Runner<'a> {
         }
     }
 
+    /// `NewRunner` over the already-erased proof seam — the kernel's
+    /// `MigrationSession` shares one `Arc<dyn DynProofService>` across
+    /// the per-call runner constructions (upstream composes the same
+    /// proof service into every runner leg).
+    #[must_use]
+    pub fn new_dyn(
+        conn: &'a mut PgConnection,
+        proof_service: Option<std::sync::Arc<dyn super::DynProofService>>,
+    ) -> Self {
+        Self {
+            conn,
+            proof_service,
+        }
+    }
+
     /// `Up` — prepare then commit.
     ///
     /// # Errors

@@ -84,6 +84,31 @@ impl TargetIdentity {
             && !self.database.is_empty()
             && !self.config_hash.is_empty()
     }
+
+    /// `broker.TargetFingerprint` — the stable SHA-256 fingerprint of a
+    /// target identity (`system_id:database_oid:database:config_hash:epoch`
+    /// fed to the digest verbatim). The reset-confirmation binding and
+    /// every provisioning journal intent key on it.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        use core::fmt::Write as _;
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(self.system_id.as_bytes());
+        h.update(b":");
+        h.update(self.database_oid.as_bytes());
+        h.update(b":");
+        h.update(self.database.as_bytes());
+        h.update(b":");
+        h.update(self.config_hash.as_bytes());
+        h.update(b":");
+        h.update(self.epoch.to_string().as_bytes());
+        let mut out = String::with_capacity(64);
+        for b in h.finalize() {
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
 }
 
 /// One-use broker-signed proof that a target is empty (expires 60 s after
@@ -122,19 +147,126 @@ pub struct ResetConfirmation {
     pub hmac: String,
 }
 
-/// `backup.ExternalRecordState` — only the ready state the migration
-/// runner produces is modeled here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `backup.ExternalRecordState` — the string states the broker's
+/// protected provisioning record can hold. `Absent` is the honest
+/// answer for a target with no record at all (upstream's
+/// `MigrationOperatorInspector` returns `ExternalRecordAbsent`, never
+/// an error, for a missing record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExternalRecordState {
-    /// `backup.ExternalRecordReady`.
+    /// `backup.ExternalRecordAbsent` — `"absent"`.
+    #[default]
+    Absent,
+    /// `backup.ExternalRecordQuarantined` — `"quarantined"`.
+    Quarantined,
+    /// `backup.ExternalRecordReady` — `"ready"`.
     Ready,
 }
 
-/// `backup.ProvisioningPhase` — the terminal phase reported by `resume`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl ExternalRecordState {
+    /// The wire state string (`backup.ExternalRecordState` values).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Quarantined => "quarantined",
+            Self::Ready => "ready",
+        }
+    }
+
+    /// The `ExternalRecordReady` predicate (upstream `IsReady`).
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Parse one wire state string; empty/unknown input is `Absent`,
+    /// never a manufactured `Ready`.
+    #[must_use]
+    pub fn parse(state: &str) -> Self {
+        match state {
+            "ready" => Self::Ready,
+            "quarantined" => Self::Quarantined,
+            _ => Self::Absent,
+        }
+    }
+}
+
+/// `backup.ProvisioningPhase` — the journal phases an operation's
+/// record passes through (`recorded → candidate_staged →
+/// baseline_installed → candidate_active`); `reset` journals
+/// `reset_started`/`database_removed`/`reset_complete` as free-form
+/// phases the enum does not close over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProvisioningPhase {
-    /// `backup.ProvisioningCandidateActive`.
+    /// `backup.ProvisioningRecorded` — `"recorded"`.
+    Recorded,
+    /// `backup.ProvisioningCandidateStaged` — `"candidate_staged"`.
+    CandidateStaged,
+    /// `backup.ProvisioningBaselineInstalled` — `"baseline_installed"`.
+    BaselineInstalled,
+    /// `backup.ProvisioningCandidateActive` — `"candidate_active"`.
     CandidateActive,
+    /// The empty phase — a settled (`ready`/`absent`) record carries
+    /// no in-flight phase (upstream `""`).
+    #[default]
+    None,
+}
+
+impl ProvisioningPhase {
+    /// The wire phase string (`backup.ProvisioningPhase` values).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::CandidateStaged => "candidate_staged",
+            Self::BaselineInstalled => "baseline_installed",
+            Self::CandidateActive => "candidate_active",
+            Self::None => "",
+        }
+    }
+
+    /// Parse one wire phase string; unknown values are `None`.
+    #[must_use]
+    pub fn parse(phase: &str) -> Self {
+        match phase {
+            "recorded" => Self::Recorded,
+            "candidate_staged" => Self::CandidateStaged,
+            "baseline_installed" => Self::BaselineInstalled,
+            "candidate_active" => Self::CandidateActive,
+            _ => Self::None,
+        }
+    }
+
+    /// `isPreBaseline` — `recorded`/`candidate_staged` phases precede
+    /// the baseline install leg of `resume`.
+    #[must_use]
+    pub const fn is_pre_baseline(self) -> bool {
+        matches!(self, Self::Recorded | Self::CandidateStaged)
+    }
+}
+
+/// `backup.Operation` — one migration operation's durable projection:
+/// the coordinator's `up`/`resume` verbs return it and
+/// `executeMigrationCommand` projects `{record_state, phase}` into the
+/// operator result. `hidden_nonce` is broker-generated and never
+/// serialized upstream; the Rust port does not model it at all.
+#[derive(Debug, Clone, Default)]
+pub struct Operation {
+    /// Operation identity.
+    pub operation_id: uuid::Uuid,
+    /// Target the operation ran against.
+    pub target: TargetIdentity,
+    /// SHA-256 of the checksum manifest the baseline install bound.
+    pub embedded_baseline_digest: String,
+    /// External record state after the verb.
+    pub record_state: ExternalRecordState,
+    /// Terminal provisioning phase reported by the verb.
+    pub provisioning_phase: ProvisioningPhase,
+    /// Operation start (UTC).
+    pub started_at: Option<time::OffsetDateTime>,
+    /// Operation finalize (UTC); absent while in flight.
+    pub finalized_at: Option<time::OffsetDateTime>,
 }
 
 /// `backup.BaselineManifest` — the installer asserts the latest applied

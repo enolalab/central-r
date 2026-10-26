@@ -54,11 +54,18 @@ central-session = { path = "../../crates/capabilities/central-session", version 
 # the same pinned workspace dep the kernel and launcher bins already
 # use.
 rustix.workspace = true
+# `migrate *` (R6 task 1): `serde` for the `MigrationDetails` envelope
+# struct's `omitempty` rules, `uuid` for the upstream
+# `uuid.Must(uuid.NewV7())` operation identities the up/status/verify
+# handlers mint — both already workspace-pinned for the dev/test
+# targets.
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 # Phase-2 recovery test matrix (`tests/phase2_acceptance/`): composes the
@@ -72,8 +79,6 @@ central-eventjournal = { path = "../../crates/capabilities/central-eventjournal"
 # admissions, checkpoints) the recovery matrix asserts on — the
 # PostgreSQL reader is `central-adapter-postgres::runview`.
 central-runview = { path = "../../crates/capabilities/central-runview", version = "0.1.0" }
-serde.workspace = true
-uuid.workspace = true
 
 [[test]]
 name = "phase2_acceptance"

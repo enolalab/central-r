@@ -16,6 +16,7 @@
 //!
 //! `query` / `app` land in this capability's later R-slices.
 
+pub mod app;
 pub mod domain;
 pub mod port;
 pub mod repository;

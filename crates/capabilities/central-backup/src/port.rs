@@ -172,6 +172,211 @@ pub struct IssueResetConfirmationRequest {
     pub target_fingerprint: String,
 }
 
+/// Object-safe boxed future the erased port traits return.
+/// `#[trait_variant]` traits are not object-safe (return-position
+/// `impl Future` cannot build a vtable), so the operator-facing seams
+/// are written in this form directly. The futures are deliberately
+/// **not** `Send`: the coordinator drives them on the one task that
+/// owns the `&mut` session (upstream's conn-bound flow), and rustc
+/// cannot prove the sqlx adapters' `async fn` futures `Send` across
+/// all captured lifetimes. The trait *objects* stay `Send`/`Sync` —
+/// they may be shared in `Arc`; their futures just may not migrate
+/// threads mid-await.
+pub type BoxFuture<'a, T> = core::pin::Pin<Box<dyn core::future::Future<Output = T> + 'a>>;
+
+/// `port.MigrationRunner` — the single-session two-phase driver
+/// contract, object-safe. The concrete
+/// `central-adapter-postgres::migrate::Runner` implements it over the
+/// one non-rebinding `central_migration` session.
+pub trait MigrationRunner: Send {
+    /// `PrepareUp` — locks + session binding + stock-target check.
+    fn prepare_up<'a>(
+        &'a mut self,
+        req: &'a PrepareUpRequest,
+    ) -> BoxFuture<'a, Result<PrepareUpResult, Failure>>;
+    /// `CommitUp` — same-session binding + proof consume + install.
+    fn commit_up<'a>(
+        &'a mut self,
+        req: &'a CommitUpRequest,
+    ) -> BoxFuture<'a, Result<UpResult, Failure>>;
+    /// `Up` — prepare then commit.
+    fn up<'a>(&'a mut self, req: &'a UpRequest) -> BoxFuture<'a, Result<UpResult, Failure>>;
+    /// `Resume` — repair leg or fresh-install leg.
+    fn resume<'a>(
+        &'a mut self,
+        req: &'a ResumeRequest,
+    ) -> BoxFuture<'a, Result<ResumeResult, Failure>>;
+}
+
+/// `port.MigrationInspector` — the read-only facts surface.
+pub trait MigrationInspector: Send {
+    /// `Inspect` — `central` schema facts; dirty evidence and a
+    /// non-terminal chain are failures, not facts.
+    fn inspect<'a>(&'a mut self) -> BoxFuture<'a, Result<PostgresMigrationFacts, Failure>>;
+}
+
+/// `port.ProtectedOperatorStateInspector` — the protected provisioning
+/// record read the coordinator's status path needs. The inspector is
+/// bound to one target at composition time (upstream `Inspect(ctx)`
+/// takes no target); an absent record answers [`ProtectedOperatorState`]
+/// with [`ExternalRecordState::Absent`], never an error.
+pub trait ProtectedOperatorStateInspector: Send + Sync {
+    /// `Inspect` — the bound target's protected record projection.
+    fn inspect_operator_state<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<ProtectedOperatorState, Failure>>;
+}
+
+/// `port.ResetRunner` — the version-zero-only reset driver.
+pub trait ResetRunner: Send {
+    /// `DeleteSchema` — locked, confirmation-bound, version-zero-only.
+    fn delete_schema<'a>(&'a mut self, req: &'a ResetRequest)
+    -> BoxFuture<'a, Result<(), Failure>>;
+}
+
+/// Object-safe erase of [`BrokerProofService`] for the coordinator's
+/// stored seam — the broker authority client (R6 task 2) implements
+/// the `trait_variant` surface; this is its object-safe twin with the
+/// identical method set.
+pub trait DynBrokerProofService: Send + Sync {
+    /// `IssueEmptyTargetProof`.
+    fn issue_empty_target_proof<'a>(
+        &'a self,
+        req: &'a IssueEmptyTargetProofRequest,
+    ) -> BoxFuture<'a, Result<VerifiedEmptyTarget, Failure>>;
+    /// `VerifyEmptyTarget`.
+    fn verify_empty_target<'a>(
+        &'a self,
+        target: &'a TargetIdentity,
+        proof: &'a VerifiedEmptyTarget,
+    ) -> BoxFuture<'a, Result<(), Failure>>;
+    /// `ConsumeEmptyProof`.
+    fn consume_empty_proof<'a>(
+        &'a self,
+        proof: VerifiedEmptyTarget,
+    ) -> BoxFuture<'a, Result<(), Failure>>;
+    /// `ConsumeVerifiedEmptyTarget`.
+    fn consume_verified_empty_target<'a>(
+        &'a self,
+        target: &'a TargetIdentity,
+        proof: VerifiedEmptyTarget,
+    ) -> BoxFuture<'a, Result<(), Failure>>;
+    /// `IssueResetConfirmation`.
+    fn issue_reset_confirmation<'a>(
+        &'a self,
+        req: &'a IssueResetConfirmationRequest,
+    ) -> BoxFuture<'a, Result<ResetConfirmation, Failure>>;
+    /// `VerifyResetConfirmation`.
+    fn verify_reset_confirmation<'a>(
+        &'a self,
+        confirmation: &'a ResetConfirmation,
+    ) -> BoxFuture<'a, Result<(), Failure>>;
+    /// `ConsumeResetConfirmation`.
+    fn consume_reset_confirmation<'a>(
+        &'a self,
+        confirmation: ResetConfirmation,
+    ) -> BoxFuture<'a, Result<(), Failure>>;
+    /// `ConsumeVerifiedResetConfirmation`.
+    fn consume_verified_reset_confirmation<'a>(
+        &'a self,
+        target: &'a TargetIdentity,
+        confirmation: ResetConfirmation,
+    ) -> BoxFuture<'a, Result<(), Failure>>;
+}
+
+impl<T: BrokerProofService + Send + Sync> DynBrokerProofService for T {
+    fn issue_empty_target_proof<'a>(
+        &'a self,
+        req: &'a IssueEmptyTargetProofRequest,
+    ) -> BoxFuture<'a, Result<VerifiedEmptyTarget, Failure>> {
+        Box::pin(BrokerProofService::issue_empty_target_proof(
+            self,
+            req.clone(),
+        ))
+    }
+    fn verify_empty_target<'a>(
+        &'a self,
+        target: &'a TargetIdentity,
+        proof: &'a VerifiedEmptyTarget,
+    ) -> BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(BrokerProofService::verify_empty_target(self, target, proof))
+    }
+    fn consume_empty_proof<'a>(
+        &'a self,
+        proof: VerifiedEmptyTarget,
+    ) -> BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(BrokerProofService::consume_empty_proof(self, proof))
+    }
+    fn consume_verified_empty_target<'a>(
+        &'a self,
+        target: &'a TargetIdentity,
+        proof: VerifiedEmptyTarget,
+    ) -> BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(BrokerProofService::consume_verified_empty_target(
+            self, target, proof,
+        ))
+    }
+    fn issue_reset_confirmation<'a>(
+        &'a self,
+        req: &'a IssueResetConfirmationRequest,
+    ) -> BoxFuture<'a, Result<ResetConfirmation, Failure>> {
+        Box::pin(BrokerProofService::issue_reset_confirmation(
+            self,
+            req.clone(),
+        ))
+    }
+    fn verify_reset_confirmation<'a>(
+        &'a self,
+        confirmation: &'a ResetConfirmation,
+    ) -> BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(BrokerProofService::verify_reset_confirmation(
+            self,
+            confirmation,
+        ))
+    }
+    fn consume_reset_confirmation<'a>(
+        &'a self,
+        confirmation: ResetConfirmation,
+    ) -> BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(BrokerProofService::consume_reset_confirmation(
+            self,
+            confirmation,
+        ))
+    }
+    fn consume_verified_reset_confirmation<'a>(
+        &'a self,
+        target: &'a TargetIdentity,
+        confirmation: ResetConfirmation,
+    ) -> BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(BrokerProofService::consume_verified_reset_confirmation(
+            self,
+            target,
+            confirmation,
+        ))
+    }
+}
+
+/// `port.ProtectedOperatorState` — the broker's projection of the
+/// protected provisioning record; the coordinator keys every mutating
+/// decision on it.
+#[derive(Debug, Clone, Default)]
+pub struct ProtectedOperatorState {
+    /// External record state.
+    pub record_state: ExternalRecordState,
+    /// In-flight provisioning phase, if any.
+    pub provisioning_phase: ProvisioningPhase,
+    /// Target the record binds.
+    pub target: TargetIdentity,
+    /// Operation identity recorded on the target.
+    pub operation_id: uuid::Uuid,
+    /// Optimistic-concurrency revision.
+    pub revision: u64,
+    /// Session binding captured when the operation started.
+    pub session_binding: SessionBinding,
+    /// Last record update.
+    pub detected_at: Option<time::OffsetDateTime>,
+}
+
 /// `port.VersionChecksum` — one `schema_migrations` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionChecksum {
