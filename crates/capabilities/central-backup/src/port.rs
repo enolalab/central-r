@@ -440,3 +440,160 @@ pub struct VersionZeroEligibility {
     /// Records are exactly the clean `baseline-zero` v0 row.
     pub clean_version_zero_only: bool,
 }
+
+// ---------------------------------------------------------------------------
+// R6 Task 3 — recovery ports (recovery_port.go family)
+//
+// Every trait below is the store/client seam a future PostgreSQL, object-
+// store, or broker adapter implements. None carries a path, object key,
+// DSN, credential, or process identity — the same locator-free contract the
+// domain records enforce.
+// ---------------------------------------------------------------------------
+
+use crate::backup::capacity::{BackupContinuitySnapshot, CapacitySnapshot, RecoveryProfile};
+use crate::backup::inventory::InventoryChunk;
+use crate::backup::manifest::SealRootManifest;
+use crate::backup::operation::{BackupAcceptedFacts, BackupOperation, DumpEvidence};
+use crate::recovery::operation::{
+    AuthorityResetReceipt, RecoveryBootstrapActivation, RecoveryBootstrapDraft,
+    RecoveryBootstrapRegistration, RestoreOperation, RestoreTicket,
+};
+use crate::recovery::profile::{ThroughputEvidence, ThroughputEvidenceBinding};
+use crate::recovery::quarantine::QuarantineFinding;
+
+/// `port.BackupJournal` — CAS-persisted backup operations (the
+/// protected journal; PostgreSQL is not the authority).
+pub trait BackupJournalStore: Send + Sync {
+    /// Load the current record, if any.
+    fn load_backup_operation(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> Result<Option<BackupOperation>, Failure>;
+    /// Compare-and-swap on `expected.revision`.
+    fn store_backup_operation(
+        &self,
+        expected: &BackupOperation,
+        next: &BackupOperation,
+    ) -> Result<(), Failure>;
+}
+
+/// `port.BackupEnvironment` — the trusted pre-admission census and
+/// accepted-point facts; only the trusted environment may produce
+/// them.
+pub trait BackupEnvironmentProbe: Send + Sync {
+    /// Fresh capacity census.
+    fn census(&self) -> Result<CapacitySnapshot, Failure>;
+    /// Accepted-point trusted facts under the exclusive lock.
+    fn accepted_facts(&self) -> Result<BackupAcceptedFacts, Failure>;
+    /// Continuous-guard snapshot.
+    fn continuity(&self) -> Result<BackupContinuitySnapshot, Failure>;
+    /// The environment's expected throughput binding.
+    fn throughput_binding(&self) -> Result<ThroughputEvidenceBinding, Failure>;
+    /// The freshest usable throughput receipt, if any.
+    fn throughput_evidence(&self) -> Result<Option<ThroughputEvidence>, Failure>;
+}
+
+/// `port.RepositoryWriter` — the sealed-media sink. Chunk bytes are
+/// produced by the domain; the adapter only persists them immutably.
+pub trait RecoveryRepositoryStore: Send + Sync {
+    /// Persist an immutable inventory chunk under its sealed identity.
+    fn write_inventory_chunk(&self, chunk: &InventoryChunk) -> Result<(), Failure>;
+    /// Persist the dump bytes and return their evidence.
+    fn write_database_dump(&self, bytes: &mut dyn std::io::Read) -> Result<DumpEvidence, Failure>;
+    /// Persist the canonical seal root and return its storage receipt
+    /// (opaque; the manifest is the domain's).
+    fn write_seal_root(&self, manifest: &SealRootManifest) -> Result<(), Failure>;
+    /// Read a chunk back for verification/restore.
+    fn read_inventory_chunk(&self, ordinal: u32) -> Result<InventoryChunk, Failure>;
+    /// Read the canonical seal root bytes.
+    fn read_seal_root(&self) -> Result<Vec<u8>, Failure>;
+}
+
+/// `port.RestoreJournal` — CAS-persisted restore operations. The
+/// journal adapter must run [`RestoreOperation::validate_transition_to`]
+/// before every write.
+pub trait RestoreJournalStore: Send + Sync {
+    /// Load the current record, if any.
+    fn load_restore_operation(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> Result<Option<RestoreOperation>, Failure>;
+    /// Compare-and-swap on `expected.revision`.
+    fn store_restore_operation(
+        &self,
+        expected: &RestoreOperation,
+        next: &RestoreOperation,
+    ) -> Result<(), Failure>;
+}
+
+/// `port.QuarantineStore` — durable quarantine findings. Resolution is
+/// recorded by the ordinary artifact lifecycle, never by callers.
+pub trait QuarantineStore: Send + Sync {
+    /// Persist a new finding.
+    fn record_finding(&self, finding: &QuarantineFinding) -> Result<(), Failure>;
+    /// Unresolved count for an operation.
+    fn unresolved_count(&self, operation_id: uuid::Uuid) -> Result<u64, Failure>;
+    /// Durable findings for an operation.
+    fn list_findings(&self, operation_id: uuid::Uuid) -> Result<Vec<QuarantineFinding>, Failure>;
+}
+
+/// `port.BrokerAuthorityReset` — the broker side of the C05 reset:
+/// ticket issue/consume, bootstrap draft/activation, TLS re-key. All
+/// plaintext credentials remain inside the broker; only hashes and
+/// opaque IDs cross.
+pub trait BrokerAuthorityReset: Send + Sync {
+    /// Issue a one-use ticket bound to manifest + target + epochs.
+    fn issue_restore_ticket(&self, ticket: &RestoreTicket) -> Result<RestoreTicket, Failure>;
+    /// Consume a ticket exactly once; replay must refuse.
+    fn consume_restore_ticket(&self, ticket: &RestoreTicket) -> Result<(), Failure>;
+    /// Create the recovery bootstrap draft.
+    fn create_bootstrap_draft(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<RecoveryBootstrapDraft, Failure>;
+    /// Activate the exact database-issued generation; re-keys broker
+    /// TLS and invalidates sessions, grants, claims, leases, fences,
+    /// provider bindings, and secret references inside the broker.
+    fn activate_bootstrap(
+        &self,
+        registration: &RecoveryBootstrapRegistration,
+    ) -> Result<RecoveryBootstrapActivation, Failure>;
+}
+
+/// `port.PostgresAuthorityReset` — the database side of C05:
+/// helper/PAM rebind and bootstrap registration while all restored
+/// authority is invalidated.
+pub trait PostgresAuthorityReset: Send + Sync {
+    /// Register the draft's exact generation atomically with the
+    /// invalidation sweep; returns the database receipt.
+    fn register_bootstrap(
+        &self,
+        draft: &RecoveryBootstrapDraft,
+    ) -> Result<RecoveryBootstrapRegistration, Failure>;
+}
+
+/// `port.RestoreEngine` — the destructive engine boundary: apply the
+/// sealed dump under the helper barrier. The adapter owns process
+/// management; the domain owns admission and the journal contract.
+pub trait RestoreEngine: Send + Sync {
+    /// `pg_restore`-equivalent apply. Refuses on stale admission.
+    fn apply_database_dump(&self, operation: &RestoreOperation) -> Result<(), Failure>;
+    /// Re-read every restored object body for inventory comparison.
+    fn verify_restored_inventory(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<Vec<QuarantineFinding>, Failure>;
+}
+
+/// `port.RecoveryProfiles` — the installed profile lookup.
+pub trait RecoveryProfileSource: Send + Sync {
+    /// The installed admission envelope.
+    fn installed_profile(&self) -> Result<RecoveryProfile, Failure>;
+}
+
+/// `port.AuthorityResetJournal` — persists the aggregate receipt with
+/// the operation CAS it authorizes.
+pub trait AuthorityResetJournalStore: Send + Sync {
+    /// Persist the receipt bound to the operation.
+    fn store_authority_receipt(&self, receipt: &AuthorityResetReceipt) -> Result<(), Failure>;
+}

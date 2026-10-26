@@ -1163,6 +1163,385 @@ fn repair_still_valid(facts: &PostgresMigrationFacts, op_state: &ProtectedOperat
 // provisioning/resume/status/verify/reset rows over in-memory fakes.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// R6 Task 3 — backup & recovery coordinators (C01–C05 orchestration)
+//
+// The coordinators sequence the domain state machines over the crate's
+// ports. They never carry locators, credentials, or adapter types: every
+// environment fact arrives through `port` traits and every persisted
+// transition goes through the domain's closed methods, so a coordinator
+// cannot manufacture a checkpoint the state machine would reject.
+// ---------------------------------------------------------------------------
+
+use crate::backup::capacity::{check_backup_admission, check_backup_continuation};
+use crate::backup::manifest::new_seal_root_manifest;
+use crate::backup::operation::{BackupPhase, BackupSealProposal, backup_failure};
+use crate::port::{
+    AuthorityResetJournalStore, BackupEnvironmentProbe, BackupJournalStore, BrokerAuthorityReset,
+    PostgresAuthorityReset, QuarantineStore, RecoveryRepositoryStore, RestoreEngine,
+    RestoreJournalStore,
+};
+use crate::recovery::operation::{AuthorityResetReceipt, RestoreTicket, new_restore_operation};
+
+/// `app.BackupCoordinator` — drives `planned → admitted → dumping →
+/// inventory → sealing → sealed` over the journal, environment, and
+/// repository ports.
+pub struct BackupCoordinator<'a> {
+    /// Protected backup journal (CAS).
+    pub journal: &'a dyn BackupJournalStore,
+    /// Trusted environment probe (census, facts, continuity).
+    pub environment: &'a dyn BackupEnvironmentProbe,
+    /// Sealed-media repository sink.
+    pub repository: &'a dyn RecoveryRepositoryStore,
+    /// Installed admission envelope.
+    pub profile: crate::backup::capacity::RecoveryProfile,
+}
+
+impl BackupCoordinator<'_> {
+    /// Runs C02 admission: census → profile/diagnostic/admission →
+    /// throughput evidence → deadline plausibility, then records the
+    /// trusted accepted point in the same protected transition.
+    pub fn admit(
+        &self,
+        operation: crate::backup::operation::BackupOperation,
+    ) -> Result<crate::backup::operation::BackupOperation> {
+        let snapshot = self.environment.census()?;
+        check_backup_admission(&self.profile, &snapshot).map_err(|check| check.into_failure())?;
+        if let Some(evidence) = self.environment.throughput_evidence()? {
+            let binding = self.environment.throughput_binding()?;
+            evidence
+                .valid_for(time::OffsetDateTime::now_utc(), &self.profile, &binding)
+                .map_err(|check| check.into_failure())?;
+            crate::recovery::profile::check_backup_deadline_plausibility(
+                &self.profile,
+                &snapshot,
+                &evidence,
+            )
+            .map_err(|check| check.into_failure())?;
+        }
+        let facts = self.environment.accepted_facts()?;
+        let next = operation.accept(facts)?;
+        self.journal.store_backup_operation(&operation, &next)?;
+        Ok(next)
+    }
+
+    /// Runs one post-admission phase under the continuity guard, then
+    /// persists the transition. `fail` maps the environmental loss to
+    /// the resumable failure class and records it.
+    pub fn advance_phase(
+        &self,
+        operation: &crate::backup::operation::BackupOperation,
+        next_phase: BackupPhase,
+        at: time::OffsetDateTime,
+    ) -> Result<crate::backup::operation::BackupOperation> {
+        let continuity = self.environment.continuity()?;
+        if let Err(failure) = check_backup_continuation(&self.profile, operation, &continuity, at) {
+            let failed = operation.fail(backup_failure::CONTINUITY_LOST, at)?;
+            let _ = self.journal.store_backup_operation(operation, &failed);
+            return Err(failure);
+        }
+        let next = operation.advance(next_phase, at)?;
+        self.journal.store_backup_operation(operation, &next)?;
+        Ok(next)
+    }
+
+    /// Seals: builds the canonical seal root over the verified chunks,
+    /// persists it, and validates the broker-bound proposal.
+    pub fn seal(
+        &self,
+        operation: &crate::backup::operation::BackupOperation,
+        dump: crate::backup::operation::DumpEvidence,
+        chunks: &[crate::backup::inventory::InventoryChunk],
+        file_tree_digest: [u8; 32],
+        proposed_at: time::OffsetDateTime,
+    ) -> Result<BackupSealProposal> {
+        let manifest = new_seal_root_manifest(operation, dump, chunks)?;
+        let root_json = manifest.canonical_json()?;
+        let proposal = BackupSealProposal {
+            operation_id: operation.operation_id,
+            backup_id: operation.backup_id,
+            target: operation.target.clone(),
+            accepted_at: operation.accepted_at,
+            repository_binding_id: operation.accepted_facts.repository_binding_id,
+            target_fingerprint: operation.accepted_facts.target_fingerprint.clone(),
+            config_fingerprint: operation.accepted_facts.config_fingerprint.clone(),
+            payload_epoch_id: operation.accepted_facts.payload_epoch_id,
+            root_manifest_json: root_json.clone(),
+            manifest_digest: manifest.digest,
+            file_tree_digest,
+            proposed_at,
+        };
+        proposal.validate()?;
+        self.repository.write_seal_root(&manifest)?;
+        Ok(proposal)
+    }
+}
+
+/// `app.RestoreCoordinator` — consumes the one-use ticket, drives the
+/// `applying → verifying → (quarantined →) ready` chain, and refuses
+/// with the closed [`crate::recovery::refusal::RestoreRefusalReason`]
+/// vocabulary.
+pub struct RestoreCoordinator<'a> {
+    /// Protected restore journal (CAS + transition validation).
+    pub journal: &'a dyn RestoreJournalStore,
+    /// Broker ticket/reset authority.
+    pub broker: &'a dyn BrokerAuthorityReset,
+    /// Durable quarantine findings.
+    pub quarantine: &'a dyn QuarantineStore,
+    /// The destructive engine.
+    pub engine: &'a dyn RestoreEngine,
+}
+
+impl RestoreCoordinator<'_> {
+    /// Issues a ticket through the broker (HMAC bound inside broker
+    /// storage) and returns it for the operator's admission ceremony.
+    pub fn issue_ticket(&self, ticket: &RestoreTicket) -> Result<RestoreTicket> {
+        self.broker.issue_restore_ticket(ticket)
+    }
+
+    /// Consumes the ticket exactly once and opens the operation at
+    /// `applying`/`ticket_consumed`. A replayed ticket or an expired
+    /// one is refused before any target mutation.
+    pub fn begin(
+        &self,
+        ticket: &RestoreTicket,
+        hmac_key: &[u8],
+        now: time::OffsetDateTime,
+    ) -> Result<crate::recovery::operation::RestoreOperation> {
+        use crate::recovery::refusal::RestoreRefusalReason;
+        if ticket.is_expired_at(now) || !ticket.verify_hmac(hmac_key) {
+            return Err(RestoreRefusalReason::StateInvalid.into_failure());
+        }
+        self.broker
+            .consume_restore_ticket(ticket)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        let operation = new_restore_operation(ticket, now)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        Ok(operation)
+    }
+
+    /// Records the database-replaced checkpoint after the engine's
+    /// destructive apply.
+    pub fn record_database_replaced(
+        &self,
+        operation: &crate::recovery::operation::RestoreOperation,
+        at: time::OffsetDateTime,
+    ) -> Result<crate::recovery::operation::RestoreOperation> {
+        use crate::recovery::refusal::RestoreRefusalReason;
+        self.engine
+            .apply_database_dump(operation)
+            .map_err(|_| RestoreRefusalReason::EngineUnavailable.into_failure())?;
+        let next = operation
+            .record_database_replaced(at)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        self.journal
+            .store_restore_operation(operation, &next)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        Ok(next)
+    }
+
+    /// Runs the inventory comparison at a state that admits it, then
+    /// records either `inventory_verified` plus any durable findings —
+    /// entering `quarantined` when findings exist — or the plain
+    /// verification checkpoint.
+    pub fn verify_inventory(
+        &self,
+        operation: &crate::recovery::operation::RestoreOperation,
+        at: time::OffsetDateTime,
+    ) -> Result<crate::recovery::operation::RestoreOperation> {
+        use crate::recovery::refusal::RestoreRefusalReason;
+        if !operation.admits_inventory_verification() {
+            return Err(RestoreRefusalReason::StateInvalid.into_failure());
+        }
+        let findings = self
+            .engine
+            .verify_restored_inventory(operation)
+            .map_err(|_| RestoreRefusalReason::MediaInvalid.into_failure())?;
+        let mut current = operation.clone();
+        if current.phase == crate::recovery::operation::RestorePhase::Verifying {
+            current = current
+                .record_inventory_verified(at)
+                .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+            self.journal
+                .store_restore_operation(operation, &current)
+                .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        }
+        for finding in &findings {
+            self.quarantine
+                .record_finding(finding)
+                .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        }
+        if !findings.is_empty() {
+            let next = current
+                .enter_quarantine(at)
+                .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+            self.journal
+                .store_restore_operation(&current, &next)
+                .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+            return Ok(next);
+        }
+        Ok(current)
+    }
+
+    /// `ResumeVerification` — only the durable journal's zero count
+    /// releases the barrier; a caller-selected boolean cannot.
+    pub fn resume_from_quarantine(
+        &self,
+        operation: &crate::recovery::operation::RestoreOperation,
+        at: time::OffsetDateTime,
+    ) -> Result<crate::recovery::operation::RestoreOperation> {
+        use crate::recovery::refusal::RestoreRefusalReason;
+        let unresolved = self
+            .quarantine
+            .unresolved_count(operation.operation_id)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        let next = operation
+            .resume_verification(unresolved, at)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        self.journal
+            .store_restore_operation(operation, &next)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        Ok(next)
+    }
+
+    /// `MarkReady` — requires the recorded authority-reset checkpoint.
+    pub fn mark_ready(
+        &self,
+        operation: &crate::recovery::operation::RestoreOperation,
+        at: time::OffsetDateTime,
+    ) -> Result<crate::recovery::operation::RestoreOperation> {
+        use crate::recovery::refusal::RestoreRefusalReason;
+        let next = operation
+            .mark_ready(at)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        self.journal
+            .store_restore_operation(operation, &next)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        Ok(next)
+    }
+}
+
+/// `app.AuthorityResetCoordinator` — the C05 sequence: bootstrap
+/// draft (broker) → registration (PostgreSQL, with the invalidation
+/// sweep) → activation (broker, TLS re-key) → aggregate receipt →
+/// protected checkpoint.
+pub struct AuthorityResetCoordinator<'a> {
+    /// Broker side of the reset.
+    pub broker: &'a dyn BrokerAuthorityReset,
+    /// PostgreSQL side of the reset.
+    pub postgres: &'a dyn PostgresAuthorityReset,
+    /// Receipt journal.
+    pub receipts: &'a dyn AuthorityResetJournalStore,
+    /// Operation journal.
+    pub journal: &'a dyn RestoreJournalStore,
+}
+
+impl AuthorityResetCoordinator<'_> {
+    /// Runs the full reset and records `authority_reset` on the
+    /// operation — the only precursor to `ready`.
+    pub fn reset(
+        &self,
+        operation: &crate::recovery::operation::RestoreOperation,
+        completed_at: time::OffsetDateTime,
+    ) -> Result<crate::recovery::operation::RestoreOperation> {
+        use crate::recovery::refusal::RestoreRefusalReason;
+        let draft = self
+            .broker
+            .create_bootstrap_draft(operation)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        draft
+            .validate_for(operation)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        let registration = self
+            .postgres
+            .register_bootstrap(&draft)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        registration
+            .validate_for(operation, &draft)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        let activation = self
+            .broker
+            .activate_bootstrap(&registration)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        activation
+            .validate_for(operation, &registration)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        let receipt = AuthorityResetReceipt {
+            operation_id: operation.operation_id,
+            previous_restore_epoch: operation.restore_epoch - 1,
+            new_restore_epoch: operation.restore_epoch,
+            previous_security_epoch: operation.security_epoch,
+            new_security_epoch: operation
+                .security_epoch
+                .checked_add(1)
+                .ok_or_else(|| RestoreRefusalReason::StateInvalid.into_failure())?,
+            broker_receipt_hash: registration.broker_receipt_hash.clone(),
+            database_receipt_hash: registration.database_receipt_hash.clone(),
+            bootstrap_candidate_id: registration.candidate_id,
+            bootstrap_generation: registration.generation,
+            bootstrap_activation_receipt_hash: activation.activation_receipt_hash.clone(),
+            aggregate_receipt_hash: format!(
+                "sha256:{}",
+                crate::wire::sha256_hex(
+                    format!(
+                        "{}{}{}{}",
+                        registration.broker_receipt_hash,
+                        registration.database_receipt_hash,
+                        activation.activation_receipt_hash,
+                        registration.generation
+                    )
+                    .as_bytes(),
+                )
+            ),
+            completed_at,
+        };
+        let next = operation
+            .record_authority_reset(&receipt)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        self.receipts
+            .store_authority_receipt(&receipt)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        self.journal
+            .store_restore_operation(operation, &next)
+            .map_err(|_| RestoreRefusalReason::StateInvalid.into_failure())?;
+        Ok(next)
+    }
+}
+
+/// `app.RestoreVerifier` — bounded re-verification: re-reads the seal
+/// root and chunks from the repository and refuses with
+/// `RESTORE_MEDIA_INVALID` on any mismatch before an operation opens.
+pub struct RestoreVerifier<'a> {
+    /// Sealed-media repository.
+    pub repository: &'a dyn RecoveryRepositoryStore,
+}
+
+impl RestoreVerifier<'_> {
+    /// Re-parses the sealed root and verifies every chunk it names.
+    pub fn verify_media(&self) -> Result<crate::backup::manifest::SealRootManifest> {
+        use crate::recovery::refusal::RestoreRefusalReason;
+        let payload = self
+            .repository
+            .read_seal_root()
+            .map_err(|_| RestoreRefusalReason::MediaInvalid.into_failure())?;
+        if payload.len() as u64 > crate::backup::capacity::MAXIMUM_SEAL_ROOT_MANIFEST_BYTES {
+            return Err(RestoreRefusalReason::MediaInvalid.into_failure());
+        }
+        let references = crate::backup::manifest::parse_seal_root_references(&payload)
+            .map_err(|_| RestoreRefusalReason::MediaInvalid.into_failure())?;
+        let mut chunks = Vec::with_capacity(references.chunks.len());
+        for reference in &references.chunks {
+            chunks.push(
+                self.repository
+                    .read_inventory_chunk(reference.ordinal)
+                    .map_err(|_| RestoreRefusalReason::MediaInvalid.into_failure())?,
+            );
+        }
+        crate::backup::manifest::parse_seal_root_manifest(&payload, &chunks)
+            .map_err(|_| RestoreRefusalReason::MediaInvalid.into_failure())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
