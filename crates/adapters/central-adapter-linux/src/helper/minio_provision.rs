@@ -212,7 +212,8 @@ pub(crate) fn exact_backup_minio_compose_model(
     let want_broker = format!(
         "/run/central-infra/{instance_id}/broker/minio-provision.sock:{BACKUP_MINIO_BROKER_SOCKET_PATH}"
     );
-    service.volumes.contains(&want_root) && service.volumes.contains(&want_broker)
+    service.volumes.contains(&want_root)
+        && service.volumes.contains(&want_broker)
         && service.env.get("CENTRAL_LOCAL_INFRA_MINIO_ADMIN_ENDPOINT")
             == Some(&"minio:9000".to_owned())
         && service.env.get("MINIO_ROOT_PASSWORD_FILE")

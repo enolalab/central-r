@@ -88,11 +88,23 @@ struct PgConn {
 }
 
 impl PgConn {
+    /// Caps the next socket syscall at the remaining exchange deadline —
+    /// upstream bounds the whole exchange with `context.WithTimeout`, so a
+    /// slow-drip peer cannot stretch it one syscall-timeout at a time.
+    fn refresh_timeouts(&self) -> Result<(), Failure> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| unavailable("postgres wire: exchange deadline exceeded"))?;
+        self.stream
+            .set_read_timeout(Some(remaining))
+            .and_then(|()| self.stream.set_write_timeout(Some(remaining)))
+            .map_err(|_| unavailable("postgres wire: timeout configure failed"))
+    }
+
     fn read_message(&mut self) -> Result<Message, Failure> {
-        if Instant::now() >= self.deadline {
-            return Err(unavailable("postgres wire: exchange deadline exceeded"));
-        }
         let mut head = [0u8; 5];
+        self.refresh_timeouts()?;
         self.stream
             .read_exact(&mut head)
             .map_err(|_| unavailable("postgres wire: read failed"))?;
@@ -102,6 +114,7 @@ impl PgConn {
             return Err(unavailable("postgres wire: malformed message"));
         }
         let mut payload = vec![0u8; len - 4];
+        self.refresh_timeouts()?;
         self.stream
             .read_exact(&mut payload)
             .map_err(|_| unavailable("postgres wire: read failed"))?;
@@ -118,6 +131,7 @@ impl PgConn {
         frame.push(kind);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(payload);
+        self.refresh_timeouts()?;
         self.stream
             .write_all(&frame)
             .map_err(|_| unavailable("postgres wire: write failed"))
