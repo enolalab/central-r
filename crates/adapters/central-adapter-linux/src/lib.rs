@@ -33,6 +33,8 @@
 #[forbid(unsafe_code)]
 pub mod backup;
 #[forbid(unsafe_code)]
+pub mod backup_launcher;
+#[forbid(unsafe_code)]
 pub mod backup_repository;
 pub mod broker;
 pub mod dev_bootstrap;

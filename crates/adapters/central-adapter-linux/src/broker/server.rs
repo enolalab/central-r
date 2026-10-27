@@ -2041,17 +2041,25 @@ pub fn handle_conn(conn: std::os::unix::net::UnixStream, svc: &Service) -> Resul
             match protocol::read_backup_worker_credential_request(&mut conn) {
                 Ok(request) => {
                     // `s.backupLaunches == nil` is upstream's first
-                    // closed gate (`handleBackupWorkerCredentialTransport`
-                    // re-checks the worker identity against it).
-                    protocol::write_deny(
-                        &mut conn,
-                        &request.operation_id.to_string(),
-                        "BACKUP_WORKER_CREDENTIAL_DENIED",
-                    );
-                    Err(Failure::denied(
-                        "broker",
-                        "broker: denied backup credential peer",
-                    ))
+                    // closed gate, then the launch store's pinned
+                    // runtime UID/GID — the handler re-checks the
+                    // worker identity against the launch evidence.
+                    let worker_peer = svc.backup_launches.as_ref().is_some_and(|launches| {
+                        peer.uid.as_raw() == launches.runtime_uid()
+                            && peer.gid.as_raw() == launches.runtime_gid()
+                    });
+                    if !worker_peer {
+                        protocol::write_deny(
+                            &mut conn,
+                            &request.operation_id.to_string(),
+                            "BACKUP_WORKER_CREDENTIAL_DENIED",
+                        );
+                        return Err(Failure::denied(
+                            "broker",
+                            "broker: denied backup credential peer",
+                        ));
+                    }
+                    svc.handle_backup_worker_credential_transport(&mut conn, &request, &peer)
                 }
                 Err(e) => {
                     protocol::write_deny(&mut conn, "unknown", "BACKUP_WORKER_CREDENTIAL_DENIED");
@@ -2060,15 +2068,27 @@ pub fn handle_conn(conn: std::os::unix::net::UnixStream, svc: &Service) -> Resul
             }
         }
         RESTORE_MIGRATION_CREDENTIAL_FRAME_MARKER => {
-            protocol::write_deny(&mut conn, "unknown", "RESTORE_CREDENTIAL_DENIED");
-            Err(Failure::denied(
-                "broker",
-                format!(
-                    "broker: denied restore credential peer {}:{}",
-                    peer.uid.as_raw(),
-                    peer.gid.as_raw()
-                ),
-            ))
+            // Reject a non-root peer before parsing: the migration
+            // credential is never released to the runtime, the backup
+            // worker, or the operator.
+            if !is_root_backup_helper_peer(&peer) {
+                protocol::write_deny(&mut conn, "unknown", "RESTORE_CREDENTIAL_DENIED");
+                return Err(Failure::denied(
+                    "broker",
+                    format!(
+                        "broker: denied restore credential peer {}:{}",
+                        peer.uid.as_raw(),
+                        peer.gid.as_raw()
+                    ),
+                ));
+            }
+            match protocol::read_restore_credential_request(&mut conn) {
+                Ok(request) => svc.handle_restore_credential_transport(&mut conn, &request, &peer),
+                Err(e) => {
+                    protocol::write_deny(&mut conn, "unknown", "RESTORE_CREDENTIAL_DENIED");
+                    Err(e)
+                }
+            }
         }
         // Upstream runs these frames' peer predicates inside their
         // handlers — the launch record's helper/engine validation —

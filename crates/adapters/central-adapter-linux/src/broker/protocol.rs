@@ -434,6 +434,78 @@ pub fn read_backup_worker_credential_request(
     })
 }
 
+/// `restoreMigrationCredentialFrameSize` — marker + kind + one UUID.
+pub const RESTORE_MIGRATION_CREDENTIAL_FRAME_SIZE: usize = 1 + 1 + 16;
+
+/// `restoreMigrationCredential` — the destructive `pg_restore`
+/// migration credential (kind 1).
+pub const RESTORE_MIGRATION_CREDENTIAL: u8 = 1;
+/// `restoreRuntimeCredential` — kind 2; the only kind a nil operation
+/// may request.
+pub const RESTORE_RUNTIME_CREDENTIAL: u8 = 2;
+/// `restoreMinioCredential` — kind 3.
+pub const RESTORE_MINIO_CREDENTIAL: u8 = 3;
+/// `restoreAuditMigrationCredential` — kind 4 (SC-DEF-62/63).
+pub const RESTORE_AUDIT_MIGRATION_CREDENTIAL: u8 = 4;
+/// `restoreMinioImportCredential` — kind 5 (ADR 0034).
+pub const RESTORE_MINIO_IMPORT_CREDENTIAL: u8 = 5;
+/// `restoreImportMigrationCredential` — kind 6 (ADR 0034).
+pub const RESTORE_IMPORT_MIGRATION_CREDENTIAL: u8 = 6;
+
+/// `validRestoreCredentialKind` — the closed `1..=6` kind set.
+#[must_use]
+pub fn valid_restore_credential_kind(kind: u8) -> bool {
+    kind == RESTORE_MIGRATION_CREDENTIAL
+        || kind == RESTORE_RUNTIME_CREDENTIAL
+        || kind == RESTORE_MINIO_CREDENTIAL
+        || kind == RESTORE_AUDIT_MIGRATION_CREDENTIAL
+        || kind == RESTORE_MINIO_IMPORT_CREDENTIAL
+        || kind == RESTORE_IMPORT_MIGRATION_CREDENTIAL
+}
+
+/// `restoreCredentialRequest` — the parsed 0xc2 frame body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreCredentialRequest {
+    /// The credential `kind` byte (`1..=6`).
+    pub kind: u8,
+    /// The operation this credential serves; nil only for the runtime
+    /// credential during verification, which runs before any
+    /// operation exists.
+    pub operation_id: uuid::Uuid,
+}
+
+/// `readRestoreCredentialRequest` — the fixed 17-byte body after the
+/// `0xc2` marker: `kind` byte, then `operation_id`. The frame carries
+/// no purpose, locator, role, path, or descriptor selector: which
+/// credential is released is fixed by executable policy, never by
+/// anything the caller writes. A non-nil operation must be UUIDv7;
+/// only the runtime credential may be requested without an operation.
+///
+/// # Errors
+/// `broker_protocol` on a short read or an invalid request.
+pub fn read_restore_credential_request(
+    r: &mut impl Read,
+) -> Result<RestoreCredentialRequest, Failure> {
+    let mut payload = [0u8; RESTORE_MIGRATION_CREDENTIAL_FRAME_SIZE - 1];
+    r.read_exact(&mut payload).map_err(|e| {
+        Failure::internal(
+            "broker_protocol",
+            format!("broker: read restore credential frame: {e}"),
+        )
+    })?;
+    let kind = payload[0];
+    let mut operation_bytes = [0u8; 16];
+    operation_bytes.copy_from_slice(&payload[1..17]);
+    let operation_id = uuid::Uuid::from_bytes(operation_bytes);
+    if !valid_restore_credential_kind(kind)
+        || (!operation_id.is_nil() && operation_id.get_version_num() != 7)
+        || (operation_id.is_nil() && kind != RESTORE_RUNTIME_CREDENTIAL)
+    {
+        return Err(invalid("broker: invalid restore credential request"));
+    }
+    Ok(RestoreCredentialRequest { kind, operation_id })
+}
+
 /// `decodeB10ProvisionedDescriptor` — `size == len(data)-4` (exactly,
 /// never a prefix), then the JSON `MinioProvisionedDescriptor`.
 ///

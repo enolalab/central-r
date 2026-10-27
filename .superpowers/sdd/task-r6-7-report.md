@@ -194,3 +194,41 @@ under their upstream peer gates; `bind_postgres_service_role` +
 `append_advisory_evaluation` remain `UNSUPPORTED_IN_THIS_SLICE`;
 slice (c) still needs the `0xc1`–`0xc5` credential transports and the
 helper backup/restore file operations.
+
+## Slice (c) part 1 — `0xc1`/`0xc2` credential transports + CBL1 client
+
+Files changed:
+- `crates/adapters/central-adapter-linux/src/broker/backup_worker_credential.rs` (new)
+- `crates/adapters/central-adapter-linux/src/broker/restore_credential.rs` (new)
+- `crates/adapters/central-adapter-linux/src/backup_launcher.rs` (new)
+- `crates/adapters/central-adapter-linux/src/broker/protocol.rs`
+- `crates/adapters/central-adapter-linux/src/broker/server.rs`
+- `crates/adapters/central-adapter-linux/src/broker/mod.rs`
+- `crates/adapters/central-adapter-linux/src/lib.rs`
+
+Live vs denied (<=8 lines):
+1. `0xc1` live: backup-worker Postgres/MinIO + throughput
+   Postgres-target/probe/MinIO credentials via sealed memfd + SCM_RIGHTS,
+   parse-before-peer-check preserving upstream operation-ID echo.
+2. `0xc2` live for kinds 2-6 (runtime, MinIO restore, audit migration,
+   MinIO import, import migration) behind root-helper peer + mode/phase
+   admission + closed `RestoreRefusalReason` sanitization.
+3. Kind 1 restore migration credential stays fail-closed: T8's capacity
+   gate is the only thing that unblocks it.
+4. `0xc3`/`0xc4`/`0xc5` capacity transports remain UNSUPPORTED.
+5. CBL1 client (launch/commit/abort/wait/assert-retained/census/release)
+   ported; helper `backup.rs`/`restore.rs` + verb-matrix flip remain
+   for part 2.
+6. Runtime-owned passfile ownership preserved for kinds 1/4; all other
+   credentials stay root-owned for broker-provenance checks.
+7. Credential bytes bounded + zeroized; malformed frames deny as
+   "unknown"; arbitrary errors never cross the helper boundary.
+8. Non-T7 helper verbs still deny `UNSUPPORTED_IN_THIS_SLICE`.
+
+Verification (run this session):
+- `cargo test -p central-adapter-linux --lib` focused credential +
+  launcher filters: 32 tests pass (27 broker credential + 5 CBL1
+  client), 0 fail.
+- `cargo clippy -p central-adapter-linux --all-targets -- -D warnings` — clean.
+- `cargo check -p central-adapter-linux` — clean.
+- `cargo fmt -p central-adapter-linux` — applied; clean after format.
