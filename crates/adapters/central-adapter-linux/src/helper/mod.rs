@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod matrix;
 pub mod migration;
 pub mod migration_launch;
+pub(crate) mod minio_provision;
 pub mod pam_ceremony;
 pub mod prepare;
 pub mod protocol;

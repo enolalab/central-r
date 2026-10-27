@@ -70,6 +70,21 @@ pub struct ProductionInstanceComposition {
     /// the broker daemon cannot disagree about where an instance's
     /// payload directories live.
     pub role_roots: central_backup::backup::capacity::RoleRoots,
+    /// `cfg.paths.backup_repository_root` —
+    /// `<authoritative_state_root>/backups`, config-verified.
+    pub backup_repository_root: String,
+    /// `/run/central-infra/<instance_id>/docker-compose.yaml` — the
+    /// one rendered compose file the preparers may run.
+    pub compose_path: String,
+    /// `cfg.object_store.bucket` — the fixed `central-artifacts-v1`
+    /// bucket the recovery purposes bind.
+    pub object_store_bucket: String,
+    /// `cfg.object_store.policy_digests.backup`.
+    pub backup_policy_digest: String,
+    /// `cfg.object_store.policy_digests.restore`.
+    pub restore_policy_digest: String,
+    /// `cfg.object_store.policy_digests.import`.
+    pub import_policy_digest: String,
 }
 
 /// `filepath.IsAbs(path) && filepath.Clean(path) == path` — absolute
@@ -206,10 +221,16 @@ pub fn load_production_instance_composition_for_owner(
     let role_roots =
         crate::infra::capacity_roles::role_roots(&instance_id).map_err(|_| INSTANCE_UNAVAILABLE)?;
     Ok(ProductionInstanceComposition {
-        instance_id,
+        instance_id: instance_id.clone(),
         authoritative_state_root: state_root.clone(),
         dependency_root: format!("{state_root}/dependencies"),
         role_roots,
+        backup_repository_root: cfg.paths.backup_repository_root.clone(),
+        compose_path: format!("/run/central-infra/{instance_id}/docker-compose.yaml"),
+        object_store_bucket: cfg.object_store.bucket.clone(),
+        backup_policy_digest: cfg.object_store.policy_digests.backup.clone(),
+        restore_policy_digest: cfg.object_store.policy_digests.restore.clone(),
+        import_policy_digest: cfg.object_store.policy_digests.import.clone(),
     })
 }
 
@@ -816,6 +837,12 @@ mod tests {
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
             role_roots: Default::default(),
+            backup_repository_root: String::new(),
+            compose_path: String::new(),
+            object_store_bucket: String::new(),
+            backup_policy_digest: String::new(),
+            restore_policy_digest: String::new(),
+            import_policy_digest: String::new(),
         };
         // Missing root.
         let err =

@@ -128,12 +128,12 @@ fn report_sweep_failure(site: &str, err: &str) {
 
 // ---------------------------------------------------------------------------
 // MinIO preparer seams — `restore_minio_composition.go` /
-// `import_minio_composition.go`. The production preparers are the
-// composition fields `newProductionRestoreMinioPreparer` needs —
-// restore policy digest, compose model, object-store bucket — which
-// the ported `ProductionInstanceComposition` does not yet carry, so
-// this slice composes `None` and the launchers refuse at the exact
-// rung upstream's nil checks sit.
+// `import_minio_composition.go`. The restore-side production
+// preparer lives in `helper/minio_provision.rs`
+// (`ProductionRestoreMinioPreparer`, the real chain the ported
+// `ProductionInstanceComposition` now feeds). The import writer is
+// still uncomposed — `import_minio` stays `None` and the import
+// launch refuses at the exact rung upstream's nil check sits.
 // ---------------------------------------------------------------------------
 
 /// `restoreMinioCredentialPreparer` — mints the operation-bound,
@@ -786,12 +786,12 @@ pub struct ProductionRestoreEngineLauncher {
     /// `minio` provisions the operation-bound, read-only MinIO
     /// identity `VerifyInventory` needs. Only `launch_restore`
     /// (apply/resume) reads it; `launch_restore_verify` never runs
-    /// `VerifyInventory` and never touches this field. `None` in this
-    /// slice — the production preparer chain is deferred — and
-    /// `launch_restore` checks that itself and refuses before doing
-    /// anything destructive, rather than the constructor taking down
-    /// every restore verb over a composition problem only
-    /// apply/resume can ever be affected by.
+    /// `VerifyInventory` and never touches this field. Production
+    /// composes `ProductionRestoreMinioPreparer`; `launch_restore`
+    /// still checks `None` itself and refuses before doing anything
+    /// destructive, so a construction that tolerated the preparer
+    /// failing narrows only apply/resume — the rung upstream's own
+    /// nil check sits on.
     minio: Option<Box<dyn RestoreMinioCredentialPreparer>>,
     /// ADR 0034's import-launch collaborators, read only by
     /// `launch_restore_import`.
@@ -851,7 +851,19 @@ impl ProductionRestoreEngineLauncher {
             role_roots: composition.role_roots.clone(),
             reserve_writer: ReserveClient::new(broker_socket.to_path_buf()),
             reserve_helper,
-            minio: None,
+            // `newProductionRestoreMinioPreparer` — the real
+            // provisioner chain: active dependency receipt → pinned
+            // image → exact compose model → broker rendezvous →
+            // scoped policy digest → operation-bound handoff →
+            // container run + strict receipt. Upstream fails the
+            // launcher when it cannot be composed, so its error
+            // propagates here identically.
+            minio: Some(Box::new(
+                crate::helper::minio_provision::ProductionRestoreMinioPreparer::new_production(
+                    composition,
+                    broker_socket,
+                )?,
+            )),
             import_deadline: restore_import_engine_deadline(),
             // `filepath.Dir(AuthoritativeStateRoot)`: the
             // instances-parent directory. `Path::parent` returns
