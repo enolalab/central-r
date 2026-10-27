@@ -259,32 +259,18 @@ pub fn is_advisory_evaluation_authority_purpose(purpose: &str) -> bool {
     purpose == ADVISORY_EVALUATION_JOURNAL_RPC
 }
 
-/// Every purpose the R6 surface registers *without* a concrete
-/// `Dispatch` handler in this slice — used by [`super::server`]'s
-/// dispatch so such a name returns [`UNSUPPORTED_IN_THIS_SLICE`]
-/// rather than `"unknown purpose"`. Purposes with a real dispatch arm
-/// (live RPCs, the B04/B05 denial ladders, the backup
-/// transport-required set, `migration_read_launch_outcome`) are NOT
-/// here — the match arm owns them, and the server-side completeness
-/// test keeps this table from drifting.
+/// Upstream RPCs this slice registers but deliberately does not port —
+/// used by [`super::server`]'s dispatch so such a name returns
+/// [`UNSUPPORTED_IN_THIS_SLICE`] rather than `"unknown purpose"`.
+/// Connection-only purposes with real `HandleConn` handlers (the
+/// backup/throughput/payload-epoch worker and helper sets,
+/// `restore_issue_launch`) are NOT here — upstream's `Dispatch`
+/// `default` answers `"unknown purpose"` for them, and the match arm
+/// owns every live dispatch.
 #[must_use]
 pub fn is_r6_purpose(purpose: &str) -> bool {
-    is_backup_worker_authority_purpose(purpose)
-        || is_backup_helper_authority_purpose(purpose)
-        || is_restore_helper_authority_purpose(purpose)
-        || is_postgres_service_role_authority_purpose(purpose)
+    is_postgres_service_role_authority_purpose(purpose)
         || is_advisory_evaluation_authority_purpose(purpose)
-        || is_recovery_authority_purpose(purpose)
-        || matches!(
-            purpose,
-            RESTORE_APPLY_AUTHORIZATION_RPC
-                | RESTORE_RESUME_AUTHORIZATION_RPC
-                | RESTORE_ABANDON_AUTHORIZATION_RPC
-                | RESTORE_ABANDON_RPC
-                | RESTORE_BARRIER_INSPECT_RPC
-                | RESTORE_TICKET_BARRIER_INSPECT_RPC
-                | MIGRATION_REPORT_OUTCOME_RPC
-        )
 }
 
 // ---------------------------------------------------------------------------
@@ -591,13 +577,15 @@ pub fn write_response(w: &mut impl Write, resp: &BrokerResponse) -> Result<(), F
 }
 
 /// `writeDeny` — `outcome: "denied"` with `evidence.message`.
+/// `Evidence.OperationID` stays `""`, exactly as every upstream
+/// denial helper leaves it.
 pub fn write_deny(w: &mut impl Write, op_id: &str, msg: &str) {
     let resp = BrokerResponse {
         operation_id: op_id.to_owned(),
         outcome: BrokerOutcome::Denied,
         result: None,
         evidence: central_infra::authority::BrokerEvidence {
-            operation_id: op_id.to_owned(),
+            operation_id: String::new(),
             code: String::new(),
             message: msg.to_owned(),
         },
@@ -612,7 +600,7 @@ pub fn write_deny_with_code(w: &mut impl Write, op_id: &str, code: &str, msg: &s
         outcome: BrokerOutcome::Denied,
         result: None,
         evidence: central_infra::authority::BrokerEvidence {
-            operation_id: op_id.to_owned(),
+            operation_id: String::new(),
             code: code.to_owned(),
             message: msg.to_owned(),
         },
@@ -853,9 +841,35 @@ mod tests {
 
     #[test]
     fn every_r6_purpose_is_registered() {
-        // Every upstream R6 name is classified — the dispatch denial
-        // table can never drift to "unknown purpose".
-        for purpose in [
+        // Only upstream RPCs this slice deliberately does not port stay
+        // in the closed table — everything else is either a live
+        // `Dispatch` arm or a connection-only purpose upstream's
+        // `default` answers `"unknown purpose"` for.
+        for purpose in ["bind_postgres_service_role", "append_advisory_evaluation"] {
+            assert!(is_r6_purpose(purpose), "unregistered R6 purpose {purpose}");
+        }
+        for handled in [
+            // Live RPCs and the purposes with a real Dispatch arm are
+            // never R6-classified — the arm owns them.
+            MIGRATION_ISSUE_EMPTY_PROOF_RPC,
+            MIGRATION_READ_RECORD_RPC,
+            AUTHORIZE_LIFECYCLE_RPC,
+            HMAC_FINGERPRINT_RPC,
+            SIGN_LEAF_RPC,
+            PRESENT_BOOTSTRAP_RPC,
+            REGISTER_BOOTSTRAP_CANDIDATE_RPC,
+            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
+            // The live recovery arms.
+            RESTORE_APPLY_AUTHORIZATION_RPC,
+            RESTORE_RESUME_AUTHORIZATION_RPC,
+            RESTORE_ABANDON_AUTHORIZATION_RPC,
+            RESTORE_ABANDON_RPC,
+            RESTORE_BARRIER_INSPECT_RPC,
+            RESTORE_TICKET_BARRIER_INSPECT_RPC,
+            RESTORE_BROKER_AUTHORITY_PREPARE_RPC,
+            RESTORE_BOOTSTRAP_ACTIVATE_RPC,
+            // Connection-only purposes — real `HandleConn` handlers,
+            // upstream `"unknown purpose"` through `Dispatch`.
             "backup_issue_launch",
             "backup_issue_minio_handoff",
             "backup_seal_for_launch",
@@ -884,31 +898,8 @@ mod tests {
             "backup_throughput_cleanup_resolved",
             "backup_ensure_payload_epoch",
             "restore_issue_launch",
-            "issue_restore_apply_authorization",
-            "issue_restore_resume_authorization",
-            "issue_restore_abandon_authorization",
-            "abandon_restore",
-            "inspect_restore_barrier",
-            "inspect_restore_ticket_barrier",
-            "prepare_recovery_broker_authority",
-            "activate_recovery_bootstrap",
-            "bind_postgres_service_role",
-            "append_advisory_evaluation",
             "migration_report_launch_outcome",
-        ] {
-            assert!(is_r6_purpose(purpose), "unregistered R6 purpose {purpose}");
-        }
-        for handled in [
-            // Live RPCs and the purposes with a real Dispatch arm are
-            // never R6-classified — the arm owns them.
-            MIGRATION_ISSUE_EMPTY_PROOF_RPC,
-            MIGRATION_READ_RECORD_RPC,
-            AUTHORIZE_LIFECYCLE_RPC,
-            HMAC_FINGERPRINT_RPC,
-            SIGN_LEAF_RPC,
-            PRESENT_BOOTSTRAP_RPC,
-            REGISTER_BOOTSTRAP_CANDIDATE_RPC,
-            ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
+            // Other live/registered arms.
             "migration_read_launch_outcome",
             "issue_migration_launch",
             "adopt_b03_minio_bootstrap",

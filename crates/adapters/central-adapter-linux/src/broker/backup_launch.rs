@@ -94,8 +94,8 @@ impl BackupLaunchState {
 }
 
 /// `backup.RepositoryBinding` as Go's `json.Marshal` emits it inside
-/// the record and its canonical payload: PascalCase fields, base64
-/// `[32]byte` digests, RFC3339 timestamp.
+/// the record and its canonical payload: PascalCase fields, JSON
+/// number-array `[32]byte` digests, RFC3339 timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryBindingJournalWire {
@@ -117,10 +117,12 @@ pub struct RepositoryBindingJournalWire {
     mount_id: u64,
     #[serde(rename = "CreatedAt", with = "wire::rfc3339")]
     created_at: OffsetDateTime,
-    #[serde(rename = "CreationNonce", with = "wire::b64")]
-    creation_nonce: Vec<u8>,
-    #[serde(rename = "ImmutableDigest", with = "wire::b64")]
-    immutable_digest: Vec<u8>,
+    /// `[sha256.Size]byte` — Go marshals fixed arrays as JSON number
+    /// arrays, not base64.
+    #[serde(rename = "CreationNonce", with = "wire::digest32")]
+    creation_nonce: [u8; 32],
+    #[serde(rename = "ImmutableDigest", with = "wire::digest32")]
+    immutable_digest: [u8; 32],
 }
 
 pub(crate) fn binding_to_wire(binding: &RepositoryBinding) -> RepositoryBindingJournalWire {
@@ -134,8 +136,8 @@ pub(crate) fn binding_to_wire(binding: &RepositoryBinding) -> RepositoryBindingJ
         root_inode: binding.root_inode,
         mount_id: binding.mount_id,
         created_at: binding.created_at,
-        creation_nonce: binding.creation_nonce.to_vec(),
-        immutable_digest: binding.immutable_digest.to_vec(),
+        creation_nonce: binding.creation_nonce,
+        immutable_digest: binding.immutable_digest,
     }
 }
 
@@ -151,8 +153,8 @@ impl Default for RepositoryBindingJournalWire {
             root_inode: 0,
             mount_id: 0,
             created_at: wire::go_zero_time(),
-            creation_nonce: Vec::new(),
-            immutable_digest: Vec::new(),
+            creation_nonce: [0u8; 32],
+            immutable_digest: [0u8; 32],
         }
     }
 }
@@ -160,16 +162,6 @@ impl Default for RepositoryBindingJournalWire {
 pub(crate) fn binding_from_wire(
     wire: &RepositoryBindingJournalWire,
 ) -> Result<RepositoryBinding, Failure> {
-    let creation_nonce: [u8; 32] = wire
-        .creation_nonce
-        .clone()
-        .try_into()
-        .map_err(|_| unavailable())?;
-    let immutable_digest: [u8; 32] = wire
-        .immutable_digest
-        .clone()
-        .try_into()
-        .map_err(|_| unavailable())?;
     Ok(RepositoryBinding {
         binding_id: wire.binding_id,
         instance_id: wire.instance_id.clone(),
@@ -180,14 +172,14 @@ pub(crate) fn binding_from_wire(
         root_inode: wire.root_inode,
         mount_id: wire.mount_id,
         created_at: wire.created_at,
-        creation_nonce,
-        immutable_digest,
+        creation_nonce: wire.creation_nonce,
+        immutable_digest: wire.immutable_digest,
     })
 }
 
 /// `backupLaunchRecord` — the on-disk shape. `reaped_*`/`completed_*`
-/// are `[32]byte` fields upstream: `,omitempty` never applies, so the
-/// zero digest serializes as base64 zeros.
+/// are `[32]byte` fields upstream: `,omitempty` never applies to a
+/// fixed array, so the zero digest serializes as 32 JSON zeros.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupLaunchRecordWire {
@@ -209,12 +201,12 @@ struct BackupLaunchRecordWire {
     state: String,
     #[serde(with = "wire::rfc3339")]
     reaped_at: OffsetDateTime,
-    #[serde(with = "wire::b64")]
-    reaped_target_lock_proof: Vec<u8>,
-    #[serde(with = "wire::b64")]
-    completed_attestation_hash: Vec<u8>,
-    #[serde(with = "wire::b64")]
-    completed_target_lock_hash: Vec<u8>,
+    #[serde(with = "wire::digest32")]
+    reaped_target_lock_proof: [u8; 32],
+    #[serde(with = "wire::digest32")]
+    completed_attestation_hash: [u8; 32],
+    #[serde(with = "wire::digest32")]
+    completed_target_lock_hash: [u8; 32],
     nonce: String,
     hmac_sha256: String,
 }
@@ -222,12 +214,12 @@ struct BackupLaunchRecordWire {
 /// `backupLaunchRecord` — domain-side shape; `None` ⇔ the Go zero
 /// `time.Time`/`[32]byte`.
 #[derive(Debug, Clone)]
-struct BackupLaunchRecord {
+pub(crate) struct BackupLaunchRecord {
     supervisor_launch_id: Uuid,
     launch_evidence_id: Uuid,
     operation_id: Uuid,
     backup_id: Uuid,
-    repository_binding: RepositoryBinding,
+    pub(crate) repository_binding: RepositoryBinding,
     peer_uid: u32,
     peer_gid: u32,
     peer_pid: i32,
@@ -262,29 +254,19 @@ fn record_to_wire(record: &BackupLaunchRecord) -> Result<BackupLaunchRecordWire,
         created_at: record.created_at.to_offset(time::UtcOffset::UTC),
         state: record.state.as_str().to_owned(),
         reaped_at: record.reaped_at.unwrap_or_else(wire::go_zero_time),
-        reaped_target_lock_proof: record
-            .reaped_target_lock_proof
-            .map(|d| d.to_vec())
-            .unwrap_or_else(|| vec![0u8; 32]),
-        completed_attestation_hash: record
-            .completed_attestation_hash
-            .map(|d| d.to_vec())
-            .unwrap_or_else(|| vec![0u8; 32]),
-        completed_target_lock_hash: record
-            .completed_target_lock_hash
-            .map(|d| d.to_vec())
-            .unwrap_or_else(|| vec![0u8; 32]),
+        reaped_target_lock_proof: record.reaped_target_lock_proof.unwrap_or([0u8; 32]),
+        completed_attestation_hash: record.completed_attestation_hash.unwrap_or([0u8; 32]),
+        completed_target_lock_hash: record.completed_target_lock_hash.unwrap_or([0u8; 32]),
         nonce: record.nonce.clone(),
         hmac_sha256: record.hmac.clone(),
     })
 }
 
-fn nonzero32(value: &[u8]) -> Result<Option<[u8; 32]>, Failure> {
-    let digest: [u8; 32] = value.to_vec().try_into().map_err(|_| unavailable())?;
-    if digest == [0u8; 32] {
-        Ok(None)
+fn nonzero32(value: [u8; 32]) -> Option<[u8; 32]> {
+    if value == [0u8; 32] {
+        None
     } else {
-        Ok(Some(digest))
+        Some(value)
     }
 }
 
@@ -312,9 +294,9 @@ fn record_from_wire(wire: &BackupLaunchRecordWire) -> Result<BackupLaunchRecord,
         } else {
             Some(wire.reaped_at)
         },
-        reaped_target_lock_proof: nonzero32(&wire.reaped_target_lock_proof)?,
-        completed_attestation_hash: nonzero32(&wire.completed_attestation_hash)?,
-        completed_target_lock_hash: nonzero32(&wire.completed_target_lock_hash)?,
+        reaped_target_lock_proof: nonzero32(wire.reaped_target_lock_proof),
+        completed_attestation_hash: nonzero32(wire.completed_attestation_hash),
+        completed_target_lock_hash: nonzero32(wire.completed_target_lock_hash),
         nonce: wire.nonce.clone(),
         hmac: wire.hmac_sha256.clone(),
     })
@@ -465,6 +447,18 @@ impl BackupLaunchStore {
             runtime_uid,
             runtime_gid,
         })
+    }
+
+    /// `s.runtimeUID`/`s.runtimeGID` — the exact worker identity
+    /// `HandleConn`'s backup-worker gate compares the peer against
+    /// (server.go lines 187/120).
+    pub(crate) fn runtime_uid(&self) -> u32 {
+        self.runtime_uid
+    }
+
+    /// The peer GID half of the worker gate.
+    pub(crate) fn runtime_gid(&self) -> u32 {
+        self.runtime_gid
     }
 
     /// `Issue` — binds the exact live worker the native supervisor is
@@ -807,7 +801,7 @@ impl BackupLaunchStore {
 
     /// `s.read` — strict decode, full structural validation, then the
     /// broker-HMAC over the canonical payload.
-    fn read(&self, id: Uuid) -> Result<BackupLaunchRecord, Failure> {
+    pub(crate) fn read(&self, id: Uuid) -> Result<BackupLaunchRecord, Failure> {
         let wire_record: BackupLaunchRecordWire =
             super::recovery_journal::read_private_json(&self.path(id))?;
         let record = record_from_wire(&wire_record)?;

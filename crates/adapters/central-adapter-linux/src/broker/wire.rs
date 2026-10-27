@@ -184,6 +184,13 @@ pub(crate) fn b64_raw_encode(bytes: &[u8]) -> String {
     b64_encode(bytes).trim_end_matches('=').to_owned()
 }
 
+/// `base64.RawURLEncoding` — URL-safe, no padding. Upstream stamps
+/// the recovery-bootstrap plaintext with this encoding before the
+/// protected backend stores it.
+pub(crate) fn b64_raw_url_encode(bytes: &[u8]) -> String {
+    b64_raw_encode(bytes).replace('+', "-").replace('/', "_")
+}
+
 /// `base64.RawStdEncoding.DecodeString` — the strict no-padding decode
 /// upstream applies to the persisted bootstrap candidate digest and the
 /// `present_bootstrap` presentation value. Rejects any `=` byte, wrong
@@ -293,6 +300,48 @@ pub(crate) fn b64_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Serde adapter for Go `[32]byte` fields — `json.Marshal` emits a
+/// fixed array type as a JSON array of byte numbers (`[104,101,...]`),
+/// NOT the base64 string `[]byte` produces. The decode side mirrors
+/// Go's `json.Unmarshal` into an array: fewer than 32 elements zero-pad,
+/// more are silently discarded, `null` leaves the zero array.
+pub(crate) mod digest32 {
+    use super::*;
+
+    pub(crate) fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter())
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let bytes = Option::<Vec<u8>>::deserialize(d)?.unwrap_or_default();
+        let mut out = [0u8; 32];
+        let take = bytes.len().min(32);
+        out[..take].copy_from_slice(&bytes[..take]);
+        Ok(out)
+    }
+}
+
+/// Go's `json.Marshal` HTML-safe escaping applied to an
+/// otherwise-identical `serde_json` document: inside JSON, `<`, `>`,
+/// `&`, U+2028 and U+2029 can only appear within string values, so a
+/// byte-level rewrite is safe and yields the exact bytes
+/// `json.Marshal` emits. `decodeExactBrokerPayload`'s canonical
+/// re-marshal comparison needs them for any free-text field.
+pub(crate) fn go_json_escape(serialized: &str) -> String {
+    let mut out = String::with_capacity(serialized.len());
+    for ch in serialized.chars() {
+        match ch {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Serde adapter for `[]byte` fields — Go's `[]byte` ⇔ standard
@@ -452,5 +501,73 @@ mod tests {
             fp,
             "9d11179f8cbc72bd60234b8315464ad276582b2edae5139770a4decf5425e803"
         );
+    }
+
+    #[test]
+    fn digest32_serializes_go_number_array() {
+        // Go golden (go1.26 `json.Marshal([32]byte("hello"))`):
+        // `[104,101,108,108,111,0,0,...]` — a number array, never the
+        // `"aGVsbG9..."` base64 a `[]byte` emits.
+        #[derive(serde::Serialize)]
+        struct W {
+            #[serde(with = "digest32")]
+            d: [u8; 32],
+        }
+        let mut d = [0u8; 32];
+        d[..5].copy_from_slice(b"hello");
+        assert_eq!(
+            serde_json::to_string(&W { d }).unwrap(),
+            r#"{"d":[104,101,108,108,111,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#
+        );
+        // A zero [32]byte still marshals all 32 numbers — Go's
+        // fixed-size arrays never trigger `omitempty`.
+        assert_eq!(
+            serde_json::to_string(&W { d: [0u8; 32] }).unwrap(),
+            r#"{"d":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#
+        );
+    }
+
+    #[test]
+    fn digest32_decode_mirrors_go_unmarshal() {
+        // `json.Unmarshal` into a `[32]byte`: absent elements zero-pad,
+        // extra elements are silently dropped, `null` leaves zeros.
+        #[derive(Deserialize)]
+        struct W {
+            #[serde(with = "digest32")]
+            d: [u8; 32],
+        }
+        let w: W = serde_json::from_str(r#"{"d":[104,101,108,108,111]}"#).unwrap();
+        assert_eq!(&w.d[..5], b"hello");
+        assert!(w.d[5..].iter().all(|b| *b == 0));
+        let w: W = serde_json::from_str(&format!(
+            "{{\"d\":[{}]}}",
+            (0..40).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+        ))
+        .unwrap();
+        assert_eq!(w.d, core::array::from_fn(|i| i as u8));
+        let w: W = serde_json::from_str(r#"{"d":null}"#).unwrap();
+        assert_eq!(w.d, [0u8; 32]);
+        // Round-trip: what we emit, Go decodes and we re-decode.
+        let mut d = [0u8; 32];
+        d[..5].copy_from_slice(b"hello");
+        let w: W = serde_json::from_str(
+            r#"{"d":[104,101,108,108,111,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+        )
+        .unwrap();
+        assert_eq!(w.d, d);
+    }
+
+    #[test]
+    fn go_json_escape_matches_golang_marshal() {
+        // Go golden (go1.26 `json.Marshal` of `{"s":"<a&b>\u2028x"}`):
+        // `{"s":"\u003ca\u0026b\u003e\u2028x"}` — `<`, `>`, `&`, U+2028,
+        // U+2029 escape inside string values. serde_json emits the raw
+        // U+2028 codepoint; the rewrite escapes it exactly as Go does.
+        assert_eq!(
+            go_json_escape("{\"s\":\"<a&b>\u{2028}x\"}"),
+            r#"{"s":"\u003ca\u0026b\u003e\u2028x"}"#
+        );
+        assert_eq!(go_json_escape("plain"), "plain");
+        assert_eq!(go_json_escape("x\u{2029}"), "x\\u2029");
     }
 }

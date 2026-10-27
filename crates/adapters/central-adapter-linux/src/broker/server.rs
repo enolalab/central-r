@@ -66,14 +66,15 @@ use super::tls::TlsAuthority;
 /// exchange and every pre-authentication denial.
 pub const CONNECTION_DEADLINE: Duration = Duration::from_secs(1);
 
-/// `migrationRPCDenied`.
+/// `migrationRPCDenied` — upstream never fills `Evidence.OperationID`:
+/// the field is `""` on every denial wire.
 fn migration_denied(operation_id: &str, message: impl Into<String>) -> BrokerResponse {
     BrokerResponse {
         operation_id: operation_id.into(),
         outcome: BrokerOutcome::Denied,
         result: None,
         evidence: BrokerEvidence {
-            operation_id: operation_id.into(),
+            operation_id: String::new(),
             code: String::new(),
             message: message.into(),
         },
@@ -91,7 +92,7 @@ fn migration_denied_with_code(
         outcome: BrokerOutcome::Denied,
         result: None,
         evidence: BrokerEvidence {
-            operation_id: operation_id.into(),
+            operation_id: String::new(),
             code: code.into(),
             message: message.into(),
         },
@@ -99,18 +100,34 @@ fn migration_denied_with_code(
 }
 
 /// `backupRPCDenied` — `Code` and `Message` both carry the denial code.
-fn backup_denied(operation_id: &str, code: &str) -> BrokerResponse {
+pub(crate) fn backup_denied(operation_id: &str, code: &str) -> BrokerResponse {
     migration_denied_with_code(operation_id, code, code)
 }
 
 /// A success response carrying `result`.
-fn success(operation_id: &str, result: serde_json::Value) -> BrokerResponse {
+pub(crate) fn success(
+    operation_id: &str,
+    result: Box<serde_json::value::RawValue>,
+) -> BrokerResponse {
     BrokerResponse {
         operation_id: operation_id.into(),
         outcome: BrokerOutcome::Success,
         result: Some(result),
         evidence: BrokerEvidence::default(),
     }
+}
+
+/// Upstream's `json.Marshal(result)` embedded verbatim in
+/// `BrokerResponse.Result`: typed structs marshal in declaration order
+/// (Go's field order), while `serde_json::json!` literals keep their
+/// already-sorted map order — identical to the former `to_value` path.
+/// A marshal failure degrades to JSON `null`, the same shape the old
+/// `to_value(..).unwrap_or_default()` call sites produced.
+fn marshal_result<T: serde::Serialize + ?Sized>(value: &T) -> Box<serde_json::value::RawValue> {
+    serde_json::value::to_raw_value(value).unwrap_or_else(|_| {
+        serde_json::value::RawValue::from_string("null".to_owned())
+            .unwrap_or_else(|_| unreachable!("null is valid JSON"))
+    })
 }
 
 /// `BrokerError` outcome — upstream's non-denial failure class
@@ -121,17 +138,17 @@ fn error_response(operation_id: &str, message: impl Into<String>) -> BrokerRespo
         outcome: BrokerOutcome::Error,
         result: None,
         evidence: BrokerEvidence {
-            operation_id: operation_id.into(),
+            operation_id: String::new(),
             code: String::new(),
             message: message.into(),
         },
     }
 }
 
-/// `Service` — aggregates the broker sub-components. Fields whose
-/// upstream counterparts are R6 stores (launch evidence, runtime
-/// bindings, recovery journal) are absent; dispatch denies their
-/// purposes with the slice's closed denial.
+/// `Service` — aggregates the broker sub-components, including the R6
+/// authority stores (recovery journal, backup/throughput/restore
+/// launch stores, payload-epoch chain, throughput journal) that the
+/// live dispatch arms in `backup_authority`/`recovery_authority` use.
 pub struct Service {
     /// The protected-state root (`0700`, broker-owned).
     pub root_path: PathBuf,
@@ -366,17 +383,29 @@ impl Service {
     // Dispatch — the closed operation matrix (service.go Dispatch)
     // ------------------------------------------------------------------
 
-    /// `Dispatch` routes a decoded request by `purpose` — upstream
-    /// `service.go`'s switch, in upstream order. Every arm is either a
-    /// live handler, the upstream denial ladder its handler runs, or —
-    /// for purposes upstream's `HandleConn` gates behind peer
-    /// credentials before `Dispatch` could ever see them — the
-    /// defensive `BACKUP_AUTHORITY_TRANSPORT_REQUIRED` fallback
-    /// upstream keeps for exactly those. What remains is the slice's
-    /// closed R6 denial, then `"unknown purpose"`.
+    /// `Service.Dispatch` — upstream's switch order: bootstrap
+    /// presentation, the recovery authority RPCs, migration proofs and
+    /// records, the B04/B05 materialization ladder, the ten
+    /// transport-required backup purposes, the permanent denials, then
+    /// the live B03/B04 arms and bootstrap candidates. Connection-only
+    /// purposes upstream never registers here (every other
+    /// `HandleConn`-gated RPC) fall to `"unknown purpose"`, exactly as
+    /// upstream's `default` — the closed R6 denial remains only for
+    /// upstream RPCs this slice deliberately does not port
+    /// (`is_r6_purpose`).
     #[must_use]
     pub fn dispatch(&self, req: &BrokerRequest) -> BrokerResponse {
         match req.purpose.as_str() {
+            PRESENT_BOOTSTRAP_RPC => self.dispatch_present_bootstrap(req),
+            RESTORE_APPLY_AUTHORIZATION_RPC => self.dispatch_restore_apply_authorization(req),
+            RESTORE_RESUME_AUTHORIZATION_RPC => self.dispatch_restore_resume_authorization(req),
+            RESTORE_ABANDON_AUTHORIZATION_RPC => self.dispatch_restore_abandon_authorization(req),
+            RESTORE_ABANDON_RPC => self.dispatch_restore_abandon(req),
+            RESTORE_BARRIER_INSPECT_RPC => self.dispatch_restore_barrier_inspect(req),
+            RESTORE_TICKET_BARRIER_INSPECT_RPC => self.dispatch_restore_ticket_barrier_inspect(req),
+            RESTORE_BROKER_AUTHORITY_PREPARE_RPC | RESTORE_BOOTSTRAP_ACTIVATE_RPC => {
+                self.dispatch_recovery_broker_authority_reset(req)
+            }
             MIGRATION_ISSUE_EMPTY_PROOF_RPC
             | MIGRATION_VERIFY_EMPTY_PROOF_RPC
             | MIGRATION_CONSUME_EMPTY_PROOF_RPC
@@ -426,10 +455,6 @@ impl Service {
             // authority: upstream answers `BrokerError` (not a denial)
             // when signing fails.
             SIGN_LEAF_RPC => self.dispatch_sign_leaf(req),
-            REGISTER_BOOTSTRAP_CANDIDATE_RPC | ACTIVATE_BOOTSTRAP_CANDIDATE_RPC => {
-                self.dispatch_bootstrap_candidate(req)
-            }
-            PRESENT_BOOTSTRAP_RPC => self.dispatch_present_bootstrap(req),
             HMAC_FINGERPRINT_RPC => self.dispatch_hmac_fingerprint(req),
             AUTHORIZE_LIFECYCLE_RPC => self.dispatch_authorize_lifecycle(req),
             CONSUME_LIFECYCLE_RPC => self.dispatch_consume_lifecycle(req),
@@ -438,7 +463,14 @@ impl Service {
                 &req.operation_id,
                 "B04_HANDOFF_DENIED: legacy pathname handoff is disabled",
             ),
-            // R6 surface — registered names with closed denials.
+            REGISTER_BOOTSTRAP_CANDIDATE_RPC | ACTIVATE_BOOTSTRAP_CANDIDATE_RPC => {
+                self.dispatch_bootstrap_candidate(req)
+            }
+            // Upstream RPCs this slice deliberately does not port get
+            // the closed denial; every other unregistered name is
+            // upstream's `default` — `"unknown purpose"` (this includes
+            // the connection-only backup/throughput/payload-epoch and
+            // restore-launch purposes, which `HandleConn` serves).
             _ if protocol::is_r6_purpose(&req.purpose) => migration_denied(
                 &req.operation_id,
                 format!("BROKER_AUTHORITY_DENIED: {}", UNSUPPORTED_IN_THIS_SLICE),
@@ -487,10 +519,10 @@ impl Service {
             // Go tags): `{"Raw":"<std b64>","Fingerprint":"…"}`.
             Ok(leaf) => success(
                 &req.operation_id,
-                serde_json::json!({
+                marshal_result(&serde_json::json!({
                     "Raw": super::wire::b64_encode(&leaf.raw),
                     "Fingerprint": leaf.fingerprint,
-                }),
+                })),
             ),
         }
     }
@@ -506,7 +538,7 @@ impl Service {
             outcome: BrokerOutcome::Denied,
             result: None,
             evidence: BrokerEvidence {
-                operation_id: req.operation_id.clone(),
+                operation_id: String::new(),
                 code: "AUTHORITY_DENIED".to_owned(),
                 message: String::new(),
             },
@@ -535,18 +567,10 @@ impl Service {
 
     /// `presentBootstrap` — the one-use staged value leaves broker
     /// memory as the response's `{"value": <raw-std-b64>}`. An empty
-    /// stage is `BOOTSTRAP_NOT_STAGED`.
-    ///
-    /// **Hard R6 requirement:** upstream `service.go:1006-1025` does
-    /// not deny on an empty in-memory stage — it first falls back to
-    /// `s.recoveryJournal.takeActivatedRecoveryBootstrap(ctx)` and
-    /// denies `BOOTSTRAP_NOT_STAGED` only when that journal take also
-    /// fails. `Service` has no `recovery_journal` field in this slice
-    /// (the store is R6), so the fallback path cannot exist here; when
-    /// the recovery journal lands this arm MUST consult it before
-    /// returning the empty-stage denial, preserving the one-use take
-    /// and the same code on its error. See the T7 report's R6
-    /// requirements.
+    /// in-memory stage first falls back to
+    /// `recoveryJournal.takeActivatedRecoveryBootstrap`, exactly as
+    /// upstream `service.go`, and denies `BOOTSTRAP_NOT_STAGED` only
+    /// when that journal take also fails.
     fn dispatch_present_bootstrap(&self, req: &BrokerRequest) -> BrokerResponse {
         let mut value = match self.bootstrap_lock() {
             Ok(mut guard) => {
@@ -575,7 +599,7 @@ impl Service {
                 outcome: BrokerOutcome::Denied,
                 result: None,
                 evidence: BrokerEvidence {
-                    operation_id: req.operation_id.clone(),
+                    operation_id: String::new(),
                     code: "BOOTSTRAP_NOT_STAGED".to_owned(),
                     message: String::new(),
                 },
@@ -583,7 +607,8 @@ impl Service {
         }
         // `defer zeroBytes(value)` — the plaintext staging buffer is
         // scrubbed after the response is built.
-        let result = serde_json::json!({"value": super::wire::b64_raw_encode(&value)});
+        let result =
+            marshal_result(&serde_json::json!({"value": super::wire::b64_raw_encode(&value)}));
         value.zeroize();
         success(&req.operation_id, result)
     }
@@ -675,13 +700,12 @@ impl Service {
             Err(e) => migration_denied(&req.operation_id, format!("{CLASS}{}", e.message())),
             Ok((binding, outcome)) => success(
                 &req.operation_id,
-                serde_json::to_value(B04AdoptResult {
+                marshal_result(&B04AdoptResult {
                     binding_id: binding.binding_id.to_string(),
                     generation_id: binding.generation_id.to_string(),
                     outcome: outcome.as_str().to_owned(),
                     ..B04AdoptResult::default()
-                })
-                .unwrap_or_default(),
+                }),
             ),
         }
     }
@@ -874,18 +898,17 @@ impl Service {
         match issued {
             Ok(b) => success(
                 &req.operation_id,
-                serde_json::to_value(B05MigrationLaunchResult {
+                marshal_result(&B05MigrationLaunchResult {
                     operation_id: b.operation_id.to_string(),
                     launch_evidence_id: b.launch_evidence_id,
-                })
-                .unwrap_or_default(),
+                }),
             ),
             Err(e) => BrokerResponse {
                 operation_id: req.operation_id.clone(),
                 outcome: BrokerOutcome::Error,
                 result: None,
                 evidence: BrokerEvidence {
-                    operation_id: req.operation_id.clone(),
+                    operation_id: String::new(),
                     code: String::new(),
                     message: format!("B05_LAUNCH_ERROR: {}", e.message()),
                 },
@@ -966,10 +989,7 @@ impl Service {
             return match launches
                 .reconcile_unreported(&request.launch_evidence_id, &req.operation_id)
             {
-                Ok(outcome) => success(
-                    &req.operation_id,
-                    serde_json::to_value(outcome).unwrap_or_default(),
-                ),
+                Ok(outcome) => success(&req.operation_id, marshal_result(&outcome)),
                 Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
             };
         }
@@ -989,10 +1009,7 @@ impl Service {
             return migration_denied(&req.operation_id, e.message().to_owned());
         }
         match launches.read_outcome(&request.launch_evidence_id, &req.operation_id) {
-            Ok(outcome) => success(
-                &req.operation_id,
-                serde_json::to_value(outcome).unwrap_or_default(),
-            ),
+            Ok(outcome) => success(&req.operation_id, marshal_result(&outcome)),
             Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
         }
     }
@@ -1058,12 +1075,10 @@ impl Service {
                 };
                 match proofs.issue_empty_target_proof(&issue_req) {
                     Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-                    Ok(p) => match serde_json::to_value(proof::VerifiedEmptyTargetWire::from(&p)) {
-                        Ok(v) => success(&req.operation_id, v),
-                        Err(_) => {
-                            migration_denied(&req.operation_id, "encode migration proof result")
-                        }
-                    },
+                    Ok(p) => success(
+                        &req.operation_id,
+                        marshal_result(&proof::VerifiedEmptyTargetWire::from(&p)),
+                    ),
                 }
             }
             MIGRATION_VERIFY_EMPTY_PROOF_RPC => {
@@ -1084,7 +1099,10 @@ impl Service {
                     &central_backup::domain::VerifiedEmptyTarget::from(&p),
                 ) {
                     Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-                    Ok(()) => success(&req.operation_id, serde_json::json!({"verified": true})),
+                    Ok(()) => success(
+                        &req.operation_id,
+                        marshal_result(&serde_json::json!({"verified": true})),
+                    ),
                 }
             }
             MIGRATION_CONSUME_EMPTY_PROOF_RPC => {
@@ -1102,7 +1120,10 @@ impl Service {
                 };
                 match result {
                     Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-                    Ok(()) => success(&req.operation_id, serde_json::json!({"consumed": true})),
+                    Ok(()) => success(
+                        &req.operation_id,
+                        marshal_result(&serde_json::json!({"consumed": true})),
+                    ),
                 }
             }
             MIGRATION_ISSUE_RESET_RPC => {
@@ -1126,12 +1147,10 @@ impl Service {
                 };
                 match proofs.issue_reset_confirmation(&issue_req) {
                     Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-                    Ok(c) => match serde_json::to_value(proof::ResetConfirmationWire::from(&c)) {
-                        Ok(v) => success(&req.operation_id, v),
-                        Err(_) => {
-                            migration_denied(&req.operation_id, "encode migration proof result")
-                        }
-                    },
+                    Ok(c) => success(
+                        &req.operation_id,
+                        marshal_result(&proof::ResetConfirmationWire::from(&c)),
+                    ),
                 }
             }
             MIGRATION_VERIFY_RESET_RPC => {
@@ -1152,7 +1171,10 @@ impl Service {
                     .verify_reset_confirmation(&central_backup::domain::ResetConfirmation::from(&r))
                 {
                     Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-                    Ok(()) => success(&req.operation_id, serde_json::json!({"verified": true})),
+                    Ok(()) => success(
+                        &req.operation_id,
+                        marshal_result(&serde_json::json!({"verified": true})),
+                    ),
                 }
             }
             MIGRATION_CONSUME_RESET_RPC => {
@@ -1174,7 +1196,10 @@ impl Service {
                 };
                 match result {
                     Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-                    Ok(()) => success(&req.operation_id, serde_json::json!({"consumed": true})),
+                    Ok(()) => success(
+                        &req.operation_id,
+                        marshal_result(&serde_json::json!({"consumed": true})),
+                    ),
                 }
             }
             _ => migration_denied(&req.operation_id, "unknown migration proof RPC"),
@@ -1210,10 +1235,8 @@ impl Service {
             _ => return migration_denied(&req.operation_id, "invalid provisioning request"),
         };
         let target = central_backup::domain::TargetIdentity::from(&target_wire);
-        let succeed = |record: &ProvisioningRecord| match serde_json::to_value(record) {
-            Ok(v) => success(&req.operation_id, v),
-            Err(_) => migration_denied(&req.operation_id, "encode provisioning result"),
-        };
+        let succeed =
+            |record: &ProvisioningRecord| success(&req.operation_id, marshal_result(record));
         match req.purpose.as_str() {
             MIGRATION_CREATE_RECORD_RPC => {
                 let Some(record) = request.record else {
@@ -1285,10 +1308,7 @@ impl Service {
         };
         match self.authorize_bound_lifecycle(&request) {
             Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-            Ok(claim) => match serde_json::to_value(claim) {
-                Ok(v) => success(&req.operation_id, v),
-                Err(_) => migration_denied(&req.operation_id, "encode lifecycle claim"),
-            },
+            Ok(claim) => success(&req.operation_id, marshal_result(&claim)),
         }
     }
 
@@ -1349,18 +1369,16 @@ impl Service {
         };
         match self.verify_dead_owner(&request.lock_id, request.owner_pid) {
             Err(e) => migration_denied(&req.operation_id, e.message().to_owned()),
-            Ok(p) => {
-                // `port.DeadOwnerProof` marshals PascalCase (no Go tags).
-                match serde_json::to_value(serde_json::json!({
+            // `port.DeadOwnerProof` marshals PascalCase (no Go tags).
+            Ok(p) => success(
+                &req.operation_id,
+                marshal_result(&serde_json::json!({
                     "LockID": p.lock_id,
                     "OwnerPID": p.owner_pid,
                     "Dead": p.dead,
                     "VerifiedAt": super::wire::format_rfc3339_nano(p.verified_at),
-                })) {
-                    Ok(v) => success(&req.operation_id, v),
-                    Err(_) => migration_denied(&req.operation_id, "encode lock owner proof"),
-                }
-            }
+                })),
+            ),
         }
     }
 
@@ -1384,7 +1402,10 @@ impl Service {
         let fp = self
             .signing
             .fingerprint(String::from_utf8_lossy(domain_raw).as_ref(), data_raw);
-        success(&req.operation_id, serde_json::json!({"fingerprint": fp}))
+        success(
+            &req.operation_id,
+            marshal_result(&serde_json::json!({"fingerprint": fp})),
+        )
     }
 
     /// The B04 ACK frame's opaque proof — `b04-ok:` + the
@@ -1596,14 +1617,13 @@ impl Service {
         // receipt HMAC only, never plaintext.
         let resp = success(
             &req.operation_id,
-            serde_json::to_value(B04MaterializeResult {
+            marshal_result(&B04MaterializeResult {
                 operation_id: receipt.operation_id.to_string(),
                 receipt_id: receipt.receipt_id.to_string(),
                 binding_id: receipt.binding_id.to_string(),
                 opaque_token: receipt.hmac.clone(),
                 safe_next_action: String::new(),
-            })
-            .unwrap_or_default(),
+            }),
         );
         protocol::write_response(conn, &resp)
     }
@@ -1817,14 +1837,13 @@ impl Service {
         // receipt HMAC only, never plaintext.
         let resp = success(
             &req.operation_id,
-            serde_json::to_value(B05MaterializePostgresMigrationResult {
+            marshal_result(&B05MaterializePostgresMigrationResult {
                 operation_id: receipt.operation_id.to_string(),
                 receipt_id: receipt.receipt_id.to_string(),
                 binding_id: receipt.binding_id.to_string(),
                 opaque_token: receipt.hmac.clone(),
                 safe_next_action: String::new(),
-            })
-            .unwrap_or_default(),
+            }),
         );
         protocol::write_response(conn, &resp)
     }
@@ -2178,13 +2197,39 @@ fn dispatch_json(
         ));
     }
     if is_backup_worker_authority_purpose(&req.purpose) {
-        // The worker launch store is R6; there is no worker identity to
-        // check against, so every worker peer denies.
-        protocol::write_deny(conn, &req.operation_id, "BACKUP_WORKER_AUTHORITY_DENIED");
-        return Err(Failure::denied(
-            "broker",
-            "broker: denied backup worker peer",
-        ));
+        // `svc.backupLaunches == nil` upstream denies identically to a
+        // wrong-credential peer — same closed store rule here.
+        let launches = svc.backup_launches.as_ref();
+        if launches.is_none_or(|l| {
+            peer.uid.as_raw() != l.runtime_uid() || peer.gid.as_raw() != l.runtime_gid()
+        }) {
+            protocol::write_deny(conn, &req.operation_id, "BACKUP_WORKER_AUTHORITY_DENIED");
+            return Err(Failure::denied(
+                "broker",
+                "broker: denied backup worker peer",
+            ));
+        }
+        let resp = match req.purpose.as_str() {
+            BACKUP_SEAL_RPC => svc.dispatch_backup_seal(req, peer),
+            BACKUP_WORKER_CONTEXT_RPC => svc.dispatch_backup_worker_context(req, peer),
+            BACKUP_WORKER_EPOCH_RPC => svc.dispatch_backup_worker_payload_epoch(req, peer),
+            BACKUP_WORKER_THROUGHPUT_RPC => svc.dispatch_backup_worker_throughput(req, peer),
+            BACKUP_WORKER_CREATE_RPC => svc.dispatch_backup_worker_create(req, peer),
+            BACKUP_WORKER_READ_RPC => svc.dispatch_backup_worker_read(req, peer),
+            BACKUP_WORKER_CAS_RPC => svc.dispatch_backup_worker_cas(req, peer),
+            BACKUP_THROUGHPUT_WORKER_CONTEXT_RPC => {
+                svc.dispatch_backup_throughput_worker_context(req, peer)
+            }
+            BACKUP_THROUGHPUT_WORKER_TARGET_RPC => {
+                svc.dispatch_backup_throughput_worker_target_locked(req, peer)
+            }
+            BACKUP_THROUGHPUT_WORKER_STAGE_RPC => {
+                svc.dispatch_backup_throughput_worker_stage(req, peer)
+            }
+            _ => unreachable!("is_backup_worker_authority_purpose covers every arm"),
+        };
+        let _ = protocol::write_response(conn, &resp);
+        return Ok(());
     }
     if is_postgres_service_role_authority_purpose(&req.purpose) {
         if !is_root_backup_helper_peer(peer) {
@@ -2224,11 +2269,31 @@ fn dispatch_json(
                 "broker: denied backup helper peer",
             ));
         }
-        protocol::write_deny(
-            conn,
-            &req.operation_id,
-            &format!("BACKUP_HELPER_AUTHORITY_DENIED: {UNSUPPORTED_IN_THIS_SLICE}"),
-        );
+        let resp = match req.purpose.as_str() {
+            BACKUP_ISSUE_LAUNCH_RPC => svc.dispatch_backup_launch_issue(req),
+            BACKUP_THROUGHPUT_ISSUE_LAUNCH_RPC => svc.dispatch_backup_throughput_launch_issue(req),
+            BACKUP_THROUGHPUT_READ_LAUNCH_RPC => svc.dispatch_backup_throughput_launch_read(req),
+            BACKUP_THROUGHPUT_FIXTURE_LOADED_RPC => {
+                svc.dispatch_backup_throughput_fixture_loaded(req)
+            }
+            BACKUP_ISSUE_MINIO_RPC => svc.dispatch_backup_minio_issue(req),
+            BACKUP_MARK_REAPED_RPC => svc.dispatch_backup_mark_reaped(req),
+            BACKUP_COMPLETE_RPC => svc.dispatch_backup_complete(req),
+            BACKUP_VERIFY_SEAL_RPC => svc.dispatch_backup_verify_seal(req),
+            BACKUP_READ_STATUS_RPC => svc.dispatch_backup_read_status(req),
+            BACKUP_THROUGHPUT_CURRENT_RPC
+            | BACKUP_THROUGHPUT_ACCEPT_RPC
+            | BACKUP_THROUGHPUT_COMPLETE_PENDING_RPC
+            | BACKUP_THROUGHPUT_ACTIVATE_RPC
+            | BACKUP_THROUGHPUT_FAILED_RPC
+            | BACKUP_THROUGHPUT_CLEANUP_REQUIRED_RPC
+            | BACKUP_THROUGHPUT_CLEANUP_RESOLVED_RPC => {
+                svc.dispatch_backup_throughput_authority(req)
+            }
+            BACKUP_ENSURE_PAYLOAD_EPOCH_RPC => svc.dispatch_backup_ensure_payload_epoch(req),
+            _ => unreachable!("is_backup_helper_authority_purpose covers every arm"),
+        };
+        let _ = protocol::write_response(conn, &resp);
         return Ok(());
     }
     if is_restore_helper_authority_purpose(&req.purpose) {
@@ -2239,11 +2304,8 @@ fn dispatch_json(
                 "broker: denied restore helper peer",
             ));
         }
-        protocol::write_deny(
-            conn,
-            &req.operation_id,
-            &format!("RESTORE_HELPER_AUTHORITY_DENIED: {UNSUPPORTED_IN_THIS_SLICE}"),
-        );
+        let resp = svc.dispatch_restore_issue_launch(req, peer);
+        let _ = protocol::write_response(conn, &resp);
         return Ok(());
     }
     if is_recovery_authority_purpose(&req.purpose) && !is_central_migrate_peer(peer) {
@@ -2461,6 +2523,12 @@ mod tests {
         Some(BTreeMap::from([("request".to_owned(), raw(json))]))
     }
 
+    /// Decode a response's verbatim `result` bytes for assertions —
+    /// the `json.Unmarshal(response.Result, …)` half of a Go test.
+    fn result_value(resp: &BrokerResponse) -> serde_json::Value {
+        serde_json::from_str(resp.result.as_ref().unwrap().get()).unwrap()
+    }
+
     #[test]
     fn dispatch_denies_unknown_and_descriptor_only_purposes() {
         let dir = TempDir::new("server");
@@ -2488,11 +2556,11 @@ mod tests {
 
     #[test]
     fn dispatch_table_covers_every_upstream_purpose() {
-        // The R5-T6 completeness gate: every purpose in upstream
-        // `service.go`'s `Dispatch` switch must land on a real arm —
-        // a live handler, an upstream denial ladder, the
-        // transport-required fallback, or the closed R6 denial — and
-        // NEVER on the `"unknown purpose"` default.
+        // Every purpose upstream's `service.go` `Dispatch` switch
+        // registers must land on a real arm — a live handler, an
+        // upstream denial ladder, the transport-required fallback, or
+        // the closed denial — and NEVER on the `"unknown purpose"`
+        // default.
         let dir = TempDir::new("server");
         let svc = service(&dir);
         for purpose in [
@@ -2516,6 +2584,15 @@ mod tests {
             ACTIVATE_BOOTSTRAP_CANDIDATE_RPC,
             ADOPT_B03_MINIO_BOOTSTRAP_RPC,
             ISSUE_B04_LIFECYCLE_PROOF_RPC,
+            // The live recovery arms upstream registers in `Dispatch`.
+            RESTORE_APPLY_AUTHORIZATION_RPC,
+            RESTORE_RESUME_AUTHORIZATION_RPC,
+            RESTORE_ABANDON_AUTHORIZATION_RPC,
+            RESTORE_ABANDON_RPC,
+            RESTORE_BARRIER_INSPECT_RPC,
+            RESTORE_TICKET_BARRIER_INSPECT_RPC,
+            RESTORE_BROKER_AUTHORITY_PREPARE_RPC,
+            RESTORE_BOOTSTRAP_ACTIVATE_RPC,
             // Upstream denial ladders.
             MIGRATION_READ_OUTCOME_RPC,
             MATERIALIZE_MINIO_ROOT_RPC,
@@ -2536,23 +2613,9 @@ mod tests {
             // Permanent denials.
             CREATE_PROTECTED_GENERATION_RPC,
             MATERIALIZE_DEPENDENCY_HANDOFF_RPC,
-            // The closed R6 surface.
-            "issue_restore_apply_authorization",
-            "issue_restore_resume_authorization",
-            "issue_restore_abandon_authorization",
-            "abandon_restore",
-            "inspect_restore_barrier",
-            "inspect_restore_ticket_barrier",
-            "prepare_recovery_broker_authority",
-            "activate_recovery_bootstrap",
+            // The closed set — upstream RPCs this slice does not port.
             "bind_postgres_service_role",
             "append_advisory_evaluation",
-            "restore_issue_launch",
-            "backup_issue_minio_handoff",
-            "backup_ensure_payload_epoch",
-            "backup_worker_active_payload_epoch",
-            "backup_worker_read_throughput",
-            "backup_throughput_issue_launch",
         ] {
             // Live purposes may succeed on an empty request (e.g.
             // `hmac_fingerprint` fingerprints empty domain+data) or
@@ -2562,6 +2625,37 @@ mod tests {
             assert_ne!(
                 resp.evidence.message, "unknown purpose",
                 "{purpose} fell through to unknown"
+            );
+        }
+        // Connection-only purposes upstream's `Dispatch` never registers
+        // — `HandleConn` serves them — MUST answer `"unknown purpose"`
+        // through `dispatch`, exactly as upstream's `default` does.
+        for purpose in [
+            RESTORE_ISSUE_LAUNCH_RPC,
+            BACKUP_ISSUE_MINIO_RPC,
+            BACKUP_WORKER_EPOCH_RPC,
+            BACKUP_WORKER_THROUGHPUT_RPC,
+            BACKUP_ENSURE_PAYLOAD_EPOCH_RPC,
+            BACKUP_THROUGHPUT_ISSUE_LAUNCH_RPC,
+            BACKUP_THROUGHPUT_READ_LAUNCH_RPC,
+            BACKUP_THROUGHPUT_FIXTURE_LOADED_RPC,
+            BACKUP_THROUGHPUT_CURRENT_RPC,
+            BACKUP_THROUGHPUT_ACCEPT_RPC,
+            BACKUP_THROUGHPUT_COMPLETE_PENDING_RPC,
+            BACKUP_THROUGHPUT_ACTIVATE_RPC,
+            BACKUP_THROUGHPUT_FAILED_RPC,
+            BACKUP_THROUGHPUT_CLEANUP_REQUIRED_RPC,
+            BACKUP_THROUGHPUT_CLEANUP_RESOLVED_RPC,
+            BACKUP_THROUGHPUT_WORKER_CONTEXT_RPC,
+            BACKUP_THROUGHPUT_WORKER_TARGET_RPC,
+            BACKUP_THROUGHPUT_WORKER_STAGE_RPC,
+            MIGRATION_REPORT_OUTCOME_RPC,
+        ] {
+            let resp = svc.dispatch(&request(purpose, None));
+            assert_eq!(resp.outcome, BrokerOutcome::Denied, "{purpose}");
+            assert_eq!(
+                resp.evidence.message, "unknown purpose",
+                "{purpose} should hit upstream's connection-only default"
             );
         }
     }
@@ -2787,26 +2881,39 @@ mod tests {
     fn dispatch_denies_every_r6_purpose_closed() {
         let dir = TempDir::new("server");
         let svc = service(&dir);
-        for purpose in [
-            "backup_issue_minio_handoff",
-            "backup_worker_active_payload_epoch",
-            "backup_worker_read_throughput",
-            "backup_ensure_payload_epoch",
-            "restore_issue_launch",
-            "issue_restore_apply_authorization",
-            "abandon_restore",
-            "prepare_recovery_broker_authority",
-            "activate_recovery_bootstrap",
-            "bind_postgres_service_role",
-            "append_advisory_evaluation",
-            "migration_report_launch_outcome",
-        ] {
+        // Only the two upstream RPCs this slice does not port keep the
+        // closed denial — everything else is live or connection-only.
+        for purpose in ["bind_postgres_service_role", "append_advisory_evaluation"] {
             let resp = svc.dispatch(&request(purpose, None));
             assert_eq!(resp.outcome, BrokerOutcome::Denied, "{purpose}");
             assert_eq!(
                 resp.evidence.message,
                 format!("BROKER_AUTHORITY_DENIED: {}", UNSUPPORTED_IN_THIS_SLICE),
                 "{purpose}"
+            );
+        }
+        // The live recovery arms answer through their own denial
+        // ladders on an empty request — never the closed text.
+        for purpose in [
+            RESTORE_APPLY_AUTHORIZATION_RPC,
+            RESTORE_RESUME_AUTHORIZATION_RPC,
+            RESTORE_ABANDON_AUTHORIZATION_RPC,
+            RESTORE_ABANDON_RPC,
+            RESTORE_BARRIER_INSPECT_RPC,
+            RESTORE_TICKET_BARRIER_INSPECT_RPC,
+            RESTORE_BROKER_AUTHORITY_PREPARE_RPC,
+            RESTORE_BOOTSTRAP_ACTIVATE_RPC,
+        ] {
+            let resp = svc.dispatch(&request(purpose, None));
+            assert_eq!(resp.outcome, BrokerOutcome::Denied, "{purpose}");
+            assert!(
+                !resp.evidence.message.starts_with("BROKER_AUTHORITY_DENIED"),
+                "{purpose} got the closed text: {}",
+                resp.evidence.message
+            );
+            assert_ne!(
+                resp.evidence.message, "unknown purpose",
+                "{purpose} fell through"
             );
         }
         // `migration_read_launch_outcome` keeps upstream's own
@@ -2835,7 +2942,7 @@ mod tests {
         req.operation_id = op.to_string();
         let resp = svc.dispatch(&req);
         assert_eq!(resp.outcome, BrokerOutcome::Success);
-        let issued = resp.result.unwrap();
+        let issued = result_value(&resp);
         // Verify over the issued proof, then consume — replay denies.
         // The dispatch binds request.operation_id to the proof's.
         let verify = serde_json::json!({
@@ -2879,7 +2986,7 @@ mod tests {
         req.operation_id = op.to_string();
         let resp = svc.dispatch(&req);
         assert_eq!(resp.outcome, BrokerOutcome::Success);
-        assert_eq!(resp.result.unwrap()["Revision"], 1);
+        assert_eq!(result_value(&resp)["Revision"], 1);
         // Read it back.
         let resp = svc.dispatch(&request(
             MIGRATION_READ_RECORD_RPC,
@@ -2901,7 +3008,7 @@ mod tests {
             request_payload(req_body.clone()),
         ));
         assert_eq!(resp.outcome, BrokerOutcome::Success);
-        let claim = resp.result.unwrap();
+        let claim = result_value(&resp);
         let resp = svc.dispatch(&request(
             CONSUME_LIFECYCLE_RPC,
             request_payload(serde_json::json!({"claim": claim, "request": req_body})),
@@ -2915,7 +3022,7 @@ mod tests {
             })),
         ));
         assert_eq!(resp.outcome, BrokerOutcome::Success);
-        assert_eq!(resp.result.unwrap()["Dead"], false);
+        assert_eq!(result_value(&resp)["Dead"], false);
     }
 
     #[test]
@@ -2936,7 +3043,7 @@ mod tests {
         assert_eq!(resp.outcome, BrokerOutcome::Success);
         let expected = svc.signing.fingerprint(r#"{"b":1,"a":2}"#, br#""x""#);
         assert_eq!(
-            resp.result.unwrap()["fingerprint"].as_str().unwrap(),
+            result_value(&resp)["fingerprint"].as_str().unwrap(),
             expected
         );
     }
@@ -3071,7 +3178,7 @@ mod tests {
             )),
         ));
         assert_eq!(resp.outcome, BrokerOutcome::Success);
-        let result = resp.result.unwrap();
+        let result = result_value(&resp);
         let der = super::super::wire::b64_decode(result["Raw"].as_str().unwrap()).unwrap();
         // `Fingerprint` is sha256-hex over the DER the response carries.
         assert_eq!(
@@ -3162,7 +3269,7 @@ mod tests {
         let resp = svc.dispatch(&request(PRESENT_BOOTSTRAP_RPC, None));
         assert_eq!(resp.outcome, BrokerOutcome::Success);
         assert_eq!(
-            resp.result.unwrap()["value"].as_str().unwrap(),
+            result_value(&resp)["value"].as_str().unwrap(),
             super::super::wire::b64_raw_encode(b"bootstrap-secret")
         );
         // Consumed — the second presentation denies identically.
@@ -3402,5 +3509,157 @@ mod tests {
         // identity — the divergence this fix removes.
         let request_hmac = handoff::compute_materialize_receipt_hmac(&svc.signing, &req2);
         assert_ne!(request_hmac, receipt.hmac);
+    }
+
+    // -- dispatch_json peer gates (upstream HandleConn) --------------------
+
+    /// A fabricated `SO_PEERCRED` triple — upstream's `unix.Ucred`.
+    fn peer(uid: u32, gid: u32) -> PeerCred {
+        PeerCred {
+            pid: rustix::process::Pid::from_raw(4321).unwrap(),
+            uid: rustix::process::Uid::from_raw(uid),
+            gid: rustix::process::Gid::from_raw(gid),
+        }
+    }
+
+    /// One `dispatch_json` exchange over a socketpair — returns the
+    /// handler's result and the decoded response line.
+    fn json_call(
+        svc: &Service,
+        cred: PeerCred,
+        req: &BrokerRequest,
+    ) -> (Result<(), Failure>, BrokerResponse) {
+        use crate::broker::deadline::DeadlineStream;
+        use rustix::net::{AddressFamily, SocketFlags, SocketType};
+        use std::io::Read;
+        let (a, b) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        let mut conn = DeadlineStream::new(a, std::time::Duration::from_secs(5)).unwrap();
+        let result = dispatch_json(&mut conn, svc, req, &cred);
+        drop(conn); // EOF so the peer read finishes.
+        let mut buf = String::new();
+        std::fs::File::from(b).read_to_string(&mut buf).unwrap();
+        let resp: BrokerResponse = serde_json::from_str(buf.trim_end_matches('\n')).unwrap();
+        (result, resp)
+    }
+
+    #[test]
+    fn dispatch_json_worker_gate_binds_launch_store_identity() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        let launches = svc.backup_launches.as_ref().unwrap();
+        let req = request(BACKUP_SEAL_RPC, None);
+        // A root peer is NOT the worker — upstream's
+        // `BACKUP_WORKER_AUTHORITY_DENIED` write_deny, exactly.
+        let (result, resp) = json_call(&svc, peer(0, 0), &req);
+        assert!(result.is_err());
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.message, "BACKUP_WORKER_AUTHORITY_DENIED");
+        // The launch store's runtime identity reaches the live arm —
+        // decode fails with the handler's own code, not the gate's.
+        let (result, resp) = json_call(
+            &svc,
+            peer(launches.runtime_uid(), launches.runtime_gid()),
+            &req,
+        );
+        assert!(result.is_ok());
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.message, "BACKUP_SEAL_DENIED");
+        assert_eq!(resp.evidence.code, "BACKUP_SEAL_DENIED");
+    }
+
+    #[test]
+    fn dispatch_json_helper_gates_require_root() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        let req = request(BACKUP_READ_STATUS_RPC, None);
+        // A non-root peer is refused at the gate — the handler's code
+        // never runs (`uid==0 && gid==0 && pid>0` upstream).
+        let (result, resp) = json_call(&svc, peer(4242, 4242), &req);
+        assert!(result.is_err());
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.message, "BACKUP_HELPER_AUTHORITY_DENIED");
+        // The same gate rejects `restore_issue_launch` with its own
+        // code — before the launch store is even consulted.
+        let (result, resp) = json_call(
+            &svc,
+            peer(4242, 4242),
+            &request(RESTORE_ISSUE_LAUNCH_RPC, None),
+        );
+        assert!(result.is_err());
+        assert_eq!(resp.evidence.message, "RESTORE_HELPER_AUTHORITY_DENIED");
+        // Root reaches the live arm — empty op → the handler's code.
+        let (result, resp) = json_call(&svc, peer(0, 0), &req);
+        assert!(result.is_ok());
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.message, "BACKUP_STATUS_DENIED");
+        // `restore_issue_launch` — its own handler denial ladder.
+        let (result, resp) = json_call(&svc, peer(0, 0), &request(RESTORE_ISSUE_LAUNCH_RPC, None));
+        assert!(result.is_ok());
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(
+            resp.evidence.message,
+            "RESTORE_LAUNCH_DENIED: missing request"
+        );
+    }
+
+    #[test]
+    fn dispatch_json_recovery_mutations_require_migration_peer() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        let req = request(RESTORE_BROKER_AUTHORITY_PREPARE_RPC, None);
+        // A non-migration peer is refused at the gate — even root.
+        let (result, resp) = json_call(&svc, peer(0, 0), &req);
+        assert!(result.is_err());
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.message, "authority denied");
+        // The migration peer passes the gate, then fails the launch
+        // binding — upstream's `B05_MIGRATION_AUTHORITY_DENIED`.
+        let (result, resp) = json_call(&svc, peer(CENTRAL_MIGRATE_UID, CENTRAL_MIGRATE_GID), &req);
+        assert!(result.is_err());
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(
+            resp.evidence.message,
+            "B05_MIGRATION_AUTHORITY_DENIED: missing launch authority"
+        );
+    }
+
+    #[test]
+    fn dispatch_json_closed_and_live_purposes() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        // `bind_postgres_service_role` — root-only gate, then the
+        // slice's closed denial (the RPC is deliberately unported).
+        let (result, resp) = json_call(
+            &svc,
+            peer(4242, 4242),
+            &request(POSTGRES_SERVICE_ROLE_BIND_RPC, None),
+        );
+        assert!(result.is_err());
+        assert_eq!(resp.evidence.message, "POSTGRES_SERVICE_ROLE_BIND_DENIED");
+        let (_, resp) = json_call(
+            &svc,
+            peer(0, 0),
+            &request(POSTGRES_SERVICE_ROLE_BIND_RPC, None),
+        );
+        assert_eq!(
+            resp.evidence.message,
+            format!("POSTGRES_SERVICE_ROLE_BIND_DENIED: {UNSUPPORTED_IN_THIS_SLICE}")
+        );
+        // `inspect_restore_barrier` — a root peer reaches the live
+        // handler; an exactly-empty payload answers with the barrier.
+        let (_, resp) = json_call(
+            &svc,
+            peer(0, 0),
+            &request(RESTORE_BARRIER_INSPECT_RPC, Some(BTreeMap::new())),
+        );
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
+        let value = result_value(&resp);
+        assert_eq!(value["active"], false);
     }
 }

@@ -792,7 +792,12 @@ pub struct BrokerRequest {
 
 /// The broker's signed reply to a broker operation (upstream
 /// `authority.BrokerResponse`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `result` is upstream's `json.RawMessage`: the verbatim marshal
+/// bytes of the typed result, embedded untouched so field order and
+/// shape are exactly what the dispatch handler produced. `RawValue`
+/// has no `PartialEq` — compare `.get()` bytes in tests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerResponse {
     /// Echoed operation identity.
     pub operation_id: String,
@@ -800,7 +805,7 @@ pub struct BrokerResponse {
     pub outcome: BrokerOutcome,
     /// The typed result payload (`,omitempty`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
+    pub result: Option<Box<serde_json::value::RawValue>>,
     /// Denial/error evidence.
     pub evidence: BrokerEvidence,
 }

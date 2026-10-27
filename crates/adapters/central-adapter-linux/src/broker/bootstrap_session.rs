@@ -529,9 +529,10 @@ impl BootstrapPresenter {
         struct PresentResult {
             value: String,
         }
-        let result: PresentResult =
-            serde_json::from_value(response.result.unwrap_or(serde_json::Value::Null))
-                .map_err(|_| denied("bootstrap presenter: invalid result"))?;
+        let result: PresentResult = response
+            .result
+            .and_then(|r| serde_json::from_str(r.get()).ok())
+            .ok_or_else(|| denied("bootstrap presenter: invalid result"))?;
         let value = wire::b64_raw_decode(&result.value)
             .filter(|v| !v.is_empty() && v.len() <= 4096)
             .map(Zeroizing::new)

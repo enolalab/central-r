@@ -251,7 +251,7 @@ fn ticket_from_wire(wire: &RestoreTicketWire) -> RestoreTicket {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreApplyAuthorizationWire {
+pub(crate) struct RestoreApplyAuthorizationWire {
     #[serde(rename = "AuthorizationID")]
     authorization_id: Uuid,
     #[serde(rename = "OperationID")]
@@ -264,7 +264,9 @@ struct RestoreApplyAuthorizationWire {
     expires_at: OffsetDateTime,
 }
 
-fn apply_authorization_to_wire(a: &RestoreApplyAuthorization) -> RestoreApplyAuthorizationWire {
+pub(crate) fn apply_authorization_to_wire(
+    a: &RestoreApplyAuthorization,
+) -> RestoreApplyAuthorizationWire {
     RestoreApplyAuthorizationWire {
         authorization_id: a.authorization_id,
         operation_id: a.operation_id,
@@ -274,7 +276,7 @@ fn apply_authorization_to_wire(a: &RestoreApplyAuthorization) -> RestoreApplyAut
     }
 }
 
-fn apply_authorization_from_wire(
+pub(crate) fn apply_authorization_from_wire(
     wire: &RestoreApplyAuthorizationWire,
 ) -> RestoreApplyAuthorization {
     RestoreApplyAuthorization {
@@ -288,7 +290,7 @@ fn apply_authorization_from_wire(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreAbandonAuthorizationWire {
+pub(crate) struct RestoreAbandonAuthorizationWire {
     #[serde(rename = "AuthorizationID")]
     authorization_id: Uuid,
     #[serde(rename = "OperationID")]
@@ -301,7 +303,7 @@ struct RestoreAbandonAuthorizationWire {
     acknowledgement: String,
 }
 
-fn abandon_authorization_to_wire(
+pub(crate) fn abandon_authorization_to_wire(
     a: &RestoreAbandonAuthorization,
 ) -> RestoreAbandonAuthorizationWire {
     RestoreAbandonAuthorizationWire {
@@ -313,7 +315,7 @@ fn abandon_authorization_to_wire(
     }
 }
 
-fn abandon_authorization_from_wire(
+pub(crate) fn abandon_authorization_from_wire(
     wire: &RestoreAbandonAuthorizationWire,
 ) -> RestoreAbandonAuthorization {
     RestoreAbandonAuthorization {
@@ -327,7 +329,7 @@ fn abandon_authorization_from_wire(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreOperationWire {
+pub(crate) struct RestoreOperationWire {
     #[serde(rename = "OperationID")]
     operation_id: Uuid,
     #[serde(rename = "TicketID")]
@@ -404,7 +406,7 @@ fn backup_phase_from_str(value: &str) -> Option<BackupPhase> {
     })
 }
 
-fn operation_to_wire(operation: &RestoreOperation) -> RestoreOperationWire {
+pub(crate) fn operation_to_wire(operation: &RestoreOperation) -> RestoreOperationWire {
     RestoreOperationWire {
         operation_id: operation.operation_id,
         ticket_id: operation.ticket_id,
@@ -427,7 +429,9 @@ fn operation_to_wire(operation: &RestoreOperation) -> RestoreOperationWire {
     }
 }
 
-fn operation_from_wire(wire: &RestoreOperationWire) -> Result<RestoreOperation, Failure> {
+pub(crate) fn operation_from_wire(
+    wire: &RestoreOperationWire,
+) -> Result<RestoreOperation, Failure> {
     let (Some(phase), Some(last_checkpoint)) = (
         restore_phase_from_str(&wire.phase),
         restore_checkpoint_from_str(&wire.last_checkpoint),
@@ -458,7 +462,7 @@ fn operation_from_wire(wire: &RestoreOperationWire) -> Result<RestoreOperation, 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupAcceptedFactsWire {
+pub(crate) struct BackupAcceptedFactsWire {
     #[serde(rename = "DatabaseTime", with = "wire::rfc3339")]
     database_time: OffsetDateTime,
     #[serde(rename = "TargetFingerprint")]
@@ -487,7 +491,7 @@ struct BackupAcceptedFactsWire {
     service_identity: String,
 }
 
-fn accepted_facts_to_wire(facts: &BackupAcceptedFacts) -> BackupAcceptedFactsWire {
+pub(crate) fn accepted_facts_to_wire(facts: &BackupAcceptedFacts) -> BackupAcceptedFactsWire {
     BackupAcceptedFactsWire {
         database_time: facts.database_time,
         target_fingerprint: facts.target_fingerprint.clone(),
@@ -504,7 +508,7 @@ fn accepted_facts_to_wire(facts: &BackupAcceptedFacts) -> BackupAcceptedFactsWir
     }
 }
 
-fn accepted_facts_from_wire(wire: &BackupAcceptedFactsWire) -> BackupAcceptedFacts {
+pub(crate) fn accepted_facts_from_wire(wire: &BackupAcceptedFactsWire) -> BackupAcceptedFacts {
     BackupAcceptedFacts {
         database_time: wire.database_time,
         target_fingerprint: wire.target_fingerprint.clone(),
@@ -523,7 +527,7 @@ fn accepted_facts_from_wire(wire: &BackupAcceptedFactsWire) -> BackupAcceptedFac
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupOperationWire {
+pub(crate) struct BackupOperationWire {
     #[serde(rename = "OperationID")]
     operation_id: Uuid,
     #[serde(rename = "BackupID")]
@@ -550,7 +554,7 @@ struct BackupOperationWire {
     updated_at: OffsetDateTime,
 }
 
-fn backup_operation_to_wire(operation: &BackupOperation) -> BackupOperationWire {
+pub(crate) fn backup_operation_to_wire(operation: &BackupOperation) -> BackupOperationWire {
     BackupOperationWire {
         operation_id: operation.operation_id,
         backup_id: operation.backup_id,
@@ -565,7 +569,9 @@ fn backup_operation_to_wire(operation: &BackupOperation) -> BackupOperationWire 
     }
 }
 
-fn backup_operation_from_wire(wire: &BackupOperationWire) -> Result<BackupOperation, Failure> {
+pub(crate) fn backup_operation_from_wire(
+    wire: &BackupOperationWire,
+) -> Result<BackupOperation, Failure> {
     let Some(phase) = backup_phase_from_str(&wire.phase) else {
         return Err(unavailable());
     };
@@ -585,7 +591,7 @@ fn backup_operation_from_wire(wire: &BackupOperationWire) -> Result<BackupOperat
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupSealProposalWire {
+pub(crate) struct BackupSealProposalWire {
     #[serde(rename = "OperationID")]
     operation_id: Uuid,
     #[serde(rename = "BackupID")]
@@ -604,12 +610,15 @@ struct BackupSealProposalWire {
     /// `BackupSealProposal` (all other fields marshal PascalCase).
     #[serde(rename = "payload_epoch_id")]
     payload_epoch_id: Uuid,
+    /// `RootManifestJSON []byte` — Go's `[]byte` base64 string.
     #[serde(rename = "RootManifestJSON", with = "wire::b64")]
     root_manifest_json: Vec<u8>,
-    #[serde(rename = "ManifestDigest", with = "wire::b64")]
-    manifest_digest: Vec<u8>,
-    #[serde(rename = "FileTreeDigest", with = "wire::b64")]
-    file_tree_digest: Vec<u8>,
+    /// `[sha256.Size]byte` — Go marshals a fixed array as a JSON
+    /// number array, not base64.
+    #[serde(rename = "ManifestDigest", with = "wire::digest32")]
+    manifest_digest: [u8; 32],
+    #[serde(rename = "FileTreeDigest", with = "wire::digest32")]
+    file_tree_digest: [u8; 32],
     #[serde(rename = "ProposedAt", with = "wire::rfc3339")]
     proposed_at: OffsetDateTime,
 }
@@ -618,7 +627,7 @@ fn digest32(value: &[u8]) -> Result<[u8; 32], Failure> {
     <[u8; 32]>::try_from(value).map_err(|_| unavailable())
 }
 
-fn seal_proposal_to_wire(proposal: &BackupSealProposal) -> BackupSealProposalWire {
+pub(crate) fn seal_proposal_to_wire(proposal: &BackupSealProposal) -> BackupSealProposalWire {
     BackupSealProposalWire {
         operation_id: proposal.operation_id,
         backup_id: proposal.backup_id,
@@ -629,13 +638,15 @@ fn seal_proposal_to_wire(proposal: &BackupSealProposal) -> BackupSealProposalWir
         config_fingerprint: proposal.config_fingerprint.clone(),
         payload_epoch_id: proposal.payload_epoch_id,
         root_manifest_json: proposal.root_manifest_json.clone(),
-        manifest_digest: proposal.manifest_digest.to_vec(),
-        file_tree_digest: proposal.file_tree_digest.to_vec(),
+        manifest_digest: proposal.manifest_digest,
+        file_tree_digest: proposal.file_tree_digest,
         proposed_at: proposal.proposed_at,
     }
 }
 
-fn seal_proposal_from_wire(wire: &BackupSealProposalWire) -> Result<BackupSealProposal, Failure> {
+pub(crate) fn seal_proposal_from_wire(
+    wire: &BackupSealProposalWire,
+) -> Result<BackupSealProposal, Failure> {
     Ok(BackupSealProposal {
         operation_id: wire.operation_id,
         backup_id: wire.backup_id,
@@ -646,15 +657,15 @@ fn seal_proposal_from_wire(wire: &BackupSealProposalWire) -> Result<BackupSealPr
         config_fingerprint: wire.config_fingerprint.clone(),
         payload_epoch_id: wire.payload_epoch_id,
         root_manifest_json: wire.root_manifest_json.clone(),
-        manifest_digest: digest32(&wire.manifest_digest)?,
-        file_tree_digest: digest32(&wire.file_tree_digest)?,
+        manifest_digest: wire.manifest_digest,
+        file_tree_digest: wire.file_tree_digest,
         proposed_at: wire.proposed_at,
     })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupSealCompanionWire {
+pub(crate) struct BackupSealCompanionWire {
     #[serde(rename = "AuthorityEnvelopeID")]
     authority_envelope_id: String,
     #[serde(rename = "BackupID")]
@@ -669,19 +680,20 @@ struct BackupSealCompanionWire {
     config_fingerprint: String,
     #[serde(rename = "PayloadEpochID")]
     payload_epoch_id: Uuid,
-    #[serde(rename = "RootManifestDigest", with = "wire::b64")]
-    root_manifest_digest: Vec<u8>,
-    #[serde(rename = "FileTreeDigest", with = "wire::b64")]
-    file_tree_digest: Vec<u8>,
+    /// `[sha256.Size]byte` — JSON number array, not base64.
+    #[serde(rename = "RootManifestDigest", with = "wire::digest32")]
+    root_manifest_digest: [u8; 32],
+    #[serde(rename = "FileTreeDigest", with = "wire::digest32")]
+    file_tree_digest: [u8; 32],
     #[serde(rename = "SealedAt", with = "wire::rfc3339")]
     sealed_at: OffsetDateTime,
     #[serde(rename = "HMAC")]
     hmac: String,
-    #[serde(rename = "Digest", with = "wire::b64")]
-    digest: Vec<u8>,
+    #[serde(rename = "Digest", with = "wire::digest32")]
+    digest: [u8; 32],
 }
 
-fn seal_companion_to_wire(companion: &BackupSealCompanion) -> BackupSealCompanionWire {
+pub(crate) fn seal_companion_to_wire(companion: &BackupSealCompanion) -> BackupSealCompanionWire {
     BackupSealCompanionWire {
         authority_envelope_id: companion.authority_envelope_id.clone(),
         backup_id: companion.backup_id,
@@ -690,15 +702,15 @@ fn seal_companion_to_wire(companion: &BackupSealCompanion) -> BackupSealCompanio
         target_fingerprint: companion.target_fingerprint.clone(),
         config_fingerprint: companion.config_fingerprint.clone(),
         payload_epoch_id: companion.payload_epoch_id,
-        root_manifest_digest: companion.root_manifest_digest.to_vec(),
-        file_tree_digest: companion.file_tree_digest.to_vec(),
+        root_manifest_digest: companion.root_manifest_digest,
+        file_tree_digest: companion.file_tree_digest,
         sealed_at: companion.sealed_at,
         hmac: companion.hmac.clone(),
-        digest: companion.digest.to_vec(),
+        digest: companion.digest,
     }
 }
 
-fn seal_companion_from_wire(
+pub(crate) fn seal_companion_from_wire(
     wire: &BackupSealCompanionWire,
 ) -> Result<BackupSealCompanion, Failure> {
     Ok(BackupSealCompanion {
@@ -709,17 +721,17 @@ fn seal_companion_from_wire(
         target_fingerprint: wire.target_fingerprint.clone(),
         config_fingerprint: wire.config_fingerprint.clone(),
         payload_epoch_id: wire.payload_epoch_id,
-        root_manifest_digest: digest32(&wire.root_manifest_digest)?,
-        file_tree_digest: digest32(&wire.file_tree_digest)?,
+        root_manifest_digest: wire.root_manifest_digest,
+        file_tree_digest: wire.file_tree_digest,
         sealed_at: wire.sealed_at,
         hmac: wire.hmac.clone(),
-        digest: digest32(&wire.digest)?,
+        digest: wire.digest,
     })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupRepositoryAttestationJournalWire {
+pub(crate) struct BackupRepositoryAttestationJournalWire {
     #[serde(rename = "LaunchEvidenceID")]
     launch_evidence_id: Uuid,
     #[serde(rename = "OperationID")]
@@ -728,20 +740,21 @@ struct BackupRepositoryAttestationJournalWire {
     backup_id: Uuid,
     #[serde(rename = "RepositoryBindingID")]
     repository_binding_id: Uuid,
-    #[serde(rename = "RootManifestDigest", with = "wire::b64")]
-    root_manifest_digest: Vec<u8>,
-    #[serde(rename = "SealCompanionDigest", with = "wire::b64")]
-    seal_companion_digest: Vec<u8>,
-    #[serde(rename = "FileTreeDigest", with = "wire::b64")]
-    file_tree_digest: Vec<u8>,
-    #[serde(rename = "RepositoryManifestDigest", with = "wire::b64")]
-    repository_manifest_digest: Vec<u8>,
+    /// `[sha256.Size]byte` — JSON number arrays, not base64.
+    #[serde(rename = "RootManifestDigest", with = "wire::digest32")]
+    root_manifest_digest: [u8; 32],
+    #[serde(rename = "SealCompanionDigest", with = "wire::digest32")]
+    seal_companion_digest: [u8; 32],
+    #[serde(rename = "FileTreeDigest", with = "wire::digest32")]
+    file_tree_digest: [u8; 32],
+    #[serde(rename = "RepositoryManifestDigest", with = "wire::digest32")]
+    repository_manifest_digest: [u8; 32],
     #[serde(rename = "RepositoryRevision")]
     repository_revision: u64,
     #[serde(rename = "AttestedAt", with = "wire::rfc3339")]
     attested_at: OffsetDateTime,
-    #[serde(rename = "ImmutableDigest", with = "wire::b64")]
-    immutable_digest: Vec<u8>,
+    #[serde(rename = "ImmutableDigest", with = "wire::digest32")]
+    immutable_digest: [u8; 32],
 }
 
 impl Default for BackupRepositoryAttestationJournalWire {
@@ -751,13 +764,13 @@ impl Default for BackupRepositoryAttestationJournalWire {
             operation_id: Uuid::nil(),
             backup_id: Uuid::nil(),
             repository_binding_id: Uuid::nil(),
-            root_manifest_digest: vec![0u8; 32],
-            seal_companion_digest: vec![0u8; 32],
-            file_tree_digest: vec![0u8; 32],
-            repository_manifest_digest: vec![0u8; 32],
+            root_manifest_digest: [0u8; 32],
+            seal_companion_digest: [0u8; 32],
+            file_tree_digest: [0u8; 32],
+            repository_manifest_digest: [0u8; 32],
             repository_revision: 0,
             attested_at: wire::go_zero_time(),
-            immutable_digest: vec![0u8; 32],
+            immutable_digest: [0u8; 32],
         }
     }
 }
@@ -771,19 +784,19 @@ fn attestation_to_wire(
             operation_id: a.operation_id,
             backup_id: a.backup_id,
             repository_binding_id: a.repository_binding_id,
-            root_manifest_digest: a.root_manifest_digest.to_vec(),
-            seal_companion_digest: a.seal_companion_digest.to_vec(),
-            file_tree_digest: a.file_tree_digest.to_vec(),
-            repository_manifest_digest: a.repository_manifest_digest.to_vec(),
+            root_manifest_digest: a.root_manifest_digest,
+            seal_companion_digest: a.seal_companion_digest,
+            file_tree_digest: a.file_tree_digest,
+            repository_manifest_digest: a.repository_manifest_digest,
             repository_revision: a.repository_revision,
             attested_at: a.attested_at,
-            immutable_digest: a.immutable_digest.to_vec(),
+            immutable_digest: a.immutable_digest,
         },
         None => BackupRepositoryAttestationJournalWire::default(),
     }
 }
 
-fn attestation_from_wire(
+pub(crate) fn attestation_from_wire(
     wire: &BackupRepositoryAttestationJournalWire,
 ) -> Result<Option<BackupRepositoryAttestation>, Failure> {
     if wire.launch_evidence_id.is_nil()
@@ -805,19 +818,19 @@ fn attestation_from_wire(
         operation_id: wire.operation_id,
         backup_id: wire.backup_id,
         repository_binding_id: wire.repository_binding_id,
-        root_manifest_digest: digest32(&wire.root_manifest_digest)?,
-        seal_companion_digest: digest32(&wire.seal_companion_digest)?,
-        file_tree_digest: digest32(&wire.file_tree_digest)?,
-        repository_manifest_digest: digest32(&wire.repository_manifest_digest)?,
+        root_manifest_digest: wire.root_manifest_digest,
+        seal_companion_digest: wire.seal_companion_digest,
+        file_tree_digest: wire.file_tree_digest,
+        repository_manifest_digest: wire.repository_manifest_digest,
         repository_revision: wire.repository_revision,
         attested_at: wire.attested_at,
-        immutable_digest: digest32(&wire.immutable_digest)?,
+        immutable_digest: wire.immutable_digest,
     }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupTargetLockJournalWire {
+pub(crate) struct BackupTargetLockJournalWire {
     #[serde(rename = "SupervisorLaunchID")]
     supervisor_launch_id: Uuid,
     #[serde(rename = "LaunchEvidenceID")]
@@ -826,12 +839,14 @@ struct BackupTargetLockJournalWire {
     operation_id: Uuid,
     #[serde(rename = "BackupID")]
     backup_id: Uuid,
+    /// `TargetLockProof string` — upstream carries the proof as a
+    /// string here; only `ImmutableDigest` is a `[32]byte` array.
     #[serde(rename = "TargetLockProof")]
     target_lock_proof: String,
     #[serde(rename = "AssertedAt", with = "wire::rfc3339")]
     asserted_at: OffsetDateTime,
-    #[serde(rename = "ImmutableDigest", with = "wire::b64")]
-    immutable_digest: Vec<u8>,
+    #[serde(rename = "ImmutableDigest", with = "wire::digest32")]
+    immutable_digest: [u8; 32],
 }
 
 impl Default for BackupTargetLockJournalWire {
@@ -843,7 +858,7 @@ impl Default for BackupTargetLockJournalWire {
             backup_id: Uuid::nil(),
             target_lock_proof: String::new(),
             asserted_at: wire::go_zero_time(),
-            immutable_digest: vec![0u8; 32],
+            immutable_digest: [0u8; 32],
         }
     }
 }
@@ -859,13 +874,13 @@ fn target_lock_to_wire(
             backup_id: a.backup_id,
             target_lock_proof: a.target_lock_proof.clone(),
             asserted_at: a.asserted_at,
-            immutable_digest: a.immutable_digest.to_vec(),
+            immutable_digest: a.immutable_digest,
         },
         None => BackupTargetLockJournalWire::default(),
     }
 }
 
-fn target_lock_from_wire(
+pub(crate) fn target_lock_from_wire(
     wire: &BackupTargetLockJournalWire,
 ) -> Result<Option<BackupTargetLockAttestation>, Failure> {
     if wire.supervisor_launch_id.is_nil()
@@ -885,7 +900,7 @@ fn target_lock_from_wire(
         backup_id: wire.backup_id,
         target_lock_proof: wire.target_lock_proof.clone(),
         asserted_at: wire.asserted_at,
-        immutable_digest: digest32(&wire.immutable_digest)?,
+        immutable_digest: wire.immutable_digest,
     }))
 }
 
@@ -1048,7 +1063,7 @@ fn seal_record_from_wire(wire: &BackupSealRecordWire) -> Result<BackupSealRecord
 
 /// `recoveryBootstrapActivationRecord`.
 #[allow(dead_code)] // slice-(b) broker-reset surface
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryBootstrapActivationRecord {
     pub generation: u64,
@@ -1064,7 +1079,7 @@ pub(crate) struct RecoveryBootstrapActivationRecord {
 /// broker half of C05. Only opaque identities and fingerprints;
 /// private TLS keys and bootstrap material stay in their own stores.
 #[allow(dead_code)] // slice-(b) broker-reset surface
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecoveryBrokerResetRecord {
     pub operation_id: Uuid,
@@ -1114,8 +1129,7 @@ impl RecoveryBrokerResetRecord {
 }
 
 /// `decodeRecoveryHash` — base64-RawStd 32-byte nonzero hash.
-#[allow(dead_code)]
-fn decode_recovery_hash(value: &str) -> Result<[u8; 32], Failure> {
+pub(crate) fn decode_recovery_hash(value: &str) -> Result<[u8; 32], Failure> {
     let decoded = wire::b64_raw_decode(value).ok_or_else(unavailable)?;
     let out = digest32(&decoded)?;
     if out == [0u8; 32] {

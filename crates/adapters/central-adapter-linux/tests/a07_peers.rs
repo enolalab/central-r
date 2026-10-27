@@ -539,8 +539,13 @@ fn broker_dispatch_denies_unknown_and_r6_purposes_exact() {
     );
     assert_eq!(resp.evidence.message, "unknown purpose");
 
-    // R6 surface: a registered-but-closed purpose name.
-    let resp = svc.dispatch(&broker_request("op-d-2", protocol::BACKUP_ISSUE_MINIO_RPC));
+    // R6 surface: a registered-but-closed purpose name — only the
+    // Postgres service-role and advisory-evaluation RPCs remain
+    // closed in this slice; the backup/recovery surface is live.
+    let resp = svc.dispatch(&broker_request(
+        "op-d-2",
+        protocol::POSTGRES_SERVICE_ROLE_BIND_RPC,
+    ));
     assert_eq!(
         resp.outcome,
         central_infra::authority::BrokerOutcome::Denied
@@ -552,6 +557,17 @@ fn broker_dispatch_denies_unknown_and_r6_purposes_exact() {
             protocol::UNSUPPORTED_IN_THIS_SLICE
         )
     );
+
+    // Connection-only purposes `HandleConn` serves (peer-gated backup
+    // helper and restore-launch RPCs) are not registered in upstream's
+    // `Dispatch` switch either — the generic path answers upstream's
+    // `default`, `"unknown purpose"`.
+    let resp = svc.dispatch(&broker_request("op-d-3", protocol::BACKUP_ISSUE_MINIO_RPC));
+    assert_eq!(
+        resp.outcome,
+        central_infra::authority::BrokerOutcome::Denied
+    );
+    assert_eq!(resp.evidence.message, "unknown purpose");
 
     // Descriptor-only transports refuse the JSON path with their
     // pinned messages.

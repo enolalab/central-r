@@ -140,3 +140,57 @@ server.rs dispatch integration.
   JSON-route peer-gate rewiring, `0xc1`/`0xc2` credential transports,
   and `[32]byte` number-array fixes for seal/attestation/binding digests
   currently serialized as b64.
+
+## R6-7(b) complete — authority dispatch + digest wire parity (this commit)
+
+- `broker/wire.rs`: `digest32` serde adapter — Go `[32]byte` marshals as a
+  fixed 32-number array (golden verified against go1.26 `json.Marshal`);
+  decode mirrors `json.Unmarshal` (short arrays zero-pad, long truncate,
+  `null` zeroes). `go_json_escape` reproduces `encoding/json`'s
+  `<`/`>`/`&`/U+2028/U+2029 escaping for the byte-equality canonical
+  re-marshal upstream's `decodeExactBrokerPayload` enforces.
+- `authority.rs`: `BrokerResponse.result` → `Option<Box<RawValue>>` —
+  verbatim JSON passthrough, preserving upstream's absent/null/result
+  distinction with no double encoding.
+- `broker/backup_authority.rs` (new): all backup RPC dispatches —
+  helper routes (issue_launch, issue_minio_handoff, mark_reaped,
+  complete_attested_seal, verify_seal, read_status, throughput
+  launch/journal/ensure-payload-epoch) and worker routes
+  (seal_for_launch, worker_context, active_payload_epoch,
+  read_throughput, create/read/CAS operation, throughput
+  context/target/stage). Strict `decode_exact_broker_payload` (one
+  `"request"` key, `deny_unknown_fields`, canonical byte-equality).
+- `broker/recovery_authority.rs` (new): restore authorization/abandon/
+  barrier dispatches (tolerant `json.Unmarshal` decode, `Some(empty)`
+  vs `None` payload distinction preserved), `restore_issue_launch`
+  (socket-PID parent binding, bare success envelope),
+  `PrepareRecoveryBrokerAuthority`, `ActivateRecoveryBootstrap`,
+  `ResetBootstrapAuthority` (session reset + zeroed staged plaintext +
+  enumerate/delete every recovery-bootstrap generation).
+- `Service::dispatch` reordered to upstream's `service.go` switch;
+  `dispatch_json` rewired to upstream `HandleConn`'s full gate ladder
+  (bootstrap-migration denial → worker UID/GID → postgres/advisory
+  root gates → backup-helper root → restore-helper root → recovery
+  migration peer → runtime/root-or-migration → launch validation →
+  migration-outcome → generic dispatch).
+- `is_r6_purpose` now contains only `bind_postgres_service_role` and
+  `append_advisory_evaluation` — the sole purposes this slice leaves
+  closed. Connection-only purposes answer upstream's `default`
+  (`"unknown purpose"`) through generic `dispatch`, exactly as
+  upstream's `Dispatch` does.
+
+Verification (all run, this session):
+- `cargo test -p central-adapter-linux` — 626 lib + 91 integration =
+  717 pass, 0 fail (includes 15 new focused tests: digest shape + Go
+  golden, exact-decode refusals, `dispatch_json` peer-gate routing,
+  envelope shapes).
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p central-adapter-linux --all-targets -- -D warnings` — clean.
+- `cargo check --workspace` — clean.
+- `cargo deny check` — ok.
+
+Live vs denied: helper/worker/recovery/restore-launch purposes are live
+under their upstream peer gates; `bind_postgres_service_role` +
+`append_advisory_evaluation` remain `UNSUPPORTED_IN_THIS_SLICE`;
+slice (c) still needs the `0xc1`–`0xc5` credential transports and the
+helper backup/restore file operations.

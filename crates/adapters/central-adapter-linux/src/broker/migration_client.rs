@@ -261,7 +261,7 @@ impl MigrationClient {
         }
         let result: B05MaterializePostgresMigrationResult = response
             .result
-            .and_then(|r| serde_json::from_value(r).ok())
+            .and_then(|r| serde_json::from_str(r.get()).ok())
             .filter(|r: &B05MaterializePostgresMigrationResult| r.operation_id == wire.operation_id)
             .ok_or_else(|| err!("invalid completion result"))?;
         Ok(result)
@@ -396,12 +396,12 @@ impl MigrationAuthorityClient {
             return Err(response_error(purpose, &response));
         }
         match response.result {
-            Some(result) => serde_json::from_value(result).map_err(|_| {
+            Some(result) => serde_json::from_str(result.get()).map_err(|_| {
                 internal(format!(
                     "migration authority {purpose} returned invalid result"
                 ))
             }),
-            None => serde_json::from_value(serde_json::Value::Null).map_err(|_| {
+            None => serde_json::from_str("null").map_err(|_| {
                 internal(format!(
                     "migration authority {purpose} returned invalid result"
                 ))
@@ -718,7 +718,7 @@ pub fn read_migration_launch_outcome(
     }
     response
         .result
-        .and_then(|r| serde_json::from_value(r).ok())
+        .and_then(|r| serde_json::from_str(r.get()).ok())
         .ok_or_else(|| internal("migration outcome decode"))
 }
 
@@ -803,7 +803,7 @@ impl MigrationLaunchIssuer {
         }
         let result: B05MigrationLaunchResult = response
             .result
-            .and_then(|r| serde_json::from_value(r).ok())
+            .and_then(|r| serde_json::from_str(r.get()).ok())
             .ok_or_else(|| err!("invalid issued evidence ID"))?;
         if uuid::Uuid::parse_str(&result.launch_evidence_id).is_err() {
             return Err(err!("invalid issued evidence ID"));

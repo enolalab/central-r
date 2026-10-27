@@ -461,10 +461,10 @@ impl LifecycleClient {
             )));
         }
         match response.result {
-            Some(result) => serde_json::from_value(result)
+            Some(result) => serde_json::from_str(result.get())
                 .map_err(|e| internal(format!("broker lifecycle: decode result: {e}"))),
             // `nil` result decodes as the Go zero value.
-            None => serde_json::from_value(serde_json::Value::Null)
+            None => serde_json::from_str("null")
                 .map_err(|e| internal(format!("broker lifecycle: decode result: {e}"))),
         }
     }
