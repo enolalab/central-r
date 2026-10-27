@@ -96,11 +96,11 @@ impl BackupLaunchState {
 /// `backup.RepositoryBinding` as Go's `json.Marshal` emits it inside
 /// the record and its canonical payload: PascalCase fields, base64
 /// `[32]byte` digests, RFC3339 timestamp.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RepositoryBindingJournalWire {
+pub struct RepositoryBindingJournalWire {
     #[serde(rename = "BindingID")]
-    binding_id: Uuid,
+    pub(crate) binding_id: Uuid,
     #[serde(rename = "InstanceID")]
     instance_id: String,
     #[serde(rename = "OwnerUID")]
@@ -123,7 +123,7 @@ struct RepositoryBindingJournalWire {
     immutable_digest: Vec<u8>,
 }
 
-fn binding_to_wire(binding: &RepositoryBinding) -> RepositoryBindingJournalWire {
+pub(crate) fn binding_to_wire(binding: &RepositoryBinding) -> RepositoryBindingJournalWire {
     RepositoryBindingJournalWire {
         binding_id: binding.binding_id,
         instance_id: binding.instance_id.clone(),
@@ -139,7 +139,27 @@ fn binding_to_wire(binding: &RepositoryBinding) -> RepositoryBindingJournalWire 
     }
 }
 
-fn binding_from_wire(wire: &RepositoryBindingJournalWire) -> Result<RepositoryBinding, Failure> {
+impl Default for RepositoryBindingJournalWire {
+    fn default() -> Self {
+        Self {
+            binding_id: Uuid::nil(),
+            instance_id: String::new(),
+            owner_uid: 0,
+            owner_gid: 0,
+            device_major: 0,
+            device_minor: 0,
+            root_inode: 0,
+            mount_id: 0,
+            created_at: wire::go_zero_time(),
+            creation_nonce: Vec::new(),
+            immutable_digest: Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn binding_from_wire(
+    wire: &RepositoryBindingJournalWire,
+) -> Result<RepositoryBinding, Failure> {
     let creation_nonce: [u8; 32] = wire
         .creation_nonce
         .clone()

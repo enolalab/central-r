@@ -27,6 +27,7 @@
 pub const PRODUCTION_SOCKET_PATH: &str = "/run/central-broker/broker.sock";
 
 pub mod backup_launch;
+pub mod backup_throughput_launch;
 pub mod bootstrap_session;
 pub mod daemon;
 pub(crate) mod deadline;
@@ -48,6 +49,7 @@ pub mod restore_launch;
 pub mod secret_bootstrap;
 pub mod server;
 pub mod signing;
+pub mod throughput_journal;
 pub mod tls;
 pub(crate) mod wire;
 // No `xdg` module: the signed XDG-view surface is upstream's
