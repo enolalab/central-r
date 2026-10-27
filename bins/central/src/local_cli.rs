@@ -57,6 +57,8 @@ pub(crate) fn local(
         "local.init" => run_init(tokens, stdout, stderr),
         "local.up" | "local.down" | "local.status" => run_lifecycle(command_id, stdout, stderr),
         "local.prepare" => run_prepare(command_id, tokens, stdout, stderr),
+        // `runLocalWipe` — the D01 verb: checkpoint, wipe, evidence.
+        "local.wipe" => crate::destructive_cli::local_wipe(command_id, tokens, stdout, stderr),
         _ => emit(
             command_id,
             stdout,
@@ -1235,7 +1237,6 @@ mod tests {
             "local.security-update",
             "local.browser.open",
             "local.trust.install",
-            "local.wipe",
             "local.audit",
             "local.dependency-upgrade-plan",
         ] {

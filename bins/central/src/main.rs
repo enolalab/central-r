@@ -34,6 +34,7 @@ use central_kernel::lifecycle;
 mod artifact_cli;
 mod backup_cli;
 mod checkpoint_cli;
+mod destructive_cli;
 mod grant_cli;
 mod harness_cli;
 mod local_cli;
@@ -317,7 +318,6 @@ mod tests {
             (&["local", "init", "--status"], "local.init.status"),
             (&["local", "init", "--resume=abc"], "local.init.resume"),
             (&["local", "init", "--abandon=abc"], "local.init.abandon"),
-            (&["local", "wipe", "--target", "/x"], "local.wipe"),
             (&["local", "audit"], "local.audit"),
             (&["local", "browser", "open"], "local.browser.open"),
             (&["local", "trust", "install"], "local.trust.install"),
@@ -339,10 +339,6 @@ mod tests {
             ),
             (&["backup", "export"], "backup.export"),
             (&["backup", "import"], "backup.import"),
-            (&["backup", "delete"], "backup.delete"),
-            (&["backup", "prune", "plan"], "backup.prune.plan"),
-            // First-match: `backup.prune.apply` is the shadowed entry.
-            (&["backup", "prune", "apply"], "backup.prune.plan"),
             (&["maintenance", "plan"], "maintenance.plan"),
             (&["maintenance", "apply"], "maintenance.apply"),
             (&["bootstrap", "show"], "bootstrap.show"),
@@ -393,6 +389,75 @@ mod tests {
             let (_, stdout, _) = invoke(argv);
             assert_eq!(parse_envelope(&stdout)["command_id"], want_id);
         }
+
+        // R6 task 11 (D01/D04): the destructive verbs are activated —
+        // they delegate to the helper socket, which is absent here, so
+        // the fail-closed seam surfaces each verb's stable refusal at
+        // exit 6 (upstream's terminal `*_FAILED` for a non-wire error):
+        // wipe cannot even seal its checkpoint, delete/prune cannot
+        // reach the helper at all. Never `UNSUPPORTED_IN_THIS_SLICE`.
+        *backup_cli::TEST_SOCKET_OVERRIDE.lock().unwrap() =
+            Some("/nonexistent/central-test/helper.sock".to_owned());
+        for (argv, want_id, want_reason, want_next) in [
+            (
+                &["local", "wipe", "--target", "/x"][..],
+                "local.wipe",
+                "WIPE_CHECKPOINT_FAILED",
+                "CREATE_CHECKPOINT_BACKUP_FIRST",
+            ),
+            (
+                &["backup", "delete"][..],
+                "backup.delete",
+                "DELETE_FAILED",
+                "INSPECT_DELETE_STATE",
+            ),
+            (
+                &["backup", "prune", "plan"][..],
+                "backup.prune.plan",
+                "PRUNE_FAILED",
+                "INSPECT_PRUNE_STATE",
+            ),
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(parsed["command_id"], want_id, "argv {argv:?}");
+            assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
+            assert_eq!(code, 6, "argv {argv:?}");
+            assert_eq!(parsed["details"]["safe_next_action"], want_next);
+        }
+        // `prune apply` refuses before any helper call: the named plan
+        // file cannot exist in this environment.
+        let plan_id = "018f8f8f-8f8f-7f8f-8f8f-8f8f8f8f8f8f";
+        let (code, stdout, _) = invoke(&["backup", "prune", "apply", &format!("--plan={plan_id}")]);
+        let parsed = parse_envelope(&stdout);
+        assert_eq!(code, 6);
+        assert_eq!(parsed["command_id"], "backup.prune.plan");
+        assert_eq!(parsed["reason"], "PRUNE_PLAN_UNKNOWN");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "RUN_CENTRAL_BACKUP_PRUNE_PLAN_FIRST"
+        );
+        // The destructive grammars gate at exit 2 before any socket.
+        for argv in [
+            &["local", "wipe"][..],
+            &["local", "wipe", "--target"][..],
+            &["backup", "delete", "--retention-days=29"][..],
+            &["backup", "prune"][..],
+            &["backup", "prune", "apply"][..],
+        ] {
+            let (code, stdout, _) = invoke(argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 2, "argv {argv:?}");
+            assert!(
+                parsed["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("GRAMMAR"),
+                "argv {argv:?}"
+            );
+        }
+        *backup_cli::TEST_SOCKET_OVERRIDE.lock().unwrap() = None;
+
         for (argv, want_reason, want_next) in [
             (
                 &["migrate", "resume"][..],

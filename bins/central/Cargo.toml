@@ -49,6 +49,12 @@ central-adapter-linux = { path = "../../crates/adapters/central-adapter-linux", 
 # the port type comes through the capability crate the bin already
 # composes against.
 central-session = { path = "../../crates/capabilities/central-session", version = "0.1.0" }
+# `central local wipe` + `central backup delete|prune` (R6 task 11):
+# the destructive domain vocabulary — closed reason constants,
+# retention floor, and the `WipeEvidence`/`DeleteEvidence` artifact
+# bodies the CLI writes — lives in `central-infra::destructive`,
+# upstream `internal/destructive`'s home.
+central-infra = { path = "../../crates/capabilities/central-infra", version = "0.1.0" }
 # `central --helper`/`--broker`/`--sandbox-launcher` mode gates (Phase
 # R5 task 1): the privilege check needs `rustix::process::getuid` —
 # the same pinned workspace dep the kernel and launcher bins already

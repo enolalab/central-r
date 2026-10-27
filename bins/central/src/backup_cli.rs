@@ -62,7 +62,7 @@ fn is_false(v: &bool) -> bool {
 
 /// `helperSocketPath` — same rule `migrate_cli`/`local_cli` use:
 /// `CENTRAL_HELPER_SOCKET` when non-empty, else production.
-fn helper_socket_path() -> String {
+pub(crate) fn helper_socket_path() -> String {
     #[cfg(test)]
     if let Some(path) = TEST_SOCKET_OVERRIDE.lock().unwrap().clone() {
         return path;
@@ -97,6 +97,16 @@ pub(crate) fn backup(
         "backup.create" => handle_create(command_id, tokens, started),
         "backup.verify" => handle_verify(command_id, tokens, started),
         "backup.status" => handle_status(command_id, tokens, started),
+        // `runBackupDelete`/`runBackupPrune` — the D04 verbs; prune's
+        // `apply` entry is shadowed by the shared `(backup, prune)`
+        // registry key upstream-fashion, so the sub-action resolves
+        // inside the handler.
+        "backup.delete" => {
+            return crate::destructive_cli::backup_delete(command_id, tokens, stdout, stderr);
+        }
+        "backup.prune.plan" => {
+            return crate::destructive_cli::backup_prune(command_id, tokens, stdout, stderr);
+        }
         _ => LocalResult::unsupported(command_id),
     };
     emit(result, stdout, stderr)
