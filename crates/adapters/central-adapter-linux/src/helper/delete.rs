@@ -17,9 +17,6 @@ use super::PeerIdentity;
 use super::grant::CeremonyScope;
 use super::protocol::{Request, Response, read_response, strict_decode, write_request};
 
-/// `restoreCeremonyDeadline` — the human ceremony's share.
-const CEREMONY_DEADLINE: Duration = Duration::from_secs(120);
-
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -422,9 +419,11 @@ impl DeleteHandler for DeleteHandlerImpl {
                 None,
             );
         };
-        let bound = std::cmp::min(deadline, Instant::now() + CEREMONY_DEADLINE);
+        // Upstream hands the ceremony the whole verb ctx — the
+        // ceremony share inside `deleteDeadline` is budget accounting,
+        // not an enforced sub-deadline.
         let Some(confirmation) =
-            pam.confirm_backup_delete(*peer, Some(bound), &self.scope, &request.operation_id)
+            pam.confirm_backup_delete(*peer, Some(deadline), &self.scope, &request.operation_id)
         else {
             return delete_response(
                 &request.operation_id,

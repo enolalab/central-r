@@ -557,9 +557,11 @@ pub fn run_helper_daemon(
         // `newProductionDeleteHandler` — D04 delete. The backup source
         // and reference checker are unavailable until the
         // repository-delete and PG plumbing land — upstream's own
-        // `unavailableDeleteSource`/`unavailableDeleteRefs` stand-ins:
-        // the handler refuses `DELETE_UNAVAILABLE` before any ceremony
-        // rather than running degraded.
+        // `unavailableDeleteSource`/`unavailableDeleteRefs` stand-ins.
+        // The deny-only advisory evaluates first, so the handler's
+        // actual first refusal is `DELETE_DENIED_SIGNED`; the
+        // unavailable seams refuse `DELETE_UNAVAILABLE` only after a
+        // signed admission, either way before any ceremony.
         delete: Some(Box::new(super::delete::DeleteHandlerImpl::new(
             Some(Box::new(PamConfirmer::new())),
             Some(Box::new(super::delete::DenyOnlyAdvisoryEvaluator)),

@@ -25,10 +25,6 @@ use super::PeerIdentity;
 use super::grant::CeremonyScope;
 use super::protocol::{Request, Response, read_response, strict_decode, write_request};
 
-/// `restoreCeremonyDeadline` — the human ceremony's share of the
-/// transport budget: two minutes, upstream's bound.
-const CEREMONY_DEADLINE: Duration = Duration::from_secs(120);
-
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -374,10 +370,6 @@ impl WipeHandlerImpl {
         }
     }
 
-    fn ceremony_deadline(&self, deadline: Instant) -> Instant {
-        std::cmp::min(deadline, Instant::now() + CEREMONY_DEADLINE)
-    }
-
     /// `resumeOrRefuse` — a wipe whose target resolves to nothing.
     /// A crash intent naming exactly the requested path completes the
     /// reseed half under the ceremony this invocation already performed;
@@ -621,12 +613,14 @@ impl WipeHandler for WipeHandlerImpl {
                 None,
             );
         };
-        let Some(confirmation) = pam.confirm_wipe(
-            *peer,
-            Some(self.ceremony_deadline(deadline)),
-            &self.scope,
-            &request.operation_id,
-        ) else {
+        // Upstream hands the ceremony the whole verb ctx — the
+        // two-minute "ceremony share" is budget accounting inside
+        // `wipeDeadline`, not an enforced sub-deadline (the restore
+        // apply path's `confirmRestoreCeremony` is the only one that
+        // binds the ceremony to its own share).
+        let Some(confirmation) =
+            pam.confirm_wipe(*peer, Some(deadline), &self.scope, &request.operation_id)
+        else {
             return wipe_response(
                 &request.operation_id,
                 "denied",

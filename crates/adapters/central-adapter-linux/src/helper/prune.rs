@@ -18,9 +18,6 @@ use super::PeerIdentity;
 use super::grant::CeremonyScope;
 use super::protocol::{Request, Response, read_response, strict_decode, write_request};
 
-/// `restoreCeremonyDeadline` — the human ceremony's share.
-const CEREMONY_DEADLINE: Duration = Duration::from_secs(120);
-
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -410,9 +407,11 @@ impl PruneHandlerImpl {
                 None,
             );
         };
-        let bound = std::cmp::min(deadline, Instant::now() + CEREMONY_DEADLINE);
+        // Upstream hands the ceremony the whole verb ctx — the
+        // ceremony share inside `pruneDeadline` is budget accounting,
+        // not an enforced sub-deadline.
         let Some(confirmation) =
-            pam.confirm_backup_prune(*peer, Some(bound), &self.scope, &plan_id.to_string())
+            pam.confirm_backup_prune(*peer, Some(deadline), &self.scope, &plan_id.to_string())
         else {
             return prune_response(
                 &request.operation_id,
