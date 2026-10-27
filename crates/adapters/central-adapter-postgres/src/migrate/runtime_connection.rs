@@ -101,6 +101,9 @@ pub(crate) async fn connect_role_from_passfile_value(
     role: &str,
     application_name: &str,
 ) -> Result<PgConnection> {
+    if value.is_empty() || value.len() > MAXIMUM_BACKUP_PASSFILE_BYTES || value.contains(&0) {
+        return Err(runtime_connection());
+    }
     let Some(entry) = parse_passfile(value) else {
         return Err(runtime_connection());
     };

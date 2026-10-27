@@ -3431,7 +3431,7 @@ mod tests {
 
 #[cfg(test)]
 mod coordinator_tests {
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, VecDeque};
     use std::io::Read as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -3552,6 +3552,44 @@ mod coordinator_tests {
             expires_at: now + time::Duration::minutes(2),
             acknowledgement: RESTORE_ABANDON_ACKNOWLEDGEMENT.into(),
         }
+    }
+
+    /// A broker-issued ticket on the journal fake — the fake's issued
+    /// record stands in for the upstream journal's own HMAC verify.
+    fn issued_ticket(journal: &RecoveryJournalFake) -> RestoreTicket {
+        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        journal.issue_ticket(&ticket);
+        ticket
+    }
+
+    /// `recoveryTestAuthorization` plus journal issuance.
+    fn issued_apply_authorization(
+        journal: &RecoveryJournalFake,
+        ticket: &RestoreTicket,
+    ) -> RestoreApplyAuthorization {
+        let authorization = recovery_test_authorization(ticket);
+        journal.issue_apply(&authorization);
+        authorization
+    }
+
+    /// `resumeTestAuthorization` plus journal issuance.
+    fn issued_resume_authorization(
+        journal: &RecoveryJournalFake,
+        operation: &RestoreOperation,
+    ) -> RestoreApplyAuthorization {
+        let authorization = resume_test_authorization(operation);
+        journal.issue_apply(&authorization);
+        authorization
+    }
+
+    /// `abandonTestAuthorization` plus journal issuance.
+    fn issued_abandon_authorization(
+        journal: &RecoveryJournalFake,
+        operation_id: Uuid,
+    ) -> RestoreAbandonAuthorization {
+        let authorization = abandon_test_authorization(operation_id);
+        journal.issue_abandon(&authorization);
+        authorization
     }
 
     /// `acceptedBackupFacts`.
@@ -4468,9 +4506,38 @@ mod coordinator_tests {
     #[derive(Default)]
     struct RecoveryJournalFake {
         operations: Mutex<BTreeMap<Uuid, RestoreOperation>>,
-        consumed: Mutex<BTreeSet<Uuid>>,
-        authorized: Mutex<BTreeSet<Uuid>>,
+        /// `(record, consumed)` — broker-issued records the journal
+        /// spends exactly once each, matching upstream's
+        /// `issued → consuming → consumed` file-state walk. A record
+        /// that was never issued refuses: a well-formed ticket or
+        /// confirmation alone is not recovery authority.
+        tickets: Mutex<BTreeMap<Uuid, (RestoreTicket, bool)>>,
+        apply_records: Mutex<BTreeMap<Uuid, (RestoreApplyAuthorization, bool)>>,
+        abandon_records: Mutex<BTreeMap<Uuid, (RestoreAbandonAuthorization, bool)>>,
         resume_edit: Mutex<Option<OperationEdit>>,
+    }
+
+    impl RecoveryJournalFake {
+        fn issue_ticket(&self, ticket: &RestoreTicket) {
+            self.tickets
+                .lock()
+                .unwrap()
+                .insert(ticket.ticket_id, (ticket.clone(), false));
+        }
+
+        fn issue_apply(&self, authorization: &RestoreApplyAuthorization) {
+            self.apply_records
+                .lock()
+                .unwrap()
+                .insert(authorization.authorization_id, (*authorization, false));
+        }
+
+        fn issue_abandon(&self, authorization: &RestoreAbandonAuthorization) {
+            self.abandon_records.lock().unwrap().insert(
+                authorization.authorization_id,
+                (authorization.clone(), false),
+            );
+        }
     }
 
     impl RestoreJournalStore for RecoveryJournalFake {
@@ -4486,19 +4553,51 @@ mod coordinator_tests {
                     "fresh authorization required",
                 ));
             }
-            let mut consumed = self.consumed.lock().unwrap();
-            if consumed.contains(&ticket.ticket_id) {
+            let mut operations = self.operations.lock().unwrap();
+            // `inspectRestoreBarrierLocked` — one non-terminal operation
+            // owns the barrier; a second active record is ambiguous and
+            // refuses the whole begin.
+            if operations.values().any(|op| !op.is_terminal()) {
+                return Err(Failure::invalid(
+                    "restore_journal",
+                    "restore barrier already held",
+                ));
+            }
+            let mut tickets = self.tickets.lock().unwrap();
+            match tickets.get(&ticket.ticket_id) {
+                Some((record, false)) if record == ticket && !ticket.is_expired_at(at) => {}
+                _ => {
+                    return Err(Failure::invalid(
+                        "restore_journal",
+                        "issued ticket required",
+                    ));
+                }
+            }
+            let mut apply_records = self.apply_records.lock().unwrap();
+            match apply_records.get(&authorization.authorization_id) {
+                Some((record, false)) if record == authorization => {}
+                _ => {
+                    return Err(Failure::invalid(
+                        "restore_journal",
+                        "fresh authorization required",
+                    ));
+                }
+            }
+            let operation = new_restore_operation(ticket, at)?;
+            if operations.contains_key(&operation.operation_id) {
+                // `writeExclusiveJSON` parity: an existing record means an
+                // earlier process durably consumed this exact ticket.
                 return Err(Failure::invalid(
                     "restore_journal",
                     "ticket already consumed",
                 ));
             }
-            let operation = new_restore_operation(ticket, at)?;
-            consumed.insert(ticket.ticket_id);
-            self.operations
-                .lock()
+            apply_records
+                .get_mut(&authorization.authorization_id)
                 .unwrap()
-                .insert(operation.operation_id, operation.clone());
+                .1 = true;
+            tickets.get_mut(&ticket.ticket_id).unwrap().1 = true;
+            operations.insert(operation.operation_id, operation.clone());
             Ok(operation)
         }
 
@@ -4517,27 +4616,40 @@ mod coordinator_tests {
             authorization: &RestoreApplyAuthorization,
             at: time::OffsetDateTime,
         ) -> Result<RestoreOperation> {
+            if !authorization.valid_at(at) || authorization.operation_id != operation_id {
+                return Err(Failure::invalid(
+                    "restore_journal",
+                    "fresh resume authorization required",
+                ));
+            }
             let operations = self.operations.lock().unwrap();
-            let mut authorized = self.authorized.lock().unwrap();
             let Some(mut op) = operations.get(&operation_id).cloned() else {
                 return Err(Failure::invalid(
                     "restore_journal",
                     "fresh resume authorization required",
                 ));
             };
-            if !op.is_resumable()
-                || !authorization.valid_at(at)
-                || authorization.operation_id != operation_id
-                || authorization.ticket_id != op.ticket_id
-                || authorized.contains(&authorization.authorization_id)
-            {
+            if !op.is_resumable() || authorization.ticket_id != op.ticket_id {
                 return Err(Failure::invalid(
                     "restore_journal",
                     "fresh resume authorization required",
                 ));
             }
-            authorized.insert(authorization.authorization_id);
-            drop(authorized);
+            let mut apply_records = self.apply_records.lock().unwrap();
+            match apply_records.get(&authorization.authorization_id) {
+                Some((record, false)) if record == authorization => {}
+                _ => {
+                    return Err(Failure::invalid(
+                        "restore_journal",
+                        "fresh resume authorization required",
+                    ));
+                }
+            }
+            apply_records
+                .get_mut(&authorization.authorization_id)
+                .unwrap()
+                .1 = true;
+            drop(apply_records);
             drop(operations);
             if let Some(edit) = self.resume_edit.lock().unwrap().as_ref() {
                 edit(&mut op);
@@ -4551,25 +4663,43 @@ mod coordinator_tests {
             authorization: &RestoreAbandonAuthorization,
             at: time::OffsetDateTime,
         ) -> Result<RestoreOperation> {
+            if !authorization.valid_at(at) || authorization.operation_id != operation_id {
+                return Err(Failure::invalid(
+                    "restore_journal",
+                    "fresh abandon authorization required",
+                ));
+            }
             let mut operations = self.operations.lock().unwrap();
-            let mut authorized = self.authorized.lock().unwrap();
             let Some(op) = operations.get(&operation_id).cloned() else {
                 return Err(Failure::invalid(
                     "restore_journal",
                     "fresh abandon authorization required",
                 ));
             };
-            if !authorization.valid_at(at)
-                || authorization.operation_id != operation_id
-                || authorized.contains(&authorization.authorization_id)
-            {
+            // Upstream reads and gates the operation before the
+            // authorization record, so a refused abandon never spends
+            // the confirmation.
+            if !op.is_resumable() {
                 return Err(Failure::invalid(
                     "restore_journal",
                     "fresh abandon authorization required",
                 ));
             }
+            let mut abandon_records = self.abandon_records.lock().unwrap();
+            match abandon_records.get(&authorization.authorization_id) {
+                Some((record, false)) if record == authorization => {}
+                _ => {
+                    return Err(Failure::invalid(
+                        "restore_journal",
+                        "fresh abandon authorization required",
+                    ));
+                }
+            }
             let abandoned = op.abandon(authorization, at)?;
-            authorized.insert(authorization.authorization_id);
+            abandon_records
+                .get_mut(&authorization.authorization_id)
+                .unwrap()
+                .1 = true;
             operations.insert(operation_id, abandoned.clone());
             Ok(abandoned)
         }
@@ -4764,10 +4894,10 @@ mod coordinator_tests {
         let journal = RecoveryJournalFake::default();
         let engine = RecoveryEngineFake::default();
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let op = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap();
         assert!(op.serving_allowed());
         assert_eq!(op.phase, RestorePhase::Ready);
@@ -4780,13 +4910,13 @@ mod coordinator_tests {
         // A consumed ticket must not begin a second restore.
         assert!(
             coordinator
-                .apply(&ticket, &recovery_test_authorization(&ticket))
+                .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
                 .is_err()
         );
         // A completed operation is not resumable.
         assert!(
             coordinator
-                .resume(op.operation_id, &resume_test_authorization(&op))
+                .resume(op.operation_id, &issued_resume_authorization(&journal, &op))
                 .is_err()
         );
     }
@@ -4796,7 +4926,7 @@ mod coordinator_tests {
         let journal = RecoveryJournalFake::default();
         let engine = RecoveryEngineFake::default();
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
             .apply(
@@ -4849,7 +4979,7 @@ mod coordinator_tests {
         ];
         for (name, mutate) in cases {
             let journal = RecoveryJournalFake::default();
-            let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+            let ticket = issued_ticket(&journal);
             let operation =
                 new_restore_operation(&ticket, time::OffsetDateTime::now_utc()).unwrap();
             journal
@@ -4864,7 +4994,7 @@ mod coordinator_tests {
                 coordinator
                     .resume(
                         operation.operation_id,
-                        &resume_test_authorization(&operation)
+                        &issued_resume_authorization(&journal, &operation)
                     )
                     .is_err(),
                 "substituted admission binding was accepted on resume ({name})"
@@ -4878,10 +5008,10 @@ mod coordinator_tests {
         let engine = RecoveryEngineFake::default();
         *engine.exclusion_err.lock().unwrap() = Some(Failure::internal("engine", "target busy"));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         let failure = failure_of(&step);
         assert_eq!(failure.code(), "RESTORE_TARGET_EXCLUSION_REQUIRED");
@@ -4898,10 +5028,10 @@ mod coordinator_tests {
         *engine.projection_err.lock().unwrap() =
             Some(Failure::internal("audit", "audit store unavailable"));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         assert_eq!(failure_of(&step).code(), "RESTORE_AUDIT_PROJECTION_FAILED");
         let operation = step.operation.as_ref().unwrap();
@@ -4929,10 +5059,10 @@ mod coordinator_tests {
         let engine = RecoveryEngineFake::default();
         *engine.exclusion.lock().unwrap() = Some(exclusion.clone());
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         assert_eq!(failure_of(&step).code(), "RESTORE_TARGET_EXCLUSION_LOST");
         assert!(step.operation.is_none());
@@ -4949,10 +5079,10 @@ mod coordinator_tests {
         let engine = RecoveryEngineFake::default();
         *engine.exclusion.lock().unwrap() = Some(exclusion.clone());
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         assert_eq!(
             failure_of(&step).code(),
@@ -4972,10 +5102,10 @@ mod coordinator_tests {
         *engine.restore_err.lock().unwrap() =
             Some(Failure::internal("engine", "pg_restore failed"));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         let failure = failure_of(&step);
         assert_eq!(failure.kind(), FailureKind::Internal);
@@ -4987,7 +5117,7 @@ mod coordinator_tests {
 
         *engine.restore_err.lock().unwrap() = None;
         let op = coordinator
-            .resume(op.operation_id, &resume_test_authorization(op))
+            .resume(op.operation_id, &issued_resume_authorization(&journal, op))
             .unwrap();
         assert!(op.serving_allowed());
         assert_eq!(engine.restore_calls.load(Ordering::SeqCst), 2);
@@ -5003,9 +5133,9 @@ mod coordinator_tests {
             let engine = RecoveryEngineFake::default();
             *engine.restore_err.lock().unwrap() = Some(cause.into_failure());
             let coordinator = restore_coordinator(&journal, &engine);
-            let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+            let ticket = issued_ticket(&journal);
             let step = coordinator
-                .apply(&ticket, &recovery_test_authorization(&ticket))
+                .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
                 .unwrap_err();
             // `Cause: backup.SanitizeRestoreRefusalCause(err)` — the
             // typed cause rides in the remediation message since
@@ -5026,9 +5156,9 @@ mod coordinator_tests {
             "adapter detail naming /var/lib/central-protected/v1",
         ));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         assert!(!step.failure.message().contains("/var/lib"));
         assert_eq!(step.failure.code(), "RESTORE_DATABASE_REPLACEMENT_FAILED");
@@ -5041,10 +5171,10 @@ mod coordinator_tests {
         *engine.restore_err.lock().unwrap() =
             Some(Failure::internal("engine", "pg_restore failed"));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         let op = step.operation.clone().unwrap();
         assert!(op.is_resumable());
@@ -5064,7 +5194,7 @@ mod coordinator_tests {
                 .is_err()
         );
         *engine.restore_err.lock().unwrap() = None;
-        let authorization = resume_test_authorization(&op);
+        let authorization = issued_resume_authorization(&journal, &op);
         let completed = coordinator.resume(op.operation_id, &authorization).unwrap();
         assert!(completed.serving_allowed());
         // Replay the consumed authorization against the still-resumable
@@ -5083,10 +5213,10 @@ mod coordinator_tests {
         let engine = RecoveryEngineFake::default();
         *engine.inventory_count.lock().unwrap() = 2;
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         let failure = failure_of(&step);
         assert_eq!(failure.kind(), FailureKind::Denied);
@@ -5095,7 +5225,7 @@ mod coordinator_tests {
         assert_eq!(op.phase, RestorePhase::Quarantined);
         assert!(!op.serving_allowed());
         let step = coordinator
-            .resume(op.operation_id, &resume_test_authorization(op))
+            .resume(op.operation_id, &issued_resume_authorization(&journal, op))
             .unwrap_err();
         assert_eq!(
             failure_of(&step).code(),
@@ -5103,7 +5233,7 @@ mod coordinator_tests {
         );
         *engine.inventory_count.lock().unwrap() = 0;
         let op = coordinator
-            .resume(op.operation_id, &resume_test_authorization(op))
+            .resume(op.operation_id, &issued_resume_authorization(&journal, op))
             .unwrap();
         assert!(op.serving_allowed());
         // Initial pass plus two quarantine reconciliation passes.
@@ -5117,10 +5247,10 @@ mod coordinator_tests {
         *engine.projection_quarantine_err.lock().unwrap() =
             Some(Failure::internal("audit", "audit unavailable"));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         assert_eq!(
             failure_of(&step).code(),
@@ -5143,10 +5273,10 @@ mod coordinator_tests {
         *engine.restore_err.lock().unwrap() =
             Some(Failure::internal("engine", "pg_restore failed"));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
 
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         let stuck = step.operation.clone().unwrap();
         assert!(stuck.is_resumable());
@@ -5154,7 +5284,7 @@ mod coordinator_tests {
         let abandoned = coordinator
             .abandon(
                 stuck.operation_id,
-                &abandon_test_authorization(stuck.operation_id),
+                &issued_abandon_authorization(&journal, stuck.operation_id),
             )
             .unwrap();
         assert_eq!(abandoned.phase, RestorePhase::Abandoned);
@@ -5181,25 +5311,17 @@ mod coordinator_tests {
         let journal = RecoveryJournalFake::default();
         let engine = RecoveryEngineFake::default();
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
         let ready = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap();
+        let authorization = issued_abandon_authorization(&journal, ready.operation_id);
         let step = coordinator
-            .abandon(
-                ready.operation_id,
-                &abandon_test_authorization(ready.operation_id),
-            )
+            .abandon(ready.operation_id, &authorization)
             .unwrap_err();
         assert_eq!(failure_of(&step).code(), "RESTORE_OPERATION_NOT_RESUMABLE");
         // The authorization was not consumed by a refused abandon.
-        assert!(
-            !journal
-                .authorized
-                .lock()
-                .unwrap()
-                .contains(&abandon_test_authorization(ready.operation_id).authorization_id)
-        );
+        assert!(!journal.abandon_records.lock().unwrap()[&authorization.authorization_id].1);
     }
 
     #[test]
@@ -5209,21 +5331,21 @@ mod coordinator_tests {
         *engine.restore_err.lock().unwrap() =
             Some(Failure::internal("engine", "pg_restore failed"));
         let coordinator = restore_coordinator(&journal, &engine);
-        let ticket = recovery_test_ticket(time::OffsetDateTime::now_utc());
+        let ticket = issued_ticket(&journal);
         let step = coordinator
-            .apply(&ticket, &recovery_test_authorization(&ticket))
+            .apply(&ticket, &issued_apply_authorization(&journal, &ticket))
             .unwrap_err();
         let stuck = step.operation.clone().unwrap();
 
         // Wrong operation binding.
-        let wrong = abandon_test_authorization(Uuid::now_v7());
+        let wrong = issued_abandon_authorization(&journal, Uuid::now_v7());
         let step = coordinator.abandon(stuck.operation_id, &wrong).unwrap_err();
         assert_eq!(
             failure_of(&step).code(),
             "RESTORE_FRESH_CONFIRMATION_REQUIRED"
         );
         // Wrong acknowledgement text.
-        let mut bad_text = abandon_test_authorization(stuck.operation_id);
+        let mut bad_text = issued_abandon_authorization(&journal, stuck.operation_id);
         bad_text.acknowledgement = "not-the-acknowledgement".into();
         assert!(coordinator.abandon(stuck.operation_id, &bad_text).is_err());
         // The operation remains resumable, not abandoned.
