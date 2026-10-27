@@ -895,6 +895,205 @@ pub fn parse_backup_repository_attestation(
 }
 
 // ---------------------------------------------------------------------------
+// BackupTargetLockAttestation (target_lock_attestation.go)
+// ---------------------------------------------------------------------------
+
+const INVALID_TARGET_LOCK: &str = "invalid backup target lock attestation";
+
+fn invalid_target_lock(message: &str) -> Failure {
+    Failure::invalid("backup_target_lock", message.to_owned())
+}
+
+/// `BackupTargetLockAttestationSchema`.
+pub const BACKUP_TARGET_LOCK_ATTESTATION_SCHEMA: &str = "central.backup-target-lock-attestation/v1";
+/// `BackupTargetLockAssertionMaxAge` — the assertion is only evidence
+/// for five seconds; a later seal completion must re-derive liveness.
+pub const BACKUP_TARGET_LOCK_ASSERTION_MAX_AGE: time::Duration = time::Duration::seconds(5);
+
+/// `backupTargetLockAttestationWire` — the attestation's canonical
+/// JSON shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupTargetLockAttestationWire {
+    schema_version: String,
+    supervisor_launch_id: String,
+    launch_evidence_id: String,
+    operation_id: String,
+    backup_id: String,
+    target_lock_proof_sha256: String,
+    asserted_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    immutable_digest_sha256: String,
+}
+
+/// `BackupTargetLockAttestation` — the locator-free helper assertion
+/// that the native per-launch monitor still retains the exact
+/// PostgreSQL session which established the accepted-point advisory
+/// locks after the worker tree was reaped. It contains no socket,
+/// PID, endpoint or credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupTargetLockAttestation {
+    /// Supervisor launch identity.
+    pub supervisor_launch_id: Uuid,
+    /// Launch evidence identity.
+    pub launch_evidence_id: Uuid,
+    /// Bound operation.
+    pub operation_id: Uuid,
+    /// Bound backup.
+    pub backup_id: Uuid,
+    /// `sha256:`-prefixed target-lock proof.
+    pub target_lock_proof: String,
+    /// Assertion instant (UTC).
+    pub asserted_at: time::OffsetDateTime,
+    /// `sha256` over the digest-less canonical payload.
+    pub immutable_digest: [u8; 32],
+}
+
+impl BackupTargetLockAttestation {
+    fn wire(&self, include_digest: bool) -> BackupTargetLockAttestationWire {
+        BackupTargetLockAttestationWire {
+            schema_version: BACKUP_TARGET_LOCK_ATTESTATION_SCHEMA.to_owned(),
+            supervisor_launch_id: self.supervisor_launch_id.to_string(),
+            launch_evidence_id: self.launch_evidence_id.to_string(),
+            operation_id: self.operation_id.to_string(),
+            backup_id: self.backup_id.to_string(),
+            target_lock_proof_sha256: self.target_lock_proof.clone(),
+            asserted_at: rfc3339(self.asserted_at),
+            immutable_digest_sha256: if include_digest {
+                hex_encode(&self.immutable_digest)
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    fn canonical_payload(&self, include_digest: bool) -> Result<Vec<u8>, Failure> {
+        if self.supervisor_launch_id.is_nil()
+            || self.launch_evidence_id.is_nil()
+            || self.operation_id.is_nil()
+            || self.backup_id.is_nil()
+            || !crate::wire::valid_sha256_fingerprint(&self.target_lock_proof)
+            || is_zero_time(self.asserted_at)
+        {
+            return Err(invalid_target_lock(INVALID_TARGET_LOCK));
+        }
+        serde_json::to_vec(&self.wire(include_digest))
+            .map_err(|_| invalid_target_lock(INVALID_TARGET_LOCK))
+    }
+
+    /// `Verify`.
+    pub fn verify(&self) -> Result<(), Failure> {
+        let payload = self.canonical_payload(false)?;
+        if self.immutable_digest == [0u8; 32]
+            || Sha256::digest(&payload).as_slice() != self.immutable_digest
+        {
+            return Err(invalid_target_lock(INVALID_TARGET_LOCK));
+        }
+        Ok(())
+    }
+
+    /// `ValidAt` — the assertion must verify and be at most
+    /// [`BACKUP_TARGET_LOCK_ASSERTION_MAX_AGE`] old.
+    pub fn valid_at(&self, now: time::OffsetDateTime) -> Result<(), Failure> {
+        self.verify()?;
+        if is_zero_time(now)
+            || now < self.asserted_at
+            || now - self.asserted_at > BACKUP_TARGET_LOCK_ASSERTION_MAX_AGE
+        {
+            return Err(invalid_target_lock("stale backup target lock attestation"));
+        }
+        Ok(())
+    }
+
+    /// `CanonicalJSON`.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, Failure> {
+        self.verify()?;
+        serde_json::to_vec(&self.wire(true)).map_err(|_| invalid_target_lock(INVALID_TARGET_LOCK))
+    }
+}
+
+/// `NewBackupTargetLockAttestation`.
+pub fn new_backup_target_lock_attestation(
+    supervisor_launch_id: Uuid,
+    launch_evidence_id: Uuid,
+    operation_id: Uuid,
+    backup_id: Uuid,
+    proof: [u8; 32],
+    asserted_at: time::OffsetDateTime,
+) -> Result<BackupTargetLockAttestation, Failure> {
+    if supervisor_launch_id.is_nil()
+        || launch_evidence_id.is_nil()
+        || operation_id.is_nil()
+        || backup_id.is_nil()
+        || proof == [0u8; 32]
+        || is_zero_time(asserted_at)
+    {
+        return Err(invalid_target_lock(INVALID_TARGET_LOCK));
+    }
+    let mut attestation = BackupTargetLockAttestation {
+        supervisor_launch_id,
+        launch_evidence_id,
+        operation_id,
+        backup_id,
+        target_lock_proof: format!("sha256:{}", hex_encode(&proof)),
+        asserted_at: asserted_at.to_offset(time::UtcOffset::UTC),
+        immutable_digest: [0u8; 32],
+    };
+    let payload = attestation.canonical_payload(false)?;
+    attestation.immutable_digest = Sha256::digest(&payload).into();
+    Ok(attestation)
+}
+
+/// `ParseBackupTargetLockAttestation` — strict decode plus canonical
+/// round-trip; used by the protected journal when re-reading a stored
+/// seal record.
+pub fn parse_backup_target_lock_attestation(
+    payload: &[u8],
+) -> Result<BackupTargetLockAttestation, Failure> {
+    let wire: BackupTargetLockAttestationWire = decode_canonical(payload)
+        .map_err(|_| invalid_target_lock("invalid backup target lock attestation encoding"))?;
+    if wire.schema_version != BACKUP_TARGET_LOCK_ATTESTATION_SCHEMA {
+        return Err(invalid_target_lock(
+            "invalid backup target lock attestation encoding",
+        ));
+    }
+    let supervisor = Uuid::parse_str(&wire.supervisor_launch_id).ok();
+    let launch = Uuid::parse_str(&wire.launch_evidence_id).ok();
+    let operation = Uuid::parse_str(&wire.operation_id).ok();
+    let backup = Uuid::parse_str(&wire.backup_id).ok();
+    let asserted_at = parse_rfc3339(&wire.asserted_at);
+    let digest = parse_sha256(&wire.immutable_digest_sha256);
+    let (
+        Some(supervisor),
+        Some(launch),
+        Some(operation),
+        Some(backup),
+        Some(asserted_at),
+        Some(digest),
+    ) = (supervisor, launch, operation, backup, asserted_at, digest)
+    else {
+        return Err(invalid_target_lock(
+            "invalid backup target lock attestation encoding",
+        ));
+    };
+    let attestation = BackupTargetLockAttestation {
+        supervisor_launch_id: supervisor,
+        launch_evidence_id: launch,
+        operation_id: operation,
+        backup_id: backup,
+        target_lock_proof: wire.target_lock_proof_sha256,
+        asserted_at,
+        immutable_digest: digest,
+    };
+    match attestation.canonical_json() {
+        Ok(canonical) if canonical == payload => Ok(attestation),
+        _ => Err(invalid_target_lock(
+            "backup target lock attestation is not canonical",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BackupFileTreeEvidence / BackupSealCompanion / BackupSealPublication
 // (repository_seal.go)
 // ---------------------------------------------------------------------------

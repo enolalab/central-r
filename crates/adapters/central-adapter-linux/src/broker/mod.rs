@@ -26,6 +26,7 @@
 /// `harness_compose::ENV_BROKER_SOCKET`.
 pub const PRODUCTION_SOCKET_PATH: &str = "/run/central-broker/broker.sock";
 
+pub mod backup_launch;
 pub mod bootstrap_session;
 pub mod daemon;
 pub(crate) mod deadline;
@@ -42,6 +43,8 @@ pub mod proof;
 pub mod protected_file;
 pub mod protocol;
 pub mod provisioning;
+pub mod recovery_journal;
+pub mod restore_launch;
 pub mod secret_bootstrap;
 pub mod server;
 pub mod signing;
