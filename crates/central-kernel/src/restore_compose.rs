@@ -13,8 +13,9 @@
 //! operation-scoped and zeroized after use.
 //!
 //! Slice boundary: ADR 0034's import *data plane* (`PlanImportSource`,
-//! `PGRestoreForImport`, `ImportDataPlaneRunner`) is not yet ported, so
-//! [`UnavailableRestoreImporter`] is the fail-closed placeholder the
+//! `PGRestoreForImport`, `ImportDataPlaneRunner`) is intentionally
+//! unported — it is T12's slice under the D03 decomposition, not R6's —
+//! so [`UnavailableRestoreImporter`] is the fail-closed placeholder the
 //! composition installs — the same position upstream's
 //! `unavailableAdmissionInspector` held before the reserve gate
 //! shipped. The helper's `import_minio` seam already refuses an import
@@ -1252,7 +1253,8 @@ impl RestoreInventoryVerifier for OperationScopedInventoryVerifier {
 
 /// `UnavailableRestoreImporter` — ADR 0034's data-plane import runner
 /// (`PlanImportSource`, `PGRestoreForImport`, `ImportDataPlaneRunner`)
-/// is not yet ported, so this is the fail-closed placeholder the
+/// is intentionally unported: it is T12's slice under the D03
+/// decomposition, not R6's. This is the fail-closed placeholder the
 /// production composition installs — the same position upstream's
 /// `unavailableAdmissionInspector` held before the reserve gate
 /// shipped. It draws nothing and refuses `EngineUnavailable` — and the

@@ -49,6 +49,7 @@ pub mod protocol;
 pub mod provisioning;
 pub(crate) mod recovery_authority;
 pub mod recovery_journal;
+pub(crate) mod restore_barrier;
 pub mod restore_capacity;
 pub mod restore_credential;
 pub mod restore_launch;

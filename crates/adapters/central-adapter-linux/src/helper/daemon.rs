@@ -325,6 +325,36 @@ pub fn run_helper_daemon(
                 return 6;
             }
         };
+    // `NewRestoreBarrierClient` — the read-only view of the
+    // broker-owned restore barrier and issued-ticket barrier that
+    // `resolvingRestoreOperationHandler` resolves against. Upstream
+    // fails composition when the client cannot be built, so a bad
+    // socket exits 6 here too.
+    let restore_barrier =
+        match crate::broker::restore_barrier::RestoreBarrierClient::new(broker_path.clone()) {
+            Ok(client) => Arc::new(client),
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {}", e.message());
+                return 6;
+            }
+        };
+    let resolving = Arc::new(
+        super::restore_resolvers::ResolvingRestoreOperationHandler::new(
+            Some(Box::new(
+                super::restore_resolvers::BrokerRestoreBarrierOperations::new(
+                    restore_barrier.clone(),
+                ),
+            )),
+            Some(Box::new(
+                super::restore_resolvers::BrokerRestoreTicketOperations::new(
+                    restore_barrier.clone(),
+                ),
+            )),
+            Some(Box::new(restore_operations.clone())),
+            Some(Box::new(restore_operations)),
+            restore_abandon,
+        ),
+    );
     let srv = Arc::new(Server {
         peer_policy: Some(peer),
         socket: Some(socket),
@@ -426,18 +456,20 @@ pub fn run_helper_daemon(
             ),
             central_backup::backup::capacity::default_recovery_profile(),
         ))),
-        // `newProductionRestoreAbandonHandler` — abandonment launches
-        // no engine and allocates no reserve, so it needs only the
-        // fresh ceremony confirmer, the narrow broker client, and the
-        // fixed helper-owned scope.
-        restore_abandon,
-        // `apply: restoreApply, resume: restoreApply` — upstream's
-        // exact sharing: the one `WithEngine` handler backs both
-        // destructive verbs, so a single `Arc` clones into both
-        // slots. The one-use authorization is spent inside the
-        // launch; it never reaches the operator.
-        restore_apply: Some(Box::new(restore_operations.clone())),
-        restore_resume: Some(Box::new(restore_operations)),
+        // `resolvingRestoreOperationHandler` — the one decorator
+        // backs all three operation verbs, upstream-fashion: the
+        // helper resolves the transport identity the CLI sent to the
+        // single protected operation the barrier reports (resume and
+        // abandon) or the single issued-ticket operation (apply,
+        // SC-DEF-59), runs the inner handler against that protected
+        // identity, and rebinds the transport ID onto the response
+        // envelope. The barrier client is the same protected broker
+        // socket the issuers already use; the one `Arc` clones into
+        // all three slots exactly as `newHelperServer` installs the
+        // one decorator.
+        restore_abandon: Some(Box::new(resolving.clone())),
+        restore_apply: Some(Box::new(resolving.clone())),
+        restore_resume: Some(Box::new(resolving)),
         // `newProductionRestoreVerifyHandler` — the non-mutating
         // verify path: the same engine launcher (as its
         // `RestoreVerifyLauncher` face), the repository's own

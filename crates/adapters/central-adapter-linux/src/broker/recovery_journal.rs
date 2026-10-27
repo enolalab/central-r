@@ -331,7 +331,7 @@ pub(crate) fn abandon_authorization_from_wire(
 #[serde(deny_unknown_fields)]
 pub(crate) struct RestoreOperationWire {
     #[serde(rename = "OperationID")]
-    operation_id: Uuid,
+    pub(crate) operation_id: Uuid,
     #[serde(rename = "TicketID")]
     ticket_id: Uuid,
     #[serde(rename = "BackupID")]

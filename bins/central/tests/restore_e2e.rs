@@ -192,6 +192,17 @@ fn c03_verify_then_c04_apply_reaches_ready_or_refuses_cleanly() {
 /// `RESTORE_NO_LIVE_OPERATION` is the only correct answer; with one,
 /// each verb must produce its closed phase vocabulary and nothing
 /// else.
+///
+/// The non-destructive `restore verify` probe decides which contract
+/// applies. When it reports `RESTORE_NO_ADMISSIBLE_BACKUP` no sealed
+/// backup — and so no ticket and no live operation — can exist on the
+/// host. On that host a `*_AUTHORITY_DENIED` from resume/abandon is
+/// only producible by a resolver chain that handed the issuer an
+/// identity the barrier never resolved: it must never appear, and the
+/// exact resolver refusal is asserted rather than merely admitted.
+/// When verification minted a ticket, a live operation may genuinely
+/// exist, so issuer authorization denial stays inside the closed
+/// vocabulary.
 #[test]
 fn resume_and_abandon_answer_only_the_closed_vocabulary() {
     let Some(helper) = gates() else {
@@ -199,8 +210,30 @@ fn resume_and_abandon_answer_only_the_closed_vocabulary() {
         return;
     };
 
+    // Probe: `restore verify` is non-destructive, and its
+    // `RESTORE_NO_ADMISSIBLE_BACKUP` proves the host carries no sealed
+    // backup — which transitively proves no live restore operation.
+    let (probe_code, probe) = run_central(&helper, &["restore", "verify"]);
+    let no_live_possible = probe_code == 6
+        && probe["reason"].as_str().unwrap_or_default() == "RESTORE_NO_ADMISSIBLE_BACKUP";
+
     for (verb, prefix) in [("resume", "RESTORE_RESUME"), ("abandon", "RESTORE_ABANDON")] {
         let (code, env) = run_central(&helper, &["restore", verb]);
+        if no_live_possible {
+            // The resolver must answer its own absent-live refusal;
+            // anything else — above all a prefixed
+            // `*_AUTHORITY_DENIED` — means the transport identity
+            // reached the issuer unresolved.
+            assert_eq!(
+                code, 6,
+                "{verb} on a live-free host must be the resolver refusal, not an issuer denial: {env}"
+            );
+            assert_eq!(
+                env["reason"], "RESTORE_NO_LIVE_OPERATION",
+                "{verb} reported {env} where only RESTORE_NO_LIVE_OPERATION is possible"
+            );
+            continue;
+        }
         match code {
             0 => {
                 assert_eq!(env["reason"], "ok");
@@ -239,6 +272,9 @@ fn resume_and_abandon_answer_only_the_closed_vocabulary() {
                 assert_eq!(env["reason"], "RESTORE_RESUME_LOCK_TIMEOUT");
             }
             7 => {
+                // Reachable only when the barrier genuinely resolved a
+                // live operation and the issuer denied it — the verify
+                // probe above established that state can exist.
                 let reason = env["reason"].as_str().unwrap_or_default();
                 assert!(
                     reason == format!("{prefix}_AUTHORITY_DENIED") || reason == "DENY_SAFE_ACTIVE",

@@ -22,6 +22,7 @@ pub mod prepare;
 pub mod protocol;
 pub mod restore;
 pub mod restore_launcher;
+pub mod restore_resolvers;
 pub mod server;
 pub mod tty_ceremony;
 
