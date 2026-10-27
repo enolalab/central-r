@@ -140,6 +140,12 @@ pub fn payload_is_empty_object(payload: &[u8]) -> Result<bool, String> {
     if trimmed.is_empty() || trimmed == b"{}" {
         return Ok(true);
     }
+    // Go decodes `var payload struct{}`: a JSON array or scalar is a
+    // type-mismatch error there, but serde accepts `[]` for an empty
+    // struct. Pin the object shape first so the grammars stay equal.
+    if !trimmed.starts_with(b"{") {
+        return Err("expected a JSON object".to_owned());
+    }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Empty {}

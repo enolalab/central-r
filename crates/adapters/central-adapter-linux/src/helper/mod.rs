@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod backup;
 pub mod browser;
 pub mod browser_runtime;
 pub mod client;
@@ -19,6 +20,7 @@ pub mod migration_launch;
 pub mod pam_ceremony;
 pub mod prepare;
 pub mod protocol;
+pub mod restore;
 pub mod server;
 pub mod tty_ceremony;
 

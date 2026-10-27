@@ -6,9 +6,14 @@
 //! R5 task 8 marks implemented only this slice's verbs: `init`, `up`,
 //! `down`, `status`, `browser-open`, `bootstrap-show`, plus `prepare`
 //! through the conditional-injection arm (its row stays `false`,
-//! upstream-fashion). Every later verb upstream's tree happens to carry
-//! as implemented is deliberately `false` here — the R5 slice must deny
-//! them with `UNSUPPORTED_IN_THIS_SLICE`, never fake them.
+//! upstream-fashion); R5 task 9 added the migration pair; R6 task 7
+//! adds exactly the seven backup/restore maintenance verbs that have
+//! real backing operations: `backup-create`, `backup-verify`,
+//! `backup-status`, `restore-verify`, `restore-apply`,
+//! `restore-resume`, `restore-abandon`. Every later verb upstream's
+//! tree happens to carry as implemented is deliberately `false` here —
+//! the slice must deny them with `UNSUPPORTED_IN_THIS_SLICE`, never
+//! fake them.
 
 use super::verb;
 use std::collections::BTreeMap;
@@ -67,13 +72,13 @@ impl Matrix {
         register(verb::SECURITY_RESCUE_CLEANUP, false, true, false);
         register(verb::MIGRATE_LAUNCH, true, true, false);
         register(verb::MIGRATE_READ_OUTCOME, true, false, false);
-        register(verb::BACKUP_CREATE, false, true, false);
-        register(verb::BACKUP_VERIFY, false, false, false);
-        register(verb::BACKUP_STATUS, false, false, false);
-        register(verb::RESTORE_VERIFY, false, false, false);
-        register(verb::RESTORE_APPLY, false, true, true);
-        register(verb::RESTORE_RESUME, false, true, true);
-        register(verb::RESTORE_ABANDON, false, true, true);
+        register(verb::BACKUP_CREATE, true, true, false);
+        register(verb::BACKUP_VERIFY, true, false, false);
+        register(verb::BACKUP_STATUS, true, false, false);
+        register(verb::RESTORE_VERIFY, true, false, false);
+        register(verb::RESTORE_APPLY, true, true, true);
+        register(verb::RESTORE_RESUME, true, true, true);
+        register(verb::RESTORE_ABANDON, true, true, true);
         register(verb::BACKUP_EXPORT, false, true, false);
         register(verb::BACKUP_IMPORT, false, true, true);
         register(verb::BACKUP_DELETE, false, true, true);
@@ -127,8 +132,10 @@ mod tests {
         assert!(helper_verb_deadline(verb::PREPARE) > std::time::Duration::ZERO);
     }
 
-    /// The R5 closed set: 35 verbs, 6 implemented plus the conditional
-    /// prepare arm; the deferred verbs upstream implements are closed.
+    /// The closed set: 35 verbs, 15 implemented (R5's eight plus the
+    /// conditional prepare arm, the R5T9 migration pair, and exactly
+    /// the seven R6T7 backup/restore maintenance verbs); the deferred
+    /// verbs upstream implements are closed.
     #[test]
     fn matrix_closes_every_later_operation() {
         let m = Matrix::new();
@@ -147,6 +154,13 @@ mod tests {
             verb::BOOTSTRAP_SHOW,
             verb::MIGRATE_LAUNCH,
             verb::MIGRATE_READ_OUTCOME,
+            verb::BACKUP_CREATE,
+            verb::BACKUP_VERIFY,
+            verb::BACKUP_STATUS,
+            verb::RESTORE_VERIFY,
+            verb::RESTORE_APPLY,
+            verb::RESTORE_RESUME,
+            verb::RESTORE_ABANDON,
         ];
         expected.sort_unstable();
         assert_eq!(implemented, expected);
@@ -155,17 +169,10 @@ mod tests {
             verb::SECURITY_UPDATE,
             verb::SECURITY_RESCUE,
             verb::STATE_AUDIT,
-            verb::BACKUP_CREATE,
-            verb::BACKUP_VERIFY,
-            verb::BACKUP_STATUS,
             verb::BACKUP_EXPORT,
             verb::BACKUP_IMPORT,
             verb::BACKUP_DELETE,
             verb::BACKUP_PRUNE,
-            verb::RESTORE_VERIFY,
-            verb::RESTORE_APPLY,
-            verb::RESTORE_RESUME,
-            verb::RESTORE_ABANDON,
             verb::MAINTENANCE_PLAN,
             verb::MAINTENANCE_APPLY,
         ] {

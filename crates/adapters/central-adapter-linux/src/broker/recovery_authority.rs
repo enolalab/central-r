@@ -29,20 +29,29 @@
 
 use central_backup::recovery::operation::{
     RecoveryBootstrapActivation, RecoveryBootstrapDraft, RecoveryBootstrapRegistration,
-    RestoreAbandonAuthorization, RestoreCheckpoint, RestoreOperation, RestorePhase,
+    RestoreAbandonAuthorization, RestoreApplyAuthorization, RestoreCheckpoint, RestoreOperation,
+    RestorePhase,
 };
 use central_foundation::failure::Failure;
 use central_infra::authority::{BrokerRequest, BrokerResponse};
 use central_session::contract::CandidateBinding;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::protocol::{RESTORE_BOOTSTRAP_ACTIVATE_RPC, RESTORE_BROKER_AUTHORITY_PREPARE_RPC};
+use super::lifecycle_client::LifecycleClient;
+use super::protocol::{
+    RESTORE_ABANDON_AUTHORIZATION_RPC, RESTORE_ABANDON_RPC, RESTORE_APPLY_AUTHORIZATION_RPC,
+    RESTORE_BOOTSTRAP_ACTIVATE_RPC, RESTORE_BROKER_AUTHORITY_PREPARE_RPC,
+    RESTORE_RESUME_AUTHORIZATION_RPC,
+};
 use super::recovery_journal::{
-    self, RecoveryBrokerResetRecord, abandon_authorization_to_wire, apply_authorization_to_wire,
-    operation_to_wire,
+    self, RecoveryBrokerResetRecord, RestoreAbandonAuthorizationWire,
+    RestoreApplyAuthorizationWire, RestoreOperationWire, abandon_authorization_from_wire,
+    abandon_authorization_to_wire, apply_authorization_from_wire, apply_authorization_to_wire,
+    operation_from_wire, operation_to_wire,
 };
 use super::restore_launch::RestoreLaunchEvidence;
 use super::server::Service;
@@ -1093,4 +1102,243 @@ fn restore_checkpoint(value: &str) -> RestoreCheckpoint {
 
 fn unavailable() -> Failure {
     Failure::internal("broker", "broker: authority store unavailable")
+}
+
+// ---------------------------------------------------------------------------
+// Client half — `recovery_authority_rpc.go`'s
+// `RestoreApplyAuthorizationIssuer` and `RestoreAbandonClient`. Each is
+// deliberately not a general recovery client: the issuer can only ask
+// the broker to issue a fresh one-use authorization; the abandon
+// client runs the issuance half and then spends exactly what it was
+// given on one terminal transition. Every call wraps the
+// `{peer_uid, peer_pid, issued_at}` payload in the standard
+// `{"request": ...}` envelope through `call_with_operation_id`, so
+// the broker records carry the protected operation identity.
+// ---------------------------------------------------------------------------
+
+/// `{peer_uid, peer_pid, issued_at}` — the client-side mirror of
+/// `restoreApplyAuthorizationRequest`/`restoreResumeAuthorizationRequest`/
+/// `restoreAbandonAuthorizationRequest` (identical shapes).
+#[derive(Serialize)]
+struct PeerAuthorizationRequestWire {
+    peer_uid: u32,
+    peer_pid: i32,
+    #[serde(with = "wire::rfc3339")]
+    issued_at: OffsetDateTime,
+}
+
+fn recovery_client_unavailable(what: &str) -> Failure {
+    Failure::internal(
+        "broker_recovery_client",
+        format!("broker {what}: unavailable"),
+    )
+}
+
+fn recovery_client_denied(what: &str) -> Failure {
+    Failure::denied("broker_recovery_client", format!("broker {what}: denied"))
+}
+
+/// `RestoreApplyAuthorizationIssuer` — asks the broker to issue a
+/// fresh one-use apply/resume authorization bound to the protected
+/// ticket record; the helper never learns the ticket HMAC.
+/// `dead_code`: the apply/resume handlers this feeds stay
+/// unconfigured until the restore engine launcher lands (upstream
+/// composes them `WithEngine` only — the authorization must never
+/// reach the operator); the type is the R6T7 wire seam that
+/// composition then wires.
+#[allow(dead_code)]
+pub struct RestoreApplyAuthorizationIssuer {
+    client: LifecycleClient,
+}
+
+#[allow(dead_code)]
+impl RestoreApplyAuthorizationIssuer {
+    /// `NewRestoreApplyAuthorizationIssuer`.
+    pub fn new(socket_path: std::path::PathBuf) -> Result<Self, Failure> {
+        if socket_path.as_os_str().is_empty() {
+            return Err(recovery_client_unavailable("restore apply authorization"));
+        }
+        Ok(Self {
+            client: LifecycleClient::new(socket_path),
+        })
+    }
+}
+
+impl crate::helper::restore::RestoreApplyAuthorizationIssuer for RestoreApplyAuthorizationIssuer {
+    /// `IssueRestoreApplyAuthorizationForOperation`. The one-
+    /// nanosecond nudge mirrors upstream exactly: the honest broker
+    /// echoes the transmitted `issued_at` back as the authorization's
+    /// `IssuedAt`, and `valid_at` requires `now` strictly after it —
+    /// validating at the exact issuing instant could never succeed.
+    fn issue_restore_apply_authorization(
+        &self,
+        _deadline: Instant,
+        operation_id: Uuid,
+        peer_uid: u32,
+        peer_pid: i32,
+        issued_at: OffsetDateTime,
+    ) -> Result<RestoreApplyAuthorization, Failure> {
+        if operation_id.is_nil() || peer_pid <= 0 || issued_at == OffsetDateTime::UNIX_EPOCH {
+            return Err(recovery_client_unavailable("restore apply authorization"));
+        }
+        let wire: RestoreApplyAuthorizationWire = self
+            .client
+            .call_with_operation_id(
+                &operation_id.to_string(),
+                RESTORE_APPLY_AUTHORIZATION_RPC,
+                &PeerAuthorizationRequestWire {
+                    peer_uid,
+                    peer_pid,
+                    issued_at,
+                },
+            )
+            .map_err(|_| recovery_client_denied("restore apply authorization"))?;
+        let authorization = apply_authorization_from_wire(&wire);
+        if authorization.operation_id != operation_id
+            || authorization.ticket_id.is_nil()
+            || !authorization.valid_at(issued_at + time::Duration::NANOSECOND)
+        {
+            return Err(recovery_client_denied("restore apply authorization"));
+        }
+        Ok(authorization)
+    }
+
+    /// `IssueRestoreResumeAuthorizationForOperation` — identical
+    /// shape, resume RPC; the same echoed-`IssuedAt` epsilon applies.
+    fn issue_restore_resume_authorization(
+        &self,
+        _deadline: Instant,
+        operation_id: Uuid,
+        peer_uid: u32,
+        peer_pid: i32,
+        issued_at: OffsetDateTime,
+    ) -> Result<RestoreApplyAuthorization, Failure> {
+        if operation_id.is_nil() || peer_pid <= 0 || issued_at == OffsetDateTime::UNIX_EPOCH {
+            return Err(recovery_client_unavailable("restore resume authorization"));
+        }
+        let wire: RestoreApplyAuthorizationWire = self
+            .client
+            .call_with_operation_id(
+                &operation_id.to_string(),
+                RESTORE_RESUME_AUTHORIZATION_RPC,
+                &PeerAuthorizationRequestWire {
+                    peer_uid,
+                    peer_pid,
+                    issued_at,
+                },
+            )
+            .map_err(|_| recovery_client_denied("restore resume authorization"))?;
+        let authorization = apply_authorization_from_wire(&wire);
+        if authorization.operation_id != operation_id
+            || authorization.ticket_id.is_nil()
+            || !authorization.valid_at(issued_at + time::Duration::NANOSECOND)
+        {
+            return Err(recovery_client_denied("restore resume authorization"));
+        }
+        Ok(authorization)
+    }
+}
+
+/// `RestoreAbandonClient` — the helper's narrow ADR 0016 view: it can
+/// ask the broker to run the issuance half and then consume what it
+/// was given; it cannot read, begin, or resume anything.
+pub struct RestoreAbandonClient {
+    client: LifecycleClient,
+}
+
+impl RestoreAbandonClient {
+    /// `NewRestoreAbandonClient`.
+    pub fn new(socket_path: std::path::PathBuf) -> Result<Self, Failure> {
+        if socket_path.as_os_str().is_empty() {
+            return Err(recovery_client_unavailable("restore abandon"));
+        }
+        Ok(Self {
+            client: LifecycleClient::new(socket_path),
+        })
+    }
+}
+
+impl crate::helper::restore::RestoreAbandonAuthority for RestoreAbandonClient {
+    /// `IssueRestoreAbandonAuthorizationForOperation`. The
+    /// acknowledgement check and the one-nanosecond `IssuedAt` epsilon
+    /// both mirror upstream verbatim.
+    fn issue_restore_abandon_authorization(
+        &self,
+        _deadline: Instant,
+        operation_id: Uuid,
+        peer_uid: u32,
+        peer_pid: i32,
+        issued_at: OffsetDateTime,
+    ) -> Result<RestoreAbandonAuthorization, Failure> {
+        if operation_id.is_nil() || peer_pid <= 0 || issued_at == OffsetDateTime::UNIX_EPOCH {
+            return Err(recovery_client_unavailable("restore abandon authorization"));
+        }
+        let wire: RestoreAbandonAuthorizationWire = self
+            .client
+            .call_with_operation_id(
+                &operation_id.to_string(),
+                RESTORE_ABANDON_AUTHORIZATION_RPC,
+                &PeerAuthorizationRequestWire {
+                    peer_uid,
+                    peer_pid,
+                    issued_at,
+                },
+            )
+            .map_err(|_| recovery_client_denied("restore abandon authorization"))?;
+        let authorization = abandon_authorization_from_wire(&wire);
+        if authorization.operation_id != operation_id
+            || authorization.acknowledgement
+                != central_backup::recovery::operation::RESTORE_ABANDON_ACKNOWLEDGEMENT
+            || !authorization.valid_at(issued_at + time::Duration::NANOSECOND)
+        {
+            return Err(recovery_client_denied("restore abandon authorization"));
+        }
+        Ok(authorization)
+    }
+
+    /// `AbandonRestore` — consumes the issued authorization on exactly
+    /// one terminal transition; the result must be `abandoned` and
+    /// valid, or the outcome is invalid at the boundary.
+    fn abandon_restore(
+        &self,
+        _deadline: Instant,
+        operation_id: Uuid,
+        authorization: &RestoreAbandonAuthorization,
+        at: OffsetDateTime,
+    ) -> Result<RestoreOperation, Failure> {
+        if operation_id.is_nil()
+            || at == OffsetDateTime::UNIX_EPOCH
+            || authorization.operation_id != operation_id
+            || !authorization.valid_at(at)
+        {
+            return Err(recovery_client_unavailable("restore abandon"));
+        }
+        /// `restoreAbandonRequest` — `{authorization, at}`.
+        #[derive(Serialize)]
+        struct AbandonRequestWire {
+            authorization: RestoreAbandonAuthorizationWire,
+            #[serde(with = "wire::rfc3339")]
+            at: OffsetDateTime,
+        }
+        let wire: RestoreOperationWire = self
+            .client
+            .call_with_operation_id(
+                &operation_id.to_string(),
+                RESTORE_ABANDON_RPC,
+                &AbandonRequestWire {
+                    authorization: abandon_authorization_to_wire(authorization),
+                    at,
+                },
+            )
+            .map_err(|_| recovery_client_denied("restore abandon"))?;
+        let operation =
+            operation_from_wire(&wire).map_err(|_| recovery_client_denied("restore abandon"))?;
+        if operation.operation_id != operation_id
+            || operation.validate().is_err()
+            || operation.phase != RestorePhase::Abandoned
+        {
+            return Err(recovery_client_denied("restore abandon"));
+        }
+        Ok(operation)
+    }
 }

@@ -775,7 +775,7 @@ impl Default for BackupRepositoryAttestationJournalWire {
     }
 }
 
-fn attestation_to_wire(
+pub(crate) fn attestation_to_wire(
     attestation: &Option<BackupRepositoryAttestation>,
 ) -> BackupRepositoryAttestationJournalWire {
     match attestation {
@@ -863,7 +863,7 @@ impl Default for BackupTargetLockJournalWire {
     }
 }
 
-fn target_lock_to_wire(
+pub(crate) fn target_lock_to_wire(
     attestation: &Option<BackupTargetLockAttestation>,
 ) -> BackupTargetLockJournalWire {
     match attestation {

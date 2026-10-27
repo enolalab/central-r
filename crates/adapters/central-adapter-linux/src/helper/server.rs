@@ -44,6 +44,35 @@ pub const MIGRATION_LAUNCH_BUDGET: Duration = Duration::from_secs(30);
 pub const MIGRATION_OUTCOME_BUDGET: Duration = Duration::from_secs(10);
 /// `backupStatusDeadline`.
 pub const BACKUP_STATUS_BUDGET: Duration = Duration::from_secs(5);
+/// `backupCreateDeadline`.
+pub const BACKUP_CREATE_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
+/// `backupVerifyDeadline`.
+pub const BACKUP_VERIFY_BUDGET: Duration = Duration::from_secs(2 * 60);
+
+/// `restoreVerifyDeadline` — derived from the default recovery
+/// profile's media-verification bound over the helper's two walks
+/// (the launcher's own plus the child's single walk), exactly as
+/// upstream's `restoreVerifyDeadline()`. An underivable bound
+/// collapses to `0`, which `handle_conn` refuses as unsupported —
+/// a verb without a positive budget never runs.
+pub fn restore_verify_deadline() -> Duration {
+    central_backup::backup::capacity::default_recovery_profile()
+        .media_verification_deadline(super::restore::RESTORE_VERIFY_HELPER_MEDIA_WALKS)
+        .map(|d| d.unsigned_abs())
+        .unwrap_or(Duration::ZERO)
+}
+
+/// `restoreApplyDeadline` — the profile's restore-run bound with the
+/// two-minute ceremony share priced in, exactly as upstream's
+/// `restoreApplyDeadline()`/`restoreResumeDeadline()`. The clamp is
+/// inside `restore_run_deadline` — a saturating profile shortens the
+/// engine share, never the ceremony.
+pub fn restore_apply_deadline() -> Duration {
+    central_backup::backup::capacity::default_recovery_profile()
+        .restore_run_deadline(time::Duration::seconds(2 * 60))
+        .map(|d| d.unsigned_abs())
+        .unwrap_or(Duration::ZERO)
+}
 
 /// `helperVerbDeadline` — this slice's rows; every later row collapses
 /// to `lifecycle_operation_deadline`'s 0 exactly as upstream's
@@ -54,6 +83,12 @@ pub fn helper_verb_deadline(verb: &str) -> Duration {
         v if v == verb::MIGRATE_LAUNCH => MIGRATION_LAUNCH_BUDGET,
         v if v == verb::MIGRATE_READ_OUTCOME => MIGRATION_OUTCOME_BUDGET,
         v if v == verb::PREPARE => PREPARE_BUDGET,
+        v if v == verb::RESTORE_VERIFY => restore_verify_deadline(),
+        v if v == verb::RESTORE_APPLY => restore_apply_deadline(),
+        v if v == verb::RESTORE_RESUME => restore_apply_deadline(),
+        v if v == verb::RESTORE_ABANDON => CEREMONY_BUDGET,
+        v if v == verb::BACKUP_CREATE => BACKUP_CREATE_BUDGET,
+        v if v == verb::BACKUP_VERIFY => BACKUP_VERIFY_BUDGET,
         v if v == verb::BACKUP_STATUS => BACKUP_STATUS_BUDGET,
         v if v == verb::BROWSER_OPEN => Duration::from_secs(30),
         v if v == verb::TRUST_INSTALL => Duration::from_secs(120),
@@ -186,6 +221,19 @@ pub struct Server {
     pub migration: Option<Box<dyn super::migration_launch::MigrationLauncher>>,
     /// `Server.MigrationOutcome` — the `migrate-read-outcome` proxy.
     pub migration_outcome: Option<Box<dyn super::migration_launch::MigrationOutcomeReader>>,
+    /// `Server.BackupCreate` — the `backup-create` handler.
+    pub backup_create: Option<Box<dyn super::backup::BackupCreator>>,
+    /// `Server.BackupRead` — backs both `backup-verify` and
+    /// `backup-status`, upstream-fashion.
+    pub backup_read: Option<Box<dyn super::backup::BackupReader>>,
+    /// `Server.RestoreVerify`.
+    pub restore_verify: Option<Box<dyn super::restore::RestoreVerifyHandler>>,
+    /// `Server.RestoreApply`.
+    pub restore_apply: Option<Box<dyn super::restore::RestoreApplyHandler>>,
+    /// `Server.RestoreResume`.
+    pub restore_resume: Option<Box<dyn super::restore::RestoreResumeHandler>>,
+    /// `Server.RestoreAbandon`.
+    pub restore_abandon: Option<Box<dyn super::restore::RestoreAbandonHandler>>,
     pub browser: Option<super::browser::BrowserHandler>,
     pub bootstrap_show: Option<super::browser::BootstrapShowHandler>,
     /// Arms the deny-safe gate while non-empty.
@@ -205,6 +253,12 @@ impl Server {
             init: None,
             migration: None,
             migration_outcome: None,
+            backup_create: None,
+            backup_read: None,
+            restore_verify: None,
+            restore_apply: None,
+            restore_resume: None,
+            restore_abandon: None,
             browser: None,
             bootstrap_show: None,
             deny_safe_dir: None,
@@ -355,6 +409,92 @@ impl Server {
                     Ok(read) => reader.read_outcome(&read, &peer),
                     Err(_) => {
                         Response::denied(&req.operation_id, 2, "INVALID_MIGRATION_OUTCOME_REQUEST")
+                    }
+                }
+            }
+            v if v == verb::BACKUP_CREATE => {
+                let Some(handler) = &self.backup_create else {
+                    return Response::deferred(&req.operation_id, "BACKUP_CREATE_UNAVAILABLE");
+                };
+                match super::backup::parse_backup_create_request(req) {
+                    Ok(create) => handler.create_backup(deadline, create, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_BACKUP_CREATE_REQUEST")
+                    }
+                }
+            }
+            v if v == verb::BACKUP_VERIFY => {
+                let Some(reader) = &self.backup_read else {
+                    return Response::deferred(&req.operation_id, "BACKUP_VERIFY_UNAVAILABLE");
+                };
+                match super::backup::parse_backup_verify_request(req) {
+                    Ok(verify) => reader.verify_backup(deadline, verify, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_BACKUP_VERIFY_REQUEST")
+                    }
+                }
+            }
+            v if v == verb::BACKUP_STATUS => {
+                let Some(reader) = &self.backup_read else {
+                    return Response::deferred(&req.operation_id, "BACKUP_STATUS_UNAVAILABLE");
+                };
+                match super::backup::parse_backup_status_request(req) {
+                    Ok(status) => reader.read_backup_status(deadline, status, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_BACKUP_STATUS_REQUEST")
+                    }
+                }
+            }
+            v if v == verb::RESTORE_VERIFY => {
+                let Some(handler) = &self.restore_verify else {
+                    return Response::deferred(&req.operation_id, "RESTORE_VERIFY_UNAVAILABLE");
+                };
+                match super::restore::parse_restore_verify_request(req) {
+                    Ok(verify) => handler.verify_restore(deadline, verify, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_RESTORE_VERIFY_REQUEST")
+                    }
+                }
+            }
+            v if v == verb::RESTORE_APPLY => {
+                let Some(handler) = &self.restore_apply else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        "RESTORE_APPLY_AUTHORIZATION_UNAVAILABLE",
+                    );
+                };
+                match super::restore::parse_restore_apply_request(req) {
+                    Ok(apply) => handler.authorize_restore_apply(deadline, apply, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_RESTORE_APPLY_REQUEST")
+                    }
+                }
+            }
+            v if v == verb::RESTORE_RESUME => {
+                let Some(handler) = &self.restore_resume else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        "RESTORE_RESUME_AUTHORIZATION_UNAVAILABLE",
+                    );
+                };
+                match super::restore::parse_restore_resume_request(req) {
+                    Ok(resume) => handler.authorize_restore_resume(deadline, resume, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_RESTORE_RESUME_REQUEST")
+                    }
+                }
+            }
+            v if v == verb::RESTORE_ABANDON => {
+                let Some(handler) = &self.restore_abandon else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        "RESTORE_ABANDON_AUTHORIZATION_UNAVAILABLE",
+                    );
+                };
+                match super::restore::parse_restore_abandon_request(req) {
+                    Ok(abandon) => handler.authorize_restore_abandon(deadline, abandon, &peer),
+                    Err(_) => {
+                        Response::denied(&req.operation_id, 2, "INVALID_RESTORE_ABANDON_REQUEST")
                     }
                 }
             }
@@ -979,7 +1119,19 @@ mod tests {
         );
         let cases = [
             (verb::WIPE, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
-            (verb::RESTORE_APPLY, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
+            // Implemented but unconfigured: the verb's own upstream
+            // unavailable answer, not the matrix's closed refusal.
+            (
+                verb::RESTORE_APPLY,
+                "deferred",
+                "RESTORE_APPLY_AUTHORIZATION_UNAVAILABLE",
+            ),
+            (
+                verb::RESTORE_VERIFY,
+                "deferred",
+                "RESTORE_VERIFY_UNAVAILABLE",
+            ),
+            (verb::BACKUP_CREATE, "deferred", "BACKUP_CREATE_UNAVAILABLE"),
             (verb::STATE_AUDIT, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
             (verb::BACKUP_EXPORT, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
             (

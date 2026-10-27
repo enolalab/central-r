@@ -425,7 +425,13 @@ impl LifecycleClient {
 
     /// `callWithOperationID` — preserves the operation identity that
     /// downstream authority records bind. Empty ids refuse.
-    fn call_with_operation_id<R: serde::Serialize, T: serde::de::DeserializeOwned>(
+    /// `pub(crate)` so the backup/restore authority clients
+    /// (`crate::broker::backup_authority`,
+    /// `crate::broker::recovery_authority`) can reuse the same
+    /// protected-socket RPC plumbing — upstream wraps this exact
+    /// method in `BackupLaunchIssuer`/`BackupOperatorAuthorityClient`/
+    /// `BackupMinioHandoffIssuer`/`BackupAttestationClient`.
+    pub(crate) fn call_with_operation_id<R: serde::Serialize, T: serde::de::DeserializeOwned>(
         &self,
         operation_id: &str,
         purpose: &str,

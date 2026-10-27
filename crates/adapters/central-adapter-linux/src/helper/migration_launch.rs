@@ -519,7 +519,10 @@ fn native_migration_command(command: &str) -> Option<crate::migration_launcher::
 }
 
 /// `migrationProcessExecutable` — `/proc/<pid>/exe` fully resolved.
-fn migration_process_executable(pid: i32) -> Result<String, Failure> {
+/// `pub(crate)` so the backup launcher's process-identity evidence
+/// reuses the exact same `/proc` read (`backup_launch.go`'s
+/// `processExecutable` is byte-identical logic).
+pub(crate) fn migration_process_executable(pid: i32) -> Result<String, Failure> {
     let link = PathBuf::from(format!("/proc/{pid}/exe"));
     let resolved = std::fs::canonicalize(&link).map_err(|e| {
         Failure::internal(
@@ -532,7 +535,9 @@ fn migration_process_executable(pid: i32) -> Result<String, Failure> {
 
 /// `migrationProcessStart` — `/proc/<pid>/stat` field 22 (starttime),
 /// parsed after the last `)` exactly like upstream's `LastIndex`.
-fn migration_process_start(pid: i32) -> Result<String, Failure> {
+/// `pub(crate)` for the same reason as
+/// [`migration_process_executable`].
+pub(crate) fn migration_process_start(pid: i32) -> Result<String, Failure> {
     let contents = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| {
         Failure::internal(
             "helper_migration",

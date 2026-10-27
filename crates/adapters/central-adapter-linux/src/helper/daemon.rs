@@ -244,6 +244,41 @@ pub fn run_helper_daemon(
             return 6;
         }
     };
+    // `resolveProductionInstanceComposition` — upstream resolves the
+    // validated instance (id + authoritative roots) before composing
+    // any backup/restore seam; a broken instance fails the daemon,
+    // not just one verb.
+    let composition = match crate::broker::daemon::resolve_production_instance_composition() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(stderr, "helper: composition: {e}");
+            return 6;
+        }
+    };
+    let broker_path: std::path::PathBuf = broker_socket_path(env).into();
+    let backup_repository_root =
+        std::path::PathBuf::from(&composition.authoritative_state_root).join("backups");
+    // `newProductionRestoreAbandonHandler` — composable in this
+    // slice: the PAM confirmer, the one-purpose broker client, and
+    // the fixed instance/target scope are all real. Upstream fails
+    // the whole composition when the client cannot be built, so the
+    // daemon exits 6 here too rather than serving a half seam.
+    let restore_abandon =
+        match crate::broker::recovery_authority::RestoreAbandonClient::new(broker_path.clone()) {
+            Ok(client) => Some(Box::new(super::restore::RestoreAbandonHandlerImpl::new(
+                Some(Box::new(PamConfirmer::new())),
+                Some(Box::new(client)),
+                CeremonyScope {
+                    instance_id: "default".to_owned(),
+                    target_id: "postgres:central".to_owned(),
+                },
+            ))
+                as Box<dyn super::restore::RestoreAbandonHandler>),
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {}", e.message());
+                return 6;
+            }
+        };
     let srv = Arc::new(Server {
         peer_policy: Some(peer),
         socket: Some(socket),
@@ -291,6 +326,78 @@ pub fn run_helper_daemon(
         migration_outcome: Some(Box::new(
             super::migration_launch::ProductionMigrationOutcomeReader::new(broker_socket_path(env)),
         )),
+        // `newProductionBackupCreateHandler` — the seams this slice
+        // can honestly produce are installed; the C02 throughput
+        // fixture gate and the MinIO provisioner preparer are later
+        // composition (their production chains are the same
+        // capacity-role machinery the restore engine launcher owns).
+        // `None` on those two keeps upstream's completeness gate
+        // reachable: the verb answers
+        // `BACKUP_CREATE_AUTHORIZATION_REQUIRED`, its own refusal —
+        // never `UNSUPPORTED`, never a made-up success.
+        backup_create: Some(Box::new(
+            super::backup::BackupCreateHandler::new_incomplete(
+                Some(Box::new(PamConfirmer::new())),
+                None,
+                Some(Box::new(
+                    crate::broker::backup_authority::BackupLaunchIssuer::new(broker_path.clone()),
+                )),
+                None,
+                Some(Box::new(super::backup::FixedBackupRepositorySource {
+                    root: backup_repository_root.clone(),
+                    instance_id: composition.instance_id.clone(),
+                })),
+                Some(Box::new(super::backup::NativeBackupProcessLauncher::new())),
+                Some(Box::new(
+                    super::backup::DescriptorBackupRepositoryAttestor {
+                        profile: central_backup::backup::capacity::default_recovery_profile(),
+                    },
+                )),
+                Some(Box::new(
+                    crate::broker::backup_authority::BackupAttestationClient::new(
+                        broker_path.clone(),
+                    ),
+                )),
+                Some(Box::new(
+                    crate::broker::backup_authority::BackupAttestationClient::new(
+                        broker_path.clone(),
+                    ),
+                )),
+            ),
+        )),
+        // `newProductionBackupReadHandler` — the fixed descriptor
+        // source plus the root-helper-only broker read client and
+        // the default recovery profile; every seam real.
+        backup_read: Some(Box::new(super::backup::BackupReadHandler::new(
+            Box::new(super::backup::FixedBackupRepositorySource {
+                root: backup_repository_root.clone(),
+                instance_id: composition.instance_id.clone(),
+            }),
+            Box::new(
+                crate::broker::backup_authority::BackupOperatorAuthorityClient::new(
+                    broker_path.clone(),
+                ),
+            ),
+            central_backup::backup::capacity::default_recovery_profile(),
+        ))),
+        // `newProductionRestoreAbandonHandler` — the one restore verb
+        // this slice can compose honestly: abandonment launches no
+        // engine and allocates no reserve, so it needs only the fresh
+        // ceremony confirmer, the narrow broker client, and the fixed
+        // helper-owned scope. Apply/resume stay unset: upstream
+        // composes them `WithEngine` — the authorization never leaves
+        // the root process — and the engine launcher is the T8
+        // capacity-transport machinery, so installing the no-engine
+        // form here would hand the one-use authorization to the
+        // operator, exactly the leak upstream's composition refuses.
+        restore_abandon,
+        // `restore_verify`/`restore_apply`/`restore_resume` stay
+        // unset for the same chain reason: the production runner and
+        // engine launcher are the restore capacity reserve helper's
+        // composition (T8). Their dispatch arms answer upstream's
+        // exact `*_UNAVAILABLE`/`RESTORE_*_AUTHORIZATION_UNAVAILABLE`.
+        // `restore_verify` would mint a ticket a no-engine apply
+        // cannot consume — the refusal is honest, the reach is not.
         // `lifecycle` stays unset for the same dependency-chain reason,
         // one link deeper: `infra::lifecycle::new_production_service`
         // needs (1) the B01 advisory evaluator — the same deferred seam

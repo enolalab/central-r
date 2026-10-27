@@ -36,6 +36,7 @@ use central_foundation::failure::Failure;
 use central_infra::authority::{BrokerRequest, BrokerResponse, RecoveryMinioHandoffRequest};
 use central_infra::domain::Purpose;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -315,14 +316,14 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct BackupLaunchAuthorityWire {
     launch_evidence_id: Uuid,
     operation_id: Uuid,
     backup_id: Uuid,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct BackupStatusResultWire {
     operation_id: String,
     backup_id: String,
@@ -1323,6 +1324,325 @@ impl Service {
 
 fn unavailable() -> Failure {
     Failure::internal("broker", "broker: authority store unavailable")
+}
+
+// ---------------------------------------------------------------------------
+// Client half — `backup_authority_rpc.go`'s `BackupLaunchIssuer`,
+// `BackupOperatorAuthorityClient`, `BackupMinioHandoffIssuer`, and
+// `BackupAttestationClient`. Each wraps [`LifecycleClient`] exactly as
+// upstream wraps `*LifecycleClient`, and every RPC goes through
+// `call_with_operation_id` on the protected socket. Denials are
+// locator-free: the broker's own diagnostic text never crosses into a
+// caller-visible error.
+// ---------------------------------------------------------------------------
+
+use super::lifecycle_client::LifecycleClient;
+
+fn client_unavailable(what: &str) -> Failure {
+    Failure::internal(
+        "broker_backup_client",
+        format!("broker {what}: unavailable"),
+    )
+}
+
+fn client_denied(what: &str) -> Failure {
+    Failure::denied("broker_backup_client", format!("broker {what}: denied"))
+}
+
+/// `BackupLaunchIssuer` — submits helper-observed launch evidence;
+/// the broker mints the opaque identity.
+pub struct BackupLaunchIssuer {
+    client: LifecycleClient,
+}
+
+impl BackupLaunchIssuer {
+    /// `NewBackupLaunchEvidenceIssuer`.
+    pub fn new(socket_path: std::path::PathBuf) -> Self {
+        Self {
+            client: LifecycleClient::new(socket_path),
+        }
+    }
+}
+
+impl crate::helper::backup::BackupLaunchEvidenceIssuer for BackupLaunchIssuer {
+    fn issue_backup_launch(
+        &self,
+        _deadline: Instant,
+        evidence: &crate::broker::backup_launch::BackupLaunchEvidence,
+    ) -> Result<crate::broker::backup_launch::BackupLaunchAuthority, Failure> {
+        if evidence.operation_id.is_empty() {
+            return Err(client_unavailable("backup launch"));
+        }
+        let payload = BackupLaunchEvidenceWire {
+            supervisor_launch_id: evidence.supervisor_launch_id,
+            pid: evidence.pid,
+            process_start: evidence.process_start.clone(),
+            executable: evidence.executable.clone(),
+            mode: evidence.mode.clone(),
+            operation_id: evidence.operation_id.clone(),
+            repository_binding: super::backup_launch::binding_to_wire(&evidence.repository_binding),
+            expires_at: evidence.expires_at,
+        };
+        let result: BackupLaunchAuthorityWire = self
+            .client
+            .call_with_operation_id(&evidence.operation_id, BACKUP_ISSUE_LAUNCH_RPC, &payload)
+            .map_err(|_| client_denied("backup launch"))?;
+        if result.launch_evidence_id.is_nil()
+            || result.operation_id.to_string() != evidence.operation_id
+            || result.backup_id.is_nil()
+        {
+            return Err(client_denied("backup launch"));
+        }
+        Ok(crate::broker::backup_launch::BackupLaunchAuthority {
+            launch_evidence_id: result.launch_evidence_id,
+            operation_id: result.operation_id,
+            backup_id: result.backup_id,
+        })
+    }
+}
+
+/// `BackupOperatorAuthorityClient` — the root-helper-only read client
+/// for physical verification and protected operation status.
+pub struct BackupOperatorAuthorityClient {
+    client: LifecycleClient,
+}
+
+impl BackupOperatorAuthorityClient {
+    /// `NewBackupOperatorAuthorityClient`.
+    pub fn new(socket_path: std::path::PathBuf) -> Self {
+        Self {
+            client: LifecycleClient::new(socket_path),
+        }
+    }
+}
+
+impl crate::helper::backup::BackupReadAuthority for BackupOperatorAuthorityClient {
+    #[allow(clippy::too_many_arguments)] // mirrors the trait signature
+    fn verify_backup_seal(
+        &self,
+        _deadline: Instant,
+        backup_id: Uuid,
+        manifest_digest: [u8; 32],
+        seal_companion_digest: [u8; 32],
+        file_tree_digest: [u8; 32],
+        repository_manifest_digest: [u8; 32],
+        repository_revision: u64,
+    ) -> Result<(), Failure> {
+        if backup_id.is_nil() || backup_id.get_version_num() != 7 || repository_revision == 0 {
+            return Err(client_unavailable("backup verify"));
+        }
+        #[derive(Deserialize)]
+        struct VerifiedResult {
+            #[serde(default)]
+            verified: bool,
+        }
+        let result: VerifiedResult = self
+            .client
+            .call_with_operation_id(
+                &backup_id.to_string(),
+                BACKUP_VERIFY_SEAL_RPC,
+                &BackupVerifySealRPCRequest {
+                    backup_id,
+                    manifest_digest_sha256: manifest_digest,
+                    seal_companion_digest_sha256: seal_companion_digest,
+                    file_tree_digest_sha256: file_tree_digest,
+                    repository_manifest_digest_sha256: repository_manifest_digest,
+                    repository_revision,
+                },
+            )
+            .map_err(|_| client_denied("backup verify"))?;
+        if !result.verified {
+            return Err(client_denied("backup verify"));
+        }
+        Ok(())
+    }
+
+    fn read_backup_status(
+        &self,
+        _deadline: Instant,
+        operation_id: Uuid,
+    ) -> Result<crate::helper::backup::BackupStatusResult, Failure> {
+        if operation_id.is_nil() || operation_id.get_version_num() != 7 {
+            return Err(client_unavailable("backup status"));
+        }
+        let result: BackupStatusResultWire = self
+            .client
+            .call_with_operation_id(
+                &operation_id.to_string(),
+                BACKUP_READ_STATUS_RPC,
+                &EmptyRequest {},
+            )
+            .map_err(|_| client_denied("backup status"))?;
+        if result.operation_id != operation_id.to_string()
+            || result.backup_id.is_empty()
+            || result.phase.is_empty()
+            || result.reason.is_empty()
+        {
+            return Err(client_denied("backup status"));
+        }
+        Ok(crate::helper::backup::BackupStatusResult {
+            operation_id: result.operation_id,
+            backup_id: result.backup_id,
+            phase: result.phase,
+            reason: result.reason,
+        })
+    }
+}
+
+/// `BackupMinioHandoffIssuer` — admitted only from the root-helper
+/// arm. Returns the credential-free, one-use provisioner receipt.
+/// `dead_code`: the MinIO credential preparer that consumes this
+/// client is the later production composition (same capacity-role
+/// machinery chain as the restore engine launcher); the type is the
+/// R6T7 wire seam, installed here so that composition only wires it.
+#[allow(dead_code)]
+pub struct BackupMinioHandoffIssuer {
+    client: LifecycleClient,
+}
+
+#[allow(dead_code)]
+impl BackupMinioHandoffIssuer {
+    /// `NewBackupMinioHandoffIssuer`.
+    pub fn new(socket_path: std::path::PathBuf) -> Self {
+        Self {
+            client: LifecycleClient::new(socket_path),
+        }
+    }
+
+    /// `IssueRecoveryMinioHandoff`.
+    pub fn issue_recovery_minio_handoff(
+        &self,
+        request: &RecoveryMinioHandoffRequest,
+    ) -> Result<central_infra::authority::RecoveryMinioHandoffReceipt, Failure> {
+        let Ok(operation_id) = Uuid::parse_str(&request.operation_id) else {
+            return Err(client_unavailable("backup minio handoff"));
+        };
+        if operation_id.is_nil() {
+            return Err(client_unavailable("backup minio handoff"));
+        }
+        let result: central_infra::authority::RecoveryMinioHandoffReceipt = self
+            .client
+            .call_with_operation_id(
+                &request.operation_id,
+                BACKUP_ISSUE_MINIO_RPC,
+                &RecoveryMinioHandoffRequestWire {
+                    operation_id: request.operation_id.clone(),
+                    instance_id: request.instance_id.clone(),
+                    purpose: request.purpose.clone(),
+                    bucket: request.bucket.clone(),
+                    key_prefix: request.key_prefix.clone(),
+                    policy_digest: request.policy_digest.clone(),
+                    expires_at: request.expires_at,
+                    fence_token: request.fence_token,
+                },
+            )
+            .map_err(|_| client_denied("backup minio handoff"))?;
+        if result.operation_id != request.operation_id
+            || result.receipt_id.is_empty()
+            || result.policy_digest.is_empty()
+        {
+            return Err(client_denied("backup minio handoff"));
+        }
+        Ok(result)
+    }
+}
+
+/// `BackupAttestationClient` — the helper-facing post-reap authority:
+/// reap evidence, then the terminal attested-seal transition.
+pub struct BackupAttestationClient {
+    client: LifecycleClient,
+}
+
+impl BackupAttestationClient {
+    /// `NewBackupAttestationClient`.
+    pub fn new(socket_path: std::path::PathBuf) -> Self {
+        Self {
+            client: LifecycleClient::new(socket_path),
+        }
+    }
+}
+
+impl crate::helper::backup::BackupLaunchReaper for BackupAttestationClient {
+    fn mark_backup_launch_reaped(
+        &self,
+        _deadline: Instant,
+        operation_id: Uuid,
+        launch_evidence_id: Uuid,
+        target_lock_proof: [u8; 32],
+        reaped_at: OffsetDateTime,
+    ) -> Result<(), Failure> {
+        if operation_id.is_nil()
+            || launch_evidence_id.is_nil()
+            || target_lock_proof == [0u8; 32]
+            || reaped_at == OffsetDateTime::UNIX_EPOCH
+        {
+            return Err(client_unavailable("backup reaping"));
+        }
+        #[derive(Deserialize)]
+        struct ReapedResult {
+            #[serde(default)]
+            reaped: bool,
+        }
+        let result: ReapedResult = self
+            .client
+            .call_with_operation_id(
+                &operation_id.to_string(),
+                BACKUP_MARK_REAPED_RPC,
+                &BackupReapedRPCRequest {
+                    operation_id,
+                    launch_evidence_id,
+                    target_lock_proof,
+                    reaped_at,
+                },
+            )
+            .map_err(|_| client_denied("backup reaping"))?;
+        if !result.reaped {
+            return Err(client_denied("backup reaping"));
+        }
+        Ok(())
+    }
+}
+
+impl crate::helper::backup::BackupSealAttestationCompleter for BackupAttestationClient {
+    fn complete_attested_backup_seal(
+        &self,
+        _deadline: Instant,
+        operation_id: Uuid,
+        launch_evidence_id: Uuid,
+        attestation: &BackupRepositoryAttestation,
+        target_lock: &BackupTargetLockAttestation,
+    ) -> Result<BackupOperation, Failure> {
+        if operation_id.is_nil()
+            || launch_evidence_id.is_nil()
+            || attestation.verify().is_err()
+            || target_lock.verify().is_err()
+        {
+            return Err(client_unavailable("backup attestation"));
+        }
+        let wire: BackupOperationWire = self
+            .client
+            .call_with_operation_id(
+                &operation_id.to_string(),
+                BACKUP_COMPLETE_RPC,
+                &BackupCompleteRPCRequest {
+                    operation_id,
+                    launch_evidence_id,
+                    attestation: super::recovery_journal::attestation_to_wire(&Some(
+                        attestation.clone(),
+                    )),
+                    target_lock_attestation: super::recovery_journal::target_lock_to_wire(&Some(
+                        target_lock.clone(),
+                    )),
+                },
+            )
+            .map_err(|_| client_denied("backup attestation"))?;
+        let operation =
+            backup_operation_from_wire(&wire).map_err(|_| client_denied("backup attestation"))?;
+        if operation.validate().is_err() {
+            return Err(client_denied("backup attestation"));
+        }
+        Ok(operation)
+    }
 }
 
 #[cfg(test)]
