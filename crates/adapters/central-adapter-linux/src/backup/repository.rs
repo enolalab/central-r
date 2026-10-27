@@ -240,6 +240,14 @@ impl Repository {
         self.binding.clone()
     }
 
+    /// Whether this handle was opened read-only (shared verification
+    /// lock). Restore admission requires it: the inspector owns no
+    /// mutation capability.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// `BindBackup` creates the immutable per-backup binding before
     /// any dump body or inventory file can be written. An exact repeat
     /// verifies the existing bytes; any substitution fails closed.

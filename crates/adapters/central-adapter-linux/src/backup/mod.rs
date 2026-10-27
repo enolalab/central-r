@@ -26,6 +26,8 @@ pub(crate) mod repository;
 mod repository_capacity;
 mod repository_throughput;
 mod repository_verifier;
+mod restore_admission;
+mod restore_capacity_source;
 mod restore_engine;
 mod throughput_probe;
 
@@ -48,6 +50,17 @@ pub use repository::{
     new_repository,
 };
 pub use repository_verifier::RepositoryVerifier;
+pub use restore_admission::{
+    RepositoryAdmissionInspector, RestoreCapacityAdmission, RestoreCapacityRequest,
+    RestoreCapacitySource, RestoreDeviceCapacity, RestoreTargetAdmission,
+    RestoreTargetAdmissionSource, new_repository_admission_inspector,
+    restore_admission_target_fingerprint,
+};
+pub use restore_capacity_source::{
+    DescriptorRestoreCapacitySource, RESTORE_CAPACITY_RESERVE_RECEIPT_SCHEMA,
+    RestoreCapacityDescriptor, RestoreCapacityReserveReceipt, RestoreCapacityReserveVerifier,
+    RestoreCapacityRole, new_descriptor_restore_capacity_source, restore_capacity_device_id,
+};
 pub use restore_engine::{
     ComposedRestoreEngine, RestoreAuditProjection, RestoreAuthorityResetter, RestoreDatabaseRunner,
     RestoreInventoryVerifier,
