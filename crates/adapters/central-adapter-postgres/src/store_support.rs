@@ -125,6 +125,42 @@ impl BlockingConn {
         })
     }
 
+    /// Builds the bridge **and** connects inside it. A `PgConnection`
+    /// binds its socket to the runtime reactor that performed the
+    /// connect, so a connection made on an ambient runtime cannot later
+    /// be driven here ("a Tokio 1.x context was found, but it is being
+    /// shutdown"). [`Self::new`] remains for connections produced by a
+    /// runtime the caller itself keeps alive for the connection's
+    /// lifetime; composition code that only has a connect future should
+    /// use this constructor.
+    ///
+    /// # Errors
+    /// `internal` when the runtime cannot be built; whatever `connect`
+    /// returns otherwise.
+    #[cfg(test)]
+    pub(crate) fn new_connecting<F, Fut>(connect: F) -> Result<Self, Failure>
+    where
+        F: FnOnce() -> Fut,
+        Fut: core::future::Future<Output = Result<PgConnection, Failure>>,
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("central-pg-backup")
+            .build()
+            .map_err(|_| {
+                Failure::internal(
+                    crate::error::codes::PG_ADAPTER_ERROR,
+                    "the backup/recovery bridge runtime is unavailable",
+                )
+            })?;
+        let conn = runtime.block_on(connect())?;
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+            runtime,
+        })
+    }
+
     /// Runs `f(&mut PgConnection)` to completion, holding the session
     /// lock for the whole call — the upstream dedicated-conn
     /// serialization (`*pgx.Conn` is not concurrent-safe either). A

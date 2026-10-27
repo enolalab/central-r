@@ -18,6 +18,7 @@ mod census;
 mod restore_admission;
 mod runtime_connection;
 mod store;
+mod target_exclusion;
 
 pub use accepted_facts::{
     AcceptedFactsReader, TrustedPayloadEpochSource, backup_target_fingerprint,
@@ -29,6 +30,10 @@ pub use runtime_connection::{
 };
 pub(crate) use store::RawReadyRow;
 pub use store::{ReadyArtifactObjectReader, ReadyArtifactRecord, ReadyArtifactSource};
+pub use target_exclusion::{
+    PostgresBackupTargetExcluder, PostgresRestoreTargetExcluder,
+    new_postgres_backup_target_excluder, new_postgres_restore_target_excluder,
+};
 
 // ---------------------------------------------------------------------------
 // Shared boundary helpers (crate-private; the capability `wire` module is
