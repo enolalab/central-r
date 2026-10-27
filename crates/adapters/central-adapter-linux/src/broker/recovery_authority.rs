@@ -1342,3 +1342,70 @@ impl crate::helper::restore::RestoreAbandonAuthority for RestoreAbandonClient {
         Ok(operation)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Port impls — `service.go`'s in-process C03/C05 authority surface.
+// The restore engine composes the broker `Service` itself as its
+// `RestoreTicketIssuer` and `BrokerAuthorityReset`: both are
+// broker-only authority values that no controller ever sees, exactly
+// as upstream hands `s` to `backup/app`'s verifier and reset
+// coordinator.
+// ---------------------------------------------------------------------------
+
+impl central_backup::port::RestoreTicketIssuer for Service {
+    /// `(*Service).IssueRestoreTicket` — stamps the ticket with the
+    /// launch record that is live at this moment (the *issuing*
+    /// launch), read through the peerless, read-only liveness reader:
+    /// this call has no peer credential and no business advancing a
+    /// launch record from `issued` to `active`. A host with no live
+    /// bound launch record stamps `Uuid::nil()` — the ticket still
+    /// issues (issuance never required a launch), but it can never
+    /// spend a reserve because the capacity gate requires a non-nil
+    /// issuing launch to compare against.
+    fn issue_restore_ticket(
+        &self,
+        backup_id: Uuid,
+        manifest_digest: &str,
+        facts: &central_backup::port::RestoreAdmissionFacts,
+        now: OffsetDateTime,
+    ) -> Result<central_backup::recovery::operation::RestoreTicket, Failure> {
+        let (Some(journal), Some(launches)) = (&self.recovery_journal, &self.restore_launches)
+        else {
+            return Err(unavailable());
+        };
+        let liveness = launches
+            .inspect_liveness(now)
+            .map_err(|_| unavailable())?;
+        let launch_evidence_id = if liveness.bound {
+            liveness.launch_evidence_id
+        } else {
+            Uuid::nil()
+        };
+        journal
+            .issue(backup_id, manifest_digest, facts, launch_evidence_id, now)
+            .map_err(|_| unavailable())
+    }
+}
+
+impl central_backup::port::BrokerAuthorityReset for Service {
+    /// `port.RecoveryBrokerAuthorityResetter` — exposes the C05
+    /// broker-side lifecycle methods ([`Service`]'s
+    /// `prepare_recovery_broker_authority` /
+    /// `activate_recovery_bootstrap`) through the domain port the
+    /// restore engine's [`central_backup::app::AuthorityResetCoordinator`]
+    /// drives.
+    fn prepare_recovery_broker_authority(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<RecoveryBootstrapDraft, Failure> {
+        Service::prepare_recovery_broker_authority(self, operation)
+    }
+
+    fn activate_recovery_bootstrap(
+        &self,
+        operation: &RestoreOperation,
+        registration: &RecoveryBootstrapRegistration,
+    ) -> Result<RecoveryBootstrapActivation, Failure> {
+        Service::activate_recovery_bootstrap(self, operation, registration)
+    }
+}
