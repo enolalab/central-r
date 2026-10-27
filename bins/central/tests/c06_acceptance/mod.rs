@@ -49,4 +49,6 @@ mod profile;
 mod runner;
 mod scenario2;
 mod scenario34;
+mod scenario5;
+
 mod slice_c;

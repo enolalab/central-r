@@ -123,7 +123,7 @@ fn deadline() -> Instant {
 
 /// `c06RestoreTicketPeerPID` — this process, which is what a helper would
 /// report for a peer it had just read credentials from.
-fn peer() -> PeerIdentity {
+pub(crate) fn peer() -> PeerIdentity {
     PeerIdentity {
         uid: rustix::process::getuid().as_raw(),
         gid: rustix::process::getgid().as_raw(),
@@ -133,7 +133,7 @@ fn peer() -> PeerIdentity {
 
 /// `c06SyntheticManifestDigest` — derived, so nothing here can be mistaken
 /// for a digest off a real backup.
-fn synthetic_manifest_digest(label: &str) -> String {
+pub(crate) fn synthetic_manifest_digest(label: &str) -> String {
     let digest =
         sha2::Sha256::digest(format!("c06-scenario-4-synthetic-manifest-{label}").as_bytes());
     format!("sha256:{}", crate::hex_lower(digest))
@@ -141,7 +141,7 @@ fn synthetic_manifest_digest(label: &str) -> String {
 
 /// `c06RestoreAdmissionFacts` — the obviously synthetic admission fact set
 /// every ticket in this battery is minted from.
-fn admission_facts(tool_version: &str) -> RestoreAdmissionFacts {
+pub(crate) fn admission_facts(tool_version: &str) -> RestoreAdmissionFacts {
     let digest = sha2::Sha256::digest(b"c06-scenario-4-synthetic-capacity-evidence");
     let hex = format!("sha256:{}", crate::hex_lower(digest));
     RestoreAdmissionFacts {
@@ -164,10 +164,10 @@ fn admission_facts(tool_version: &str) -> RestoreAdmissionFacts {
 }
 
 /// A temp root that removes itself — `t.TempDir`.
-struct TempRoot(PathBuf);
+pub(crate) struct TempRoot(pub(crate) PathBuf);
 
 impl TempRoot {
-    fn new(group: &str) -> Result<Self, String> {
+    pub(crate) fn new(group: &str) -> Result<Self, String> {
         let root = std::env::temp_dir().join(format!("c06-s34-{group}-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&root).map_err(|e| format!("create the protected root: {e}"))?;
         // The broker expects to create the broker root itself underneath.
@@ -185,14 +185,14 @@ impl Drop for TempRoot {
 /// readback surface) plus a second [`RecoveryJournalStore`] over the same
 /// protected root — `c06NewBrokerService`'s `(service, root)` pair, with the
 /// second store standing where upstream's second `broker.Service` stands.
-struct Broker {
-    service: Service,
-    journal: Arc<RecoveryJournalStore>,
-    root: PathBuf,
+pub(crate) struct Broker {
+    pub(crate) service: Service,
+    pub(crate) journal: Arc<RecoveryJournalStore>,
+    pub(crate) root: PathBuf,
     _tmp: TempRoot,
 }
 
-fn broker_battery(group: &str) -> Result<Broker, String> {
+pub(crate) fn broker_battery(group: &str) -> Result<Broker, String> {
     let tmp = TempRoot::new(group)?;
     let root = tmp.0.join(format!("protected-{group}"));
     let service = Service::new(root.clone(), rustix::process::getuid().as_raw())
@@ -220,7 +220,7 @@ fn broker_battery(group: &str) -> Result<Broker, String> {
 // what keep a vacuous find from turning into a vacuous pair.
 // ---------------------------------------------------------------------------
 
-fn walk_protected_records(
+pub(crate) fn walk_protected_records(
     root: &Path,
     visit: &mut dyn FnMut(&Path, &serde_json::Value),
 ) -> Result<usize, String> {
@@ -262,7 +262,7 @@ fn walk_protected_records(
 /// member; returns the state it replaced.
 /// Wire records carry Go's PascalCase member names (`TicketID`); read both
 /// shapes so the walk stays layout-independent but never silently misses.
-fn member<'a>(
+pub(crate) fn member<'a>(
     object: &'a serde_json::Map<String, serde_json::Value>,
     snake: &str,
     pascal: &str,
@@ -609,7 +609,7 @@ const RESTORE_OPERATION_VERBS: [&str; 3] = ["apply", "resume", "abandon"];
 /// Mint a ticket, issue its apply authorization and really begin the
 /// restore — `c06BeginARealRestore`: the barrier the live source reads is
 /// occupied by something a restore actually consumed a ticket to create.
-fn begin_a_real_restore(
+pub(crate) fn begin_a_real_restore(
     journal: &RecoveryJournalStore,
     facts: &RestoreAdmissionFacts,
     base: OffsetDateTime,
@@ -1044,7 +1044,7 @@ fn live_operation_fixture(begun: &RestoreOperation) -> Result<RestoreOperation, 
 /// The pg_restore version this host carries — measured, never asserted from
 /// a constant, because manifest field 17 checks a run's tool versions
 /// against the ticket's recorded ones.
-fn measured_pg_tool_version() -> String {
+pub(crate) fn measured_pg_tool_version() -> String {
     crate::fixture::pg_tool_version_output("pg_restore")
         .and_then(|raw| crate::evidence::parse_pg_tool_version("pg_restore", &raw))
         .unwrap_or_else(|_| "16.14".to_owned())
