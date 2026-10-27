@@ -232,3 +232,10 @@ Verification (run this session):
 - `cargo clippy -p central-adapter-linux --all-targets -- -D warnings` — clean.
 - `cargo check -p central-adapter-linux` — clean.
 - `cargo fmt -p central-adapter-linux` — applied; clean after format.
+
+R6-T7 part 2 (helper backup/restore slice) — commit a2d3b94.
+Changed: helper/{backup,restore,daemon,matrix,server,protocol,migration_launch,mod}.rs + broker/{backup_authority,recovery_authority,recovery_journal,lifecycle_client}.rs (12 files, +3825).
+Backup: CBL1 create launch, throughput gate, evidence→reap→attest seal chain, descriptor-bound repository, verify/status read path; restore: verify/apply/resume/abandon with fresh per-verb PAM+TTY + one-use authorizations; RESTORE_*/BACKUP_* refusal codes verbatim.
+Matrix: exactly 7 maintenance verbs implemented (15 total); server dispatch + per-verb deadlines + operator peer arm wired.
+Tests: 659/659 adapter lib pass; fmt, clippy -D warnings, cargo check --workspace, cargo deny check all clean.
+T7 complete. T8 still required: restore verify/apply/resume stay unconfigured (unavailable, not success); kind-1 migration + 0xc3–0xc5 capacity transports remain fail-closed.

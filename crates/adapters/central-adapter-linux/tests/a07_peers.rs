@@ -471,11 +471,13 @@ fn broker_backup_credential_frame_denied_echoes_operation() {
     );
 }
 
-/// The 0xc2 restore-migration credential and the 0xc3/0xc4/0xc5
-/// reserve/receipt/inspection transports are closed R6 surfaces:
-/// every peer gets the fixed denial, never a parsed payload.
+/// The 0xc2 restore-migration credential frame keeps its own peer
+/// denial; the 0xc3/0xc4/0xc5 reserve/receipt/inspection transports
+/// are live since Task 8 and answer with their own refusal
+/// vocabularies — `*_PEER_DENIED` for an unauthorized peer,
+/// `*_FRAME_INVALID` for a peer that passed and a body that did not.
 #[test]
-fn broker_restore_framed_transports_closed_denied() {
+fn broker_restore_framed_transports_live_vocabularies() {
     let scratch = Scratch::new("broker-c2");
     let svc = broker_service(&scratch, euid() + 1);
     let resp = broker_exchange(&svc, &[protocol::RESTORE_MIGRATION_CREDENTIAL_FRAME_MARKER])
@@ -484,21 +486,42 @@ fn broker_restore_framed_transports_closed_denied() {
     assert_eq!(resp["outcome"], "denied");
     assert_eq!(resp["evidence"]["message"], "RESTORE_CREDENTIAL_DENIED");
 
-    for marker in [
-        protocol::RESTORE_CAPACITY_RESERVE_FRAME_MARKER,
-        protocol::RESTORE_CAPACITY_RECEIPT_FRAME_MARKER,
-        protocol::RESTORE_CAPACITY_RESERVE_INSPECTION_FRAME_MARKER,
+    // 0xc3/0xc4/0xc5 are live transports since Task 8: they answer
+    // with their own refusal vocabularies, never the closed-matrix
+    // `UNSUPPORTED_IN_THIS_SLICE`. Each arm's peer gate runs first:
+    // a peer that is neither root nor the runtime uid is PEER_DENIED;
+    // a root peer is admitted and the bare-marker frame then fails
+    // the request decode — FRAME_INVALID.
+    let root = euid() == 0;
+    for (marker, reason) in [
+        (
+            protocol::RESTORE_CAPACITY_RESERVE_FRAME_MARKER,
+            if root {
+                "RESTORE_RESERVE_FRAME_INVALID"
+            } else {
+                "RESTORE_RESERVE_PEER_DENIED"
+            },
+        ),
+        (
+            protocol::RESTORE_CAPACITY_RECEIPT_FRAME_MARKER,
+            if root {
+                "RESTORE_RECEIPT_FRAME_INVALID"
+            } else {
+                "RESTORE_RECEIPT_PEER_DENIED"
+            },
+        ),
+        (
+            protocol::RESTORE_CAPACITY_RESERVE_INSPECTION_FRAME_MARKER,
+            if root {
+                "RESTORE_INSPECTION_FRAME_INVALID"
+            } else {
+                "RESTORE_INSPECTION_PEER_DENIED"
+            },
+        ),
     ] {
         let resp = broker_exchange(&svc, &[marker]).expect("denial written");
         assert_eq!(resp["outcome"], "denied", "marker {marker:#04x}");
-        assert_eq!(
-            resp["evidence"]["message"],
-            format!(
-                "BROKER_AUTHORITY_DENIED: {}",
-                protocol::UNSUPPORTED_IN_THIS_SLICE
-            ),
-            "marker {marker:#04x}"
-        );
+        assert_eq!(resp["evidence"]["message"], reason, "marker {marker:#04x}");
     }
 }
 

@@ -13,11 +13,12 @@
 //! `/var/lib/central-protected/v1/instances/<id>/protected` chain)
 //! → `NewService` → `LISTEN_FDS` → `Harden()` → `Serve` on fd 3.
 //!
-//! What the port does not carry is upstream's `RoleRoots`/digest
-//! fields: the Rust [`Service`] owns no capacity-role consumer yet —
-//! they are validated configuration, but only `instance_id` escapes
-//! the composition struct (documented divergence; the fields join
-//! when the R6 capacity gate lands).
+//! The composition carries upstream's `RoleRoots` — derived by
+//! `infra::capacity_roles`, never read from the config — and threads
+//! it into the service (`NewServiceWithRoleRoots`) so the restore
+//! capacity gate's precondition 4 can reach each device's reserve
+//! object. Upstream's digest fields stay unported: no consumer exists
+//! for them yet.
 
 use std::io::Write;
 use std::os::fd::AsFd;
@@ -47,10 +48,10 @@ const INSTANCE_UNAVAILABLE: &str = "production instance authority unavailable";
 const BROKER_UNAVAILABLE: &str = "production broker authority unavailable";
 
 /// `productionInstanceComposition` — the fields the broker daemon
-/// consumes. Upstream carries the full config-bound topology
-/// snapshot; the port carries only what `NewService` needs (the
-/// validated instance id) — the capacity-role roots and policy
-/// digests are the R6 capacity gate's composition.
+/// and the helper's restore-capacity sweep consume. Upstream carries
+/// the full config-bound topology snapshot; the port carries the
+/// validated instance id, the state/dependency roots, and the derived
+/// capacity-role roots — the policy digests remain without a consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionInstanceComposition {
     /// The instance's validated identity — the directory name,
@@ -62,6 +63,13 @@ pub struct ProductionInstanceComposition {
     /// `<authoritative_state_root>/dependencies` — upstream's
     /// `DependencyRoot`, where the active dependency receipt lives.
     pub dependency_root: String,
+    /// The host directories backing the four capacity-reserve roles —
+    /// upstream `productionInstanceComposition.RoleRoots`. Derived,
+    /// never accepted: `infra::capacity_roles::role_roots` is the same
+    /// derivation the Compose mount renderer uses, so the helper and
+    /// the broker daemon cannot disagree about where an instance's
+    /// payload directories live.
+    pub role_roots: central_backup::backup::capacity::RoleRoots,
 }
 
 /// `filepath.IsAbs(path) && filepath.Clean(path) == path` — absolute
@@ -195,10 +203,13 @@ pub fn load_production_instance_composition_for_owner(
     {
         return Err(INSTANCE_UNAVAILABLE);
     }
+    let role_roots =
+        crate::infra::capacity_roles::role_roots(&instance_id).map_err(|_| INSTANCE_UNAVAILABLE)?;
     Ok(ProductionInstanceComposition {
         instance_id,
         authoritative_state_root: state_root.clone(),
         dependency_root: format!("{state_root}/dependencies"),
+        role_roots,
     })
 }
 
@@ -316,13 +327,17 @@ pub fn run_broker_daemon_at(
             return 6;
         }
     };
-    let svc = match Service::new(root_path, CENTRAL_RUNTIME_UID) {
+    let mut svc = match Service::new(root_path, CENTRAL_RUNTIME_UID) {
         Ok(s) => s,
         Err(e) => {
             let _ = writeln!(stderr, "broker: new service: {}", e.message());
             return 6;
         }
     };
+    // `NewServiceWithRoleRoots` — the composition's `role_roots` is
+    // threaded into the service here so that the capacity gate's
+    // precondition 4 can reach each device's reserve object.
+    svc.set_role_roots(composition.role_roots);
     // Upstream checks LISTEN_FDS after the service is built (the
     // composition resolution must precede hardening — see
     // SC-DEF-07's comment upstream carried in modes.rs).
@@ -800,6 +815,7 @@ mod tests {
             instance_id: id.clone(),
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
+            role_roots: Default::default(),
         };
         // Missing root.
         let err =

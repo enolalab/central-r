@@ -108,8 +108,9 @@ fn helper_matrix_denies_unregistered_verbs_exact() {
 }
 
 /// Every registered-but-unimplemented verb on the operator arm defers
-/// with the same reason — upstream's B–E command surface stays closed
-/// this slice.
+/// with the same reason. The seven maintenance verbs Task 7 ported
+/// (`backup-create` … `restore-abandon`) are implemented now — they
+/// answer with their own refusal codes and are asserted elsewhere.
 #[test]
 fn helper_matrix_defers_unimplemented_operator_verbs_exact() {
     let server = operator_server();
@@ -118,13 +119,6 @@ fn helper_matrix_defers_unimplemented_operator_verbs_exact() {
         verb::PREPARE,
         verb::SECURITY_UPDATE,
         verb::TRUST_INSTALL,
-        verb::BACKUP_CREATE,
-        verb::BACKUP_VERIFY,
-        verb::BACKUP_STATUS,
-        verb::RESTORE_VERIFY,
-        verb::RESTORE_APPLY,
-        verb::RESTORE_RESUME,
-        verb::RESTORE_ABANDON,
         verb::BACKUP_EXPORT,
         verb::BACKUP_IMPORT,
         verb::BACKUP_DELETE,
