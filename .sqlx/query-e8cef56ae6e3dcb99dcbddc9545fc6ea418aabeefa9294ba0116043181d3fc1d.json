@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pg_backend_pid() AS \"pid!\",\n                            inet_client_port() AS \"port!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pid!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "port!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "e8cef56ae6e3dcb99dcbddc9545fc6ea418aabeefa9294ba0116043181d3fc1d"
+}

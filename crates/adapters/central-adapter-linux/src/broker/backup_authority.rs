@@ -105,38 +105,38 @@ fn backup_success<T: Serialize>(operation_id: &str, result: &T) -> BrokerRespons
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupWorkerIdentityRPCRequest {
-    launch_evidence_id: Uuid,
+pub(crate) struct BackupWorkerIdentityRPCRequest {
+    pub(crate) launch_evidence_id: Uuid,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupWorkerOperationRPCRequest {
-    launch_evidence_id: Uuid,
-    operation: BackupOperationWire,
+pub(crate) struct BackupWorkerOperationRPCRequest {
+    pub(crate) launch_evidence_id: Uuid,
+    pub(crate) operation: BackupOperationWire,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupWorkerThroughputRPCRequest {
-    launch_evidence_id: Uuid,
-    operation: BackupOperationWire,
-    accepted_facts: BackupAcceptedFactsWire,
+pub(crate) struct BackupWorkerThroughputRPCRequest {
+    pub(crate) launch_evidence_id: Uuid,
+    pub(crate) operation: BackupOperationWire,
+    pub(crate) accepted_facts: BackupAcceptedFactsWire,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupWorkerCASRPCRequest {
-    launch_evidence_id: Uuid,
-    expected: BackupOperationWire,
-    next: BackupOperationWire,
+pub(crate) struct BackupWorkerCASRPCRequest {
+    pub(crate) launch_evidence_id: Uuid,
+    pub(crate) expected: BackupOperationWire,
+    pub(crate) next: BackupOperationWire,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupSealRPCRequest {
-    launch_evidence_id: Uuid,
-    proposal: BackupSealProposalWire,
+pub(crate) struct BackupSealRPCRequest {
+    pub(crate) launch_evidence_id: Uuid,
+    pub(crate) proposal: BackupSealProposalWire,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -215,17 +215,17 @@ struct RecoveryMinioHandoffRequestWire {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupThroughputWorkerIdentityRequest {
-    launch_evidence_id: Uuid,
+pub(crate) struct BackupThroughputWorkerIdentityRequest {
+    pub(crate) launch_evidence_id: Uuid,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupThroughputWorkerStageRequest {
-    launch_evidence_id: Uuid,
-    evidence: ThroughputEvidenceWire,
+pub(crate) struct BackupThroughputWorkerStageRequest {
+    pub(crate) launch_evidence_id: Uuid,
+    pub(crate) evidence: ThroughputEvidenceWire,
     #[serde(with = "wire::rfc3339")]
-    staged_at: OffsetDateTime,
+    pub(crate) staged_at: OffsetDateTime,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,9 +237,9 @@ struct BackupThroughputFixtureLoadedRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackupThroughputWorkerTargetRequest {
-    launch_evidence_id: Uuid,
-    attestation: BackupThroughputTargetLockAttestation,
+pub(crate) struct BackupThroughputWorkerTargetRequest {
+    pub(crate) launch_evidence_id: Uuid,
+    pub(crate) attestation: BackupThroughputTargetLockAttestation,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -317,10 +317,10 @@ fn is_false(v: &bool) -> bool {
 }
 
 #[derive(Serialize, Deserialize)]
-struct BackupLaunchAuthorityWire {
-    launch_evidence_id: Uuid,
-    operation_id: Uuid,
-    backup_id: Uuid,
+pub(crate) struct BackupLaunchAuthorityWire {
+    pub(crate) launch_evidence_id: Uuid,
+    pub(crate) operation_id: Uuid,
+    pub(crate) backup_id: Uuid,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -331,9 +331,9 @@ struct BackupStatusResultWire {
     reason: String,
 }
 
-#[derive(Serialize)]
-struct PayloadEpochResult {
-    payload_epoch_id: Uuid,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PayloadEpochResult {
+    pub(crate) payload_epoch_id: Uuid,
 }
 
 /// `BackupThroughputAttemptStatus` — the root reconciliation view.

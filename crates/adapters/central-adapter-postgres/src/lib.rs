@@ -37,7 +37,12 @@ pub mod runview;
 pub mod scheduler;
 pub mod serve_support;
 pub mod session;
-mod store_support;
+/// `BlockingConn` is `pub` because the backup/restore worker
+/// composition shares one dedicated `central_runtime` session across
+/// the exclusion lease, accepted-facts, census, and ready-artifact
+/// readers — upstream's single `connection` threaded through every
+/// C01 constructor.
+pub mod store_support;
 pub mod task;
 pub mod workflow;
 pub mod workspace;

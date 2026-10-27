@@ -161,8 +161,11 @@ pub struct BackupThroughputLaunchAuthority {
     pub deadline: OffsetDateTime,
 }
 
-/// `BackupThroughputWorkerContext`.
-#[derive(Debug, Clone, Serialize)]
+/// `BackupThroughputWorkerContext`. `Deserialize` is the worker-side
+/// read half (`BackupThroughputWorkerAuthority.WorkerContext`) —
+/// `default` covers every field the omitempty rules may drop, exactly
+/// like Go's zero-value decode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupThroughputWorkerContext {
     pub launch_evidence_id: Uuid,
     pub operation_id: Uuid,
@@ -177,8 +180,10 @@ pub struct BackupThroughputWorkerContext {
     /// `time.Duration` `,omitempty` — nanoseconds; omitted when zero.
     #[serde(
         rename = "fixture_load_elapsed",
+        default,
         skip_serializing_if = "duration_is_zero",
-        serialize_with = "ser_duration_ns"
+        serialize_with = "ser_duration_ns",
+        deserialize_with = "de_duration_ns"
     )]
     pub fixture_load_elapsed: time::Duration,
     #[serde(default, skip_serializing_if = "String::is_empty")]

@@ -125,6 +125,36 @@ pub(super) fn validate_sealed_passfile<Fd: AsFd>(fd: &Fd) -> Result<(), Failure>
     Ok(())
 }
 
+/// `io.ReadAll(io.LimitReader(passfile, max+1))` plus the NUL refusal —
+/// the one-shot bounded read of a sealed credential descriptor for the
+/// runtime-connection parse upstream performs inside
+/// `openRuntimeConnectionFromSealedPassfile`. The read starts at the
+/// descriptor's current offset exactly like upstream's `*os.File`;
+/// callers own [`zeroize::Zeroize`]-style wiping of the returned bytes.
+///
+/// # Errors
+/// `backup_pg_tool_unavailable` on any seal/shape violation, a read
+/// failure, an empty value, a value over 64 KiB, or a NUL byte.
+pub fn read_sealed_passfile_value<Fd: AsFd>(fd: &Fd) -> Result<Vec<u8>, Failure> {
+    validate_sealed_passfile(fd)?;
+    let mut value = Vec::with_capacity(4096);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = rustix::io::read(fd, &mut buf).map_err(|_| pg_tool_unavailable())?;
+        if n == 0 {
+            break;
+        }
+        value.extend_from_slice(&buf[..n]);
+        if u64::try_from(value.len()).unwrap_or(u64::MAX) > MAXIMUM_PASSFILE_BYTES {
+            return Err(pg_tool_unavailable());
+        }
+    }
+    if value.is_empty() || value.contains(&0) {
+        return Err(pg_tool_unavailable());
+    }
+    Ok(value)
+}
+
 /// The one redacted process-boundary failure. Callers may classify on
 /// this stable code only — never on stderr or a locator.
 fn pg_tool_unavailable() -> Failure {

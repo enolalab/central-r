@@ -1,23 +1,26 @@
 //! `postgres_target_exclusion.go` — the session-scoped PostgreSQL
-//! advisory-lock fences. Both excluders own one **dedicated**
+//! advisory-lock fences. Both excluders share one **dedicated**
 //! `PgConnection` through [`BlockingConn`]: a pool would let a later
 //! query run on another session and silently lose the exclusion. The
 //! lock pair is always `SERVE_TARGET_EXCLUSION_LOCK_KEY` plus the
 //! SHA-256-derived target key — two recovery attempts for the same
 //! database contend on one fence.
 //!
-//! Known design gap (carried, not weakened):
-//! [`central_backup::port::BackupTargetLockRetainer::retain_for_post_reap`]
-//! upstream hijacks the pgx connection's raw socket and hands a
-//! duplicate to the native monitor over SCM_RIGHTS. `sqlx::PgConnection`
-//! exposes no socket descriptor, so the Rust retainer fails closed —
-//! the handoff boundary remains for T7/T9 composition work.
+//! Retention note: upstream `RetainForPostReap` hijacks the pgx
+//! connection's raw socket and hands a duplicate to the native monitor
+//! over SCM_RIGHTS. `sqlx::PgConnection` keeps its stream private, so
+//! the Rust split is the honest equivalent: the lease records
+//! `inet_client_port()` at acquire time and the adapter-linux
+//! `LocalPostgresSocketRetainer` resolves the exact session descriptor
+//! by `/proc/self/fd` scan, then `F_DUPFD_CLOEXEC`s it into the same
+//! callback shape. The lease's [`BackupTargetExclusion::mark_retained`]
+//! mirrors upstream's `e.retained = true` — after it the worker-side
+//! lease refuses every further operation.
 
 use central_backup::backup::operation::BACKUP_TARGET_LOCK_PROTOCOL;
 use central_backup::domain::TargetIdentity;
 use central_backup::port::{
-    BackupTargetExcluder, BackupTargetExclusion, BackupTargetLockRetainer, RestoreTargetExcluder,
-    RestoreTargetExclusion,
+    BackupTargetExcluder, BackupTargetExclusion, RestoreTargetExcluder, RestoreTargetExclusion,
 };
 use central_backup::recovery::operation::{RestoreOperation, SERVE_TARGET_EXCLUSION_LOCK_KEY};
 use central_foundation::failure::Failure;
@@ -237,13 +240,14 @@ pub struct PostgresBackupTargetExcluder {
     conn: Arc<BlockingConn>,
 }
 
-/// `NewPostgresBackupTargetExcluder`.
+/// `NewPostgresBackupTargetExcluder` — binds the shared dedicated
+/// session. The same `Arc<BlockingConn>` feeds the accepted-facts,
+/// census, and ready-artifact readers, mirroring upstream's single
+/// `connection` threaded through every C01 constructor.
 pub fn new_postgres_backup_target_excluder(
-    conn: PgConnection,
+    conn: Arc<BlockingConn>,
 ) -> Result<PostgresBackupTargetExcluder, Failure> {
-    Ok(PostgresBackupTargetExcluder {
-        conn: Arc::new(BlockingConn::new(conn)?),
-    })
+    Ok(PostgresBackupTargetExcluder { conn })
 }
 
 impl BackupTargetExcluder for PostgresBackupTargetExcluder {
@@ -253,7 +257,7 @@ impl BackupTargetExcluder for PostgresBackupTargetExcluder {
     fn acquire_backup_target_exclusion(
         &self,
         target: &TargetIdentity,
-    ) -> Result<Box<dyn BackupTargetExclusion>, Failure> {
+    ) -> Result<std::sync::Arc<dyn BackupTargetExclusion>, Failure> {
         if !target.is_valid() {
             return Err(backup_target_exclusion_unavailable());
         }
@@ -289,21 +293,26 @@ impl BackupTargetExcluder for PostgresBackupTargetExcluder {
             }
             acquired.push(key);
         }
-        let backend_pid = self
+        let (backend_pid, client_port) = self
             .conn
             .run(|c| {
                 Box::pin(async move {
-                    sqlx::query_scalar!(r#"SELECT pg_backend_pid() AS "pid!""#)
-                        .fetch_one(c)
-                        .await
-                        .map_err(|_| backup_target_exclusion_unavailable())
+                    sqlx::query!(
+                        r#"SELECT pg_backend_pid() AS "pid!",
+                            inet_client_port() AS "port!""#
+                    )
+                    .fetch_one(c)
+                    .await
+                    .map_err(|_| backup_target_exclusion_unavailable())
+                    .map(|row| (row.pid, row.port))
                 })
             })
             .map_err(|_| {
                 release(&self.conn, &acquired);
                 backup_target_exclusion_unavailable()
             })?;
-        if backend_pid <= 0 {
+        let client_port = u16::try_from(client_port).unwrap_or(0);
+        if backend_pid <= 0 || client_port == 0 {
             release(&self.conn, &acquired);
             return Err(backup_target_exclusion_unavailable());
         }
@@ -318,23 +327,25 @@ impl BackupTargetExcluder for PostgresBackupTargetExcluder {
             backend_pid
         );
         let digest = Sha256::digest(proof_payload.as_bytes());
-        Ok(Box::new(PostgresBackupExclusion {
+        Ok(std::sync::Arc::new(PostgresBackupExclusion {
             conn: self.conn.clone(),
             keys: acquired,
             proof: format!("sha256:{}", super::hex_encode(&digest)),
+            client_port,
             state: Mutex::new(ExclusionState::Held),
         }))
     }
 }
 
-/// The lease lifecycle: held or released. Upstream also has a
-/// `retained` state set inside `RetainForPostReap` once the socket is
-/// hijacked; the sqlx retainer can never reach it (see
-/// [`BackupTargetLockRetainer::retain_for_post_reap`] below).
+/// The lease lifecycle — held, released, or `Retained` (upstream's
+/// `e.retained = true`, set when the session socket is handed to the
+/// monitor). `Retained` refuses every further operation exactly like
+/// upstream's `released || e.retained` guard.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExclusionState {
     Held,
     Released,
+    Retained,
 }
 
 /// `postgresBackupTargetExclusion`.
@@ -342,6 +353,9 @@ struct PostgresBackupExclusion {
     conn: Arc<BlockingConn>,
     keys: Vec<i64>,
     proof: String,
+    /// `inet_client_port()` recorded at acquire — the retainer's
+    /// socket-identity hint (see the module's retention note).
+    client_port: u16,
     state: Mutex<ExclusionState>,
 }
 
@@ -400,22 +414,25 @@ impl BackupTargetExclusion for PostgresBackupExclusion {
     fn proof(&self) -> String {
         self.proof.clone()
     }
-}
 
-impl BackupTargetLockRetainer for PostgresBackupExclusion {
-    /// `RetainForPostReap` — **design gap, carried fail-closed**.
-    /// Upstream hijacks the pgx connection's raw TCP socket and hands
-    /// a duplicate to the native monitor over SCM_RIGHTS.
-    /// `sqlx::PgConnection` exposes no socket descriptor (sqlx owns
-    /// the stream end to end), so no honest implementation exists
-    /// over this driver — refusing keeps the composition closed
-    /// rather than faking a handoff. Tracked under the remaining
-    /// T7/T9 composition work.
-    fn retain_for_post_reap(
-        &self,
-        _callback: &mut dyn FnMut(std::os::fd::RawFd, [u8; 32]) -> Result<(), Failure>,
-    ) -> Result<(), Failure> {
-        Err(backup_target_exclusion_unavailable())
+    /// The session-local port recorded at acquire — the honest
+    /// replacement for upstream's `Hijack` socket reach: the
+    /// OS-boundary retainer resolves the descriptor itself.
+    fn client_port(&self) -> Option<u16> {
+        (self.state() == ExclusionState::Held).then_some(self.client_port)
+    }
+
+    /// `e.retained = true` — the one-way transition. The retainer
+    /// marks the lease before the descriptor handoff so a failed
+    /// handoff cannot leave the session reusable, exactly like
+    /// upstream's post-`Hijack` unusable pgx connection.
+    fn mark_retained(&self) -> Result<(), Failure> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if *state != ExclusionState::Held {
+            return Err(backup_target_exclusion_unavailable());
+        }
+        *state = ExclusionState::Retained;
+        Ok(())
     }
 }
 
@@ -508,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn backup_exclusion_excludes_releases_and_retains_fail_closed() {
+    fn backup_exclusion_excludes_releases_and_retains_one_way() {
         let _gate = EXCLUSION_GATE.lock().unwrap();
         let Some(url) = test_pg_url() else {
             eprintln!("CENTRAL_TEST_PG_URL unset; skipping integration test");
@@ -532,23 +549,29 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(busy.code(), "backup_target_busy");
-        // The post-reap handoff fails closed over sqlx (documented
-        // gap) — constructed directly here since the retainer impl
-        // lives on the concrete exclusion type.
-        let direct = PostgresBackupExclusion {
-            conn: Arc::new(blocking_conn(&url)),
-            keys: vec![1, 2],
-            proof: "sha256:00".into(),
-            state: Mutex::new(ExclusionState::Held),
-        };
-        assert!(
-            direct
-                .retain_for_post_reap(&mut |_fd, _proof| Ok(()))
-                .is_err()
-        );
-        lease.release().unwrap();
+        // The recorded `inet_client_port()` hints the real TCP session
+        // to the OS-boundary retainer; `mark_retained` is the one-way
+        // transition after which the lease refuses everything.
+        assert!(lease.client_port().is_some());
+        lease.mark_retained().unwrap();
         assert!(lease.assert_held().is_err());
-        // The competitor now owns the fence.
+        assert!(lease.release().is_err());
+        assert!(lease.client_port().is_none());
+        assert!(lease.mark_retained().is_err());
+        // Retention keeps the session's fence held — the monitor owns
+        // the release decision, so a competitor still sees busy.
+        assert_eq!(
+            competitor
+                .acquire_backup_target_exclusion(&target)
+                .err()
+                .unwrap()
+                .code(),
+            "backup_target_busy"
+        );
+        // Dropping the last handle to the locked session releases the
+        // advisory keys; the competitor then owns the fence.
+        drop(lease);
+        drop(owner);
         let second = competitor.acquire_backup_target_exclusion(&target).unwrap();
         second.release().unwrap();
     }

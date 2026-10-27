@@ -351,6 +351,53 @@ pub(crate) fn socket_activation_fd(index: u32) -> Result<std::os::fd::OwnedFd, E
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
 }
 
+/// Adopt a fixed inherited descriptor: prove it open (`F_GETFD`), pin
+/// `FD_CLOEXEC` on it (`F_SETFD`), and take ownership. The backup
+/// worker's FD5 monitor channel is the call site — upstream's
+/// `prepareTargetLockHandoff` does the same get/set/own sequence via
+/// `os.NewFile`. The caller's contract is upstream's: `fd` names a
+/// live descriptor this process alone owns (an inherited fixed slot),
+/// and no other Rust handle may use the number afterwards.
+///
+/// # Errors
+/// `EBADF` when the fd is not open; the `F_SETFD` `errno` otherwise.
+pub(crate) fn adopt_inherited_fd(fd: std::os::fd::RawFd) -> Result<std::os::fd::OwnedFd, Errno> {
+    if fd < 0 {
+        return Err(Errno::BADF);
+    }
+    // SAFETY: `fd` is a number, not a pointer — `fcntl` cannot touch
+    // user memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: as above; `flags | FD_CLOEXEC` is a valid flag word.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(last_errno());
+    }
+    // SAFETY: `fd` was just proven open and is owned solely by this
+    // process under the caller's fixed-slot contract — the `OwnedFd`
+    // assumes that ownership exactly once.
+    use std::os::fd::FromRawFd as _;
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// `BorrowedFd::borrow_raw` for a descriptor of the calling process.
+/// The audit contract callers must meet — and document at the call
+/// site — is that `fd` names a descriptor this process holds open
+/// *right now* (a `/proc/self/fd` listing entry or a fixed inherited
+/// slot the composition still owns). `BorrowedFd` has no `Drop`, so
+/// the borrow can never close or consume; the `'static` lifetime the
+/// constructor demands is discharged by the contract's "use
+/// transiently" rule, matching this module's documented-contract style
+/// (`getpwnam`, `install_signal_handler`).
+pub(crate) fn borrow_process_fd(fd: std::os::fd::RawFd) -> std::os::fd::BorrowedFd<'static> {
+    // SAFETY: caller proves `fd` is a live descriptor of this process;
+    // `BorrowedFd` cannot outlive the process it names in any use this
+    // module permits.
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+}
+
 /// Hand-written Linux-PAM FFI (`pam`), R5 task 5 / decision D1.
 ///
 /// This is a byte-exact port of the upstream cgo shim

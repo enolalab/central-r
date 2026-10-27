@@ -546,6 +546,49 @@ pub trait BackupTargetExclusion: Send + Sync {
     /// `Proof` — the accepted-point lock proof bound into the
     /// operation's accepted facts (a fingerprint, never a secret).
     fn proof(&self) -> String;
+    /// The local TCP port of the session that owns the lease — the
+    /// retainer's socket-identity hint. Upstream reaches the same
+    /// socket through `pgx`'s `Hijack`; sqlx keeps its stream private,
+    /// so the lease instead records `inet_client_port()` at acquire
+    /// time and the OS-boundary retainer resolves the descriptor by
+    /// `/proc/self/fd` scan. `None` means the implementation cannot
+    /// name its session endpoint (a non-socket lease), which makes
+    /// retention unavailable by construction.
+    fn client_port(&self) -> Option<u16>;
+    /// The `retained` lifecycle transition — upstream's
+    /// `e.retained = true` set inside `RetainForPostReap` once the
+    /// session socket has been hijacked. After this call succeeds
+    /// `assert_held`/`release`/a second retain must all refuse: the
+    /// monitor owns the session's continuation and the worker-side
+    /// lease is intentionally unusable.
+    ///
+    /// # Errors
+    /// Implementation-defined [`Failure`] when the lease is not in the
+    /// held state.
+    fn mark_retained(&self) -> Result<(), Failure>;
+}
+
+/// Shared-lease forwarding: the environment takes ownership while the
+/// post-run retainer still needs the same session lock, so the
+/// composition holds the lease as an `Arc` and hands a clone into the
+/// boxed environment capability — the same shared pointer upstream's
+/// composition passes to both.
+impl BackupTargetExclusion for std::sync::Arc<dyn BackupTargetExclusion> {
+    fn assert_held(&self) -> Result<(), Failure> {
+        (**self).assert_held()
+    }
+    fn release(&self) -> Result<(), Failure> {
+        (**self).release()
+    }
+    fn proof(&self) -> String {
+        (**self).proof()
+    }
+    fn client_port(&self) -> Option<u16> {
+        (**self).client_port()
+    }
+    fn mark_retained(&self) -> Result<(), Failure> {
+        (**self).mark_retained()
+    }
 }
 
 /// `port.BackupTargetLockRetainer` — the one-way final handoff of the
@@ -554,22 +597,31 @@ pub trait BackupTargetExclusion: Send + Sync {
 /// trusted native monitor before returning success. After success the
 /// lease is intentionally unusable in this process; the monitor
 /// becomes its sole owner through terminal seal.
+/// `RetainForPostReap`'s transfer callback — receives a borrow of the
+/// fresh `F_DUPFD_CLOEXEC` duplicate (live only for the call) and the
+/// raw lock proof. The descriptor borrow is higher-ranked (`for<'fd>`)
+/// so each call binds its own short borrow; `'o` bounds only the
+/// trait-object storage.
+pub type TargetLockTransfer<'o> =
+    dyn for<'fd> FnMut(std::os::fd::BorrowedFd<'fd>, [u8; 32]) -> Result<(), Failure> + 'o;
+
 pub trait BackupTargetLockRetainer: Send + Sync {
     /// `RetainForPostReap`.
-    fn retain_for_post_reap(
-        &self,
-        callback: &mut dyn FnMut(std::os::fd::RawFd, [u8; 32]) -> Result<(), Failure>,
-    ) -> Result<(), Failure>;
+    fn retain_for_post_reap(&self, callback: &mut TargetLockTransfer<'_>) -> Result<(), Failure>;
 }
 
 /// `port.BackupTargetExcluder` — acquires the backup-time
 /// target-exclusive fence for an already-validated target identity.
+/// The lease returns as `Arc` because the worker composition shares
+/// the exact acquired session between the environment probe and the
+/// post-reap retainer — upstream threads the same `lease` value
+/// through both.
 pub trait BackupTargetExcluder: Send + Sync {
     /// `AcquireBackupTargetExclusion`.
     fn acquire_backup_target_exclusion(
         &self,
         target: &TargetIdentity,
-    ) -> Result<Box<dyn BackupTargetExclusion>, Failure>;
+    ) -> Result<std::sync::Arc<dyn BackupTargetExclusion>, Failure>;
 }
 
 /// `port.BackupDatabaseCensusReader` — reads the live target's

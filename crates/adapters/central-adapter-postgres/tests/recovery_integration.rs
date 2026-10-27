@@ -35,6 +35,7 @@ use central_adapter_postgres::recovery::{
     ImportTableRef, ImportTargetInspector, PruneBatch, PruneCandidate, PruneJournal, PruneLogStore,
     PruneRowState, RecoveryAuditStore,
 };
+use central_adapter_postgres::store_support::BlockingConn;
 use central_backup::backup::operation::BACKUP_DATABASE_SCHEMA_VERSION;
 use central_backup::port::{PostgresAuthorityReset, RestoreQuarantineStore};
 use central_backup::recovery::operation::{
@@ -1477,7 +1478,10 @@ fn readers_bind_the_fixed_central_database() {
 
     let payload_epoch = Arc::new(FixturePayloadEpoch(Uuid::now_v7()));
     let facts = AcceptedFactsReader::new(
-        rt.block_on(runtime_conn("central")).expect("runtime conn"),
+        Arc::new(
+            BlockingConn::new(rt.block_on(runtime_conn("central")).expect("runtime conn"))
+                .expect("facts session bridge"),
+        ),
         payload_epoch.clone(),
     )
     .expect("facts reader");
@@ -1486,9 +1490,11 @@ fn readers_bind_the_fixed_central_database() {
     assert!(!target.system_id.trim().is_empty());
     assert!(target.is_valid());
 
-    let census =
-        CapacityCensusReader::new(rt.block_on(runtime_conn("central")).expect("runtime conn"))
-            .expect("census reader");
+    let census = CapacityCensusReader::new(Arc::new(
+        BlockingConn::new(rt.block_on(runtime_conn("central")).expect("runtime conn"))
+            .expect("census session bridge"),
+    ))
+    .expect("census reader");
     let snapshot = census.read_backup_capacity().expect("census");
     assert!(snapshot.database_time > time::OffsetDateTime::UNIX_EPOCH);
     assert!(snapshot.database_bytes > 0);

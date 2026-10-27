@@ -29,6 +29,7 @@ pub const PRODUCTION_SOCKET_PATH: &str = "/run/central-broker/broker.sock";
 pub(crate) mod backup_authority;
 pub mod backup_launch;
 pub mod backup_throughput_launch;
+pub mod backup_worker_client;
 pub mod backup_worker_credential;
 pub mod bootstrap_session;
 pub mod daemon;

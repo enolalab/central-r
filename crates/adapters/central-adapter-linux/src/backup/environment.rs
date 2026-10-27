@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use central_backup::backup::capacity::{
     BackupContinuitySnapshot, CapacitySnapshot, DeviceCapacitySnapshot,
@@ -64,12 +64,12 @@ struct EnvironmentState {
 
 /// `BackupEnvironment` — see the module header.
 pub struct BackupEnvironment {
-    lock: Box<dyn BackupTargetExclusion>,
-    repository: Box<dyn BackupRepositoryInspector>,
-    database: Box<dyn BackupDatabaseCensusReader>,
-    authority: Box<dyn BackupAuthorityLease>,
-    throughput: Box<dyn BackupThroughputSource>,
-    facts: Box<dyn BackupAcceptedFactsBuilder>,
+    lock: Arc<dyn BackupTargetExclusion>,
+    repository: Arc<dyn BackupRepositoryInspector>,
+    database: Arc<dyn BackupDatabaseCensusReader>,
+    authority: Arc<dyn BackupAuthorityLease>,
+    throughput: Arc<dyn BackupThroughputSource>,
+    facts: Arc<dyn BackupAcceptedFactsBuilder>,
     state: Mutex<EnvironmentState>,
 }
 
@@ -78,12 +78,12 @@ pub struct BackupEnvironment {
 /// check.
 #[allow(clippy::too_many_arguments)]
 pub fn new_backup_environment(
-    lock: Option<Box<dyn BackupTargetExclusion>>,
-    repository: Option<Box<dyn BackupRepositoryInspector>>,
-    database: Option<Box<dyn BackupDatabaseCensusReader>>,
-    authority: Option<Box<dyn BackupAuthorityLease>>,
-    throughput: Option<Box<dyn BackupThroughputSource>>,
-    facts: Option<Box<dyn BackupAcceptedFactsBuilder>>,
+    lock: Option<Arc<dyn BackupTargetExclusion>>,
+    repository: Option<Arc<dyn BackupRepositoryInspector>>,
+    database: Option<Arc<dyn BackupDatabaseCensusReader>>,
+    authority: Option<Arc<dyn BackupAuthorityLease>>,
+    throughput: Option<Arc<dyn BackupThroughputSource>>,
+    facts: Option<Arc<dyn BackupAcceptedFactsBuilder>>,
 ) -> Result<BackupEnvironment, Failure> {
     let (
         Some(lock),
@@ -276,6 +276,12 @@ mod tests {
         fn proof(&self) -> String {
             PROOF.to_owned()
         }
+        fn client_port(&self) -> Option<u16> {
+            None
+        }
+        fn mark_retained(&self) -> Result<(), Failure> {
+            Err(Failure::unavailable("test_lock", "retention unsupported"))
+        }
     }
 
     struct FakeInspector {
@@ -418,23 +424,23 @@ mod tests {
         let lock_held = Arc::new(AtomicBool::new(true));
         let authority_held = Arc::new(AtomicBool::new(true));
         let environment = new_backup_environment(
-            Some(Box::new(FakeLock {
+            Some(Arc::new(FakeLock {
                 held: lock_held.clone(),
             })),
-            Some(Box::new(FakeInspector {
+            Some(Arc::new(FakeInspector {
                 bytes: repo_bytes.clone(),
                 sealed: 1,
                 binding_id,
                 device_id: "fs-abc".into(),
             })),
-            Some(Box::new(FakeDatabase)),
-            Some(Box::new(FakeAuthority {
+            Some(Arc::new(FakeDatabase)),
+            Some(Arc::new(FakeAuthority {
                 held: authority_held.clone(),
             })),
-            Some(Box::new(FakeThroughput {
+            Some(Arc::new(FakeThroughput {
                 evidence: evidence(),
             })),
-            Some(Box::new(FakeFacts)),
+            Some(Arc::new(FakeFacts)),
         )
         .unwrap();
         Harness {
@@ -483,14 +489,14 @@ mod tests {
         assert!(new_backup_environment(None, None, None, None, None, None).is_err());
         assert!(
             new_backup_environment(
-                Some(Box::new(FakeLock {
+                Some(Arc::new(FakeLock {
                     held: Arc::new(AtomicBool::new(true)),
                 })),
                 None,
                 None,
                 None,
                 None,
-                Some(Box::new(FakeFacts)),
+                Some(Arc::new(FakeFacts)),
             )
             .is_err()
         );

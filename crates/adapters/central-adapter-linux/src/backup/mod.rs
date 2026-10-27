@@ -29,6 +29,7 @@ mod repository_verifier;
 mod restore_admission;
 mod restore_capacity_source;
 mod restore_engine;
+mod target_retention;
 mod throughput_probe;
 
 pub use capacity::device_capacity_from_descriptor;
@@ -45,6 +46,7 @@ pub use pg_restore::{
     PgRestore, PgRestoreConfig, RestoreDumpSource, SealedRestorePassfileProvider,
 };
 pub use pgdump_throughput::{PgDumpThroughputProbe, ThroughputProbePassfileProvider};
+pub use pgtool::read_sealed_passfile_value;
 pub use repository::{
     Repository, VerificationEvidence, inspect_repository_descriptor, media_verification_walks,
     new_repository,
@@ -65,6 +67,7 @@ pub use restore_engine::{
     ComposedRestoreEngine, RestoreAuditProjection, RestoreAuthorityResetter, RestoreDatabaseRunner,
     RestoreInventoryVerifier,
 };
+pub use target_retention::{LocalPostgresSocketRetainer, TargetLockHandoff};
 pub use throughput_probe::{
     ThroughputProbeDumpSource, ThroughputProbeObjectSource, ThroughputProbeRepository,
     ThroughputProbeRunner, new_throughput_probe_runner,

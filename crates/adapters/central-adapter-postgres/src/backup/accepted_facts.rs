@@ -14,7 +14,6 @@ use central_backup::backup::operation::{
 };
 use central_backup::domain::TargetIdentity;
 use central_foundation::failure::Failure;
-use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::error::SqlxContext as _;
@@ -48,9 +47,11 @@ pub trait TrustedPayloadEpochSource: Send + Sync {
 }
 
 /// `AcceptedFactsReader` — one dedicated runtime session plus the
-/// protected payload-epoch seam.
+/// protected payload-epoch seam. The session is the shared
+/// `Arc<BlockingConn>` the whole C01 composition binds — upstream's
+/// single `connection`.
 pub struct AcceptedFactsReader {
-    conn: BlockingConn,
+    conn: Arc<BlockingConn>,
     payload_epochs: Arc<dyn TrustedPayloadEpochSource>,
 }
 
@@ -61,11 +62,11 @@ impl AcceptedFactsReader {
     /// `recovery_accepted_facts` when `payload_epochs` is absent or the
     /// bridge runtime cannot be built.
     pub fn new(
-        conn: PgConnection,
+        conn: Arc<BlockingConn>,
         payload_epochs: Arc<dyn TrustedPayloadEpochSource>,
     ) -> Result<Self, Failure> {
         Ok(Self {
-            conn: BlockingConn::new(conn)?,
+            conn,
             payload_epochs,
         })
     }
@@ -205,6 +206,26 @@ pub(crate) fn sha256_fingerprint(payload: &[u8]) -> String {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(payload);
     format!("sha256:{}", crate::backup::hex_encode(&digest))
+}
+
+impl central_backup::port::BackupAcceptedFactsBuilder for AcceptedFactsReader {
+    /// `BuildBackupAcceptedFacts` — the inherent trusted build above,
+    /// surfaced through the port for the environment composition.
+    fn build_backup_accepted_facts(
+        &self,
+        operation: &BackupOperation,
+        database_time: time::OffsetDateTime,
+        repository_binding_id: Uuid,
+        target_lock_proof: &str,
+    ) -> Result<BackupAcceptedFacts, Failure> {
+        Self::build_backup_accepted_facts(
+            self,
+            operation,
+            database_time,
+            repository_binding_id,
+            target_lock_proof,
+        )
+    }
 }
 
 #[cfg(test)]

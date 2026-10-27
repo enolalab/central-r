@@ -5,7 +5,7 @@
 //! so the admission census and the inventory it bounds are the same set.
 
 use central_foundation::failure::Failure;
-use sqlx::PgConnection;
+use std::sync::Arc;
 
 use crate::error::SqlxContext as _;
 use crate::store_support::BlockingConn;
@@ -22,33 +22,24 @@ fn capacity_census_unavailable() -> Failure {
 
 /// `CapacityCensus` is a single database-derived admission observation.
 /// It contains no object key, target locator, or credential — upstream
-/// `port.BackupDatabaseCensus`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BackupDatabaseCensus {
-    /// The one observation instant (`clock_timestamp()` on target).
-    pub database_time: time::OffsetDateTime,
-    /// `pg_database_size(current_database())`.
-    pub database_bytes: u64,
-    /// `SUM(size)` over the ready predicate.
-    pub object_bytes: u64,
-    /// `COUNT(*)` over the ready predicate.
-    pub record_count: u64,
-}
+/// `port.BackupDatabaseCensus` (the capability's own struct; re-exported
+/// here so this module stays the census seam).
+pub use central_backup::port::BackupDatabaseCensus;
 
-/// `CapacityCensusReader` — one dedicated runtime session.
+/// `CapacityCensusReader` — one dedicated runtime session, shared
+/// with the rest of the C01 composition through the same `Arc`.
 pub struct CapacityCensusReader {
-    conn: BlockingConn,
+    conn: Arc<BlockingConn>,
 }
 
 impl CapacityCensusReader {
     /// `NewCapacityCensusReader`.
     ///
     /// # Errors
-    /// `recovery_capacity_census` when the bridge runtime cannot be built.
-    pub fn new(conn: PgConnection) -> Result<Self, Failure> {
-        Ok(Self {
-            conn: BlockingConn::new(conn)?,
-        })
+    /// `recovery_capacity_census` never fires here — the constructor
+    /// is infallible over an already-bridged session.
+    pub fn new(conn: Arc<BlockingConn>) -> Result<Self, Failure> {
+        Ok(Self { conn })
     }
 
     /// `ReadBackupCapacity` — the `backupCapacityCensusSQL` observation:
@@ -89,5 +80,14 @@ impl CapacityCensusReader {
             record_count: u64::try_from(row.record_count)
                 .map_err(|_| capacity_census_unavailable())?,
         })
+    }
+}
+
+impl central_backup::port::BackupDatabaseCensusReader for CapacityCensusReader {
+    /// `ReadBackupCapacity` — the inherent census read above, surfaced
+    /// through the port so the worker composition hands the reader to
+    /// the environment as a trait object.
+    fn read_backup_capacity(&self) -> Result<BackupDatabaseCensus, Failure> {
+        Self::read_backup_capacity(self)
     }
 }

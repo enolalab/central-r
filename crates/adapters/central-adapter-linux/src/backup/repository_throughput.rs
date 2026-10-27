@@ -188,6 +188,28 @@ fn copy_bounded_probe_stream(
     Ok((total, digest.finalize().into()))
 }
 
+impl super::throughput_probe::ThroughputProbeRepository for Repository {
+    /// `MeasureDumpProbe` — the inherent bounded write+reread+checksum
+    /// above, surfaced through the probe-runner port so the kernel
+    /// composition hands the repository over as a trait object.
+    fn measure_dump_probe(
+        &self,
+        operation_id: Uuid,
+        source: &mut dyn Read,
+    ) -> Result<(u64, Duration), Failure> {
+        Self::measure_dump_probe(self, operation_id, source)
+    }
+
+    /// `MeasureObjectProbe` — as above.
+    fn measure_object_probe(
+        &self,
+        operation_id: Uuid,
+        source: &mut dyn Read,
+    ) -> Result<(u64, Duration), Failure> {
+        Self::measure_object_probe(self, operation_id, source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

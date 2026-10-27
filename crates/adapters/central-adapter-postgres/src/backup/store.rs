@@ -13,7 +13,6 @@ use central_backup::port::{
     ReadyArtifactSource as ReadyArtifactSourcePort,
 };
 use central_foundation::failure::Failure;
-use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::error::SqlxContext as _;
@@ -53,24 +52,23 @@ pub trait ReadyArtifactObjectReader: Send + Sync {
 /// `ReadyArtifactSource` implements
 /// [`central_backup::port::ReadyArtifactSource`].
 pub struct ReadyArtifactSource {
-    conn: BlockingConn,
+    conn: Arc<BlockingConn>,
     objects: Arc<dyn ReadyArtifactObjectReader>,
 }
 
 impl ReadyArtifactSource {
-    /// `NewReadyArtifactSource` — refuses a missing object seam.
+    /// `NewReadyArtifactSource` — refuses a missing object seam. The
+    /// session is the C01 composition's shared `Arc<BlockingConn>` —
+    /// upstream's single `connection`.
     ///
     /// # Errors
-    /// `recovery_ready_artifact_source` when the bridge runtime cannot
-    /// be built.
+    /// `recovery_ready_artifact_source` never fires here — the
+    /// constructor is infallible over an already-bridged session.
     pub fn new(
-        conn: PgConnection,
+        conn: Arc<BlockingConn>,
         objects: Arc<dyn ReadyArtifactObjectReader>,
     ) -> Result<Self, Failure> {
-        Ok(Self {
-            conn: BlockingConn::new(conn)?,
-            objects,
-        })
+        Ok(Self { conn, objects })
     }
 }
 

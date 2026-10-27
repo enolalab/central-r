@@ -96,7 +96,7 @@ pub(crate) async fn begin_tx(pool: &PgPool) -> Result<Transaction<'static, Postg
 /// tokio runtime — `Runtime::block_on` panics inside one. The backup and
 /// restore workers drive the sync coordinators on plain OS threads, so
 /// that is the intended call context.
-pub(crate) struct BlockingConn {
+pub struct BlockingConn {
     conn: std::sync::Mutex<PgConnection>,
     runtime: tokio::runtime::Runtime,
 }
@@ -107,7 +107,7 @@ impl BlockingConn {
     ///
     /// # Errors
     /// `internal` when the runtime cannot be built.
-    pub(crate) fn new(conn: PgConnection) -> Result<Self, Failure> {
+    pub fn new(conn: PgConnection) -> Result<Self, Failure> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -137,8 +137,7 @@ impl BlockingConn {
     /// # Errors
     /// `internal` when the runtime cannot be built; whatever `connect`
     /// returns otherwise.
-    #[cfg(test)]
-    pub(crate) fn new_connecting<F, Fut>(connect: F) -> Result<Self, Failure>
+    pub fn new_connecting<F, Fut>(connect: F) -> Result<Self, Failure>
     where
         F: FnOnce() -> Fut,
         Fut: core::future::Future<Output = Result<PgConnection, Failure>>,

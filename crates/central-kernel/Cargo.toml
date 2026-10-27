@@ -61,6 +61,9 @@ serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+# `backup_compose` — `zeroize::Zeroizing` wipes the bounded passfile
+# bytes the instant the runtime connection is built.
+zeroize.workspace = true
 tracing.workspace = true
 # `migrate_compose` — operation/launch-evidence identities are
 # `uuid::Uuid` (the migration operator's own wire vocabulary).
