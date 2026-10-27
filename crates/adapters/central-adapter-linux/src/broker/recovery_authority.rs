@@ -30,7 +30,7 @@
 use central_backup::recovery::operation::{
     RecoveryBootstrapActivation, RecoveryBootstrapDraft, RecoveryBootstrapRegistration,
     RestoreAbandonAuthorization, RestoreApplyAuthorization, RestoreCheckpoint, RestoreOperation,
-    RestorePhase,
+    RestorePhase, RestoreTicket,
 };
 use central_foundation::failure::Failure;
 use central_infra::authority::{BrokerRequest, BrokerResponse};
@@ -1400,5 +1400,170 @@ impl central_backup::port::BrokerAuthorityReset for Service {
         registration: &RecoveryBootstrapRegistration,
     ) -> Result<RecoveryBootstrapActivation, Failure> {
         Service::activate_recovery_bootstrap(self, operation, registration)
+    }
+}
+
+impl Service {
+    /// `(*Service).ReadIssuedRestoreTicketForOperation` — the complete
+    /// protected ticket the root restore engine must hand to
+    /// `begin_restore`. An in-process root read with no socket RPC:
+    /// the ticket carries nonce and HMAC material.
+    ///
+    /// # Errors
+    /// `recovery_journal` unavailable on any absent/tampered record —
+    /// an opaque identity selects a record, it never substitutes for
+    /// one.
+    pub fn read_issued_restore_ticket_for_operation(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<RestoreTicket, Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        if operation_id.is_nil() {
+            return Err(unavailable());
+        }
+        let ticket_id = journal
+            .resolve_issued_ticket_for_operation(operation_id, OffsetDateTime::now_utc())
+            .map_err(|_| unavailable())?;
+        self.read_issued_restore_ticket(ticket_id)
+    }
+
+    /// `(*Service).ReadIssuedRestoreTicket` — the whole ticket for an
+    /// exact still-issued ticket id. It exists only for the root
+    /// restore engine; the ticket carries nonce and HMAC material, so
+    /// this is deliberately an in-process root read with no socket
+    /// RPC and no operator-facing route.
+    ///
+    /// # Errors
+    /// `recovery_journal` unavailable when the record is missing,
+    /// consumed, or tampered.
+    pub fn read_issued_restore_ticket(&self, ticket_id: Uuid) -> Result<RestoreTicket, Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        if ticket_id.is_nil() {
+            return Err(unavailable());
+        }
+        let (ticket, state) = journal.read_ticket(ticket_id).map_err(|_| unavailable())?;
+        if state != "issued" || ticket.ticket_id != ticket_id {
+            return Err(unavailable());
+        }
+        Ok(ticket)
+    }
+
+    /// `(*Service).ReadIssuedRestoreApplyAuthorization` — the complete
+    /// protected authorization for an exact still-issued
+    /// authorization id. `begin`/`resume` compare the whole value, so
+    /// the root engine cannot proceed from an id alone; a consumed or
+    /// consuming record is never returned.
+    ///
+    /// # Errors
+    /// `recovery_journal` unavailable when the record is missing,
+    /// consumed, consuming, or tampered.
+    pub fn read_issued_restore_apply_authorization(
+        &self,
+        authorization_id: Uuid,
+    ) -> Result<RestoreApplyAuthorization, Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        if authorization_id.is_nil() {
+            return Err(unavailable());
+        }
+        let (authorization, state) = journal
+            .read_restore_apply_authorization(authorization_id)
+            .map_err(|_| unavailable())?;
+        if state != "issued" || authorization.authorization_id != authorization_id {
+            return Err(unavailable());
+        }
+        Ok(authorization)
+    }
+}
+
+impl central_backup::port::RestoreJournalStore for Service {
+    /// `port.RestoreJournal` — upstream composes the same in-process
+    /// `*broker.Service` as the engine's protected journal; every
+    /// method delegates to the recovery journal the service already
+    /// owns.
+    fn begin_restore(
+        &self,
+        ticket: &RestoreTicket,
+        authorization: &RestoreApplyAuthorization,
+        at: OffsetDateTime,
+    ) -> Result<RestoreOperation, Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        journal.begin_restore(ticket, authorization, at)
+    }
+
+    fn resume_restore(
+        &self,
+        operation_id: Uuid,
+        authorization: &RestoreApplyAuthorization,
+        at: OffsetDateTime,
+    ) -> Result<RestoreOperation, Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        journal.resume_restore(operation_id, authorization, at)
+    }
+
+    fn abandon_restore(
+        &self,
+        operation_id: Uuid,
+        authorization: &RestoreAbandonAuthorization,
+        at: OffsetDateTime,
+    ) -> Result<RestoreOperation, Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        journal.abandon_restore(operation_id, authorization, at)
+    }
+
+    fn read_restore(&self, operation_id: Uuid) -> Result<RestoreOperation, Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        journal.read_restore(operation_id)
+    }
+
+    fn compare_and_swap_restore(
+        &self,
+        expected: &RestoreOperation,
+        next: &RestoreOperation,
+    ) -> Result<(), Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        journal.compare_and_swap_restore(expected, next)
+    }
+}
+
+impl central_backup::port::BackupSealVerifier for Service {
+    /// `port.BackupSealVerifier` — the broker's protected seal
+    /// attestation, delegated to the recovery journal the service
+    /// already owns (upstream's `Seals: service` composition field).
+    fn verify_backup_seal(
+        &self,
+        backup_id: Uuid,
+        manifest_digest: [u8; 32],
+        seal_companion_digest: [u8; 32],
+        file_tree_digest: [u8; 32],
+        repository_manifest_digest: [u8; 32],
+        repository_revision: u64,
+    ) -> Result<(), Failure> {
+        let Some(journal) = &self.recovery_journal else {
+            return Err(unavailable());
+        };
+        journal.verify_backup_seal(
+            backup_id,
+            manifest_digest,
+            seal_companion_digest,
+            file_tree_digest,
+            repository_manifest_digest,
+            repository_revision,
+        )
     }
 }

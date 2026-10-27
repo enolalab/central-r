@@ -24,7 +24,7 @@ mod shape_spec;
 pub mod verify_shape;
 
 pub use baseline::BaselineInstaller;
-pub use grants::reapply_runtime_grants;
+pub use grants::{reapply_runtime_grants, recreate_recovery_bootstrap_registrations_table};
 pub use inspector::Inspector;
 pub use manifest::{
     B10_FORWARD_CORRECTION_CHECKSUM, B10_FORWARD_CORRECTION_VERSION, LATEST_VERSION, MIGRATIONS,

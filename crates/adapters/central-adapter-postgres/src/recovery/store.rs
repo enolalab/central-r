@@ -38,7 +38,7 @@ fn corrupt(message: &'static str) -> Failure {
 /// `project_restore_operation` inherent method is the audit-projection
 /// half the composed `RestoreEngine` delegates to.
 pub struct RecoveryAuditStore {
-    conn: BlockingConn,
+    conn: std::sync::Arc<BlockingConn>,
 }
 
 impl RecoveryAuditStore {
@@ -49,8 +49,18 @@ impl RecoveryAuditStore {
     /// `pg_adapter_error` when the bridge runtime cannot be built.
     pub fn new(conn: PgConnection) -> Result<Self, Failure> {
         Ok(Self {
-            conn: BlockingConn::new(conn)?,
+            conn: std::sync::Arc::new(BlockingConn::new(conn)?),
         })
+    }
+
+    /// `lazyMigrationAuditProjection`'s/`lazyMigrationAuthorityResetter`'s
+    /// shared-session constructor: the SC-DEF-62 composition holds the
+    /// C04 target exclusion on the same `central_migration` session every
+    /// projection and C05 reset writes through, so the kernel hands the
+    /// one lazily opened bridge to every per-call store it builds.
+    #[must_use]
+    pub fn from_blocking_conn(conn: std::sync::Arc<BlockingConn>) -> Self {
+        Self { conn }
     }
 
     /// `ProjectRestoreOperation` is idempotent for an exact protected

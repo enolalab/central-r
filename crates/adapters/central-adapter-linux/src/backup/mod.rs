@@ -43,7 +43,8 @@ pub use operator_state::{
 };
 pub use pg_dump::{PgDump, PgDumpConfig, PgDumpStream, SealedPassfileProvider};
 pub use pg_restore::{
-    PgRestore, PgRestoreConfig, RestoreDumpSource, SealedRestorePassfileProvider,
+    PINNED_PG_RESTORE_VERSION, PgRestore, PgRestoreConfig, RestoreDumpSource,
+    SealedRestorePassfileProvider,
 };
 pub use pgdump_throughput::{PgDumpThroughputProbe, ThroughputProbePassfileProvider};
 pub use pgtool::read_sealed_passfile_value;

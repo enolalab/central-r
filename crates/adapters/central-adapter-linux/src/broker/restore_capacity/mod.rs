@@ -27,7 +27,10 @@ pub(crate) mod gate;
 pub mod helper;
 pub mod inspection;
 pub(crate) mod object;
-pub(crate) mod receipt;
+/// `broker.RestoreCapacityReceipt` — upstream exports the wire type;
+/// the root restore engine's composition maps it onto the frozen
+/// capacity source's receipt shape.
+pub mod receipt;
 pub mod reserve_frame;
 pub(crate) mod store;
 pub(crate) mod store_path;

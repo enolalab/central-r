@@ -141,6 +141,19 @@ pub fn new_postgres_restore_target_excluder(
     })
 }
 
+impl PostgresRestoreTargetExcluder {
+    /// `lazyMigrationExcluder`'s shared-session constructor: the C04
+    /// advisory locks this excluder acquires must live on the exact
+    /// `central_migration` session the audit projection and authority
+    /// resetter write through (SC-DEF-62), so the kernel's restore
+    /// composition hands the one lazily opened bridge rather than a
+    /// second connection.
+    #[must_use]
+    pub fn from_blocking_conn(conn: Arc<BlockingConn>) -> Self {
+        Self { conn }
+    }
+}
+
 impl RestoreTargetExcluder for PostgresRestoreTargetExcluder {
     /// `AcquireRestoreTargetExclusion` — `is_resumable`, not a literal
     /// `Applying` comparison: Apply's own prospective operation is

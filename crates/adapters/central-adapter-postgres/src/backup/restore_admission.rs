@@ -80,6 +80,28 @@ impl RestoreTargetAdmissionReader {
         })
     }
 
+    /// `OpenRuntimeConnectionFromSealedPassfile` composition shape: the
+    /// caller only has a connect future, and a `PgConnection` must be
+    /// made on the same runtime that will drive it
+    /// ([`BlockingConn::new_connecting`]'s reactor-binding rule).
+    ///
+    /// # Errors
+    /// `restore_target_admission` when the bridge runtime cannot be
+    /// built; whatever `connect` returns otherwise.
+    pub fn new_connecting<F, Fut>(
+        connect: F,
+        payload_epochs: Arc<dyn TrustedPayloadEpochSource>,
+    ) -> Result<Self, Failure>
+    where
+        F: FnOnce() -> Fut,
+        Fut: core::future::Future<Output = Result<PgConnection, Failure>>,
+    {
+        Ok(Self {
+            conn: BlockingConn::new_connecting(connect)?,
+            payload_epochs,
+        })
+    }
+
     /// `ReadRestoreTargetAdmission` — the `restoreTargetAdmissionSQL`
     /// probe plus upstream shape checks: nonblank system id/OID,
     /// `central` database, nonempty marker set, nonnegative and

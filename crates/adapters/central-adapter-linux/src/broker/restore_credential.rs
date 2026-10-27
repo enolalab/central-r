@@ -17,6 +17,7 @@
 
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::Arc;
 
 use central_foundation::failure::Failure;
 use rustix::process::Uid;
@@ -611,6 +612,35 @@ impl RestoreCredentialClient {
             return Err(RestoreRefusalReason::EngineUnavailable.into_failure());
         }
         Ok(fd)
+    }
+}
+
+/// `SealedRestorePassfileProvider` — the pinned `pg_restore`
+/// adapter's narrow boundary, satisfied by the same kind-1 draw the
+/// inherent method performs. `fkDroppingRestoreDatabase` and
+/// `NewPGRestore` hold this trait so neither can draw any other
+/// credential kind through it.
+impl crate::backup::SealedRestorePassfileProvider for RestoreCredentialClient {
+    fn open_sealed_restore_passfile(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<std::fs::File, Failure> {
+        RestoreCredentialClient::open_sealed_restore_passfile(self, operation)
+            .map(std::fs::File::from)
+    }
+}
+
+/// The trait's object form must box the shared client: composition hands
+/// one `Arc<RestoreCredentialClient>` to both the `pg_restore` runner and
+/// the FK-dropping wrapper.
+impl crate::backup::SealedRestorePassfileProvider for Arc<RestoreCredentialClient> {
+    fn open_sealed_restore_passfile(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<std::fs::File, Failure> {
+        (**self)
+            .open_sealed_restore_passfile(operation)
+            .map(std::fs::File::from)
     }
 }
 

@@ -65,6 +65,36 @@ impl RestoredInventoryVerifier {
         })
     }
 
+    /// `openRuntimeConnectionFromSealedPassfile` composition shape —
+    /// `operationScopedInventoryVerifier` only has a connect future, and
+    /// a `PgConnection` must be made on the same runtime that will drive
+    /// it ([`BlockingConn::new_connecting`]'s reactor-binding rule).
+    ///
+    /// # Errors
+    /// `recovery_restored_inventory` when the profile is invalid or the
+    /// bridge runtime cannot be built; whatever `connect` returns
+    /// otherwise.
+    pub fn new_connecting<F, Fut>(
+        connect: F,
+        repository: Arc<dyn RecoveryInventorySource>,
+        objects: Arc<dyn ReadyArtifactObjectReader>,
+        profile: RecoveryProfile,
+    ) -> Result<Self, Failure>
+    where
+        F: FnOnce() -> Fut,
+        Fut: core::future::Future<Output = Result<PgConnection, Failure>>,
+    {
+        if profile.validate().is_err() {
+            return Err(restored_inventory_unavailable());
+        }
+        Ok(Self {
+            repository,
+            conn: BlockingConn::new_connecting(connect)?,
+            objects,
+            profile,
+        })
+    }
+
     /// `VerifyInventory` — the merge walk: sealed inventory entries
     /// against restored ready rows in artifact-ID order, then a body
     /// reread for every exact match. Findings carry the observation

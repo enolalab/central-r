@@ -234,6 +234,45 @@ impl Service {
     /// authority, nonce root, bootstrap recovery, proof state, epoch
     /// root.
     pub fn new(root_path: PathBuf, runtime_uid: u32) -> Result<Self, Failure> {
+        Self::new_with_helper_executable(root_path, runtime_uid, "")
+    }
+
+    /// `NewServiceForRestoreEngine` is `new` for the one caller that
+    /// is not itself the real broker/helper process: `central-restore`
+    /// (`central_kernel::restore_compose`), composing its own
+    /// in-process `Service` over the protected root it inherited.
+    /// SC-DEF-58: the restore-launch store's `helper_executable` check
+    /// must compare against the real root helper's installed path,
+    /// not against "whoever is calling `new`" self-resolved via
+    /// `/proc/self/exe` — self-resolution is only correct when the
+    /// caller genuinely is the helper. `helper_executable_path` must
+    /// be the real, fixed helper install path; it must not be empty.
+    ///
+    /// # Errors
+    /// [`Failure`] when `helper_executable_path` is empty, or any
+    /// [`new`]'s sub-component errors.
+    pub fn new_for_restore_engine(
+        root_path: PathBuf,
+        runtime_uid: u32,
+        helper_executable_path: &str,
+    ) -> Result<Self, Failure> {
+        if helper_executable_path.is_empty() {
+            return Err(Failure::internal(
+                "broker",
+                "restore engine service requires an explicit helper executable path",
+            ));
+        }
+        Self::new_with_helper_executable(root_path, runtime_uid, helper_executable_path)
+    }
+
+    /// `newServiceWithHelperExecutable` — the shared body: an empty
+    /// `helper_executable_path` leaves the restore-launch store on its
+    /// own `/proc/self/exe` self-resolution.
+    fn new_with_helper_executable(
+        root_path: PathBuf,
+        runtime_uid: u32,
+        helper_executable_path: &str,
+    ) -> Result<Self, Failure> {
         let signing = Arc::new(SigningService::new_persistent(&root_path)?);
         let tls = Some(TlsAuthority::new_persistent(&root_path)?);
         let signer = Some(Arc::new(Ed25519Signer::new()?));
@@ -304,10 +343,11 @@ impl Service {
             runtime_uid,
             runtime_gid,
         )?);
-        let restore_launches = Some(RestoreLaunchStore::new(
+        let restore_launches = Some(RestoreLaunchStore::new_with_helper_executable(
             &root_path,
             signing.clone(),
             recovery_journal.clone(),
+            helper_executable_path,
         )?);
         // `newServiceWithHelperExecutable`'s unconditional stores: the
         // reserve record store and the receipt ledger, both rooted at

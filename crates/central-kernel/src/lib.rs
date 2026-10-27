@@ -30,6 +30,7 @@ pub mod lifecycle;
 pub mod migrate_compose;
 pub mod readiness;
 pub mod readyproof;
+pub mod restore_compose;
 pub mod retry_compose;
 pub mod scheduler_compose;
 pub mod scheduler_harness;

@@ -166,9 +166,15 @@ impl BlockingConn {
     /// poisoned mutex is recovered: the connection itself is not
     /// corrupted by a panic above it.
     ///
+    /// `pub` for the kernel's restore composition: upstream's
+    /// `cmd/central-restore` runs its SC-DEF-60/61/65 DDL steps on a
+    /// dedicated migration session it opens itself; the Rust model keeps
+    /// the identical session here and lets the composition drive the
+    /// exact same statements through it.
+    ///
     /// # Errors
     /// Whatever `f` returns.
-    pub(crate) fn run<T, F>(&self, f: F) -> Result<T, Failure>
+    pub fn run<T, F>(&self, f: F) -> Result<T, Failure>
     where
         F: for<'a> FnOnce(
             &'a mut PgConnection,

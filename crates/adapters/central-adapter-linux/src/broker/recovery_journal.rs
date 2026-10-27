@@ -2583,7 +2583,8 @@ impl RecoveryJournalStore {
 
     /// `resolveIssuedTicketForOperation` — scans protected ticket
     /// state for the exact unexpired issued ticket of one operation.
-    fn resolve_issued_ticket_for_operation(
+    /// `pub(crate)` for `recovery_authority`'s root-engine reader.
+    pub(crate) fn resolve_issued_ticket_for_operation(
         &self,
         operation_id: Uuid,
         now: OffsetDateTime,
@@ -3127,8 +3128,9 @@ impl RecoveryJournalStore {
         wire::hmac_equal(ticket.hmac.as_bytes(), expected.as_bytes())
     }
 
-    /// `readTicket` — `(ticket, state)`.
-    fn read_ticket(&self, ticket_id: Uuid) -> Result<(RestoreTicket, String), Failure> {
+    /// `readTicket` — `(ticket, state)`. `pub(crate)` for
+    /// `recovery_authority`'s root-engine `ReadIssuedRestoreTicket`.
+    pub(crate) fn read_ticket(&self, ticket_id: Uuid) -> Result<(RestoreTicket, String), Failure> {
         let record: RestoreTicketRecordWire = read_private_json(&self.ticket_path(ticket_id))?;
         if record.ticket.ticket_id != ticket_id
             || !matches!(record.state.as_str(), "issued" | "consumed")
@@ -3136,6 +3138,25 @@ impl RecoveryJournalStore {
             return Err(unavailable());
         }
         Ok((ticket_from_wire(&record.ticket), record.state))
+    }
+
+    /// `readRestoreApplyAuthorization` — the record-level read the
+    /// root restore engine's `protectedRestoreState` needs before
+    /// `begin`/`resume` compare the whole authorization value against
+    /// argv's identity. An opaque identity selects a record; it never
+    /// substitutes for one.
+    pub(crate) fn read_restore_apply_authorization(
+        &self,
+        authorization_id: Uuid,
+    ) -> Result<(RestoreApplyAuthorization, String), Failure> {
+        let record: RestoreApplyRecordWire = read_private_json(&self.apply_path(authorization_id))?;
+        let authorization = apply_authorization_from_wire(&record.authorization);
+        if authorization.authorization_id != authorization_id
+            || !matches!(record.state.as_str(), "issued" | "consuming" | "consumed")
+        {
+            return Err(unavailable());
+        }
+        Ok((authorization, record.state))
     }
 
     /// `readTicketRecord` — the whole record (launch carry check).

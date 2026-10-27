@@ -2660,6 +2660,36 @@ pub struct RestoreVerificationResult {
     pub expires_at: time::OffsetDateTime,
 }
 
+/// `app.RestoreImportResult` — the operator-safe result of ADR 0034's
+/// import run: the staged plan executed against the data plane
+/// (`pg_restore` of the staged dump, upload of the staged bodies,
+/// post-import verification). It carries counts and digests, never
+/// paths, keys, or credential material.
+#[derive(Debug, Clone)]
+pub struct RestoreImportResult {
+    /// Operation identity the import executed. The engine refuses a
+    /// result naming any other operation.
+    pub operation_id: uuid::Uuid,
+    /// Hex SHA-256 of the exact `restore-plan.json` bytes the run
+    /// consumed.
+    pub plan_sha256: String,
+    /// Hex SHA-256 of the staged dump bytes `pg_restore` consumed,
+    /// re-hashed at open.
+    pub dump_sha256: String,
+    /// Number of `TABLE` entries from the dump's own table of contents
+    /// found in the target afterwards. Zero tables is refused, never
+    /// reported.
+    pub tables_present: i32,
+    /// Number of restored ready artifacts whose staged body was
+    /// uploaded and read back with a matching digest.
+    pub bodies_verified: i32,
+    /// Hex SHA-256 over the sorted `(schema.table, exact row count)`
+    /// listing of the target after the restore: recorded evidence, not
+    /// a comparison input — the plan carries no source-side shape to
+    /// compare against.
+    pub shape_checksum: String,
+}
+
 /// `app.RestoreVerifier` implements C03's non-mutating admission
 /// path. The broker issues and stores the one-use ticket; this
 /// service never hands its secret material to a transport or CLI

@@ -145,18 +145,20 @@ pub trait RestoreCapacitySource: Send + Sync {
 pub struct RepositoryAdmissionInspector {
     repository: Repository,
     seals: Arc<dyn BackupSealVerifier>,
-    target: Box<dyn RestoreTargetAdmissionSource>,
+    target: Arc<dyn RestoreTargetAdmissionSource>,
     capacity: Box<dyn RestoreCapacitySource>,
     profile: RecoveryProfile,
 }
 
 /// `NewRestoreAdmissionInspector` — refuses unless the repository is a
 /// validated read-only handle, every authority is present, and the
-/// installed recovery profile validates.
+/// installed recovery profile validates. `target` is shared (`Arc`)
+/// because upstream's `productionRestoreAdmissionInspector` passes the
+/// same trusted reader into the inspector it builds on every call.
 pub fn new_repository_admission_inspector(
     repository: Repository,
     seals: Arc<dyn BackupSealVerifier>,
-    target: Box<dyn RestoreTargetAdmissionSource>,
+    target: Arc<dyn RestoreTargetAdmissionSource>,
     capacity: Box<dyn RestoreCapacitySource>,
     profile: RecoveryProfile,
 ) -> Result<RepositoryAdmissionInspector, Failure> {
@@ -831,7 +833,7 @@ mod tests {
             Repository::read_only_from_descriptor(open_dir(&f.dir), &f.repository.binding())
                 .unwrap(),
             seals,
-            Box::new(TargetFake {
+            Arc::new(TargetFake {
                 admission: f.target.clone(),
                 calls: Mutex::new(0),
             }),
@@ -894,7 +896,7 @@ mod tests {
             new_repository_admission_inspector(
                 writer,
                 Arc::new(SealFake::default()),
-                Box::new(TargetFake {
+                Arc::new(TargetFake {
                     admission: fixture.target.clone(),
                     calls: Mutex::new(0)
                 }),
@@ -937,7 +939,7 @@ mod tests {
             )
             .unwrap(),
             Arc::new(SealFake::default()),
-            Box::new(TargetFake {
+            Arc::new(TargetFake {
                 admission: stale,
                 calls: Mutex::new(0),
             }),
