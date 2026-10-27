@@ -41,6 +41,8 @@ use zeroize::Zeroize as _;
 
 use crate::sys::peercred::{PeerCred, peercred};
 
+use super::backup_launch::BackupLaunchStore;
+use super::backup_throughput_launch::BackupThroughputLaunchStore;
 use super::bootstrap_session::{self, BootstrapSession};
 use super::handoff::{self, HandoffService};
 use super::journal::Journal;
@@ -53,8 +55,11 @@ use super::protocol::{self, *};
 use super::provisioning::{
     self, ProvisioningRecord, ProvisioningStore, ReplaceProvisioningRecordRequest,
 };
+use super::recovery_journal::RecoveryJournalStore;
+use super::restore_launch::RestoreLaunchStore;
 use super::secret_bootstrap::SecretBootstrap;
 use super::signing::{Ed25519Signer, SigningService};
+use super::throughput_journal::ThroughputJournalStore;
 use super::tls::TlsAuthority;
 
 /// `brokerConnectionDeadline` — one second; bounds the initial framed
@@ -147,8 +152,20 @@ pub struct Service {
     pub provisioning: Option<ProvisioningStore>,
     /// The proof service.
     pub proofs: Option<ProofService>,
-    /// The payload epoch store.
-    pub payload_epochs: Option<PayloadEpochStore>,
+    /// The payload epoch store (`s.payloadEpochs`) — shared with the
+    /// throughput launch store, hence the `Arc`.
+    pub payload_epochs: Option<Arc<PayloadEpochStore>>,
+    /// The protected recovery/backup operation journal
+    /// (`s.recoveryJournal`).
+    pub recovery_journal: Option<Arc<RecoveryJournalStore>>,
+    /// Backup worker launch evidence (`s.backupLaunches`).
+    pub backup_launches: Option<BackupLaunchStore>,
+    /// Restore engine launch evidence (`s.restoreLaunches`).
+    pub restore_launches: Option<RestoreLaunchStore>,
+    /// The C02 throughput journal (`s.throughput`).
+    pub throughput: Option<Arc<ThroughputJournalStore>>,
+    /// The throughput probe launch store (`s.throughputLaunches`).
+    pub throughput_launches: Option<BackupThroughputLaunchStore>,
     /// The sealed-memfd handoff factory (`s.handoff` — outbound
     /// descriptor minting; the inbound B04 transport uses the
     /// `handoff` module's free functions directly).
@@ -220,6 +237,50 @@ impl Service {
             SigningService::from_key(signing.key_copy()),
         )?);
         let launches = Some(MigrationLaunchStore::new(&root_path, signing.clone())?);
+        // R6 stores (`newServiceWithHelperExecutable`): the protected
+        // recovery journal, then every store bound to it.
+        let recovery_journal = Arc::new(RecoveryJournalStore::new(
+            &root_path,
+            signing.clone(),
+            backend.clone(),
+        )?);
+        // `runtimeGID := os.Getgid()` unless the runtime is the pinned
+        // central UID — then the pairing is the fixed 501/501.
+        let runtime_gid = if runtime_uid == CENTRAL_RUNTIME_UID {
+            CENTRAL_RUNTIME_UID
+        } else {
+            rustix::process::getgid().as_raw()
+        };
+        let backup_launches = Some(BackupLaunchStore::new(
+            &root_path,
+            signing.clone(),
+            recovery_journal.clone(),
+            runtime_uid,
+            runtime_gid,
+        )?);
+        let throughput = Arc::new(ThroughputJournalStore::new(
+            &root_path,
+            signing.clone(),
+            central_backup::backup::capacity::default_recovery_profile(),
+        )?);
+        let payload_epochs = Arc::new(
+            payload_epochs
+                .ok_or_else(|| Failure::internal("broker", "payload epoch store unavailable"))?,
+        );
+        let throughput_launches = Some(BackupThroughputLaunchStore::new(
+            &root_path,
+            signing.clone(),
+            recovery_journal.clone(),
+            throughput.clone(),
+            payload_epochs.clone(),
+            runtime_uid,
+            runtime_gid,
+        )?);
+        let restore_launches = Some(RestoreLaunchStore::new(
+            &root_path,
+            signing.clone(),
+            recovery_journal.clone(),
+        )?);
         Ok(Self {
             root_path,
             backend,
@@ -230,7 +291,12 @@ impl Service {
             nonces,
             provisioning,
             proofs,
-            payload_epochs,
+            payload_epochs: Some(payload_epochs),
+            recovery_journal: Some(recovery_journal),
+            backup_launches,
+            restore_launches,
+            throughput: Some(throughput),
+            throughput_launches,
             handoff,
             bootstrap,
             bootstrap_session,
@@ -256,7 +322,12 @@ impl Service {
         nonces: Option<LifecycleNonceStore>,
         provisioning: Option<ProvisioningStore>,
         proofs: Option<ProofService>,
-        payload_epochs: Option<PayloadEpochStore>,
+        payload_epochs: Option<Arc<PayloadEpochStore>>,
+        recovery_journal: Option<Arc<RecoveryJournalStore>>,
+        backup_launches: Option<BackupLaunchStore>,
+        restore_launches: Option<RestoreLaunchStore>,
+        throughput: Option<Arc<ThroughputJournalStore>>,
+        throughput_launches: Option<BackupThroughputLaunchStore>,
         handoff: HandoffService,
         bootstrap: Option<SecretBootstrap>,
         bootstrap_session: Option<BootstrapSession>,
@@ -274,6 +345,11 @@ impl Service {
             provisioning,
             proofs,
             payload_epochs,
+            recovery_journal,
+            backup_launches,
+            restore_launches,
+            throughput,
+            throughput_launches,
             handoff,
             bootstrap,
             bootstrap_session,
@@ -483,6 +559,16 @@ impl Service {
             }
             Err(_) => Vec::new(),
         };
+        // Upstream falls back to `recoveryJournal.takeActivatedRecoveryBootstrap`
+        // before reporting an empty stage: the journal's one-use take
+        // preserves the same semantics and the same denial on failure.
+        if value.is_empty()
+            && let Some(journal) = &self.recovery_journal
+        {
+            value = journal
+                .take_activated_recovery_bootstrap()
+                .unwrap_or_default();
+        }
         if value.is_empty() {
             return BrokerResponse {
                 operation_id: req.operation_id.clone(),

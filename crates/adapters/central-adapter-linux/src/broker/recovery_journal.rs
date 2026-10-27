@@ -465,7 +465,9 @@ struct BackupAcceptedFactsWire {
     target_fingerprint: String,
     #[serde(rename = "ConfigFingerprint")]
     config_fingerprint: String,
-    #[serde(rename = "PayloadEpochID")]
+    /// `PayloadEpochID uuid.UUID \`json:"payload_epoch_id"\`` — the one
+    /// tagged field in upstream's otherwise untagged struct.
+    #[serde(rename = "payload_epoch_id")]
     payload_epoch_id: Uuid,
     #[serde(rename = "RepositoryBindingID")]
     repository_binding_id: Uuid,
@@ -598,7 +600,9 @@ struct BackupSealProposalWire {
     target_fingerprint: String,
     #[serde(rename = "ConfigFingerprint")]
     config_fingerprint: String,
-    #[serde(rename = "PayloadEpochID")]
+    /// `json:"payload_epoch_id"` — upstream's lone tag on
+    /// `BackupSealProposal` (all other fields marshal PascalCase).
+    #[serde(rename = "payload_epoch_id")]
     payload_epoch_id: Uuid,
     #[serde(rename = "RootManifestJSON", with = "wire::b64")]
     root_manifest_json: Vec<u8>,
