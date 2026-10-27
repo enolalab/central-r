@@ -1053,6 +1053,15 @@ dependencies = [
 [[package]]
 name = "central-restore"
 version = "0.1.0"
+dependencies = [
+ "central-backup",
+ "central-foundation",
+ "central-kernel",
+ "serde",
+ "serde_json",
+ "time",
+ "uuid",
+]
 
 [[package]]
 name = "central-retry"

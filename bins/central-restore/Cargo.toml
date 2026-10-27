@@ -6,5 +6,25 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[dependencies]
+central-backup = { path = "../../crates/capabilities/central-backup", version = "0.1.0" }
+central-foundation = { path = "../../crates/central-foundation", version = "0.1.0" }
+central-kernel = { path = "../../crates/central-kernel", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+# `sys.rs` is the audited descriptor boundary (FD_CLOEXEC/borrow_raw):
+# this crate lists the workspace lints by hand (it cannot both inherit
+# and override `unsafe_code`) with `unsafe_code` at "deny" instead of
+# "forbid".
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
