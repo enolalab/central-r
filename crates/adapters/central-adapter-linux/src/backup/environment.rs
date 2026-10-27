@@ -24,9 +24,16 @@ use central_backup::port::{
 use central_foundation::failure::Failure;
 use uuid::Uuid;
 
+/// `wire.zero_time` — the domain's Go `time.Time{}` equivalent.
+pub(crate) fn zero_time() -> time::OffsetDateTime {
+    time::OffsetDateTime::UNIX_EPOCH
+        .replace_year(1)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+}
+
 /// `time.Time.IsZero` — the same convention the domain's wire layer
 /// pins (year 1, January 1, UTC).
-fn is_zero_time(t: time::OffsetDateTime) -> bool {
+pub(crate) fn is_zero_time(t: time::OffsetDateTime) -> bool {
     t.year() == 1
         && t.month() == time::Month::January
         && t.day() == 1

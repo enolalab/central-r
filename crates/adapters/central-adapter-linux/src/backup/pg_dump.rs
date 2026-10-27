@@ -30,7 +30,7 @@ use super::pgtool;
 pub const PINNED_PG_DUMP_VERSION: &str = "16.14";
 
 /// `pinnedPGRole` — `central_runtime`, never `central_migration`.
-const PINNED_BACKUP_ROLE: &str = "central_runtime";
+pub(super) const PINNED_BACKUP_ROLE: &str = "central_runtime";
 
 /// The one redacted process-boundary failure (upstream
 /// `errDumpProcessUnavailable`). Stable code only.
@@ -66,7 +66,7 @@ pub struct PgDumpConfig {
 }
 
 impl PgDumpConfig {
-    fn validate(&self) -> Result<(), Failure> {
+    pub(super) fn validate(&self) -> Result<(), Failure> {
         if !self.binary_path.is_absolute()
             || self.version != PINNED_PG_DUMP_VERSION
             || self.max_elapsed.is_zero()
@@ -237,7 +237,7 @@ pub struct PgDumpStream {
 }
 
 impl PgDumpStream {
-    fn new(child: Child, stdout: ChildStdout, deadline: Instant) -> Self {
+    pub(super) fn new(child: Child, stdout: ChildStdout, deadline: Instant) -> Self {
         let pid = i32::try_from(child.id()).unwrap_or_default();
         let start = pgtool::process_start_time(pid);
         let pidfd = Pid::from_raw(pid).and_then(|p| crate::sys::pidfd::open(p).ok());

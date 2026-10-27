@@ -68,7 +68,7 @@ pub struct PgRestoreConfig {
 }
 
 impl PgRestoreConfig {
-    fn validate(&self) -> Result<(), Failure> {
+    pub(super) fn validate(&self) -> Result<(), Failure> {
         if !self.binary_path.is_absolute()
             || self.version != PINNED_PG_RESTORE_VERSION
             || self.max_elapsed.is_zero()
