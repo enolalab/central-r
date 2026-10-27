@@ -40,6 +40,7 @@ mod local_cli;
 mod migrate_cli;
 mod modes;
 mod node_cli;
+mod restore_cli;
 mod run_cli;
 mod serve;
 
@@ -201,6 +202,9 @@ fn dispatch(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -
     if command_id.starts_with("backup.") {
         return backup_cli::backup(command_id, tokens, stdout, stderr);
     }
+    if command_id.starts_with("restore.") {
+        return restore_cli::restore(command_id, tokens, stdout, stderr);
+    }
     let result = LocalResult::unsupported(command_id);
     match result.write_json_line(stdout) {
         Ok(()) => result.exit_code,
@@ -339,10 +343,6 @@ mod tests {
             (&["backup", "prune", "plan"], "backup.prune.plan"),
             // First-match: `backup.prune.apply` is the shadowed entry.
             (&["backup", "prune", "apply"], "backup.prune.plan"),
-            (&["restore", "verify"], "restore.verify"),
-            (&["restore", "apply"], "restore.apply"),
-            (&["restore", "resume"], "restore.resume"),
-            (&["restore", "abandon"], "restore.abandon"),
             (&["maintenance", "plan"], "maintenance.plan"),
             (&["maintenance", "apply"], "maintenance.apply"),
             (&["bootstrap", "show"], "bootstrap.show"),
@@ -501,6 +501,63 @@ mod tests {
             let parsed = parse_envelope(&stdout);
             assert_eq!(code, 3, "argv {argv:?}");
             assert_eq!(parsed["command_id"], want_id, "argv {argv:?}");
+            assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
+        }
+
+        // R6 `restore verify|apply|resume|abandon` (task 9b): the
+        // helper-delegated verbs fail closed at exit 3 with the
+        // socket absent (still under the `_backup_serial` pin —
+        // restore_cli shares backup_cli's override), and each
+        // closed grammar gates extra arguments at exit 2.
+        for (argv, want_id, want_reason) in [
+            (
+                vec!["restore", "verify"],
+                "restore.verify",
+                "RESTORE_VERIFY_DEPENDENCY_UNAVAILABLE",
+            ),
+            (
+                vec!["restore", "apply"],
+                "restore.apply",
+                "RESTORE_APPLY_DEPENDENCY_UNAVAILABLE",
+            ),
+            (
+                vec!["restore", "resume"],
+                "restore.resume",
+                "RESTORE_RESUME_DEPENDENCY_UNAVAILABLE",
+            ),
+            (
+                vec!["restore", "abandon"],
+                "restore.abandon",
+                "RESTORE_ABANDON_DEPENDENCY_UNAVAILABLE",
+            ),
+        ] {
+            let (code, stdout, _) = invoke(&argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 3, "argv {argv:?}");
+            assert_eq!(parsed["command_id"], want_id, "argv {argv:?}");
+            assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
+        }
+        for (argv, want_reason) in [
+            (
+                vec!["restore", "verify", "extra"],
+                "INVALID_RESTORE_VERIFY_GRAMMAR",
+            ),
+            (
+                vec!["restore", "apply", "extra"],
+                "INVALID_RESTORE_APPLY_GRAMMAR",
+            ),
+            (
+                vec!["restore", "resume", "extra"],
+                "INVALID_RESTORE_RESUME_GRAMMAR",
+            ),
+            (
+                vec!["restore", "abandon", "extra"],
+                "INVALID_RESTORE_ABANDON_GRAMMAR",
+            ),
+        ] {
+            let (code, stdout, _) = invoke(&argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 2, "argv {argv:?}");
             assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
         }
 
