@@ -47,4 +47,5 @@ mod fingerprint;
 mod fixture;
 mod profile;
 mod runner;
+mod scenario2;
 mod slice_c;

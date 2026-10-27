@@ -230,8 +230,19 @@ fn the_synthetic_body_reader_matches_the_buffered_body() {
 
 /// `c06RecordSet` — the mutable half of `EvidenceInputs`, plus the scenario
 /// transcripts attached through `attach_log`.
+///
+/// The `pre_corruption`/`corrupted` slots are upstream's
+/// `RecordPreCorruptionFingerprint`/`RecordPostCorruptionFingerprint`: a
+/// fingerprint that fails its capture-side validation never reaches the set,
+/// and each slot refuses a second record.
 #[derive(Default)]
 pub struct RecordSet {
+    /// The pre-corruption fingerprint scenario 1 records (validated).
+    pub pre_corruption: Option<crate::fingerprint::StateFingerprint>,
+    /// The post-corruption fingerprint scenario 2 records (validated as a
+    /// corrupted instance — a body the store cannot answer is omitted, never
+    /// placeholdered).
+    pub corrupted: Option<crate::fingerprint::StateFingerprint>,
     pub observed: ObservedMeasurements,
     pub capacity_reserve: Vec<CapacityReserveRecord>,
     pub ceremony_records: Vec<CeremonyRecord>,
@@ -266,6 +277,66 @@ impl RecordSet {
             log_sha256: log_sha256.to_owned(),
         });
     }
+
+    /// `RecordPreCorruptionFingerprint` — scenario 1's baseline capture:
+    /// `validate` (the strict capture), exactly once, and its digest into the
+    /// fixture digests the artifact carries.
+    pub fn record_pre_corruption(
+        &mut self,
+        fingerprint: crate::fingerprint::StateFingerprint,
+    ) -> Result<(), String> {
+        fingerprint.validate()?;
+        if self.pre_corruption.is_some() {
+            return Err(
+                "the pre-corruption fingerprint was recorded twice; the baseline scenario 7 compares against must be a single capture"
+                    .to_owned(),
+            );
+        }
+        self.fixture_sha256.insert(
+            "state_fingerprint.pre_corruption".to_owned(),
+            fingerprint.digest(),
+        );
+        self.pre_corruption = Some(fingerprint);
+        Ok(())
+    }
+
+    /// `RecordPostCorruptionFingerprint` — scenario 2's corrupted-instance
+    /// capture: `validate_as_corrupted` (the second capture's arm), exactly
+    /// once, and its digest into the fixture digests.
+    pub fn record_corrupted(
+        &mut self,
+        fingerprint: crate::fingerprint::StateFingerprint,
+    ) -> Result<(), String> {
+        fingerprint.validate_as_corrupted()?;
+        if self.corrupted.is_some() {
+            return Err(
+                "the post-corruption fingerprint was recorded twice; the damaged-state scenario 7 must differ from must be a single capture"
+                    .to_owned(),
+            );
+        }
+        self.fixture_sha256.insert(
+            "state_fingerprint.post_corruption".to_owned(),
+            fingerprint.digest(),
+        );
+        self.corrupted = Some(fingerprint);
+        Ok(())
+    }
+}
+
+/// The process-wide record set the run's scenarios write through. Upstream
+/// carries it on the harness; the Rust port's equivalent is the shared slot
+/// the emitter reads — a per-body `RecordSet::default()` would discard every
+/// record before `zz_emit_the_evidence` saw it.
+static RECORDS: std::sync::OnceLock<std::sync::Mutex<RecordSet>> = std::sync::OnceLock::new();
+
+/// `records` — a lock guard over the run's shared record set. A poisoned
+/// lock is recovered: the records under it are not corrupted by a panic
+/// above them, only the scenario that panicked is.
+pub fn records() -> std::sync::MutexGuard<'static, RecordSet> {
+    RECORDS
+        .get_or_init(|| std::sync::Mutex::new(RecordSet::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// `declared_command_lines` — the closed vocabulary of command lines the run

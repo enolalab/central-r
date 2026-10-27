@@ -96,7 +96,7 @@ fn armed_probe() {
 
 /// `c06Scenario` — the wrapper every scenario body goes through: armed gate,
 /// precondition census, then `runner.run`.
-fn scenario(
+pub(crate) fn scenario(
     id: &str,
     preconditions_met: impl FnOnce(&crate::evidence::PrivilegeProfile) -> Option<(ReasonClass, String)>,
     body: impl FnOnce(&mut crate::runner::Scenario) -> Result<(), String>,
@@ -115,7 +115,7 @@ fn scenario(
 /// The standard precondition read for the live scenarios: uid 0, the pinned
 /// pg tools, docker, plus physical console and PAM where the entry declares
 /// them. Returns the first unmet precondition's reason class + detail.
-fn unmet_precondition(
+pub(crate) fn unmet_precondition(
     id: &str,
     profile: &crate::evidence::PrivilegeProfile,
 ) -> Option<(ReasonClass, String)> {
@@ -244,7 +244,7 @@ fn c06_s9_capacity_below_floor() {
             if !Path::new(&root).exists() {
                 runner.skip(id, ReasonClass::PreconditionFailed, "no repository root is provisioned (CENTRAL_C06_REPO_ROOT); the scenario needs a real repository binding to measure projected bytes", false);
             }
-            let mut records = fixture::RecordSet::default();
+            let mut records = fixture::records();
             // Measure the repository's device through the production source —
             // never a fabricated free-space figure.
             let descriptor = std::fs::File::open(&root)
@@ -284,7 +284,7 @@ fn c06_s9_capacity_below_floor() {
                     release_confirmed_at: String::new(),
                 });
             let _ = s;
-            let _ = records;
+            drop(records);
             Ok(())
         },
     );
@@ -489,7 +489,7 @@ fn zz_emit_the_evidence() {
     // Same structural wait as reconcile — the emitted scenario set derives
     // from the recorded outcomes, so emission must see the finished run.
     runner.await_completeness(crate::runner::completeness_wait());
-    let records = fixture::RecordSet::default();
+    let records = fixture::records();
     let inputs = EvidenceInputs {
         generated_at: Some(std::time::SystemTime::now()),
         repo_root: env!("CARGO_MANIFEST_DIR")
@@ -497,16 +497,16 @@ fn zz_emit_the_evidence() {
             .to_owned(),
         privilege_profile: fixture::measure_privilege_profile(),
         observed: records.observed.clone(),
-        capacity_reserve: records.capacity_reserve,
-        ceremony_records: records.ceremony_records,
-        protected_journal: records.protected_journal,
-        restart_observations: records.restart_observations,
-        destructive_confirmations: records.destructive_confirmations,
-        quarantine_resolutions: records.quarantine_resolutions,
-        authority_reset: records.authority_reset,
-        image_digests: records.image_digests,
-        fixture_sha256: records.fixture_sha256,
-        commands: records.commands,
+        capacity_reserve: records.capacity_reserve.clone(),
+        ceremony_records: records.ceremony_records.clone(),
+        protected_journal: records.protected_journal.clone(),
+        restart_observations: records.restart_observations.clone(),
+        destructive_confirmations: records.destructive_confirmations.clone(),
+        quarantine_resolutions: records.quarantine_resolutions.clone(),
+        authority_reset: records.authority_reset.clone(),
+        image_digests: records.image_digests.clone(),
+        fixture_sha256: records.fixture_sha256.clone(),
+        commands: records.commands.clone(),
         ..Default::default()
     };
     match evidence::emit(runner, inputs) {
