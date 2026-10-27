@@ -115,6 +115,11 @@ libc = "=0.2.191"
 # Cryptography — broker, advisory verification, CSRF/session/approval binding
 ed25519-dalek = "=3.0.0"
 hmac = "=0.13.0"
+# central-adapter-linux only (R6 task 12): the bx1 bundle's AES-256-GCM
+# chunked stream (upstream internal/portable/bundle.go). Pure-Rust
+# `aes`/`gcm`/`aead` chain — the same RustCrypto family ed25519-dalek
+# already pins transitively.
+aes-gcm = "=0.11.1"
 rand = "=0.10.3"
 zeroize = "=1.9.1"
 # Broker TLS authority (R5 task 7): rcgen mints the Ed25519 CA and

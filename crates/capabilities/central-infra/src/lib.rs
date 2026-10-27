@@ -26,5 +26,6 @@ pub mod destructive;
 pub mod domain;
 pub mod lifecycle;
 pub mod port;
+pub mod portable;
 pub mod prepare;
 pub mod query;
