@@ -956,6 +956,20 @@ pub trait PostgresAuthorityReset: Send + Sync {
     ) -> Result<AuthorityResetReceipt, Failure>;
 }
 
+/// `port.RestoreTargetExcluder` — acquires the target-exclusive C04
+/// barrier. A lock acquisition belongs to exactly one protected
+/// operation and must not allow a caller-selected target or operation
+/// to be substituted. [`RestoreEngine`]'s composed production
+/// implementation delegates this one method to a dedicated excluder
+/// (upstream `restore_engine.go`).
+pub trait RestoreTargetExcluder: Send + Sync {
+    /// `AcquireRestoreTargetExclusion`.
+    fn acquire_restore_target_exclusion(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<Box<dyn RestoreTargetExclusion>, Failure>;
+}
+
 /// `port.RestoreEngine` — owns mutation and verification boundaries.
 /// Every method is idempotent for the supplied operation/checkpoint:
 /// a coordinator restart invokes the exact same protected operation,

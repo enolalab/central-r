@@ -31,6 +31,8 @@
 //!   the protected daemon's denial matrix (R5 task 9 / A06).
 
 #[forbid(unsafe_code)]
+pub mod backup;
+#[forbid(unsafe_code)]
 pub mod backup_repository;
 pub mod broker;
 pub mod dev_bootstrap;

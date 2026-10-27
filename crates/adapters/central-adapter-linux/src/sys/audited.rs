@@ -1044,3 +1044,68 @@ pub(crate) fn command_run_as(cmd: &mut std::process::Command, uid: u32, gid: u32
         })
     };
 }
+
+/// `SysProcAttr{Setpgid, Pdeathsig}` plus the fd-3 passfile handoff for
+/// the pinned `pg_dump`/`pg_restore` invocations (upstream
+/// `internal/adapter/backup/pgdump_linux.go` and `pgrestore_linux.go`).
+/// The post-fork child runs, in order:
+///
+///   1. `setpgid(0, 0)` — a private process group so `Close`/settle can
+///      `kill(-pid)` the whole tree (`killpg` also lands on any
+///      descendant that inherited the dump pipe).
+///   2. `prctl(PR_SET_PDEATHSIG, SIGKILL)` — a lost adapter cannot
+///      strand a live `central_runtime`/`central_migration` credential
+///      or a half-finished destructive restore.
+///   3. `getppid() != parent_pid` → `kill(getpid(), SIGKILL)` — closes
+///      the fork/exec race where the parent already died and the death
+///      signal therefore never fires.
+///   4. `dup2(passfile_fd, 3)` — `PGPASSFILE=/proc/self/fd/3`;
+///      `dup2` clears `CLOEXEC` so fd 3 alone survives `execve` (the
+///      broker descriptor itself is `O_CLOEXEC` and dies at exec).
+///
+/// Installed through `pre_exec` because `CommandExt::pre_exec` is
+/// `unsafe` and every caller lives under `forbid(unsafe_code)`.
+///
+/// SAFETY: the closure runs only in the post-fork child before exec;
+/// every call is an async-signal-safe libc entry point operating on
+/// the child's own copy-on-write pages — the same audit standard as
+/// `child_exec`/`command_run_as` above. `passfile_fd` is `RawFd`: the
+/// parent's `File` is held alive by the caller until `spawn` returns,
+/// then closed immediately so only the child's fd-3 copy remains.
+pub(crate) fn pg_tool_command(
+    cmd: &mut std::process::Command,
+    passfile_fd: std::os::fd::RawFd,
+    parent_pid: u32,
+) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(move || {
+            // 1. Private process group.
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // 2. Parent-death signal.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // 3. Race check — the parent may already have exited
+            //    between fork and prctl.
+            if libc::getppid() as u32 != parent_pid {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+                return Err(std::io::Error::other("parent exited"));
+            }
+            // 4. fd 3 passfile handoff. `dup2` clears `CLOEXEC` on the
+            //    copy; when the broker descriptor already happens to
+            //    be fd 3 there is no copy to make — its own `CLOEXEC`
+            //    must be cleared explicitly or `execve` drops it.
+            if passfile_fd == 3 {
+                if libc::fcntl(3, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(passfile_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    };
+}
