@@ -6,7 +6,7 @@
 use central_foundation::failure::Failure;
 use uuid::Uuid;
 
-use crate::domain::TargetIdentity;
+use crate::domain::{ExternalRecordState, TargetIdentity};
 use crate::wire::{
     FIELD_SEPARATOR, hex_encode, hmac_sha256, is_v7, is_zero_time, mac_equal, rfc3339_nano,
     valid_recovery_digest, valid_sha256_fingerprint,
@@ -30,7 +30,12 @@ fn invalid_restore() -> Failure {
 /// C03/C04. Consumption is recorded by the protected operation journal,
 /// never the database being restored. `hidden_nonce` is never
 /// serialized or displayed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-implemented: `hidden_nonce` and `hmac` are
+/// protected verifier material and must never reach a log line
+/// (upstream `RestoreVerificationResult` "intentionally omits the
+/// protected ticket's HMAC and hidden nonce").
+#[derive(Clone, PartialEq, Eq)]
 pub struct RestoreTicket {
     /// Ticket identity.
     pub ticket_id: Uuid,
@@ -140,10 +145,41 @@ impl RestoreTicket {
     }
 
     /// Mints the hex HMAC field — the broker-side counterpart used by
-    /// tests and future broker adapters.
+    /// the in-crate harnesses that stand in for the broker adapter.
+    /// Deliberately **not** `pub` and test-gated: HMAC minting stays
+    /// inside the broker boundary (the protected journal/ticket
+    /// adapter); the app layer never holds the key. The T4 broker
+    /// adapter owns any deliberate cross-crate minting path.
+    #[cfg(test)]
     #[must_use]
-    pub fn issue_hmac(&self, key: &[u8]) -> String {
+    pub(crate) fn issue_hmac(&self, key: &[u8]) -> String {
         hex_encode(&hmac_sha256(key, &self.canonical_payload()))
+    }
+}
+
+/// `Debug` elides `hidden_nonce` and `hmac`; every other field is
+/// already public operator-facing data.
+impl core::fmt::Debug for RestoreTicket {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RestoreTicket")
+            .field("ticket_id", &self.ticket_id)
+            .field("operation_id", &self.operation_id)
+            .field("backup_id", &self.backup_id)
+            .field("target", &self.target)
+            .field("target_fingerprint", &self.target_fingerprint)
+            .field("manifest_digest", &self.manifest_digest)
+            .field("security_epoch", &self.security_epoch)
+            .field("restore_epoch", &self.restore_epoch)
+            .field("config_fingerprint", &self.config_fingerprint)
+            .field("payload_epoch_id", &self.payload_epoch_id)
+            .field("database_schema_version", &self.database_schema_version)
+            .field("capacity_evidence_digest", &self.capacity_evidence_digest)
+            .field("tool_version", &self.tool_version)
+            .field("hidden_nonce", &"<redacted>")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("hmac", &"<redacted>")
+            .finish()
     }
 }
 
@@ -295,6 +331,22 @@ impl RestorePhase {
             Self::Abandoned => "abandoned",
         }
     }
+
+    /// `RestorePhase.externalRecordState` — the protected
+    /// operator-state value this phase projects into the external
+    /// audit record. `Abandoned` intentionally maps to `None`: that
+    /// record is reserved for the migration/restore serving barrier
+    /// and has no `abandoned` value.
+    #[must_use]
+    pub const fn protected_state(self) -> Option<ExternalRecordState> {
+        match self {
+            Self::Applying => Some(ExternalRecordState::Applying),
+            Self::Verifying => Some(ExternalRecordState::Verifying),
+            Self::Quarantined => Some(ExternalRecordState::Quarantined),
+            Self::Ready => Some(ExternalRecordState::Ready),
+            Self::Abandoned => None,
+        }
+    }
 }
 
 /// `AuthorityResetReceipt` — the non-secret aggregate evidence returned
@@ -361,10 +413,109 @@ impl AuthorityResetReceipt {
     }
 }
 
+/// The canonical 11-field aggregate payload the finalize transaction
+/// hashes (`recovery_audit.go` — the anonymous `struct` marshalled by
+/// `FinalizeDatabaseAuthorityReset`). Field order is part of the
+/// hashed wire shape.
+#[derive(serde::Serialize)]
+struct AggregateReceiptPayload<'a> {
+    operation_id: String,
+    previous_restore_epoch: u64,
+    new_restore_epoch: u64,
+    previous_security_epoch: u64,
+    new_security_epoch: u64,
+    broker_receipt_hash: &'a str,
+    database_receipt_hash: &'a str,
+    candidate_id: String,
+    generation: u64,
+    activation_receipt_hash: &'a str,
+    completed_at: String,
+}
+
+/// `FinalizeDatabaseAuthorityReset`'s receipt construction — the
+/// deterministic part of the protected transaction, kept in the
+/// domain so the hash formula stays byte-faithful and testable. The
+/// *port* still owns the transaction that chooses `completed_at`
+/// (`GREATEST(clock_timestamp(), activation.activated_at)` once, UTC,
+/// truncated to microseconds) and persists the result; this function
+/// performs the truncation, canonical encoding, hashing, and
+/// `ValidateFor` check the upstream transaction performs.
+///
+/// `operation` must be the exact projected record (`verifying` at
+/// `inventory_verified`) and `activation` must bind the same
+/// registration the reset transaction inserted.
+pub fn new_authority_reset_receipt(
+    operation: &RestoreOperation,
+    registration: &RecoveryBootstrapRegistration,
+    activation: &RecoveryBootstrapActivation,
+    completed_at: time::OffsetDateTime,
+) -> Result<AuthorityResetReceipt, Failure> {
+    if is_zero_time(completed_at) {
+        return Err(Failure::invalid(
+            "backup_recovery",
+            "invalid recovery authority-reset completion instant",
+        ));
+    }
+    // `completedAt.UTC().Truncate(time.Microsecond)` — done before
+    // the payload and the struct field so both agree exactly.
+    let completed_at = {
+        let utc = completed_at.to_offset(time::UtcOffset::UTC);
+        utc - time::Duration::nanoseconds(i64::from(utc.nanosecond() % 1000))
+    };
+    let receipt = AuthorityResetReceipt {
+        operation_id: operation.operation_id,
+        previous_restore_epoch: operation.restore_epoch.saturating_sub(1),
+        new_restore_epoch: operation.restore_epoch,
+        previous_security_epoch: operation.security_epoch,
+        new_security_epoch: operation.security_epoch.saturating_add(1),
+        broker_receipt_hash: registration.broker_receipt_hash.clone(),
+        database_receipt_hash: registration.database_receipt_hash.clone(),
+        bootstrap_candidate_id: registration.candidate_id,
+        bootstrap_generation: registration.generation,
+        bootstrap_activation_receipt_hash: activation.activation_receipt_hash.clone(),
+        aggregate_receipt_hash: String::new(),
+        completed_at,
+    };
+    let payload = serde_json::to_vec(&AggregateReceiptPayload {
+        operation_id: operation.operation_id.to_string(),
+        previous_restore_epoch: receipt.previous_restore_epoch,
+        new_restore_epoch: receipt.new_restore_epoch,
+        previous_security_epoch: receipt.previous_security_epoch,
+        new_security_epoch: receipt.new_security_epoch,
+        broker_receipt_hash: &receipt.broker_receipt_hash,
+        database_receipt_hash: &receipt.database_receipt_hash,
+        candidate_id: registration.candidate_id.to_string(),
+        generation: registration.generation,
+        activation_receipt_hash: &receipt.bootstrap_activation_receipt_hash,
+        completed_at: rfc3339_nano(completed_at),
+    })
+    .map_err(|_| {
+        Failure::internal(
+            "backup_recovery",
+            "recovery authority reset finalization encoding failed",
+        )
+    })?;
+    let mut receipt = receipt;
+    {
+        use sha2::Digest as _;
+        receipt.aggregate_receipt_hash =
+            format!("sha256:{}", hex_encode(&sha2::Sha256::digest(&payload)));
+    }
+    receipt.validate_for(operation).map_err(|_| {
+        Failure::invalid(
+            "backup_recovery",
+            "recovery authority reset finalization produced invalid evidence",
+        )
+    })?;
+    Ok(receipt)
+}
+
 /// `RecoveryBootstrapDraft` — broker-created recovery bootstrap
 /// evidence. Plaintext remains in protected broker storage; only
-/// hashes and opaque IDs cross this boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// hashes and opaque IDs cross this boundary. `Debug` is
+/// hand-implemented: `verifier_hash`/`candidate_digest` are
+/// verifier-derived material and never render.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryBootstrapDraft {
     /// Bound operation.
     pub operation_id: Uuid,
@@ -380,6 +531,22 @@ pub struct RecoveryBootstrapDraft {
     pub broker_receipt_hash: String,
     /// Creation instant.
     pub created_at: time::OffsetDateTime,
+}
+
+/// `Debug` elides the verifier-derived `verifier_hash` and
+/// `candidate_digest`.
+impl core::fmt::Debug for RecoveryBootstrapDraft {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecoveryBootstrapDraft")
+            .field("operation_id", &self.operation_id)
+            .field("draft_id", &self.draft_id)
+            .field("candidate_id", &self.candidate_id)
+            .field("verifier_hash", &"<redacted>")
+            .field("candidate_digest", &"<redacted>")
+            .field("broker_receipt_hash", &self.broker_receipt_hash)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 impl RecoveryBootstrapDraft {
@@ -408,8 +575,10 @@ impl RecoveryBootstrapDraft {
 
 /// `RecoveryBootstrapRegistration` — the exact fresh generation
 /// atomically registered by PostgreSQL while all restored authority
-/// is invalidated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// is invalidated. `Debug` is hand-implemented for the same reason
+/// as [`RecoveryBootstrapDraft`]: `verifier_hash`/`candidate_digest`
+/// never render.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryBootstrapRegistration {
     /// Bound operation.
     pub operation_id: Uuid,
@@ -429,6 +598,24 @@ pub struct RecoveryBootstrapRegistration {
     pub database_receipt_hash: String,
     /// Registration instant.
     pub registered_at: time::OffsetDateTime,
+}
+
+/// `Debug` elides the verifier-derived `verifier_hash` and
+/// `candidate_digest`.
+impl core::fmt::Debug for RecoveryBootstrapRegistration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecoveryBootstrapRegistration")
+            .field("operation_id", &self.operation_id)
+            .field("draft_id", &self.draft_id)
+            .field("candidate_id", &self.candidate_id)
+            .field("generation", &self.generation)
+            .field("verifier_hash", &"<redacted>")
+            .field("candidate_digest", &"<redacted>")
+            .field("broker_receipt_hash", &self.broker_receipt_hash)
+            .field("database_receipt_hash", &self.database_receipt_hash)
+            .field("registered_at", &self.registered_at)
+            .finish()
+    }
 }
 
 impl RecoveryBootstrapRegistration {
@@ -592,6 +779,13 @@ pub fn new_restore_operation(
 }
 
 impl RestoreOperation {
+    /// `ProtectedState` — the only operator-state value the operation
+    /// may project into the external audit record.
+    #[must_use]
+    pub const fn protected_state(&self) -> Option<ExternalRecordState> {
+        self.phase.protected_state()
+    }
+
     /// `IsResumable` — the exact protected operation, rather than a
     /// new ticket or process-local reconstruction, may resume.
     #[must_use]

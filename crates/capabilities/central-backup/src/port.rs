@@ -442,158 +442,571 @@ pub struct VersionZeroEligibility {
 }
 
 // ---------------------------------------------------------------------------
-// R6 Task 3 — recovery ports (recovery_port.go family)
+// R6 Task 3 — backup/recovery ports (`internal/backup/port/recovery_port.go`)
 //
-// Every trait below is the store/client seam a future PostgreSQL, object-
-// store, or broker adapter implements. None carries a path, object key,
-// DSN, credential, or process identity — the same locator-free contract the
-// domain records enforce.
+// Every trait below is the store/client seam a future PostgreSQL,
+// object-store, or broker adapter implements. None carries a path,
+// object key, DSN, credential, process identity, or broker secret —
+// the same locator-free contract the domain records enforce. Methods
+// are synchronous like the domain; an adapter that needs async I/O
+// owns the bridging, exactly as the migration ports keep `sqlx` out.
 // ---------------------------------------------------------------------------
 
 use crate::backup::capacity::{BackupContinuitySnapshot, CapacitySnapshot, RecoveryProfile};
-use crate::backup::inventory::InventoryChunk;
+use crate::backup::inventory::{InventoryChunk, InventoryEntry, MAXIMUM_INVENTORY_CHUNK_ENTRIES};
 use crate::backup::manifest::SealRootManifest;
 use crate::backup::operation::{BackupAcceptedFacts, BackupOperation, DumpEvidence};
 use crate::recovery::operation::{
     AuthorityResetReceipt, RecoveryBootstrapActivation, RecoveryBootstrapDraft,
-    RecoveryBootstrapRegistration, RestoreOperation, RestoreTicket,
+    RecoveryBootstrapRegistration, RestoreAbandonAuthorization, RestoreApplyAuthorization,
+    RestoreOperation, RestoreTicket,
 };
-use crate::recovery::profile::{ThroughputEvidence, ThroughputEvidenceBinding};
+use crate::recovery::profile::ThroughputEvidence;
 use crate::recovery::quarantine::QuarantineFinding;
+use crate::repository::{BackupFileTreeEvidence, BackupSealCompanion, BackupSealPublication};
 
-/// `port.BackupJournal` — CAS-persisted backup operations (the
-/// protected journal; PostgreSQL is not the authority).
+/// `port.ErrBackupArtifactEvidenceMismatch` — the adapter-neutral
+/// signal that a complete Artifact body disagreed with its immutable
+/// database size or checksum. The application may classify repeated
+/// occurrences as corrupted; transport, capacity, authority, and
+/// repository I/O errors must not use this code and therefore cannot
+/// be mislabeled as data corruption. An adapter signals it by
+/// returning a [`Failure`] whose [`Failure::code`] equals this value.
+pub const ERR_BACKUP_ARTIFACT_EVIDENCE_MISMATCH: &str = "backup_artifact_evidence_mismatch";
+
+/// `io.ReadCloser` — a body stream whose close may fail. The
+/// coordinator distinguishes a clean copy+close from either half
+/// failing (upstream `copyArtifactBody` checks both), so the close is
+/// explicit rather than `Drop`.
+pub trait ReadClose: std::io::Read + Send {
+    /// `Close` — terminal flush/fence; its error is itself evidence.
+    fn close(self: Box<Self>) -> Result<(), Failure>;
+}
+
+/// `port.BackupAdmissionSnapshot` — one atomic, trusted admission
+/// observation. Facts become part of the protected operation before
+/// any dump write; the remaining fields prove the C02 resource and
+/// authority preconditions at that same boundary. The environment
+/// must produce all five fields under the same held evidence set —
+/// split reads would admit a snapshot no instant ever contained.
+#[derive(Debug, Clone)]
+pub struct BackupAdmissionSnapshot {
+    /// Accepted-point trusted facts.
+    pub facts: BackupAcceptedFacts,
+    /// Fresh capacity census.
+    pub capacity: CapacitySnapshot,
+    /// The throughput receipt measured against this environment.
+    /// Required — admission cannot pass on missing evidence.
+    pub throughput: ThroughputEvidence,
+    /// The target-exclusive lock was observed held at snapshot time.
+    pub target_lock_held: bool,
+    /// The authority acceptance receipt was observed held at snapshot
+    /// time.
+    pub authority_receipt_held: bool,
+}
+
+/// `port.RestoreAdmissionFacts` bind the protected target authority,
+/// sealed payload and schema identity, current installed
+/// configuration, and fresh trusted capacity evidence. None may be
+/// supplied by CLI values.
+#[derive(Debug, Clone)]
+pub struct RestoreAdmissionFacts {
+    /// Destination target identity.
+    pub target: TargetIdentity,
+    /// `sha256:`-prefixed target fingerprint.
+    pub target_fingerprint: String,
+    /// Security epoch.
+    pub security_epoch: u64,
+    /// Restore epoch.
+    pub restore_epoch: u64,
+    /// `sha256:`-prefixed config fingerprint.
+    pub config_fingerprint: String,
+    /// Payload epoch (v7 UUID).
+    pub payload_epoch_id: uuid::Uuid,
+    /// Pinned schema version.
+    pub database_schema_version: String,
+    /// `sha256:`-prefixed capacity evidence digest.
+    pub capacity_evidence_digest: String,
+    /// Pinned dump tool version (`"pg_restore-16.14"`).
+    pub tool_version: String,
+}
+
+/// `port.RecoveryVerificationEvidence` — the adapter-neutral result
+/// of one full verification walk of a sealed backup. It carries the
+/// complete sealed root manifest, not only the digests, because C03
+/// admission needs the accepted facts and the sealed media quantities
+/// too — and re-reading them is a second SHA-256 walk of the whole
+/// dump and every artifact body, which at the profile's admitted
+/// floor throughput costs as much as the first. Locator-free: opaque
+/// identities, fingerprints, sizes, and checksums only.
+#[derive(Debug, Clone)]
+pub struct RecoveryVerificationEvidence {
+    /// Backup operation identity.
+    pub operation_id: uuid::Uuid,
+    /// Sealed backup identity.
+    pub backup_id: uuid::Uuid,
+    /// Repository binding identity.
+    pub repository_binding_id: uuid::Uuid,
+    /// Seal-root manifest digest.
+    pub manifest_digest: [u8; 32],
+    /// Seal companion digest.
+    pub seal_companion_digest: [u8; 32],
+    /// Immutable file-tree digest.
+    pub file_tree_digest: [u8; 32],
+    /// Published repository manifest digest.
+    pub repository_manifest_digest: [u8; 32],
+    /// Published repository manifest revision.
+    pub repository_revision: u64,
+    /// Dump evidence.
+    pub dump: DumpEvidence,
+    /// Sealed artifact count.
+    pub artifact_count: u64,
+    /// Sealed object bytes.
+    pub object_bytes: u64,
+    /// The complete verified seal-root manifest.
+    pub manifest: SealRootManifest,
+}
+
+/// `port.ReadyArtifactCursor` — the opaque, stable seek position for
+/// the globally unique Artifact identity. Artifact IDs are
+/// application-generated UUIDs, so the cursor reveals neither an
+/// object key nor a backing-store locator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadyArtifactCursor {
+    /// Last entry's artifact identity (nil = from the start).
+    pub artifact_id: uuid::Uuid,
+}
+
+/// `port.ReadyArtifactPage` — one bounded, canonical metadata page.
+/// `complete` is authoritative: an empty incomplete page is invalid,
+/// while an empty complete first page is the valid inventory of an
+/// instance with no ready Artifacts. `next_cursor` is meaningful only
+/// when `complete` is false and must name the final entry in
+/// `entries`.
+#[derive(Debug, Clone)]
+pub struct ReadyArtifactPage {
+    /// Page entries.
+    pub entries: Vec<InventoryEntry>,
+    /// Resume position for the next page.
+    pub next_cursor: ReadyArtifactCursor,
+    /// No more pages.
+    pub complete: bool,
+}
+
+/// `port.MaximumReadyArtifactPageEntries` — the largest PostgreSQL
+/// metadata page a C01 worker may hold. It deliberately matches one
+/// immutable inventory chunk, so the application service can write
+/// and release one complete page before requesting the next seek
+/// position.
+pub const MAXIMUM_READY_ARTIFACT_PAGE_ENTRIES: usize = MAXIMUM_INVENTORY_CHUNK_ENTRIES;
+
+/// `port.BackupJournal` — the durable operation authority for an
+/// ordinary backup. It persists the accepted consistent point before
+/// a dump starts and uses CAS for every phase, so a lost controller
+/// cannot mistake unsealed evidence for a completed backup.
 pub trait BackupJournalStore: Send + Sync {
-    /// Load the current record, if any.
-    fn load_backup_operation(
-        &self,
-        operation_id: uuid::Uuid,
-    ) -> Result<Option<BackupOperation>, Failure>;
-    /// Compare-and-swap on `expected.revision`.
-    fn store_backup_operation(
+    /// `CreateBackup` — persists the planned operation; a duplicate
+    /// identity must refuse.
+    fn create_backup(&self, operation: &BackupOperation) -> Result<(), Failure>;
+    /// `ReadBackup` — the durable record; absent is an error.
+    fn read_backup(&self, operation_id: uuid::Uuid) -> Result<BackupOperation, Failure>;
+    /// `CompareAndSwapBackup` — the store must require
+    /// `current == expected` and validate
+    /// `expected.validate_transition_to(next)` under its lock before
+    /// writing `next`.
+    fn compare_and_swap_backup(
         &self,
         expected: &BackupOperation,
         next: &BackupOperation,
     ) -> Result<(), Failure>;
 }
 
-/// `port.BackupEnvironment` — the trusted pre-admission census and
-/// accepted-point facts; only the trusted environment may produce
-/// them.
+/// `port.BackupEnvironment` — fresh, safe measurements without
+/// revealing repository paths or credentials. The coordinator
+/// requires a new snapshot at every phase boundary and no more than
+/// one write quantum apart.
 pub trait BackupEnvironmentProbe: Send + Sync {
-    /// Fresh capacity census.
-    fn census(&self) -> Result<CapacitySnapshot, Failure>;
-    /// Accepted-point trusted facts under the exclusive lock.
-    fn accepted_facts(&self) -> Result<BackupAcceptedFacts, Failure>;
-    /// Continuous-guard snapshot.
-    fn continuity(&self) -> Result<BackupContinuitySnapshot, Failure>;
-    /// The environment's expected throughput binding.
-    fn throughput_binding(&self) -> Result<ThroughputEvidenceBinding, Failure>;
-    /// The freshest usable throughput receipt, if any.
-    fn throughput_evidence(&self) -> Result<Option<ThroughputEvidence>, Failure>;
+    /// `AdmissionSnapshot` — the atomic facts+capacity+throughput+
+    /// lock/receipt observation for this exact operation.
+    fn admission_snapshot(
+        &self,
+        operation: &BackupOperation,
+    ) -> Result<BackupAdmissionSnapshot, Failure>;
+    /// `ContinuationSnapshot` — the continuity guard for this exact
+    /// operation.
+    fn continuation_snapshot(
+        &self,
+        operation: &BackupOperation,
+    ) -> Result<BackupContinuitySnapshot, Failure>;
 }
 
-/// `port.RepositoryWriter` — the sealed-media sink. Chunk bytes are
-/// produced by the domain; the adapter only persists them immutably.
+/// `port.ReadyArtifactSource` — metadata and stream bodies for ready
+/// artifacts through the dedicated recovery identity. No live object
+/// key crosses this capability boundary.
+pub trait ReadyArtifactSource: Send + Sync {
+    /// `ListReadyArtifacts`.
+    fn list_ready_artifacts(
+        &self,
+        operation: &BackupOperation,
+        after: ReadyArtifactCursor,
+        limit: usize,
+    ) -> Result<ReadyArtifactPage, Failure>;
+    /// `OpenReadyArtifact`.
+    fn open_ready_artifact(
+        &self,
+        operation: &BackupOperation,
+        entry: &InventoryEntry,
+    ) -> Result<Box<dyn ReadClose>, Failure>;
+}
+
+/// `port.BackupDumper` — starts the pinned `pg_dump` invocation whose
+/// output is consumed once by the repository. The returned stream
+/// carries no credential value.
+pub trait BackupDumper: Send + Sync {
+    /// `StartDump`.
+    fn start_dump(&self, operation: &BackupOperation) -> Result<Box<dyn ReadClose>, Failure>;
+}
+
+/// `port.BackupSealer` — the worker-facing broker commit. It may
+/// issue the exact seal companion, but it deliberately cannot perform
+/// the terminal sealed transition: only the post-reap helper
+/// attestation boundary can do that.
+pub trait BackupSealer: Send + Sync {
+    /// `SealBackup`.
+    fn seal_backup(
+        &self,
+        proposal: &crate::backup::operation::BackupSealProposal,
+    ) -> Result<BackupSealCompanion, Failure>;
+}
+
+/// `port.BackupRepository` — stores only immutable recovery evidence
+/// beneath the helper-selected recovery root. Its implementation must
+/// reject arbitrary paths and overwrites, and every write carries the
+/// exact `backup_id` it binds.
 pub trait RecoveryRepositoryStore: Send + Sync {
-    /// Persist an immutable inventory chunk under its sealed identity.
-    fn write_inventory_chunk(&self, chunk: &InventoryChunk) -> Result<(), Failure>;
-    /// Persist the dump bytes and return their evidence.
-    fn write_database_dump(&self, bytes: &mut dyn std::io::Read) -> Result<DumpEvidence, Failure>;
-    /// Persist the canonical seal root and return its storage receipt
-    /// (opaque; the manifest is the domain's).
-    fn write_seal_root(&self, manifest: &SealRootManifest) -> Result<(), Failure>;
-    /// Read a chunk back for verification/restore.
-    fn read_inventory_chunk(&self, ordinal: u32) -> Result<InventoryChunk, Failure>;
-    /// Read the canonical seal root bytes.
-    fn read_seal_root(&self) -> Result<Vec<u8>, Failure>;
+    /// `BindBackup` — binds this exact operation's backup identity;
+    /// every later write must carry it.
+    fn bind_backup(&self, operation: &BackupOperation) -> Result<(), Failure>;
+    /// `WriteDump(backupID, source, maximumBytes)` — persists the dump
+    /// bytes, refusing past `maximum_bytes`, and returns their
+    /// evidence.
+    fn write_dump(
+        &self,
+        backup_id: uuid::Uuid,
+        source: &mut dyn std::io::Read,
+        maximum_bytes: i64,
+    ) -> Result<DumpEvidence, Failure>;
+    /// `WriteArtifactBody(backupID, entry, source)` — persists one
+    /// artifact body; a complete body that disagrees with `entry`'s
+    /// size or checksum is
+    /// [`ERR_BACKUP_ARTIFACT_EVIDENCE_MISMATCH`], not an I/O failure.
+    fn write_artifact_body(
+        &self,
+        backup_id: uuid::Uuid,
+        entry: &InventoryEntry,
+        source: &mut dyn std::io::Read,
+    ) -> Result<(), Failure>;
+    /// `WriteChunk(backupID, chunk)` — persists an immutable inventory
+    /// chunk under its sealed identity.
+    fn write_chunk(&self, backup_id: uuid::Uuid, chunk: &InventoryChunk) -> Result<(), Failure>;
+    /// `WriteManifest` — persists the canonical root manifest and
+    /// returns the file-tree evidence the seal proposal binds;
+    /// callers never supply the digest.
+    fn write_manifest(
+        &self,
+        manifest: &SealRootManifest,
+    ) -> Result<BackupFileTreeEvidence, Failure>;
+    /// `WriteSealCompanion` — persists the broker-issued companion and
+    /// returns the publication receipt for the exact companion and
+    /// root index revision durably synchronized.
+    fn write_seal_companion(
+        &self,
+        backup_id: uuid::Uuid,
+        companion: &BackupSealCompanion,
+    ) -> Result<BackupSealPublication, Failure>;
+    /// Reads an immutable inventory chunk back for
+    /// verification/restore; backup-scoped like every other access.
+    fn read_inventory_chunk(
+        &self,
+        backup_id: uuid::Uuid,
+        ordinal: u32,
+    ) -> Result<InventoryChunk, Failure>;
+    /// Reads the canonical seal root bytes; backup-scoped.
+    fn read_seal_root(&self, backup_id: uuid::Uuid) -> Result<Vec<u8>, Failure>;
 }
 
-/// `port.RestoreJournal` — CAS-persisted restore operations. The
-/// journal adapter must run [`RestoreOperation::validate_transition_to`]
-/// before every write.
+/// `port.RecoveryRepositoryVerifier` — reads only sealed repository
+/// evidence. Its implementation must not repair, delete, or enumerate
+/// paths outside the exact backup ID supplied by the controller.
+pub trait RecoveryRepositoryVerifier: Send + Sync {
+    /// `VerifyBackup` — one full verification walk of the sealed
+    /// backup; the result is checked again downstream rather than
+    /// trusted.
+    fn verify_backup(
+        &self,
+        backup_id: uuid::Uuid,
+        profile: &RecoveryProfile,
+    ) -> Result<RecoveryVerificationEvidence, Failure>;
+}
+
+/// `port.RecoveryInventorySource` — the exact ordered, sealed
+/// Artifact inventory for C04 verification. Implementations must
+/// revalidate the repository seal and all referenced immutable
+/// evidence before returning; callers never receive repository paths
+/// or object keys.
+pub trait RecoveryInventorySource: Send + Sync {
+    /// `ReadVerifiedInventory`.
+    fn read_verified_inventory(
+        &self,
+        backup_id: uuid::Uuid,
+        profile: &RecoveryProfile,
+    ) -> Result<Vec<InventoryEntry>, Failure>;
+}
+
+/// `port.BackupSealVerifier` — the broker-side counterpart required
+/// before C03 can issue a restore ticket. Repository hashes alone are
+/// insufficient: an unsealed or locally fabricated manifest must
+/// never become restorable.
+pub trait BackupSealVerifier: Send + Sync {
+    /// `VerifyBackupSeal`.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_backup_seal(
+        &self,
+        backup_id: uuid::Uuid,
+        manifest_digest: [u8; 32],
+        seal_companion_digest: [u8; 32],
+        file_tree_digest: [u8; 32],
+        repository_manifest_digest: [u8; 32],
+        repository_revision: u64,
+    ) -> Result<(), Failure>;
+}
+
+/// `port.RestoreAdmissionInspector` — judges the destination against
+/// evidence that has already been verified once. Implementations must
+/// not accept the evidence on trust: it arrives as a parameter, so an
+/// implementation is required to re-establish, from authority it owns
+/// rather than from the value it was handed, that the evidence names
+/// the backup asked for, belongs to its own repository binding, and
+/// is the one the broker sealed.
+pub trait RestoreAdmissionInspector: Send + Sync {
+    /// `InspectRestoreAdmission`.
+    fn inspect_restore_admission(
+        &self,
+        backup_id: uuid::Uuid,
+        evidence: &RecoveryVerificationEvidence,
+    ) -> Result<RestoreAdmissionFacts, Failure>;
+}
+
+/// `port.RestoreTicketIssuer` — broker-owned. Issue persists the
+/// one-use protected ticket — minting the fresh operation/ticket IDs,
+/// the 32-byte hidden nonce, the epochs/fingerprints binding, and the
+/// ticket HMAC — before returning it to the verifier; callers must
+/// never render the returned nonce or HMAC to an operator result.
+pub trait RestoreTicketIssuer: Send + Sync {
+    /// `IssueRestoreTicket`.
+    fn issue_restore_ticket(
+        &self,
+        backup_id: uuid::Uuid,
+        manifest_digest: &str,
+        facts: &RestoreAdmissionFacts,
+        now: time::OffsetDateTime,
+    ) -> Result<RestoreTicket, Failure>;
+}
+
+/// `port.RestoreJournal` — the protected, external source of truth
+/// for recovery. Its `begin_restore` atomically validates and
+/// consumes a broker ticket while publishing `applying`, before any
+/// database mutation. PostgreSQL projections may mirror these records
+/// but cannot replace this interface.
 pub trait RestoreJournalStore: Send + Sync {
-    /// Load the current record, if any.
-    fn load_restore_operation(
+    /// `BeginRestore` — consumes both the verified ticket and a fresh
+    /// helper-issued apply authorization under the same protected
+    /// operation lock (ticket HMAC + one-use consumption included).
+    /// A ticket by itself is insufficient authority to start
+    /// destructive replacement. Returns the durable record.
+    fn begin_restore(
+        &self,
+        ticket: &RestoreTicket,
+        authorization: &RestoreApplyAuthorization,
+        at: time::OffsetDateTime,
+    ) -> Result<RestoreOperation, Failure>;
+    /// `ResumeRestore` — consumes a new helper-issued PAM/TTY
+    /// authorization before returning the exact resumable protected
+    /// operation. Reading an operation ID alone is never sufficient
+    /// authority to continue destructive recovery.
+    fn resume_restore(
         &self,
         operation_id: uuid::Uuid,
-    ) -> Result<Option<RestoreOperation>, Failure>;
-    /// Compare-and-swap on `expected.revision`.
-    fn store_restore_operation(
+        authorization: &RestoreApplyAuthorization,
+        at: time::OffsetDateTime,
+    ) -> Result<RestoreOperation, Failure>;
+    /// `AbandonRestore` — consumes a fresh helper-issued abandonment
+    /// authorization and publishes ADR 0016's terminal outcome for
+    /// exactly its operation, under the same protected lock that
+    /// consumes the authorization.
+    fn abandon_restore(
+        &self,
+        operation_id: uuid::Uuid,
+        authorization: &RestoreAbandonAuthorization,
+        at: time::OffsetDateTime,
+    ) -> Result<RestoreOperation, Failure>;
+    /// `ReadRestore` — the durable record; absent is an error.
+    fn read_restore(&self, operation_id: uuid::Uuid) -> Result<RestoreOperation, Failure>;
+    /// `CompareAndSwapRestore` — the store must require
+    /// `current == expected` and run
+    /// [`RestoreOperation::validate_transition_to`] under its lock
+    /// before writing `next`, so a caller-supplied record can never
+    /// skip checkpoints or manufacture a security-epoch advance.
+    fn compare_and_swap_restore(
         &self,
         expected: &RestoreOperation,
         next: &RestoreOperation,
     ) -> Result<(), Failure>;
 }
 
-/// `port.QuarantineStore` — durable quarantine findings. Resolution is
-/// recorded by the ordinary artifact lifecycle, never by callers.
-pub trait QuarantineStore: Send + Sync {
-    /// Persist a new finding.
-    fn record_finding(&self, finding: &QuarantineFinding) -> Result<(), Failure>;
-    /// Unresolved count for an operation.
-    fn unresolved_count(&self, operation_id: uuid::Uuid) -> Result<u64, Failure>;
-    /// Durable findings for an operation.
-    fn list_findings(&self, operation_id: uuid::Uuid) -> Result<Vec<QuarantineFinding>, Failure>;
+/// `port.RestoreBarrierInspector` — the read-only startup view of
+/// the external recovery journal. It reports the one non-ready
+/// restore that blocks serving; an unreadable, corrupt, or ambiguous
+/// journal must be returned as an error so startup fails closed.
+pub trait RestoreBarrierInspector: Send + Sync {
+    /// `InspectRestoreBarrier` — `(operation, active)`.
+    fn inspect_restore_barrier(&self) -> Result<(RestoreOperation, bool), Failure>;
 }
 
-/// `port.BrokerAuthorityReset` — the broker side of the C05 reset:
-/// ticket issue/consume, bootstrap draft/activation, TLS re-key. All
-/// plaintext credentials remain inside the broker; only hashes and
-/// opaque IDs cross.
+/// `port.RestoreTargetExclusion` — the restore-time fence for the
+/// exact protected PostgreSQL target. It must be backed by an
+/// external durable lock, rather than a process-local mutex: a lost
+/// lease leaves the operation applying and prevents its replacement
+/// checkpoint from being published.
+pub trait RestoreTargetExclusion: Send {
+    /// `AssertHeld` — refuses when the external lease is lost.
+    fn assert_held(&self) -> Result<(), Failure>;
+    /// `Release` — the terminal, once-only release.
+    fn release(&self) -> Result<(), Failure>;
+}
+
+/// `port.RestoreQuarantineStore` persists only typed, locator-free
+/// mismatches. During quarantine, `record_quarantine_findings`
+/// receives a complete fresh inventory result and resolves only prior
+/// findings absent from that result. Thus resolution is evidence of
+/// the ordinary Artifact re-ingest or delete-intent/finalization
+/// capability, never a caller-selected flag clear.
+pub trait RestoreQuarantineStore: Send + Sync {
+    /// `RecordQuarantineFindings` — persists the complete fresh
+    /// finding set and returns the surviving unresolved count.
+    fn record_quarantine_findings(
+        &self,
+        operation: &RestoreOperation,
+        findings: &[QuarantineFinding],
+    ) -> Result<u64, Failure>;
+    /// `UnresolvedQuarantineCount`.
+    fn unresolved_quarantine_count(&self, operation: &RestoreOperation) -> Result<u64, Failure>;
+}
+
+/// `port.RecoveryBrokerAuthorityResetter` — invalidates broker-owned
+/// authority, stages a protected fresh bootstrap draft, and later
+/// activates only the exact generation registered by PostgreSQL.
+/// Plaintext never crosses this port.
 pub trait BrokerAuthorityReset: Send + Sync {
-    /// Issue a one-use ticket bound to manifest + target + epochs.
-    fn issue_restore_ticket(&self, ticket: &RestoreTicket) -> Result<RestoreTicket, Failure>;
-    /// Consume a ticket exactly once; replay must refuse.
-    fn consume_restore_ticket(&self, ticket: &RestoreTicket) -> Result<(), Failure>;
-    /// Create the recovery bootstrap draft.
-    fn create_bootstrap_draft(
+    /// `PrepareRecoveryBrokerAuthority` — the protected fresh
+    /// bootstrap draft.
+    fn prepare_recovery_broker_authority(
         &self,
         operation: &RestoreOperation,
     ) -> Result<RecoveryBootstrapDraft, Failure>;
-    /// Activate the exact database-issued generation; re-keys broker
-    /// TLS and invalidates sessions, grants, claims, leases, fences,
-    /// provider bindings, and secret references inside the broker.
-    fn activate_bootstrap(
+    /// `ActivateRecoveryBootstrap` — activates only the exact
+    /// database-registered generation; re-keys broker TLS and
+    /// invalidates sessions, grants, claims, leases, fences, provider
+    /// bindings, and secret references inside the broker.
+    fn activate_recovery_bootstrap(
         &self,
+        operation: &RestoreOperation,
         registration: &RecoveryBootstrapRegistration,
     ) -> Result<RecoveryBootstrapActivation, Failure>;
 }
 
-/// `port.PostgresAuthorityReset` — the database side of C05:
-/// helper/PAM rebind and bootstrap registration while all restored
-/// authority is invalidated.
+/// `port.RecoveryDatabaseAuthorityResetter` — performs the single
+/// PostgreSQL C05 reset transaction and registers the fresh
+/// generation before broker activation. Finalize appends aggregate
+/// evidence only after exact protected activation.
 pub trait PostgresAuthorityReset: Send + Sync {
-    /// Register the draft's exact generation atomically with the
-    /// invalidation sweep; returns the database receipt.
-    fn register_bootstrap(
+    /// `ResetDatabaseAuthority` — registers the draft's exact
+    /// generation inside the same transaction that invalidates all
+    /// restored authority; returns the database receipt.
+    fn reset_database_authority(
         &self,
+        operation: &RestoreOperation,
         draft: &RecoveryBootstrapDraft,
     ) -> Result<RecoveryBootstrapRegistration, Failure>;
+    /// `FinalizeDatabaseAuthorityReset` — inside one protected
+    /// transaction: verifies the exact `verifying`/`inventory_verified`
+    /// projection, chooses `completed_at` once
+    /// (`GREATEST(clock_timestamp(), activation.activated_at)`, UTC,
+    /// truncated to microseconds), builds the canonical 11-field
+    /// aggregate via
+    /// [`crate::recovery::operation::new_authority_reset_receipt`],
+    /// and persists the receipt — replaying the stored receipt on
+    /// retry. The caller never supplies `completed_at` or the
+    /// aggregate hash.
+    fn finalize_database_authority_reset(
+        &self,
+        operation: &RestoreOperation,
+        registration: &RecoveryBootstrapRegistration,
+        activation: &RecoveryBootstrapActivation,
+    ) -> Result<AuthorityResetReceipt, Failure>;
 }
 
-/// `port.RestoreEngine` — the destructive engine boundary: apply the
-/// sealed dump under the helper barrier. The adapter owns process
-/// management; the domain owns admission and the journal contract.
+/// `port.RestoreEngine` — owns mutation and verification boundaries.
+/// Every method is idempotent for the supplied operation/checkpoint:
+/// a coordinator restart invokes the exact same protected operation,
+/// never a freshly derived one.
 pub trait RestoreEngine: Send + Sync {
-    /// `pg_restore`-equivalent apply. Refuses on stale admission.
-    fn apply_database_dump(&self, operation: &RestoreOperation) -> Result<(), Failure>;
-    /// Re-read every restored object body for inventory comparison.
-    fn verify_restored_inventory(
+    /// `AcquireRestoreTargetExclusion` — the target-exclusive C04
+    /// barrier. A lock acquisition belongs to exactly one protected
+    /// operation and must not allow a caller-selected target or
+    /// operation to be substituted.
+    fn acquire_restore_target_exclusion(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<Box<dyn RestoreTargetExclusion>, Failure>;
+    /// `RestoreDatabase` — the `pg_restore`-equivalent apply under
+    /// the helper barrier. A refusal should carry one of the closed
+    /// [`crate::recovery::refusal`] reasons as its code so the
+    /// coordinator can surface it as the sanitized cause.
+    fn restore_database(&self, operation: &RestoreOperation) -> Result<(), Failure>;
+    /// `ProjectRestoreOperation` — mirrors the broker-owned state into
+    /// PostgreSQL after database replacement. The broker remains
+    /// authoritative, but every later effect and the final ready
+    /// transition require this idempotent audit projection to be
+    /// caught up first.
+    fn project_restore_operation(&self, operation: &RestoreOperation) -> Result<(), Failure>;
+    /// `VerifyInventory` — re-reads every restored object body for
+    /// inventory comparison.
+    fn verify_inventory(
         &self,
         operation: &RestoreOperation,
     ) -> Result<Vec<QuarantineFinding>, Failure>;
+    /// `RecordQuarantineFindings` — mandatory even for an empty
+    /// inventory result: the durable typed projection, rather than an
+    /// engine-local count, is authoritative for the quarantine
+    /// barrier. Returns the surviving unresolved count.
+    fn record_quarantine_findings(
+        &self,
+        operation: &RestoreOperation,
+        findings: &[QuarantineFinding],
+    ) -> Result<u64, Failure>;
+    /// `UnresolvedQuarantineCount`.
+    fn unresolved_quarantine_count(&self, operation: &RestoreOperation) -> Result<u64, Failure>;
+    /// `ResetAuthority` — the broker+database C05 reset producing the
+    /// aggregate receipt.
+    fn reset_authority(
+        &self,
+        operation: &RestoreOperation,
+    ) -> Result<AuthorityResetReceipt, Failure>;
 }
 
 /// `port.RecoveryProfiles` — the installed profile lookup.
 pub trait RecoveryProfileSource: Send + Sync {
     /// The installed admission envelope.
     fn installed_profile(&self) -> Result<RecoveryProfile, Failure>;
-}
-
-/// `port.AuthorityResetJournal` — persists the aggregate receipt with
-/// the operation CAS it authorizes.
-pub trait AuthorityResetJournalStore: Send + Sync {
-    /// Persist the receipt bound to the operation.
-    fn store_authority_receipt(&self, receipt: &AuthorityResetReceipt) -> Result<(), Failure>;
 }

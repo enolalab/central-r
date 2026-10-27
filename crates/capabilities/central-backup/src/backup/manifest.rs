@@ -381,21 +381,6 @@ pub fn parse_seal_root_references(payload: &[u8]) -> Result<SealRootReferences, 
     Ok(references)
 }
 
-/// PostgreSQL engine/dump compatibility (restore admission):
-/// the dump's recorded tool family must match the target engine's
-/// major version line. `pg_dump-16.14` restores only into a `16.x`
-/// engine. Pinned-tool and engine majors that differ are refused as
-/// `RESTORE_MEDIA_INVALID` by the caller — this predicate is the
-/// pure check.
-#[must_use]
-pub fn postgres_version_compatible(dump_tool_version: &str, engine_version: &str) -> bool {
-    let dump_major = dump_tool_version
-        .strip_prefix("pg_dump-")
-        .and_then(|rest| rest.split('.').next());
-    let engine_major = engine_version.split('.').next();
-    matches!((dump_major, engine_major), (Some(d), Some(e)) if !d.is_empty() && !e.is_empty() && d == e)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,15 +490,5 @@ mod tests {
         );
         // Non-contiguous ordinals refuse.
         assert!(new_seal_root_manifest(&operation, dump(), &[chunk(1)]).is_err());
-    }
-
-    #[test]
-    fn postgres_major_lines_must_match() {
-        assert!(postgres_version_compatible("pg_dump-16.14", "16.3"));
-        assert!(postgres_version_compatible("pg_dump-16.14", "16"));
-        assert!(!postgres_version_compatible("pg_dump-16.14", "15.9"));
-        assert!(!postgres_version_compatible("pg_dump-16.14", "17.0"));
-        assert!(!postgres_version_compatible("other", "16.3"));
-        assert!(!postgres_version_compatible("pg_dump-16.14", ""));
     }
 }

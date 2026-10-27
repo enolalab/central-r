@@ -148,8 +148,10 @@ pub struct ResetConfirmation {
 }
 
 /// `backup.ExternalRecordState` — the string states the broker's
-/// protected provisioning record can hold. `Absent` is the honest
-/// answer for a target with no record at all (upstream's
+/// protected provisioning record can hold, including the restore
+/// phases the recovery audit projection uses (`applying`,
+/// `verifying`, `quarantined`). `Absent` is the honest answer for a
+/// target with no record at all (upstream's
 /// `MigrationOperatorInspector` returns `ExternalRecordAbsent`, never
 /// an error, for a missing record).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -157,10 +159,16 @@ pub enum ExternalRecordState {
     /// `backup.ExternalRecordAbsent` — `"absent"`.
     #[default]
     Absent,
-    /// `backup.ExternalRecordQuarantined` — `"quarantined"`.
-    Quarantined,
+    /// `backup.ExternalRecordInitializing` — `"initializing"`.
+    Initializing,
     /// `backup.ExternalRecordReady` — `"ready"`.
     Ready,
+    /// `backup.ExternalRecordApplying` — `"applying"` (restore).
+    Applying,
+    /// `backup.ExternalRecordVerifying` — `"verifying"` (restore).
+    Verifying,
+    /// `backup.ExternalRecordQuarantined` — `"quarantined"`.
+    Quarantined,
 }
 
 impl ExternalRecordState {
@@ -169,8 +177,11 @@ impl ExternalRecordState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "absent",
-            Self::Quarantined => "quarantined",
+            Self::Initializing => "initializing",
             Self::Ready => "ready",
+            Self::Applying => "applying",
+            Self::Verifying => "verifying",
+            Self::Quarantined => "quarantined",
         }
     }
 
@@ -180,12 +191,44 @@ impl ExternalRecordState {
         matches!(self, Self::Ready)
     }
 
+    /// `backup.ExternalRecordState.ValidTransitions` — the closed set
+    /// of legal next states: `absent → initializing → ready|absent`;
+    /// `ready → applying|quarantined`; `applying → verifying`;
+    /// `verifying → ready|quarantined`; `quarantined → verifying`.
+    #[must_use]
+    pub const fn valid_transitions(self) -> &'static [Self] {
+        match self {
+            Self::Absent => &[Self::Initializing],
+            Self::Initializing => &[Self::Ready, Self::Absent],
+            Self::Ready => &[Self::Applying, Self::Quarantined],
+            Self::Applying => &[Self::Verifying],
+            Self::Verifying => &[Self::Ready, Self::Quarantined],
+            Self::Quarantined => &[Self::Verifying],
+        }
+    }
+
+    /// `backup.ExternalRecordState.CanTransition`.
+    #[must_use]
+    pub fn can_transition(self, next: Self) -> bool {
+        self.valid_transitions().contains(&next)
+    }
+
+    /// `backup.ExternalRecordState.IsTerminal` — `ready` is the only
+    /// terminal external state.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
     /// Parse one wire state string; empty/unknown input is `Absent`,
     /// never a manufactured `Ready`.
     #[must_use]
     pub fn parse(state: &str) -> Self {
         match state {
+            "initializing" => Self::Initializing,
             "ready" => Self::Ready,
+            "applying" => Self::Applying,
+            "verifying" => Self::Verifying,
             "quarantined" => Self::Quarantined,
             _ => Self::Absent,
         }
@@ -243,6 +286,33 @@ impl ProvisioningPhase {
     #[must_use]
     pub const fn is_pre_baseline(self) -> bool {
         matches!(self, Self::Recorded | Self::CandidateStaged)
+    }
+
+    /// `backup.ProvisioningPhase.ValidTransitions` — the linear
+    /// `recorded → candidate_staged → baseline_installed →
+    /// candidate_active` chain; `candidate_active` (and `None`) have
+    /// no legal successors.
+    #[must_use]
+    pub const fn valid_transitions(self) -> &'static [Self] {
+        match self {
+            Self::Recorded => &[Self::CandidateStaged],
+            Self::CandidateStaged => &[Self::BaselineInstalled],
+            Self::BaselineInstalled => &[Self::CandidateActive],
+            Self::CandidateActive | Self::None => &[],
+        }
+    }
+
+    /// `backup.ProvisioningPhase.CanTransition`.
+    #[must_use]
+    pub fn can_transition(self, next: Self) -> bool {
+        self.valid_transitions().contains(&next)
+    }
+
+    /// `backup.ProvisioningPhase.IsTerminal` — `candidate_active` is
+    /// the terminal provisioning phase.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::CandidateActive)
     }
 }
 

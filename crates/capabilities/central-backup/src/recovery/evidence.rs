@@ -10,14 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::wire::{sha256_hex, valid_recovery_digest, wire_failure};
 
-fn evidence_failure(message: &'static str) -> Failure {
+fn evidence_failure(message: impl Into<String>) -> Failure {
     wire_failure("backup_recovery_evidence", message)
 }
 
-/// `EvidenceDigest` — SHA-256 over the emitted document bytes.
+/// `EvidenceDigest` — lowercase-hex SHA-256 over the emitted document
+/// bytes, terminating newline included. Callers add the `sha256:`
+/// prefix at the manifest field that carries it.
 #[must_use]
 pub fn evidence_digest(document: &[u8]) -> String {
-    format!("sha256:{}", sha256_hex(document))
+    sha256_hex(document)
 }
 
 /// `ScenarioResult` — `pass`/`fail` only; a skipped or unknown value
@@ -356,31 +358,289 @@ pub fn validate_quarantine_resolutions(resolutions: &QuarantineResolutions) -> R
     Ok(())
 }
 
-/// `ScanProhibitions` (bounded domain half) — a document must not
-/// carry DSN-shaped text, an absolute path, or the typed
-/// confirmation phrase. The full byte-shape walk lives upstream; the
-/// domain reproduces its three load-bearing refusals.
-pub fn scan_prohibitions(document: &str) -> Result<(), Failure> {
-    let lowered = document.to_ascii_lowercase();
-    if lowered.contains("postgres://")
-        || lowered.contains("postgresql://")
-        || lowered.contains("password=")
-        || lowered.contains("central.restore-confirm")
-    {
-        return Err(evidence_failure(
-            "recovery evidence carries prohibited locator or credential material",
-        ));
+// ---------------------------------------------------------------------------
+// the prohibition scan (governance section 3.1)
+// ---------------------------------------------------------------------------
+
+/// `confirmationPhrasePrefixes` — the destructive-ceremony phrase
+/// prefixes declared at
+/// `internal/adapter/authority/helper/confirmation_phrase.go`. They
+/// are unexported there and cannot be imported, so they are restated
+/// here exactly as upstream restates them: a phrase the helper reads
+/// and this scanner does not know is a phrase that can reach the
+/// artifact.
+const CONFIRMATION_PHRASE_PREFIXES: [&str; 10] = [
+    "RESET VERSION-ZERO",
+    "RESTORE CENTRAL",
+    "ABANDON RESTORE",
+    "WIPE CENTRAL",
+    "EXPORT CENTRAL",
+    "IMPORT CENTRAL",
+    "DELETE BACKUP",
+    "PRUNE ARTIFACTS",
+    "RESCUE CENTRAL",
+    "PATCH CENTRAL",
+];
+
+/// `base64BlobThreshold` — the length at which an unbroken run of
+/// base64 alphabet is treated as an encoded blob rather than an
+/// identifier. Digests are exempted explicitly by [`is_hex_digest`]:
+/// a sha-256 hex string is a declared, checked field and is also a
+/// subset of the base64 alphabet.
+const BASE64_BLOB_THRESHOLD: usize = 48;
+
+/// `pathBoundary` — the characters after which a `'/'` begins a path
+/// rather than continuing one, so `"/etc/x"` and `"--dir=/etc/x"` are
+/// hits while `"docker.io/library/postgres"` and
+/// `"./internal/recovery/..."` are not.
+///
+/// The set covers every separator a captured diagnostic can put in
+/// front of a path — including the line terminators, because a
+/// failing scenario's stderr arrives newline-separated. The residual
+/// limit upstream accepts, unchanged: a path with no boundary byte
+/// before it at all (embedded mid-token) evades this.
+const PATH_BOUNDARY: &str = " \t\n\r\u{b}\u{c}\"'=:(,[<;>&";
+
+/// `weakPathBoundary` — boundaries ordinary prose produces as often
+/// as a shell does. After a weak boundary a `'/'` has to begin more
+/// than one path segment before it counts; every value the widened
+/// set was added to catch still catches, because a leaked filesystem
+/// path has segments to spare. The residual upstream accepts: a
+/// single-segment path (`"/etc"`) appearing only immediately after
+/// `')'` or `'|'` is not detected.
+const WEAK_PATH_BOUNDARY: &str = ")|";
+
+/// `prohibitedClass` — the class name governance reports, or `None`.
+fn prohibited_class(value: &str) -> Option<&'static str> {
+    if contains_private_key(value) {
+        Some("private key material")
+    } else if contains_dsn(value) {
+        Some("a DSN")
+    } else if contains_confirmation_phrase(value) {
+        Some("a confirmation phrase prefix")
+    } else if contains_absolute_path(value) {
+        Some("an absolute path")
+    } else if is_base64_shaped_blob(value) {
+        Some("a base64-shaped blob")
+    } else {
+        None
     }
-    for line in document.lines() {
-        for token in line.split(|c: char| c.is_whitespace() || "\"'=:(,[<;>&".contains(c)) {
-            if token.len() > 1 && token.starts_with('/') && token[1..].contains('/') {
-                return Err(evidence_failure(
-                    "recovery evidence carries prohibited locator or credential material",
-                ));
+}
+
+/// `privateKeyPattern` — `BEGIN[ A-Z0-9]*PRIVATE KEY`: `BEGIN`,
+/// a run of uppercase/digit/space characters, then `PRIVATE KEY`.
+fn contains_private_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = find_subslice(&bytes[from..], b"BEGIN") {
+        let begin = from + offset;
+        let mut at = begin + 5;
+        loop {
+            if bytes[at..].starts_with(b"PRIVATE KEY") {
+                return true;
             }
+            if at >= bytes.len() || !matches!(bytes[at], b' ' | b'A'..=b'Z' | b'0'..=b'9') {
+                break;
+            }
+            at += 1;
+        }
+        from = begin + 1;
+    }
+    false
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// `containsDSN` — `"://"` anywhere, or a credential keyword followed
+/// by optional whitespace and `'='` (upstream's case-insensitive
+/// `(password|passfile|sslkey|sslcert|sslpassword)\s*=`).
+fn contains_dsn(value: &str) -> bool {
+    if value.contains("://") {
+        return true;
+    }
+    let lowered = value.to_ascii_lowercase();
+    let bytes = lowered.as_bytes();
+    for keyword in ["password", "passfile", "sslkey", "sslcert", "sslpassword"] {
+        let needle = keyword.as_bytes();
+        let mut from = 0;
+        while let Some(offset) = find_subslice(&bytes[from..], needle) {
+            let mut at = from + offset + needle.len();
+            // regexp `\s` = [\t\n\f\r ].
+            while at < bytes.len() && matches!(bytes[at], b'\t' | b'\n' | 0x0b | b'\r' | b' ') {
+                at += 1;
+            }
+            if at < bytes.len() && bytes[at] == b'=' {
+                return true;
+            }
+            from += offset + 1;
         }
     }
-    Ok(())
+    false
+}
+
+/// `containsConfirmationPhrase`.
+fn contains_confirmation_phrase(value: &str) -> bool {
+    CONFIRMATION_PHRASE_PREFIXES
+        .iter()
+        .any(|prefix| value.contains(prefix))
+}
+
+/// `containsAbsolutePath`.
+fn contains_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    for position in 0..bytes.len() {
+        if bytes[position] != b'/' {
+            continue;
+        }
+        if position + 1 >= bytes.len() || !is_path_byte(bytes[position + 1]) {
+            continue;
+        }
+        if position == 0 {
+            return true;
+        }
+        let previous = bytes[position - 1];
+        if PATH_BOUNDARY.as_bytes().contains(&previous) {
+            return true;
+        }
+        if WEAK_PATH_BOUNDARY.as_bytes().contains(&previous)
+            && has_second_segment(&bytes[position + 1..])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `hasSecondSegment` — whether the token beginning at `rest` (the
+/// bytes after a leading `'/'`) carries a second `'/'`-separated
+/// segment. It is how a weak boundary is told from a strong one.
+fn has_second_segment(rest: &[u8]) -> bool {
+    for position in 0..rest.len() {
+        if rest[position] == b'/' {
+            return position + 1 < rest.len() && is_path_byte(rest[position + 1]);
+        }
+        if !is_path_byte(rest[position]) {
+            return false;
+        }
+    }
+    false
+}
+
+/// `isPathByte` — `[A-Za-z0-9._-]`.
+fn is_path_byte(candidate: u8) -> bool {
+    candidate.is_ascii_alphanumeric() || matches!(candidate, b'.' | b'_' | b'-')
+}
+
+/// `isBase64ShapedBlob` — whether the value CONTAINS an encoded blob,
+/// not whether it IS one. The unit judged is a maximal run of base64
+/// alphabet: anything outside it — a space, a quote, a hyphen, an
+/// underscore, a full stop — ends the run, so ordinary prose and
+/// every UUID break into pieces far below the threshold.
+fn is_base64_shaped_blob(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !is_base64_byte(bytes[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && is_base64_byte(bytes[end]) {
+            end += 1;
+        }
+        if run_is_blob_shaped(&bytes[start..end]) {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// `runIsBlobShaped` — decides one maximal run of base64 alphabet.
+/// The run is split on `'='` before the length test: a genuine base64
+/// encoding carries `'='` only as trailing padding, so splitting
+/// never breaks a real blob, but it stops a label welded to a digest
+/// (`"sha256=<64 hex>"`) from reading as a blob.
+fn run_is_blob_shaped(run: &[u8]) -> bool {
+    if run.len() < BASE64_BLOB_THRESHOLD {
+        return false;
+    }
+    run.split(|b| *b == b'=')
+        .any(|piece| piece.len() >= BASE64_BLOB_THRESHOLD && !is_hex_digest(piece))
+}
+
+/// `isHexDigest` — exactly 40 or 64 lowercase hex chars.
+fn is_hex_digest(value: &[u8]) -> bool {
+    if value.len() != 40 && value.len() != 64 {
+        return false;
+    }
+    value
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
+/// `isBase64Byte` — `[A-Za-z0-9+/=]`.
+fn is_base64_byte(candidate: u8) -> bool {
+    candidate.is_ascii_alphanumeric() || matches!(candidate, b'+' | b'/' | b'=')
+}
+
+/// `walkJSONStrings` — visits every string in the decoded artifact:
+/// object keys (at `path.key (key)`) and string values alike. Keys
+/// are visited in sorted order (`serde_json`'s object is a
+/// `BTreeMap`; upstream sorts the map keys itself).
+fn walk_json_strings(node: &serde_json::Value, path: &str, visit: &mut dyn FnMut(&str, &str)) {
+    match node {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                visit(&format!("{path}.{key} (key)"), key);
+                walk_json_strings(value, &format!("{path}.{key}"), visit);
+            }
+        }
+        serde_json::Value::Array(elements) => {
+            for (index, element) in elements.iter().enumerate() {
+                walk_json_strings(element, &format!("{path}[{index}]"), visit);
+            }
+        }
+        serde_json::Value::String(text) => visit(path, text),
+        _ => {}
+    }
+}
+
+/// `ScanProhibitions` — reads every string in an emitted artifact,
+/// values and object keys alike, and reports the classes governance
+/// section 3.1 forbids. A hit fails the emit.
+///
+/// The report names the JSON path and the class and never the
+/// offending value: an error that quoted what it found would copy
+/// the prohibited material into a run report, which is where it
+/// would then be read from.
+pub fn scan_prohibitions(document: &[u8]) -> Result<(), Failure> {
+    let decoded: serde_json::Value = serde_json::from_slice(document).map_err(|e| {
+        evidence_failure(format!(
+            "recovery: the emitted artifact could not be re-read for the prohibition scan: {e}"
+        ))
+    })?;
+    let mut problems = Vec::new();
+    walk_json_strings(&decoded, "$", &mut |path, value| {
+        if let Some(class) = prohibited_class(value) {
+            problems.push(format!("{path} carries {class}"));
+        }
+    });
+    if problems.is_empty() {
+        return Ok(());
+    }
+    problems.sort();
+    Err(evidence_failure(format!(
+        "recovery: the emitted artifact carries material governance section 3.1 forbids:\n  - {}",
+        problems.join("\n  - ")
+    )))
 }
 
 /// Transcript artifact rule: `<scenario-id>.transcript.txt` whose
@@ -470,12 +730,51 @@ mod tests {
 
     #[test]
     fn prohibition_scan_refuses_locators_and_credentials() {
-        assert!(scan_prohibitions("{\"note\":\"clean\"}").is_ok());
-        assert!(scan_prohibitions("postgres://u:p@h/db").is_err());
-        assert!(scan_prohibitions("password=hunter2").is_err());
-        assert!(scan_prohibitions("wrote /var/lib/central/dump.pg").is_err());
+        // Clean document, and a declared digest field exempted from
+        // the base64-blob class.
         let digest = format!("sha256:{}", "a".repeat(64));
-        assert!(scan_prohibitions(&format!("digest={digest}")).is_ok());
+        assert!(scan_prohibitions(
+            format!(r#"{{"note":"clean","digest":"{digest}","uuid":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}}"#)
+                .as_bytes()
+        )
+        .is_ok());
+        // Each upstream class.
+        assert!(scan_prohibitions(br#"{"d":"postgres://u:p@h/db"}"#.as_slice()).is_err());
+        assert!(scan_prohibitions(br#"{"d":"password=hunter2"}"#.as_slice()).is_err());
+        assert!(scan_prohibitions(br#"{"d":"sslcert = x"}"#.as_slice()).is_err());
+        assert!(
+            scan_prohibitions(br#"{"d":"-----BEGIN RSA PRIVATE KEY-----"}"#.as_slice()).is_err()
+        );
+        assert!(
+            scan_prohibitions(br#"{"d":"typed RESTORE CENTRAL before apply"}"#.as_slice()).is_err()
+        );
+        assert!(
+            scan_prohibitions(br#"{"d":"wrote /var/lib/central/dump.pg"}"#.as_slice()).is_err()
+        );
+        assert!(
+            scan_prohibitions(
+                br#"{"d":"stderr:\n/var/lib/postgresql/17/main/base/16384 could not be opened"}"#
+                    .as_slice()
+            )
+            .is_err()
+        );
+        // Weak boundary: two segments needed after ')' or '|'.
+        assert!(scan_prohibitions(br#"{"d":"rows(before)/rows(after)"}"#.as_slice()).is_ok());
+        assert!(scan_prohibitions(br#"{"d":"expected (5)/got 3"}"#.as_slice()).is_ok());
+        assert!(scan_prohibitions(br#"{"d":"(cd /srv/data)"}"#.as_slice()).is_err());
+        assert!(scan_prohibitions(br#"{"d":"single /etc only"}"#.as_slice()).is_err());
+        assert!(scan_prohibitions(br#"{"d":"see )/etc for detail"}"#.as_slice()).is_ok());
+        // Base64 blob vs labelled digest vs plain UUID.
+        let blob = "QUJD".repeat(13); // 52 chars, no hex shape
+        assert!(
+            scan_prohibitions(format!(r#"{{"d":"helper replied {blob}"}}"#).as_bytes()).is_err()
+        );
+        let labelled = format!("sha256={}", "a".repeat(64));
+        assert!(scan_prohibitions(format!(r#"{{"d":"{labelled}"}}"#).as_bytes()).is_ok());
+        // Object keys are scanned too.
+        assert!(scan_prohibitions(br#"{"/var/lib/x":1}"#.as_slice()).is_err());
+        // Not JSON at all refuses to re-read.
+        assert!(scan_prohibitions(b"not json").is_err());
     }
 
     #[test]

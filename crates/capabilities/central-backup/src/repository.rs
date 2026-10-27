@@ -20,6 +20,12 @@ pub const REPOSITORY_BINDING_SCHEMA: &str = "central.backup-repository-binding/v
 pub const REPOSITORY_MANIFEST_SCHEMA: &str = "central.backup-repository-manifest/v1";
 /// `MaximumSealedBackups`.
 pub const MAXIMUM_SEALED_BACKUPS: usize = 16;
+/// `BackupSealCompanionSchema`.
+pub const BACKUP_SEAL_COMPANION_SCHEMA: &str = "central.backup-seal/v1";
+/// `BackupSealHMACDomain`.
+pub const BACKUP_SEAL_HMAC_DOMAIN: &str = "slice-c-backup-seal-v1";
+/// `BackupSealKeyVersion`.
+pub const BACKUP_SEAL_KEY_VERSION: &str = "hmac-fingerprint-v1";
 
 fn invalid_binding(message: &str) -> Failure {
     Failure::invalid("backup_repository_binding", message.to_owned())
@@ -39,6 +45,8 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// `parseSHA256` — exactly 64 lowercase hex chars; the re-encode
+/// check rejects uppercase/mixed input exactly as upstream.
 fn parse_sha256(raw: &str) -> Option<[u8; 32]> {
     let raw = raw.as_bytes();
     if raw.len() != 64 {
@@ -48,13 +56,15 @@ fn parse_sha256(raw: &str) -> Option<[u8; 32]> {
         match b {
             b'0'..=b'9' => Some(b - b'0'),
             b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
             _ => None,
         }
     };
     let mut out = [0u8; 32];
     for i in 0..32 {
         out[i] = (nibble(raw[i * 2])? << 4) | nibble(raw[i * 2 + 1])?;
+    }
+    if hex_encode(&out).as_bytes() != raw {
+        return None;
     }
     Some(out)
 }
@@ -82,8 +92,11 @@ fn decode_canonical<'a, T: Deserialize<'a>>(payload: &'a [u8]) -> Result<T, Fail
 }
 
 fn rfc3339(t: time::OffsetDateTime) -> String {
-    t.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+    // `x.Format(time.RFC3339Nano)` upstream — the shared wire helper
+    // (fractional seconds when nonzero, `Z` suffix), not the `time`
+    // crate's `Rfc3339` descriptor which truncates sub-second
+    // precision and would silently change every canonical digest.
+    crate::wire::rfc3339_nano(t)
 }
 
 fn parse_rfc3339(raw: &str) -> Option<time::OffsetDateTime> {
@@ -387,6 +400,285 @@ pub fn new_repository_manifest(
     let payload = manifest.canonical_payload(false)?;
     manifest.digest = Sha256::digest(&payload).into();
     Ok(manifest)
+}
+
+// ---------------------------------------------------------------------------
+// BackupFileTreeEvidence / BackupSealCompanion / BackupSealPublication
+// (repository_seal.go)
+// ---------------------------------------------------------------------------
+
+const INVALID_SEAL_COMPANION: &str = "invalid recovery seal companion";
+
+fn invalid_seal_companion(message: &str) -> Failure {
+    Failure::invalid("backup_seal_companion", message.to_owned())
+}
+
+/// `BackupFileTreeEvidence` — binds the ordered immutable files present
+/// before the broker seal. The digest covers canonical logical
+/// identities, sizes, and checksums; it carries no repository pathname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackupFileTreeEvidence {
+    /// SHA-256 over the canonical file-tree encoding.
+    pub digest: [u8; 32],
+}
+
+impl BackupFileTreeEvidence {
+    /// `Validate`.
+    pub fn validate(&self) -> Result<(), Failure> {
+        if self.digest == [0u8; 32] {
+            return Err(invalid_seal_companion(
+                "invalid recovery file-tree evidence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `BackupSealPublication` — the locator-free receipt for the exact
+/// companion and root index revision durably synchronized after the
+/// broker commit. It is later consumed by the broker's dedicated
+/// terminal completion transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupSealPublication {
+    /// Bound operation.
+    pub operation_id: Uuid,
+    /// Bound backup.
+    pub backup_id: Uuid,
+    /// Repository binding.
+    pub repository_binding_id: Uuid,
+    /// Digest of the seal-root manifest the entry binds.
+    pub root_manifest_digest: [u8; 32],
+    /// Digest of the exact companion JSON.
+    pub seal_companion_digest: [u8; 32],
+    /// Digest of the immutable file tree.
+    pub file_tree_digest: [u8; 32],
+    /// Digest of the published repository manifest revision.
+    pub repository_manifest_digest: [u8; 32],
+    /// Published repository manifest revision.
+    pub repository_revision: u64,
+}
+
+impl BackupSealPublication {
+    /// `Validate`.
+    pub fn validate(&self) -> Result<(), Failure> {
+        if self.operation_id.is_nil()
+            || self.backup_id.is_nil()
+            || self.repository_binding_id.is_nil()
+            || self.root_manifest_digest == [0u8; 32]
+            || self.seal_companion_digest == [0u8; 32]
+            || self.file_tree_digest == [0u8; 32]
+            || self.repository_manifest_digest == [0u8; 32]
+            || self.repository_revision == 0
+        {
+            return Err(invalid_seal_companion("invalid recovery seal publication"));
+        }
+        Ok(())
+    }
+
+    /// `Binds` — the publication receipt names exactly the broker
+    /// companion it claims to have synchronized.
+    #[must_use]
+    pub fn binds(&self, companion: &BackupSealCompanion) -> bool {
+        self.validate().is_ok()
+            && companion.verify().is_ok()
+            && self.operation_id == companion.operation_id
+            && self.backup_id == companion.backup_id
+            && self.repository_binding_id == companion.repository_binding_id
+            && self.root_manifest_digest == companion.root_manifest_digest
+            && self.seal_companion_digest == companion.digest
+            && self.file_tree_digest == companion.file_tree_digest
+    }
+}
+
+/// `backupSealCompanionWire` — the companion's canonical JSON shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupSealCompanionWire {
+    schema_version: String,
+    authority_envelope_id: String,
+    hmac_domain: String,
+    key_version: String,
+    backup_id: String,
+    operation_id: String,
+    repository_binding_id: String,
+    target_fingerprint_sha256: String,
+    config_fingerprint_sha256: String,
+    payload_epoch_id: String,
+    root_manifest_digest_sha256: String,
+    file_tree_digest_sha256: String,
+    sealed_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    hmac_sha256: String,
+}
+
+/// `BackupSealCompanion` — the repository copy of the broker-owned
+/// final seal. Its HMAC is integrity evidence, not a reusable
+/// credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupSealCompanion {
+    /// `sha256:`-prefixed authority envelope identity.
+    pub authority_envelope_id: String,
+    /// Bound backup.
+    pub backup_id: Uuid,
+    /// Bound operation.
+    pub operation_id: Uuid,
+    /// Repository binding.
+    pub repository_binding_id: Uuid,
+    /// `sha256:`-prefixed target fingerprint.
+    pub target_fingerprint: String,
+    /// `sha256:`-prefixed config fingerprint.
+    pub config_fingerprint: String,
+    /// Payload epoch (v7 UUID).
+    pub payload_epoch_id: Uuid,
+    /// Seal-root manifest digest.
+    pub root_manifest_digest: [u8; 32],
+    /// Immutable file-tree digest.
+    pub file_tree_digest: [u8; 32],
+    /// Seal instant (UTC).
+    pub sealed_at: time::OffsetDateTime,
+    /// Broker integrity HMAC (lowercase hex, no prefix).
+    pub hmac: String,
+    /// `sha256` over the canonical JSON — set by [`Self::verify`] or
+    /// [`parse_backup_seal_companion`].
+    pub digest: [u8; 32],
+}
+
+impl BackupSealCompanion {
+    fn wire(&self, include_hmac: bool) -> BackupSealCompanionWire {
+        BackupSealCompanionWire {
+            schema_version: BACKUP_SEAL_COMPANION_SCHEMA.to_owned(),
+            authority_envelope_id: self.authority_envelope_id.clone(),
+            hmac_domain: BACKUP_SEAL_HMAC_DOMAIN.to_owned(),
+            key_version: BACKUP_SEAL_KEY_VERSION.to_owned(),
+            backup_id: self.backup_id.to_string(),
+            operation_id: self.operation_id.to_string(),
+            repository_binding_id: self.repository_binding_id.to_string(),
+            target_fingerprint_sha256: self.target_fingerprint.clone(),
+            config_fingerprint_sha256: self.config_fingerprint.clone(),
+            payload_epoch_id: self.payload_epoch_id.to_string(),
+            root_manifest_digest_sha256: hex_encode(&self.root_manifest_digest),
+            file_tree_digest_sha256: hex_encode(&self.file_tree_digest),
+            sealed_at: rfc3339(self.sealed_at),
+            hmac_sha256: if include_hmac {
+                self.hmac.clone()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    /// `validateShape`.
+    fn validate_shape(&self, require_hmac: bool) -> Result<(), Failure> {
+        if !crate::wire::valid_sha256_fingerprint(&self.authority_envelope_id)
+            || self.backup_id.is_nil()
+            || self.operation_id.is_nil()
+            || self.repository_binding_id.is_nil()
+            || !crate::wire::valid_sha256_fingerprint(&self.target_fingerprint)
+            || !crate::wire::valid_sha256_fingerprint(&self.config_fingerprint)
+            || !crate::wire::is_v7(self.payload_epoch_id)
+            || self.root_manifest_digest == [0u8; 32]
+            || self.file_tree_digest == [0u8; 32]
+            || is_zero_time(self.sealed_at)
+        {
+            return Err(invalid_seal_companion(INVALID_SEAL_COMPANION));
+        }
+        if require_hmac && parse_sha256(&self.hmac).is_none() {
+            return Err(invalid_seal_companion(INVALID_SEAL_COMPANION));
+        }
+        Ok(())
+    }
+
+    /// `HMACPayload` — the exact canonical value the broker
+    /// authenticated (the companion without its HMAC field).
+    pub fn hmac_payload(&self) -> Result<Vec<u8>, Failure> {
+        self.validate_shape(false)?;
+        serde_json::to_vec(&self.wire(false))
+            .map_err(|_| invalid_seal_companion(INVALID_SEAL_COMPANION))
+    }
+
+    /// `CanonicalJSON` — the bytes the repository copy carries.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, Failure> {
+        self.validate_shape(true)?;
+        serde_json::to_vec(&self.wire(true))
+            .map_err(|_| invalid_seal_companion(INVALID_SEAL_COMPANION))
+    }
+
+    /// `Verify` — the digest must equal `sha256` over the canonical
+    /// JSON (which includes the HMAC field).
+    pub fn verify(&self) -> Result<(), Failure> {
+        let payload = self.canonical_json()?;
+        if self.digest == [0u8; 32] || Sha256::digest(&payload).as_slice() != self.digest {
+            return Err(invalid_seal_companion(INVALID_SEAL_COMPANION));
+        }
+        Ok(())
+    }
+}
+
+/// `ParseBackupSealCompanion` — strict decode plus canonical
+/// round-trip; the digest is recomputed from the exact payload bytes.
+pub fn parse_backup_seal_companion(payload: &[u8]) -> Result<BackupSealCompanion, Failure> {
+    let wire: BackupSealCompanionWire = decode_canonical(payload)
+        .map_err(|_| invalid_seal_companion("invalid recovery seal companion encoding"))?;
+    if wire.schema_version != BACKUP_SEAL_COMPANION_SCHEMA
+        || wire.hmac_domain != BACKUP_SEAL_HMAC_DOMAIN
+        || wire.key_version != BACKUP_SEAL_KEY_VERSION
+    {
+        return Err(invalid_seal_companion(
+            "invalid recovery seal companion encoding",
+        ));
+    }
+    let backup_id = Uuid::parse_str(&wire.backup_id).ok();
+    let operation_id = Uuid::parse_str(&wire.operation_id).ok();
+    let repository_binding_id = Uuid::parse_str(&wire.repository_binding_id).ok();
+    let payload_epoch_id = Uuid::parse_str(&wire.payload_epoch_id).ok();
+    let root_digest = parse_sha256(&wire.root_manifest_digest_sha256);
+    let tree_digest = parse_sha256(&wire.file_tree_digest_sha256);
+    let sealed_at = parse_rfc3339(&wire.sealed_at);
+    let (
+        Some(backup_id),
+        Some(operation_id),
+        Some(repository_binding_id),
+        Some(payload_epoch_id),
+        Some(root_digest),
+        Some(tree_digest),
+        Some(sealed_at),
+    ) = (
+        backup_id,
+        operation_id,
+        repository_binding_id,
+        payload_epoch_id,
+        root_digest,
+        tree_digest,
+        sealed_at,
+    )
+    else {
+        return Err(invalid_seal_companion(
+            "invalid recovery seal companion encoding",
+        ));
+    };
+    let mut companion = BackupSealCompanion {
+        authority_envelope_id: wire.authority_envelope_id,
+        backup_id,
+        operation_id,
+        repository_binding_id,
+        target_fingerprint: wire.target_fingerprint_sha256,
+        config_fingerprint: wire.config_fingerprint_sha256,
+        payload_epoch_id,
+        root_manifest_digest: root_digest,
+        file_tree_digest: tree_digest,
+        sealed_at,
+        hmac: wire.hmac_sha256,
+        digest: [0u8; 32],
+    };
+    match companion.canonical_json() {
+        Ok(canonical) if canonical == payload => {
+            companion.digest = Sha256::digest(payload).into();
+            Ok(companion)
+        }
+        _ => Err(invalid_seal_companion(
+            "recovery seal companion is not canonical",
+        )),
+    }
 }
 
 #[cfg(test)]
