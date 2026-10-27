@@ -16,6 +16,8 @@ const INVALID_MANIFEST: &str = "invalid recovery repository manifest";
 
 /// `repositoryBindingSchemaVersion`.
 pub const REPOSITORY_BINDING_SCHEMA: &str = "central.backup-repository-binding/v1";
+/// `backupBindingSchemaVersion`.
+pub const BACKUP_BINDING_SCHEMA: &str = "central.backup-binding/v1";
 /// `RepositoryManifestSchema`.
 pub const REPOSITORY_MANIFEST_SCHEMA: &str = "central.backup-repository-manifest/v1";
 /// `MaximumSealedBackups`.
@@ -26,6 +28,8 @@ pub const BACKUP_SEAL_COMPANION_SCHEMA: &str = "central.backup-seal/v1";
 pub const BACKUP_SEAL_HMAC_DOMAIN: &str = "slice-c-backup-seal-v1";
 /// `BackupSealKeyVersion`.
 pub const BACKUP_SEAL_KEY_VERSION: &str = "hmac-fingerprint-v1";
+/// `BackupRepositoryAttestationSchema`.
+pub const REPOSITORY_ATTESTATION_SCHEMA: &str = "central.backup-repository-attestation/v1";
 
 fn invalid_binding(message: &str) -> Failure {
     Failure::invalid("backup_repository_binding", message.to_owned())
@@ -281,6 +285,187 @@ pub fn parse_repository_binding(payload: &[u8]) -> Result<RepositoryBinding, Fai
 }
 
 // ---------------------------------------------------------------------------
+// BackupBinding (repository_metadata.go) — the per-backup `binding.json`.
+// ---------------------------------------------------------------------------
+
+const INVALID_BACKUP_BINDING: &str = "invalid recovery backup binding";
+
+fn invalid_backup_binding(message: &str) -> Failure {
+    Failure::invalid("backup_repository_binding", message.to_owned())
+}
+
+/// `backupBindingWire`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupBindingWire {
+    schema_version: String,
+    repository_binding_id: String,
+    backup_id: String,
+    operation_id: String,
+    target_fingerprint_sha256: String,
+    config_fingerprint_sha256: String,
+    payload_epoch_id: String,
+    accepted_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    immutable_digest_sha256: String,
+}
+
+/// `BackupBinding` — ties a create-only backup directory to the
+/// protected accepted operation before the first dump byte is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupBinding {
+    /// Repository binding identity this backup belongs to.
+    pub repository_binding_id: Uuid,
+    /// Backup identity.
+    pub backup_id: Uuid,
+    /// Operation identity.
+    pub operation_id: Uuid,
+    /// `sha256:`-prefixed target fingerprint.
+    pub target_fingerprint: String,
+    /// `sha256:`-prefixed pinned-config fingerprint.
+    pub config_fingerprint: String,
+    /// Payload epoch (v7 UUID).
+    pub payload_epoch_id: Uuid,
+    /// Accepted consistent point (target database time).
+    pub accepted_at: time::OffsetDateTime,
+    /// `sha256` over the digest-less canonical payload.
+    pub immutable_digest: [u8; 32],
+}
+
+impl BackupBinding {
+    fn wire(&self, include_digest: bool) -> BackupBindingWire {
+        BackupBindingWire {
+            schema_version: BACKUP_BINDING_SCHEMA.to_owned(),
+            repository_binding_id: self.repository_binding_id.to_string(),
+            backup_id: self.backup_id.to_string(),
+            operation_id: self.operation_id.to_string(),
+            target_fingerprint_sha256: self.target_fingerprint.clone(),
+            config_fingerprint_sha256: self.config_fingerprint.clone(),
+            payload_epoch_id: self.payload_epoch_id.to_string(),
+            accepted_at: rfc3339(self.accepted_at),
+            immutable_digest_sha256: if include_digest {
+                hex_encode(&self.immutable_digest)
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    fn canonical_payload(&self, include_digest: bool) -> Result<Vec<u8>, Failure> {
+        if self.repository_binding_id.is_nil()
+            || self.backup_id.is_nil()
+            || self.operation_id.is_nil()
+            || !crate::wire::valid_sha256_fingerprint(&self.target_fingerprint)
+            || !crate::wire::valid_sha256_fingerprint(&self.config_fingerprint)
+            || !crate::wire::is_v7(self.payload_epoch_id)
+            || is_zero_time(self.accepted_at)
+        {
+            return Err(invalid_backup_binding(INVALID_BACKUP_BINDING));
+        }
+        serde_json::to_vec(&self.wire(include_digest))
+            .map_err(|_| invalid_backup_binding(INVALID_BACKUP_BINDING))
+    }
+
+    /// `Verify` — the digest over the digest-less canonical payload.
+    pub fn verify(&self) -> Result<(), Failure> {
+        let payload = self.canonical_payload(false)?;
+        if self.immutable_digest == [0u8; 32]
+            || Sha256::digest(&payload).as_slice() != self.immutable_digest
+        {
+            return Err(invalid_backup_binding(INVALID_BACKUP_BINDING));
+        }
+        Ok(())
+    }
+
+    /// `CanonicalJSON` — the bytes `backups/<id>/binding.json` carries.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, Failure> {
+        self.verify()?;
+        serde_json::to_vec(&self.wire(true))
+            .map_err(|_| invalid_backup_binding(INVALID_BACKUP_BINDING))
+    }
+}
+
+/// `NewBackupBinding` — the immutable binding derived only from the
+/// accepted protected operation; a `Planned` operation can never bind.
+pub fn new_backup_binding(
+    operation: &crate::backup::operation::BackupOperation,
+) -> Result<BackupBinding, Failure> {
+    if operation.validate().is_err()
+        || operation.phase == crate::backup::operation::BackupPhase::Planned
+        || operation.accepted_facts.validate().is_err()
+    {
+        return Err(invalid_backup_binding(INVALID_BACKUP_BINDING));
+    }
+    let facts = &operation.accepted_facts;
+    let mut binding = BackupBinding {
+        repository_binding_id: facts.repository_binding_id,
+        backup_id: operation.backup_id,
+        operation_id: operation.operation_id,
+        target_fingerprint: facts.target_fingerprint.clone(),
+        config_fingerprint: facts.config_fingerprint.clone(),
+        payload_epoch_id: facts.payload_epoch_id,
+        accepted_at: operation.accepted_at.to_offset(time::UtcOffset::UTC),
+        immutable_digest: [0u8; 32],
+    };
+    let payload = binding.canonical_payload(false)?;
+    binding.immutable_digest = Sha256::digest(&payload).into();
+    Ok(binding)
+}
+
+/// `ParseBackupBinding` — strict decode plus canonical round-trip.
+pub fn parse_backup_binding(payload: &[u8]) -> Result<BackupBinding, Failure> {
+    let wire: BackupBindingWire = decode_canonical(payload)
+        .map_err(|_| invalid_backup_binding("invalid recovery backup binding encoding"))?;
+    if wire.schema_version != BACKUP_BINDING_SCHEMA {
+        return Err(invalid_backup_binding(
+            "invalid recovery backup binding encoding",
+        ));
+    }
+    let repository_binding_id = Uuid::parse_str(&wire.repository_binding_id).ok();
+    let backup_id = Uuid::parse_str(&wire.backup_id).ok();
+    let operation_id = Uuid::parse_str(&wire.operation_id).ok();
+    let payload_epoch_id = Uuid::parse_str(&wire.payload_epoch_id).ok();
+    let accepted_at = parse_rfc3339(&wire.accepted_at);
+    let digest = parse_sha256(&wire.immutable_digest_sha256);
+    let (
+        Some(repository_binding_id),
+        Some(backup_id),
+        Some(operation_id),
+        Some(payload_epoch_id),
+        Some(accepted_at),
+        Some(digest),
+    ) = (
+        repository_binding_id,
+        backup_id,
+        operation_id,
+        payload_epoch_id,
+        accepted_at,
+        digest,
+    )
+    else {
+        return Err(invalid_backup_binding(
+            "invalid recovery backup binding encoding",
+        ));
+    };
+    let binding = BackupBinding {
+        repository_binding_id,
+        backup_id,
+        operation_id,
+        target_fingerprint: wire.target_fingerprint_sha256,
+        config_fingerprint: wire.config_fingerprint_sha256,
+        payload_epoch_id,
+        accepted_at,
+        immutable_digest: digest,
+    };
+    match binding.canonical_json() {
+        Ok(canonical) if canonical == payload => Ok(binding),
+        _ => Err(invalid_backup_binding(
+            "recovery backup binding is not canonical",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RepositoryManifest (repository_seal.go)
 // ---------------------------------------------------------------------------
 
@@ -400,6 +585,313 @@ pub fn new_repository_manifest(
     let payload = manifest.canonical_payload(false)?;
     manifest.digest = Sha256::digest(&payload).into();
     Ok(manifest)
+}
+
+/// `ParseRepositoryManifest` — strict decode, entry parsing, sorted
+/// re-derivation, digest equality, and byte-for-byte canonical
+/// round-trip; nothing else is a valid `repository-manifest.json`.
+pub fn parse_repository_manifest(payload: &[u8]) -> Result<RepositoryManifest, Failure> {
+    let wire: RepositoryManifestWire = decode_canonical(payload)
+        .map_err(|_| invalid_manifest("invalid recovery repository manifest encoding"))?;
+    if wire.schema_version != REPOSITORY_MANIFEST_SCHEMA {
+        return Err(invalid_manifest(
+            "invalid recovery repository manifest encoding",
+        ));
+    }
+    let binding_id = Uuid::parse_str(&wire.root_binding_id)
+        .ok()
+        .filter(|id| !id.is_nil())
+        .ok_or_else(|| invalid_manifest("invalid recovery repository manifest encoding"))?;
+    let mut entries = Vec::with_capacity(wire.sealed_backups.len());
+    for entry in &wire.sealed_backups {
+        let backup_id = Uuid::parse_str(&entry.backup_id).ok();
+        let accepted_at = parse_rfc3339(&entry.accepted_at);
+        let root_digest = parse_sha256(&entry.root_manifest_digest_sha256);
+        let companion_digest = parse_sha256(&entry.seal_companion_digest_sha256);
+        let tree_digest = parse_sha256(&entry.file_tree_digest_sha256);
+        let (
+            Some(backup_id),
+            Some(accepted_at),
+            Some(root_digest),
+            Some(companion_digest),
+            Some(tree_digest),
+        ) = (
+            backup_id,
+            accepted_at,
+            root_digest,
+            companion_digest,
+            tree_digest,
+        )
+        else {
+            return Err(invalid_manifest(
+                "invalid recovery repository manifest encoding",
+            ));
+        };
+        entries.push(RepositoryManifestEntry {
+            backup_id,
+            accepted_at,
+            root_manifest_digest: root_digest,
+            seal_companion_digest: companion_digest,
+            file_tree_digest: tree_digest,
+        });
+    }
+    let declared = parse_sha256(&wire.manifest_digest_sha256)
+        .ok_or_else(|| invalid_manifest("invalid recovery repository manifest encoding"))?;
+    let manifest = new_repository_manifest(binding_id, wire.revision, entries)?;
+    if manifest.digest != declared {
+        return Err(invalid_manifest(
+            "invalid recovery repository manifest encoding",
+        ));
+    }
+    match manifest.canonical_json() {
+        Ok(canonical) if canonical == payload => Ok(manifest),
+        _ => Err(invalid_manifest(
+            "recovery repository manifest is not canonical",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BackupRepositoryAttestation (repository_attestation.go)
+// ---------------------------------------------------------------------------
+
+const INVALID_ATTESTATION: &str = "invalid recovery repository attestation";
+
+fn invalid_attestation(message: &str) -> Failure {
+    Failure::invalid("backup_repository_attestation", message.to_owned())
+}
+
+/// `backupRepositoryAttestationWire`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupRepositoryAttestationWire {
+    schema_version: String,
+    launch_evidence_id: String,
+    operation_id: String,
+    backup_id: String,
+    repository_binding_id: String,
+    root_manifest_digest_sha256: String,
+    seal_companion_digest_sha256: String,
+    file_tree_digest_sha256: String,
+    repository_manifest_digest_sha256: String,
+    repository_revision: u64,
+    attested_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    immutable_digest_sha256: String,
+}
+
+/// `BackupRepositoryAttestation` — the locator-free result of a
+/// trusted helper re-reading the sealed repository after the backup
+/// worker and all of its descendants have been reaped. It is the only
+/// repository evidence accepted by the broker's terminal seal
+/// transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupRepositoryAttestation {
+    /// Launch evidence identity.
+    pub launch_evidence_id: Uuid,
+    /// Bound operation.
+    pub operation_id: Uuid,
+    /// Bound backup.
+    pub backup_id: Uuid,
+    /// Repository binding.
+    pub repository_binding_id: Uuid,
+    /// Seal-root manifest digest.
+    pub root_manifest_digest: [u8; 32],
+    /// Seal companion digest.
+    pub seal_companion_digest: [u8; 32],
+    /// File-tree digest.
+    pub file_tree_digest: [u8; 32],
+    /// Repository manifest digest.
+    pub repository_manifest_digest: [u8; 32],
+    /// Repository revision.
+    pub repository_revision: u64,
+    /// Attestation instant (UTC).
+    pub attested_at: time::OffsetDateTime,
+    /// `sha256` over the digest-less canonical payload.
+    pub immutable_digest: [u8; 32],
+}
+
+impl BackupRepositoryAttestation {
+    fn wire(&self, include_digest: bool) -> BackupRepositoryAttestationWire {
+        BackupRepositoryAttestationWire {
+            schema_version: REPOSITORY_ATTESTATION_SCHEMA.to_owned(),
+            launch_evidence_id: self.launch_evidence_id.to_string(),
+            operation_id: self.operation_id.to_string(),
+            backup_id: self.backup_id.to_string(),
+            repository_binding_id: self.repository_binding_id.to_string(),
+            root_manifest_digest_sha256: hex_encode(&self.root_manifest_digest),
+            seal_companion_digest_sha256: hex_encode(&self.seal_companion_digest),
+            file_tree_digest_sha256: hex_encode(&self.file_tree_digest),
+            repository_manifest_digest_sha256: hex_encode(&self.repository_manifest_digest),
+            repository_revision: self.repository_revision,
+            attested_at: rfc3339(self.attested_at),
+            immutable_digest_sha256: if include_digest {
+                hex_encode(&self.immutable_digest)
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    fn canonical_payload(&self, include_digest: bool) -> Result<Vec<u8>, Failure> {
+        if self.launch_evidence_id.is_nil()
+            || self.operation_id.is_nil()
+            || self.backup_id.is_nil()
+            || self.repository_binding_id.is_nil()
+            || self.root_manifest_digest == [0u8; 32]
+            || self.seal_companion_digest == [0u8; 32]
+            || self.file_tree_digest == [0u8; 32]
+            || self.repository_manifest_digest == [0u8; 32]
+            || self.repository_revision == 0
+            || is_zero_time(self.attested_at)
+        {
+            return Err(invalid_attestation(INVALID_ATTESTATION));
+        }
+        serde_json::to_vec(&self.wire(include_digest))
+            .map_err(|_| invalid_attestation(INVALID_ATTESTATION))
+    }
+
+    /// `Verify`.
+    pub fn verify(&self) -> Result<(), Failure> {
+        let payload = self.canonical_payload(false)?;
+        if self.immutable_digest == [0u8; 32]
+            || Sha256::digest(&payload).as_slice() != self.immutable_digest
+        {
+            return Err(invalid_attestation(INVALID_ATTESTATION));
+        }
+        Ok(())
+    }
+
+    /// `CanonicalJSON`.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, Failure> {
+        self.verify()?;
+        serde_json::to_vec(&self.wire(true)).map_err(|_| invalid_attestation(INVALID_ATTESTATION))
+    }
+
+    /// `Publication` — the seal publication this attestation carries.
+    pub fn publication(&self) -> Result<BackupSealPublication, Failure> {
+        self.verify()?;
+        Ok(BackupSealPublication {
+            operation_id: self.operation_id,
+            backup_id: self.backup_id,
+            repository_binding_id: self.repository_binding_id,
+            root_manifest_digest: self.root_manifest_digest,
+            seal_companion_digest: self.seal_companion_digest,
+            file_tree_digest: self.file_tree_digest,
+            repository_manifest_digest: self.repository_manifest_digest,
+            repository_revision: self.repository_revision,
+        })
+    }
+
+    /// `Binds` — the attestation names exactly this companion, and it
+    /// cannot predate the seal it claims.
+    #[must_use]
+    pub fn binds(&self, companion: &BackupSealCompanion) -> bool {
+        match self.publication() {
+            Ok(publication) => {
+                publication.binds(companion) && self.attested_at >= companion.sealed_at
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// `NewBackupRepositoryAttestation`.
+pub fn new_backup_repository_attestation(
+    launch_evidence_id: Uuid,
+    publication: &BackupSealPublication,
+    attested_at: time::OffsetDateTime,
+) -> Result<BackupRepositoryAttestation, Failure> {
+    if launch_evidence_id.is_nil() || publication.validate().is_err() || is_zero_time(attested_at) {
+        return Err(invalid_attestation(INVALID_ATTESTATION));
+    }
+    let mut attestation = BackupRepositoryAttestation {
+        launch_evidence_id,
+        operation_id: publication.operation_id,
+        backup_id: publication.backup_id,
+        repository_binding_id: publication.repository_binding_id,
+        root_manifest_digest: publication.root_manifest_digest,
+        seal_companion_digest: publication.seal_companion_digest,
+        file_tree_digest: publication.file_tree_digest,
+        repository_manifest_digest: publication.repository_manifest_digest,
+        repository_revision: publication.repository_revision,
+        attested_at: attested_at.to_offset(time::UtcOffset::UTC),
+        immutable_digest: [0u8; 32],
+    };
+    let payload = attestation.canonical_payload(false)?;
+    attestation.immutable_digest = Sha256::digest(&payload).into();
+    Ok(attestation)
+}
+
+/// `ParseBackupRepositoryAttestation` — strict decode plus canonical
+/// round-trip.
+pub fn parse_backup_repository_attestation(
+    payload: &[u8],
+) -> Result<BackupRepositoryAttestation, Failure> {
+    let wire: BackupRepositoryAttestationWire = decode_canonical(payload)
+        .map_err(|_| invalid_attestation("invalid recovery repository attestation encoding"))?;
+    if wire.schema_version != REPOSITORY_ATTESTATION_SCHEMA {
+        return Err(invalid_attestation(
+            "invalid recovery repository attestation encoding",
+        ));
+    }
+    let launch_id = Uuid::parse_str(&wire.launch_evidence_id).ok();
+    let operation_id = Uuid::parse_str(&wire.operation_id).ok();
+    let backup_id = Uuid::parse_str(&wire.backup_id).ok();
+    let binding_id = Uuid::parse_str(&wire.repository_binding_id).ok();
+    let root_digest = parse_sha256(&wire.root_manifest_digest_sha256);
+    let companion_digest = parse_sha256(&wire.seal_companion_digest_sha256);
+    let tree_digest = parse_sha256(&wire.file_tree_digest_sha256);
+    let index_digest = parse_sha256(&wire.repository_manifest_digest_sha256);
+    let attested_at = parse_rfc3339(&wire.attested_at);
+    let digest = parse_sha256(&wire.immutable_digest_sha256);
+    let (
+        Some(launch_id),
+        Some(operation_id),
+        Some(backup_id),
+        Some(binding_id),
+        Some(root_digest),
+        Some(companion_digest),
+        Some(tree_digest),
+        Some(index_digest),
+        Some(attested_at),
+        Some(digest),
+    ) = (
+        launch_id,
+        operation_id,
+        backup_id,
+        binding_id,
+        root_digest,
+        companion_digest,
+        tree_digest,
+        index_digest,
+        attested_at,
+        digest,
+    )
+    else {
+        return Err(invalid_attestation(
+            "invalid recovery repository attestation encoding",
+        ));
+    };
+    let attestation = BackupRepositoryAttestation {
+        launch_evidence_id: launch_id,
+        operation_id,
+        backup_id,
+        repository_binding_id: binding_id,
+        root_manifest_digest: root_digest,
+        seal_companion_digest: companion_digest,
+        file_tree_digest: tree_digest,
+        repository_manifest_digest: index_digest,
+        repository_revision: wire.repository_revision,
+        attested_at,
+        immutable_digest: digest,
+    };
+    match attestation.canonical_json() {
+        Ok(canonical) if canonical == payload => Ok(attestation),
+        _ => Err(invalid_attestation(
+            "recovery repository attestation is not canonical",
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

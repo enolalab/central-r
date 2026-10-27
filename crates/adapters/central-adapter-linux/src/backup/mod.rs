@@ -14,15 +14,25 @@
 //! [`crate::sys::audited::pg_tool_command`], and closes the parent copy
 //! the instant `spawn` returns.
 
+pub(crate) mod capacity;
 mod pg_dump;
 mod pg_restore;
 mod pgtool;
+pub(crate) mod repository;
+mod repository_capacity;
+mod repository_verifier;
 mod restore_engine;
 
+pub use capacity::device_capacity_from_descriptor;
 pub use pg_dump::{PgDump, PgDumpConfig, PgDumpStream, SealedPassfileProvider};
 pub use pg_restore::{
     PgRestore, PgRestoreConfig, RestoreDumpSource, SealedRestorePassfileProvider,
 };
+pub use repository::{
+    Repository, VerificationEvidence, inspect_repository_descriptor, media_verification_walks,
+    new_repository,
+};
+pub use repository_verifier::RepositoryVerifier;
 pub use restore_engine::{
     ComposedRestoreEngine, RestoreAuditProjection, RestoreAuthorityResetter, RestoreDatabaseRunner,
     RestoreInventoryVerifier,

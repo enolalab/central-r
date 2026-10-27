@@ -505,6 +505,33 @@ pub struct BackupAdmissionSnapshot {
     pub authority_receipt_held: bool,
 }
 
+/// `port.BackupDatabaseCensus` — the live target's accepted-point
+/// measurements (`backup/port/recovery_port.go`). `database_time` is
+/// the accepted consistent point and must come from the target
+/// database itself.
+#[derive(Debug, Clone)]
+pub struct BackupDatabaseCensus {
+    /// Target database time at measurement.
+    pub database_time: time::OffsetDateTime,
+    /// Live database bytes the dump will carry.
+    pub database_bytes: u64,
+    /// Live object bytes the inventory will carry.
+    pub object_bytes: u64,
+    /// Live record count the inventory will enumerate.
+    pub record_count: u64,
+}
+
+/// `port.BackupRepositoryCensus` — the descriptor-derived repository
+/// observation; `bytes` includes sealed, unsealed, partial, and
+/// temporary regular files.
+#[derive(Debug, Clone, Default)]
+pub struct BackupRepositoryCensus {
+    /// Total committed repository bytes.
+    pub bytes: u64,
+    /// Sealed backups in the canonical root index.
+    pub sealed_backups: u64,
+}
+
 /// `port.RestoreAdmissionFacts` bind the protected target authority,
 /// sealed payload and schema identity, current installed
 /// configuration, and fresh trusted capacity evidence. None may be

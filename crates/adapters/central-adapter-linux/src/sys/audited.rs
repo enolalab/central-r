@@ -122,6 +122,36 @@ pub(crate) fn install_signal_handler(
     Ok(())
 }
 
+/// `fstatfs(fd, &statfs)` returning only `f_fsid` — the filesystem
+/// identity rustix's `StatFs` struct keeps private. The recovery
+/// capacity boundary (upstream `capacity_linux.go`'s
+/// `opaqueFilesystemID`) hashes exactly this kernel value into its
+/// opaque device identity, so substituting `st_dev` would change the
+/// evidence bytes the binding pins.
+///
+/// # Errors
+/// `Errno` of the `fstatfs` failure.
+pub(crate) fn statfs_fsid<Fd: std::os::fd::AsFd>(fd: Fd) -> Result<u64, Errno> {
+    // SAFETY: `stat` is a live zeroed `statfs` out-buffer for the
+    // call's duration; `fd` borrows a live descriptor for the syscall
+    // only. `f_fsid` is `fsid_t` — a two-`int` struct (`__fsid_t`) —
+    // and this reads exactly those public `val` fields.
+    unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        if libc::fstatfs(std::os::fd::AsRawFd::as_raw_fd(&fd.as_fd()), &raw mut stat) != 0 {
+            return Err(last_errno());
+        }
+        // SAFETY: `fsid_t` is `__fsid_t`, a `repr(C)` struct of
+        // exactly two `c_int`s (its only member, private in libc's
+        // bindings); transmuting the 8-byte copyable value to
+        // `[c_int; 2]` reads the same `val[0]`/`val[1]` upstream's
+        // `unix.Statfs_t.Fsid.Val` exposes — same size, same
+        // alignment, same two fields, nothing else.
+        let val: [libc::c_int; 2] = std::mem::transmute(stat.f_fsid);
+        Ok((u64::from(val[0] as u32) << 32) | u64::from(val[1] as u32))
+    }
+}
+
 /// `nanosleep(2)` — the raw syscall, not the library shape.
 /// `std::thread::sleep` and glibc's `nanosleep` both route through
 /// `clock_nanosleep` (230) on this toolchain; the broker's seccomp
