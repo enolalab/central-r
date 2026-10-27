@@ -1,5 +1,6 @@
 //! `helper/backup_launch.go` + `helper/backup_read.go` +
 //! `helper/backup_read_client_linux.go` +
+//! `helper/client_linux.go`'s backup-create client half +
 //! `cmd/central/backup_helper_composition.go`'s descriptor seams —
 //! the root helper's `backup-create`, `backup-verify`, and
 //! `backup-status` verbs.
@@ -96,6 +97,16 @@ pub struct BackupVerifyRequest {
 #[derive(Debug, Clone)]
 pub struct BackupStatusRequest {
     pub operation_id: String,
+}
+
+/// `BackupCreateResult` — the locator-free sealed outcome the helper
+/// returns for `backup-create`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupCreateResult {
+    pub operation_id: String,
+    pub backup_id: String,
+    pub phase: String,
 }
 
 /// `BackupVerifyResult` — the locator-free verification projection.
@@ -1576,6 +1587,139 @@ fn valid_backup_read_uuid(value: &str) -> bool {
     match Uuid::parse_str(value) {
         Ok(id) => !id.is_nil() && is_v7(id) && id.to_string() == value,
         Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `client_linux.go`'s backup-create half — the unprivileged operator
+// client for `backup-create`.
+// ---------------------------------------------------------------------------
+
+/// `BackupCreateWireReason*` — the complete whitelist of helper
+/// reason tokens this client retains from its exit-7 boundary (plus
+/// the one worker token SC-DEF-91 admits). Fixed closed vocabulary,
+/// never diagnostic text.
+pub const BACKUP_CREATE_WIRE_REASON_AUTHORIZATION_REQUIRED: &str =
+    "BACKUP_CREATE_AUTHORIZATION_REQUIRED";
+pub const BACKUP_CREATE_WIRE_REASON_AUTHORITY_DENIED: &str = "AUTHORITY_DENIED";
+pub const BACKUP_CREATE_WIRE_REASON_WORKER_FAILED: &str = "BACKUP_WORKER_FAILED";
+/// `DenySafeActiveWireReason` — the deny-safe gate's refusal token,
+/// whitelisted here like upstream's shared constant.
+pub const DENY_SAFE_ACTIVE_WIRE_REASON: &str = "DENY_SAFE_ACTIVE";
+
+/// `BackupCreateClientError` — the stable exit class from the helper
+/// boundary plus a whitelisted reason token; helper diagnostic text
+/// is dropped by [`retained_backup_create_reason`].
+#[derive(Debug)]
+pub struct BackupCreateClientError {
+    exit_code: i64,
+    reason: String,
+}
+
+impl std::fmt::Display for BackupCreateClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("helper: backup create failed")
+    }
+}
+
+impl std::error::Error for BackupCreateClientError {}
+
+impl BackupCreateClientError {
+    /// `ExitCode`.
+    pub fn exit_code(&self) -> i64 {
+        self.exit_code
+    }
+    /// `Reason` — the whitelisted token or `""` ("no distinguishable
+    /// reason"); callers map `""` to their generic exit-class arm.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// `retainedBackupCreateReason` — every reason outside the closed
+/// whitelist folds to `""` so no helper-authored text survives the
+/// boundary.
+fn retained_backup_create_reason(reason: &str) -> String {
+    match reason {
+        DENY_SAFE_ACTIVE_WIRE_REASON
+        | BACKUP_CREATE_WIRE_REASON_AUTHORIZATION_REQUIRED
+        | BACKUP_CREATE_WIRE_REASON_AUTHORITY_DENIED
+        | BACKUP_CREATE_WIRE_REASON_WORKER_FAILED => reason.to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn backup_create_error(exit_code: i64, reason: &str) -> BackupCreateClientError {
+    let exit_code = if !(2..=7).contains(&exit_code) {
+        6
+    } else {
+        exit_code
+    };
+    BackupCreateClientError {
+        exit_code,
+        reason: retained_backup_create_reason(reason),
+    }
+}
+
+/// `BackupCreateClient` — `NewBackupCreateClient`'s linux
+/// implementation: the unprivileged CLI's whole view of
+/// `backup-create`.
+pub struct BackupCreateClient {
+    socket_path: String,
+}
+
+impl BackupCreateClient {
+    /// `NewBackupCreateClient`.
+    pub fn new(socket_path: impl Into<String>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+        }
+    }
+
+    /// `CreateBackup` — one bounded request/response exchange; the
+    /// helper owns the repository descriptor, worker, deadline, and
+    /// environment, so the request carries only the operation ID.
+    pub fn create_backup(
+        &self,
+        operation_id: &str,
+    ) -> Result<BackupCreateResult, BackupCreateClientError> {
+        if self.socket_path.is_empty() || operation_id.is_empty() {
+            return Err(backup_create_error(3, ""));
+        }
+        let mut conn = std::os::unix::net::UnixStream::connect(&self.socket_path)
+            .map_err(|_| backup_create_error(3, ""))?;
+        let bound = Duration::from_secs(5);
+        let _ = conn.set_read_timeout(Some(bound));
+        let _ = conn.set_write_timeout(Some(bound));
+        // `json.Marshal(BackupCreateRequest{})` — the request's only
+        // field is `json:"-"`, so the payload is exactly `{}`.
+        let payload = serde_json::value::RawValue::from_string("{}".to_owned()).ok();
+        let request = Request {
+            operation_id: operation_id.to_owned(),
+            verb: super::verb::BACKUP_CREATE.to_owned(),
+            payload,
+        };
+        write_request(&mut conn, &request).map_err(|_| backup_create_error(3, ""))?;
+        let response = read_response(&mut conn).map_err(|_| backup_create_error(3, ""))?;
+        if response.outcome != "success" || response.exit_code != 0 {
+            return Err(backup_create_error(response.exit_code, &response.reason));
+        }
+        let payload = response
+            .result
+            .as_ref()
+            .map(|r| r.get().as_bytes().to_vec())
+            .unwrap_or_default();
+        let result: BackupCreateResult =
+            decode_exact_backup_read_result(&payload).map_err(|_| backup_create_error(6, ""))?;
+        if result.operation_id != operation_id
+            || result.backup_id.is_empty()
+            || result.phase != "sealed"
+        {
+            // Upstream passes `response.ExitCode` (0) here, which the
+            // constructor clamps to the terminal class.
+            return Err(backup_create_error(response.exit_code, &response.reason));
+        }
+        Ok(result)
     }
 }
 

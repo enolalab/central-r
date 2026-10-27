@@ -32,6 +32,7 @@ use central_foundation::local_result::LocalResult;
 use central_kernel::lifecycle;
 
 mod artifact_cli;
+mod backup_cli;
 mod checkpoint_cli;
 mod grant_cli;
 mod harness_cli;
@@ -197,6 +198,9 @@ fn dispatch(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -
     if command_id.starts_with("migrate-") {
         return migrate_cli::migrate(command_id, tokens, stdout, stderr);
     }
+    if command_id.starts_with("backup.") {
+        return backup_cli::backup(command_id, tokens, stdout, stderr);
+    }
     let result = LocalResult::unsupported(command_id);
     match result.write_json_line(stdout) {
         Ok(()) => result.exit_code,
@@ -329,9 +333,6 @@ mod tests {
                 &["local", "dependency", "upgrade", "apply"],
                 "local.dependency-upgrade-plan",
             ),
-            (&["backup", "create"], "backup.create"),
-            (&["backup", "verify", "id"], "backup.verify"),
-            (&["backup", "status"], "backup.status"),
             (&["backup", "export"], "backup.export"),
             (&["backup", "import"], "backup.import"),
             (&["backup", "delete"], "backup.delete"),
@@ -444,6 +445,63 @@ mod tests {
             let parsed = parse_envelope(&stdout);
             assert_eq!(code, 3, "argv {argv:?}");
             assert_eq!(parsed["reason"], "MIGRATION_HELPER_UNAVAILABLE");
+        }
+
+        // R6 `backup create|verify|status` (task 9a): the helper-
+        // delegated verbs fail closed at exit 3 with the socket
+        // absent; the flag grammars gate at exit 2. The serial guard
+        // keeps the pin atomic against backup_cli's stub tests.
+        let _backup_serial = backup_cli::TEST_SERIAL.lock().unwrap();
+        *backup_cli::TEST_SOCKET_OVERRIDE.lock().unwrap() =
+            Some("/nonexistent/central-test/helper.sock".to_owned());
+        let (code, stdout, _) = invoke(&["backup", "create"]);
+        let parsed = parse_envelope(&stdout);
+        assert_eq!(code, 3);
+        assert_eq!(parsed["command_id"], "backup.create");
+        assert_eq!(parsed["reason"], "BACKUP_CREATE_DEPENDENCY_UNAVAILABLE");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "START_OR_REPAIR_CENTRAL_HELPER"
+        );
+        let valid_op = uuid::Uuid::now_v7().to_string();
+        for (argv, want_reason) in [
+            (
+                vec!["backup", "create", "extra"],
+                "INVALID_BACKUP_CREATE_GRAMMAR",
+            ),
+            (vec!["backup", "verify"], "INVALID_BACKUP_VERIFY_GRAMMAR"),
+            (
+                vec!["backup", "verify", "bogus"],
+                "INVALID_BACKUP_VERIFY_GRAMMAR",
+            ),
+            (vec!["backup", "status"], "INVALID_BACKUP_STATUS_GRAMMAR"),
+            (
+                vec!["backup", "status", "bogus"],
+                "INVALID_BACKUP_STATUS_GRAMMAR",
+            ),
+        ] {
+            let (code, stdout, _) = invoke(&argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 2, "argv {argv:?}");
+            assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
+        }
+        for (argv, want_id, want_reason) in [
+            (
+                vec!["backup", "verify", &valid_op],
+                "backup.verify",
+                "BACKUP_VERIFY_DEPENDENCY_UNAVAILABLE",
+            ),
+            (
+                vec!["backup", "status", &valid_op],
+                "backup.status",
+                "BACKUP_STATUS_DEPENDENCY_UNAVAILABLE",
+            ),
+        ] {
+            let (code, stdout, _) = invoke(&argv);
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(code, 3, "argv {argv:?}");
+            assert_eq!(parsed["command_id"], want_id, "argv {argv:?}");
+            assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
         }
 
         // R5 local skeletons.
