@@ -212,7 +212,7 @@ pub(crate) fn missing_live_env() -> Option<(ReasonClass, String)> {
 /// `connectBlocking` — a dedicated session through the port's own sync/async
 /// bridge. `BlockingConn::run` must be called off-runtime; scenario bodies
 /// run on libtest's plain threads, so that holds.
-fn connect_pg(dsn: &str) -> Result<BlockingConn, String> {
+pub(crate) fn connect_pg(dsn: &str) -> Result<BlockingConn, String> {
     let dsn_owned = dsn.to_owned();
     BlockingConn::new_connecting(move || {
         let dsn = dsn_owned.clone();
