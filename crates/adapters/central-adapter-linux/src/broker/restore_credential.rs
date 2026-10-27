@@ -334,12 +334,10 @@ impl Service {
     /// transport handler (the design's decision 1) and used only by
     /// the gate.
     ///
-    /// **R6-7c boundary:** the capacity-reserve gate requires the T8
-    /// `restoreCapacityReserves`/`restoreCapacityReceipts` stores this
-    /// `Service` does not carry. The gate's own nil-store answer —
-    /// `RESTORE_STATE_INVALID` — is therefore the only answer this
-    /// slice can produce: kind 1 stays fail-closed and the passfile
-    /// read below is unreachable until T8 lands.
+    /// A `Service` composed without the capacity stores answers the
+    /// gate's nil-store refusal — `RESTORE_STATE_INVALID` — and never
+    /// reaches the passfile read, so an unwired deployment stays
+    /// fail-closed.
     fn resolve_restore_migration_credential(
         &self,
         operation_id: Uuid,
@@ -362,32 +360,16 @@ impl Service {
         // precondition (which is what makes "the destructive window
         // has been entered" true and is what the gate's expiry
         // decision rests on) and before any credential material is
-        // read, so a refusal never touches the secret store. In this
-        // slice the reserve/receipt stores do not exist — see the
-        // function's doc comment — so the gate is permanently
-        // `STATE_INVALID`, the same answer upstream's nil-store check
-        // produces.
-        self.assert_restore_capacity_reserve_gate(&operation, launch)?;
+        // read, so a refusal never touches the secret store. The gate
+        // itself lives in `restore_capacity::gate` — see
+        // `Service::assert_restore_capacity_reserve_gate` for the four
+        // preconditions and the expiry decision.
+        self.assert_restore_capacity_reserve_gate(
+            &operation,
+            launch,
+            time::OffsetDateTime::now_utc(),
+        )?;
         self.read_active_migration_passfile()
-    }
-
-    /// `assertRestoreCapacityReserveGate` — **T8 boundary stub.** The
-    /// upstream gate resolves the operation's bound reserve set and
-    /// receipt against the launch binding; those stores are the
-    /// `0xc3`/`0xc4`/`0xc5` transports this slice deliberately does not
-    /// implement, so the gate can only ever answer
-    /// `RESTORE_STATE_INVALID` — its own fail-closed nil-store
-    /// precondition — and the destructive passfile can never be
-    /// released through it here.
-    ///
-    /// # Errors
-    /// Always `RESTORE_STATE_INVALID` until T8 implements the gate.
-    fn assert_restore_capacity_reserve_gate(
-        &self,
-        _operation: &RestoreOperation,
-        _binding: &RestoreLaunchBinding,
-    ) -> Result<(), Failure> {
-        Err(RestoreRefusalReason::StateInvalid.into_failure())
     }
 
     /// `resolveRestoreAuditMigrationCredential` releases the same
@@ -820,13 +802,13 @@ mod tests {
         new_restore_operation(&ticket, datetime!(2026-03-01 12:30:00 UTC)).unwrap()
     }
 
-    /// Kind 1 is fail-closed in this slice: the capacity gate is the
-    /// only path to the passfile, and it can only answer
-    /// `STATE_INVALID` while the T8 stores are absent — even for an
-    /// operation parked at the one checkpoint that would otherwise
-    /// admit it.
+    /// Kind 1's capacity gate fails closed against the evidence, not
+    /// against the stores: with the T8 stores composed but no reserve
+    /// set bound to this operation, the only answer is
+    /// `STATE_INVALID` — even for an operation parked at the one
+    /// checkpoint that would otherwise admit it.
     #[test]
-    fn kind_one_capacity_gate_stays_closed() {
+    fn kind_one_capacity_gate_refuses_without_reserve() {
         let root = std::env::temp_dir().join(format!("rcred-{}", Uuid::now_v7()));
         let svc = Service::new(root.clone(), 501).expect("service");
         let operation = applying_operation();
@@ -835,7 +817,11 @@ mod tests {
             mode: "apply",
         };
         let err = svc
-            .assert_restore_capacity_reserve_gate(&operation, &binding)
+            .assert_restore_capacity_reserve_gate(
+                &operation,
+                &binding,
+                time::OffsetDateTime::now_utc(),
+            )
             .unwrap_err();
         assert_eq!(err.code(), "RESTORE_STATE_INVALID");
         let _ = std::fs::remove_dir_all(&root);

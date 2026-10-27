@@ -36,17 +36,10 @@ impl CapacityRole {
 }
 
 /// `backup.RoleRoots` — the resolved host directory backing each role.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RoleRoots {
-    /// PostgreSQL data directory.
-    pub postgres_data: String,
-    /// PostgreSQL WAL root.
-    pub postgres_wal: String,
-    /// PostgreSQL temp area.
-    pub postgres_temp: String,
-    /// Object-store data directory.
-    pub object_data: String,
-}
+/// The domain type is used directly, as upstream does: `infralifecycle`
+/// resolves it and the broker daemon's composition carries the exact
+/// same value with no adapter-owned copy to drift.
+pub use central_backup::backup::capacity::RoleRoots;
 
 /// `roleServiceCandidates` — durable-data service keys that could back
 /// each role, most specific first. Today `postgres_wal`/`postgres_temp`

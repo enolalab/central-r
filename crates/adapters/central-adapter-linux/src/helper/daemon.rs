@@ -416,11 +416,77 @@ pub fn run_helper_daemon(
         // result onto the wire shape once composed.
         ..Server::new()
     });
+    // `runHelperRestoreCapacityReserveStartupSweep` — the sweep's
+    // first named call site: this daemon's own startup reconciliation
+    // pass. It is the pass that recovers from a crash — a host that
+    // came back up holding reserve objects nothing claims frees them
+    // here, before any new restore attempt is admitted — and it
+    // publishes the bucketed inspection digest the hardened broker
+    // serves on frame `0xc5`. It runs after composition and before
+    // `serve`, and its failure is reported rather than fatal:
+    // refusing to start the helper because a housekeeping pass failed
+    // would take away the operator's only path to a recovery.
+    run_restore_capacity_startup_sweep(&composition, stderr);
     if let Err(e) = serve(listen, &srv, IDLE_TIMEOUT, cancel) {
         let _ = writeln!(stderr, "helper: {e}");
         return 3;
     }
     0
+}
+
+/// `runHelperRestoreCapacityReserveStartupSweep` —
+/// [`SweepCaller::HelperStartup`]'s whole call site. It resolves the
+/// same protected root every other helper capability resolves, builds
+/// the narrow reserve view over it — never a whole broker `Service`
+/// (see [`ReserveHelperAuthority`]) — runs one reconciliation pass,
+/// and publishes its findings.
+///
+/// Every failure is reported to the journal and swallowed: neither a
+/// failed sweep nor a failed publish is a reason to refuse a
+/// recovery, and a disaster-recovery tool that will not run because
+/// its housekeeping pass failed is the failure mode this whole plan
+/// exists to avoid. The message carries the call site and the
+/// failure's own sanitized text, never a pathname.
+fn run_restore_capacity_startup_sweep(
+    composition: &crate::broker::daemon::ProductionInstanceComposition,
+    stderr: &mut dyn Write,
+) {
+    const SITE: &str = "helper-startup";
+    let root = match crate::broker::daemon::production_broker_root_at(
+        composition,
+        crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+        0,
+        0,
+    ) {
+        Ok(root) => root,
+        Err(e) => {
+            report_sweep_failure(SITE, e, stderr);
+            return;
+        }
+    };
+    let authority = match crate::broker::restore_capacity::helper::ReserveHelperAuthority::new(
+        &root,
+        composition.role_roots.clone(),
+        crate::broker::restore_capacity::sweep::SweepCaller::HelperStartup,
+    ) {
+        Ok(authority) => authority,
+        Err(e) => {
+            report_sweep_failure(SITE, e.message(), stderr);
+            return;
+        }
+    };
+    if let Err((_, e)) = authority.sweep_and_publish(time::OffsetDateTime::now_utc()) {
+        report_sweep_failure(SITE, e.message(), stderr);
+    }
+}
+
+/// `reportRestoreCapacityReserveSweepFailure` — the one place a sweep
+/// or publish failure is surfaced.
+fn report_sweep_failure(site: &str, err: &str, stderr: &mut dyn Write) {
+    let _ = writeln!(
+        stderr,
+        "central: restore capacity reserve sweep ({site}): {err}"
+    );
 }
 
 /// `signal.NotifyContext(SIGINT, SIGTERM)` — an eventfd that becomes

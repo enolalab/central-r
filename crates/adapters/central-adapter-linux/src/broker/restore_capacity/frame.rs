@@ -181,6 +181,15 @@ fn frame_invalid(detail: &str) -> Failure {
 /// `readRestoreCapacityReceiptRequest` — read and shape-validate one
 /// frame body, marker already consumed. No protected-state access:
 /// everything refused is a property of the bytes.
+/// Fixed-width UUID field. The callers read exactly `*_PAYLOAD_SIZE`
+/// bytes before slicing, so the field is 16 bytes by construction —
+/// `copy_from_slice` stands in for the infallible `try_into`.
+fn uuid_field(payload: &[u8]) -> Uuid {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&payload[..16]);
+    Uuid::from_bytes(bytes)
+}
+
 fn read_request(conn: &mut DeadlineStream) -> Result<ReceiptRequest, Failure> {
     let mut kind = [0u8; 1];
     conn.read_exact(&mut kind)
@@ -208,7 +217,7 @@ fn read_request(conn: &mut DeadlineStream) -> Result<ReceiptRequest, Failure> {
             let mut payload = [0u8; CONSUME_PAYLOAD_SIZE];
             conn.read_exact(&mut payload)
                 .map_err(|e| frame_invalid(&format!("read consume payload: {e}")))?;
-            let receipt_id = Uuid::from_bytes(payload[..16].try_into().expect("16 bytes"));
+            let receipt_id = uuid_field(&payload[..16]);
             if receipt_id.is_nil() || receipt_id.get_version_num() != 7 {
                 return Err(frame_invalid(
                     "invalid restore capacity receipt consume request",
@@ -231,8 +240,8 @@ fn read_request(conn: &mut DeadlineStream) -> Result<ReceiptRequest, Failure> {
             let mut payload = [0u8; BIND_PAYLOAD_SIZE];
             conn.read_exact(&mut payload)
                 .map_err(|e| frame_invalid(&format!("read bind payload: {e}")))?;
-            let set_id = Uuid::from_bytes(payload[..16].try_into().expect("16 bytes"));
-            let operation_id = Uuid::from_bytes(payload[16..].try_into().expect("16 bytes"));
+            let set_id = uuid_field(&payload[..16]);
+            let operation_id = uuid_field(&payload[16..]);
             for id in [set_id, operation_id] {
                 if id.is_nil() || id.get_version_num() != 7 {
                     return Err(frame_invalid(
@@ -274,7 +283,13 @@ impl Service {
                 "broker: restore capacity receipt store unavailable",
             ));
         }
-        let launches = self.restore_launches.as_ref().expect("checked above");
+        let Some(launches) = self.restore_launches.as_ref() else {
+            protocol::write_deny(conn, "unknown", ReceiptRefusal::Unavailable.as_str());
+            return Err(Failure::internal(
+                "broker_restore_capacity",
+                "broker: restore capacity launch store unavailable",
+            ));
+        };
         let binding = match launches.validate_peer(peer) {
             Ok(b) => b,
             Err(e) => {
@@ -952,7 +967,6 @@ mod tests {
     use crate::broker::testutil::TempDir;
     use central_backup::domain::TargetIdentity;
     use central_infra::authority::{BrokerOutcome, BrokerResponse};
-    use std::io::Write as _;
     use std::process::Child;
 
     // --- fixture --------------------------------------------------------------

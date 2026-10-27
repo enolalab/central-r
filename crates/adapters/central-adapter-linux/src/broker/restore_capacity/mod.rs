@@ -13,16 +13,25 @@
 //!
 //! - [`receipt`] — receipt records, bearer proofs, draw/spend ledgers.
 //! - [`frame`] — the `0xc4` receipt frame handler + engine client.
+//! - [`reserve_frame`] — the `0xc3` reserve frame handler + helper client.
+//! - [`object`] — the daemon's read-only reserve-object presence check.
 //! - [`store`] — the protected, HMAC-signed set/member/operation record
 //!   store.
 //! - [`store_path`] — the single resolver naming device-keyed reserve
 //!   objects; every physical-object lookup in this package routes
 //!   through it.
 
+pub mod allocation;
 pub mod frame;
+pub(crate) mod gate;
+pub mod helper;
+pub mod inspection;
+pub(crate) mod object;
 pub(crate) mod receipt;
+pub mod reserve_frame;
 pub(crate) mod store;
 pub(crate) mod store_path;
+pub mod sweep;
 
 use central_foundation::failure::Failure;
 use serde::{Deserialize, Serialize};
@@ -47,7 +56,7 @@ pub(crate) const RESERVE_ROLES: [ReserveRole; 4] = [
 /// verbatim (`"postgres_data"`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ReserveRole {
+pub enum ReserveRole {
     PostgresData,
     PostgresWal,
     PostgresTemp,
@@ -67,10 +76,7 @@ impl ReserveRole {
 
     /// `restoreCapacityReserveRoleRootPath` — pick this role's root path
     /// out of `RoleRoots`.
-    pub(crate) fn root<'a>(
-        self,
-        roots: &'a central_backup::backup::capacity::RoleRoots,
-    ) -> &'a str {
+    pub(crate) fn root(self, roots: &central_backup::backup::capacity::RoleRoots) -> &str {
         match self {
             Self::PostgresData => roots.postgres_data.as_str(),
             Self::PostgresWal => roots.postgres_wal.as_str(),
@@ -86,7 +92,7 @@ impl ReserveRole {
 /// non-released state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ReserveState {
+pub enum ReserveState {
     Intent,
     Allocated,
     ProvisionallyConsumed,

@@ -55,6 +55,7 @@ const MAX_RECORD_BYTES: u64 = 16 * 1024;
 pub(crate) const BUNDLE_MAX_BYTES: usize = 16 * 1024;
 /// `restoreCapacityReceiptHandoffPurpose` — the sealed memfd's purpose
 /// label.
+#[allow(dead_code)] // the memfd handoff purpose constant, used by the engine-side handoff
 pub(crate) const HANDOFF_PURPOSE: &str = "restore-capacity-receipts";
 
 /// `RestoreCapacityReceiptLifetime` — the design's 20-minute receipt
@@ -374,6 +375,7 @@ pub(crate) struct ReceiptMint {
 /// yields: the member identity the spent receipt belongs to and the
 /// window the provisional mark is in force for.
 #[derive(Debug)]
+#[allow(dead_code)] // carried fields the engine-side caller reads
 pub(crate) struct ReceiptConsumption {
     pub receipt_id: Uuid,
     pub set_id: Uuid,
@@ -385,6 +387,7 @@ pub(crate) struct ReceiptConsumption {
 /// `RestoreCapacityProvisionalMark` — one receipt-keyed provisional
 /// consumption mark and whether it is still in force.
 #[derive(Debug)]
+#[allow(dead_code)] // the provisional-mark record shape, read by the engine side
 pub(crate) struct ProvisionalMark {
     pub receipt_id: Uuid,
     pub set_id: Uuid,
@@ -513,10 +516,12 @@ impl ReceiptStore {
     }
 
     /// `s.receipts`/`s.draws`/`s.spends` — sweep enumeration roots.
+    #[allow(dead_code)] // record directory accessor for the engine-side sweep
     pub(crate) fn receipts_dir(&self) -> &Path {
         &self.receipts
     }
 
+    #[allow(dead_code)] // record directory accessor for the engine-side sweep
     pub(crate) fn draws_dir(&self) -> &Path {
         &self.draws
     }
@@ -750,6 +755,7 @@ impl ReceiptStore {
 
     /// `ProvisionalMark` — the receipt-keyed provisional consumption
     /// mark: consumed, and still in force inside its own window.
+    #[allow(dead_code)] // the engine-side provisional mark read
     pub(crate) fn provisional_mark(
         &self,
         receipt_id: Uuid,
@@ -794,6 +800,7 @@ impl ReceiptStore {
 
     /// `readReceiptAtPath` — sweep variant (receipt directory is
     /// enumerated by name only).
+    #[allow(dead_code)] // path form used by the helper-side sweep
     pub(crate) fn read_receipt_at_path(&self, path: &Path) -> Result<ReceiptRecord, Failure> {
         let raw = read_receipt_bytes(path)?;
         let record: ReceiptRecord = decode_record(&raw)?;
@@ -1147,7 +1154,7 @@ mod tests {
     fn source_fn<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source
             .find(signature)
-            .unwrap_or_else(|| panic!("this file declares no {signature}"));
+            .expect("this file declares the signature");
         let body = &source[start..];
         // Find the end: the first `\nfn `, `\n/// ` or `\n// ---` at
         // column 0 after the signature.

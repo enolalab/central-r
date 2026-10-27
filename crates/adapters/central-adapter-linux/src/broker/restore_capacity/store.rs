@@ -319,7 +319,7 @@ impl OperationIndexRecord {
 /// set. Carries no operation id: "verify allocates" means the set exists
 /// before the operation does.
 #[derive(Debug, Clone)]
-pub(crate) struct ReserveSetIntent {
+pub struct ReserveSetIntent {
     pub launch_evidence_id: Uuid,
     pub backup_id: Uuid,
     pub repository_binding_id: Uuid,
@@ -332,7 +332,7 @@ pub(crate) struct ReserveSetIntent {
 /// `RestoreCapacityReserveMemberIntent` — one role's pre-allocation
 /// measurement.
 #[derive(Debug, Clone)]
-pub(crate) struct ReserveMemberIntent {
+pub struct ReserveMemberIntent {
     pub role: ReserveRole,
     pub device_fingerprint: String,
     pub st_dev: u64,
@@ -345,7 +345,7 @@ pub(crate) struct ReserveMemberIntent {
 
 /// `readRestoreCapacityReserveBytes` — the same protected-file
 /// discipline `readPrivateJSON` applies, minus the decode.
-fn read_reserve_bytes(path: &Path) -> Result<Vec<u8>, Failure> {
+pub(crate) fn read_reserve_bytes(path: &Path) -> Result<Vec<u8>, Failure> {
     // `errors.Is(err, os.ErrNotExist)` → not-found; anything else
     // → unavailable. `open_protected_file` maps everything to Failure,
     // so the existence check runs first; a file that vanishes between
@@ -393,7 +393,7 @@ fn read_reserve_bytes(path: &Path) -> Result<Vec<u8>, Failure> {
 /// envelope first (an unknown future version is *ambiguous*, never
 /// absent), then a strict `deny_unknown_fields` decode of the same
 /// bytes; trailing content is ambiguous too.
-fn decode_record<T: DeserializeOwned>(raw: &[u8]) -> Result<T, Failure> {
+pub(crate) fn decode_record<T: DeserializeOwned>(raw: &[u8]) -> Result<T, Failure> {
     #[derive(Deserialize)]
     struct Envelope<'a> {
         schema_version: &'a str,
@@ -421,7 +421,7 @@ pub(crate) struct ReserveStore {
     sets: PathBuf,
     members: PathBuf,
     operations: PathBuf,
-    signing: std::sync::Arc<SigningService>,
+    pub(crate) signing: std::sync::Arc<SigningService>,
 }
 
 impl ReserveStore {
@@ -1083,6 +1083,7 @@ fn same_member_intent(existing: &ReserveMemberRecord, candidate: &ReserveMemberR
 /// The completeness rule frame `0xc3` derives from durable records only:
 /// every role has a member record, and each is at-or-past `allocated`.
 /// Never caller memory.
+#[allow(dead_code)] // completeness check the engine-side bind path uses
 pub(crate) fn member_records_complete(members: &[ReserveMemberRecord]) -> bool {
     if members.len() != RESERVE_ROLES.len() {
         return false;

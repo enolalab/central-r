@@ -412,6 +412,7 @@ impl Service {
     /// Upstream constructs the daemon with the layout it discovered;
     /// `None` (the compose default) is the `RoleRoots()` unavailable
     /// answer.
+    #[allow(dead_code)] // composition seam for the helper/daemon wiring
     pub(crate) fn set_role_roots(&mut self, roots: central_backup::backup::capacity::RoleRoots) {
         self.role_roots = Some(roots);
     }
@@ -420,6 +421,7 @@ impl Service {
     /// root — attach pre-built restore-capacity stores; `Service::new`
     /// already constructs both unconditionally, so this only serves
     /// the `compose` test seam.
+    #[allow(dead_code)] // composition seam for the helper/daemon wiring
     pub(crate) fn set_restore_capacity_stores(
         &mut self,
         reserves: Option<restore_capacity::store::ReserveStore>,
@@ -2153,25 +2155,27 @@ pub fn handle_conn(conn: std::os::unix::net::UnixStream, svc: &Service) -> Resul
                 }
             }
         }
-        // Upstream runs these frames' peer predicates inside their
-        // handlers — the launch record's helper/engine validation —
-        // before any frame body is read (server.go's comments on the
-        // 0xc3/0xc4/0xc5 arms). That launch-record machinery is R6;
-        // this slice denies every peer with the same `Denied` outcome
-        // the predicates produce, and R6 restores the real predicate
-        // checks behind this dispatch arm.
-        RESTORE_CAPACITY_RESERVE_FRAME_MARKER
-        | RESTORE_CAPACITY_RECEIPT_FRAME_MARKER
-        | RESTORE_CAPACITY_RESERVE_INSPECTION_FRAME_MARKER => {
-            protocol::write_deny(
-                &mut conn,
-                "unknown",
-                &format!("BROKER_AUTHORITY_DENIED: {UNSUPPORTED_IN_THIS_SLICE}"),
-            );
-            Err(Failure::denied(
-                "broker",
-                "broker: unsupported framed transport",
-            ))
+        // Frame 0xc3 — the root helper's reserve-set write path. The
+        // peer predicate (the launch record's helper validation) runs
+        // inside the handler, before any frame body is read; when the
+        // stores were not composed the handler itself denies with the
+        // frame's own `Unavailable` vocabulary, so this arm is the live
+        // path only, never a bypass.
+        RESTORE_CAPACITY_RESERVE_FRAME_MARKER => {
+            svc.handle_restore_capacity_reserve_connection(&mut conn, &peer)
+        }
+        // Frame 0xc4 — the restore engine's receipt channel (draw,
+        // consume, bind). Same placement rule: `ValidatePeer` and the
+        // launch-mode gate run before the body is read.
+        RESTORE_CAPACITY_RECEIPT_FRAME_MARKER => {
+            svc.handle_restore_capacity_receipt_connection(&mut conn, &peer)
+        }
+        // Frame 0xc5 — the root-only reserve inspection surface. The
+        // peer predicate (root, and never the runtime UID) runs inside
+        // the handler before the kind byte is read; the digest read is
+        // a single openat of a fixed name, never an enumeration.
+        RESTORE_CAPACITY_RESERVE_INSPECTION_FRAME_MARKER => {
+            svc.handle_restore_capacity_inspection_connection(&mut conn, &peer)
         }
         _ => {
             // JSON line transport — the first byte is part of the line,

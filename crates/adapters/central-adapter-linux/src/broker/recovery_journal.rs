@@ -1012,8 +1012,8 @@ struct RecoveryMinioOperationBindingWire {
 /// `None` ⇔ the Go zero struct (`committed`); `completed_at` `None` ⇔
 /// Go's zero `time.Time`.
 #[derive(Debug, Clone)]
-struct BackupSealRecord {
-    proposal: BackupSealProposal,
+pub(crate) struct BackupSealRecord {
+    pub(crate) proposal: BackupSealProposal,
     companion: BackupSealCompanion,
     state: String,
     attestation: Option<BackupRepositoryAttestation>,
@@ -3203,7 +3203,7 @@ impl RecoveryJournalStore {
     /// `readBackupSeal` — strict decode plus the broker-HMAC
     /// re-derivation: the stored companion must equal what this key
     /// would mint for the stored proposal.
-    fn read_backup_seal(&self, backup_id: Uuid) -> Result<BackupSealRecord, Failure> {
+    pub(crate) fn read_backup_seal(&self, backup_id: Uuid) -> Result<BackupSealRecord, Failure> {
         let wire_record: BackupSealRecordWire = read_private_json(&self.seal_path(backup_id))?;
         let record = seal_record_from_wire(&wire_record)?;
         if record.proposal.backup_id != backup_id

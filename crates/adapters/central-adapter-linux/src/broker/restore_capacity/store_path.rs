@@ -70,11 +70,13 @@ const OBJECT_EXISTS: &str = "broker_restore_reserve_object_exists";
 const OBJECT_ABSENT: &str = "broker_restore_reserve_object_absent";
 
 /// `errors.Is(err, os.ErrExist)` — the create path's "already there".
+#[allow(dead_code)] // create-path classification for the helper-side allocator
 pub(crate) fn is_object_exists(f: &Failure) -> bool {
     f.code() == OBJECT_EXISTS
 }
 
 /// `errors.Is(err, os.ErrNotExist)` — the open path's "not there".
+#[allow(dead_code)] // open-path classification for the helper-side sweep
 pub(crate) fn is_object_absent(f: &Failure) -> bool {
     f.code() == OBJECT_ABSENT
 }
@@ -457,6 +459,7 @@ fn check_object_stat(stat: &rustix::fs::Stat, want_dev: u64) -> Result<(), Failu
 
 /// `fstatfs` availability bytes at the held descriptor — the
 /// measurement behind `ObservedFreeBytes` (`f_bavail * f_bsize`).
+#[allow(dead_code)] // fstatfs free-bytes reading for the helper-side measurement
 pub(crate) fn available_bytes<Fd: AsFd>(fd: Fd) -> Result<u64, Failure> {
     let s = rustix::fs::fstatfs(fd).map_err(|e| {
         Failure::internal(
