@@ -713,6 +713,7 @@ dependencies = [
  "central-adapter-postgres",
  "central-adapter-s3",
  "central-artifact",
+ "central-backup",
  "central-checkpoint",
  "central-eventjournal",
  "central-execution",

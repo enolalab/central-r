@@ -79,10 +79,30 @@ central-eventjournal = { path = "../../crates/capabilities/central-eventjournal"
 # admissions, checkpoints) the recovery matrix asserts on — the
 # PostgreSQL reader is `central-adapter-postgres::runview`.
 central-runview = { path = "../../crates/capabilities/central-runview", version = "0.1.0" }
+# R6 task 10 slice A (`tests/c06_acceptance/`): the C06 recovery
+# acceptance suite composes the production recovery domain
+# (`check_backup_admission`, the recovery profile, the throughput
+# receipt) the way upstream `internal/recovery` imports `internal/backup`.
+central-backup = { path = "../../crates/capabilities/central-backup", version = "0.1.0" }
+# The ceremony driver's TTY probe performs the same descriptor
+# operations upstream performs (open/TIOCEXCL/termios/deadline) through
+# the pinned rustix safe wrappers — `unsafe_code` is forbid here, so the
+# probe shares the vocabulary the audited adapter boundary already
+# enables (pty/termios land via feature unification; declared for the
+# surface the test itself uses).
+rustix = { workspace = true, features = ["pty", "termios"] }
 
 [[test]]
 name = "phase2_acceptance"
 path = "tests/phase2_acceptance/mod.rs"
+
+# R6 task 10 slice A — C06 recovery acceptance (ceremony driver +
+# slice-C acceptance core). Portable machinery runs on any host; the
+# live scenarios gate on CENTRAL_C06_REFERENCE_HOST and the entry's
+# declared preconditions.
+[[test]]
+name = "c06_acceptance"
+path = "tests/c06_acceptance/mod.rs"
 
 [lints]
 workspace = true
