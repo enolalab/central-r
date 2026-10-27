@@ -881,6 +881,11 @@ version = "0.1.0"
 [[package]]
 name = "central-backup-launcherd"
 version = "0.1.0"
+dependencies = [
+ "central-adapter-linux",
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "central-checkpoint"

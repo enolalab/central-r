@@ -1,10 +1,56 @@
 [package]
 name = "central-backup-launcherd"
-description = "Backup/restore launcher daemon mediating privileged steps (fd-3 pg_dump/pg_restore)"
+description = "Dedicated backup launcher daemon mediating central-backup privilege (supervised worker, retained target lock)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[dependencies]
+# Shared audited Linux primitives: `pidfd_open`/`pidfd_send_signal`
+# and `SO_PEERCRED`/`SCM_RIGHTS` live in the adapter's `sys` subtree —
+# the single audited site — instead of this binary's own syscall layer.
+central-adapter-linux = { path = "../../crates/adapters/central-adapter-linux", version = "0.1.0" }
+rustix = { workspace = true, features = ["event", "pipe", "rand"] }
+# The launcher binaries are one of the two places audited `unsafe` may
+# live (workflow §5.2): libc carries the syscall sites rustix has no
+# safe wrapper for (fork/execve, dup2/dup3 to fixed descriptor
+# numbers, setgroups/setuid/setgid, close_range, sigaction, _exit,
+# waitpid, prctl). Every use sits inside `sys`, behind a named safe
+# wrapper with a comment, like upstream's own syscall layer.
+libc = "=0.2.191"
+
+[features]
+# `test-build` compiles in every CBL_TEST_* knob (upstream's
+# -DSOCKET_PATH/-DBACKUP_PATH/-DCENTRAL_BACKUP_LAUNCHER_TEST_PEER_UID
+# … compile-time test overrides) and the `cbl-test-worker` fixture
+# binary: the knobs and the fixture must never reach a production
+# build — a production build carries none of them and none of the
+# CBL_TEST_* environment names is read.
+test-build = []
+
+[[bin]]
+name = "central-backup-launcherd"
+path = "src/main.rs"
+
+# The upstream `test_worker.c` fixture, gated like the test suite:
+# built only when `test-build` is on so `tests/` can exec it as the
+# supervised worker.
+[[bin]]
+name = "cbl-test-worker"
+path = "src/test_worker.rs"
+required-features = ["test-build"]
+
+# The launcher binaries are the audited `unsafe` sites (workflow
+# §5.2): `sys.rs` opts back in per module, so this crate lists the
+# workspace lints by hand (it cannot both inherit and override
+# `unsafe_code`) with `unsafe_code` at "deny" instead of "forbid".
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
