@@ -16,6 +16,7 @@
 
 pub(crate) mod capacity;
 mod environment;
+mod objectstore_backup;
 mod pg_dump;
 mod pg_restore;
 mod pgdump_throughput;
@@ -29,6 +30,10 @@ mod throughput_probe;
 
 pub use capacity::device_capacity_from_descriptor;
 pub use environment::{BackupEnvironment, new_backup_environment};
+pub use objectstore_backup::{
+    S3BackupObjectSource, new_backup_reader_from_sealed_credential,
+    new_import_writer_from_sealed_credential,
+};
 pub use pg_dump::{PgDump, PgDumpConfig, PgDumpStream, SealedPassfileProvider};
 pub use pg_restore::{
     PgRestore, PgRestoreConfig, RestoreDumpSource, SealedRestorePassfileProvider,

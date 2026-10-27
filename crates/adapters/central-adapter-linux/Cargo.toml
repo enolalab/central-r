@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 central-adapter-harness = { path = "../central-adapter-harness", version = "0.1.0" }
+central-adapter-s3 = { path = "../central-adapter-s3", version = "0.1.0" }
+central-artifact = { path = "../../capabilities/central-artifact", version = "0.1.0" }
 central-backup = { path = "../../capabilities/central-backup", version = "0.1.0" }
 central-foundation = { path = "../../central-foundation", version = "0.1.0" }
 central-harness = { path = "../../capabilities/central-harness", version = "0.1.0" }

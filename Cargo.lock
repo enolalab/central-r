@@ -756,6 +756,8 @@ name = "central-adapter-linux"
 version = "0.1.0"
 dependencies = [
  "central-adapter-harness",
+ "central-adapter-s3",
+ "central-artifact",
  "central-backup",
  "central-foundation",
  "central-harness",
