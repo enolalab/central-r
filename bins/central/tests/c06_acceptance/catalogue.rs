@@ -557,4 +557,119 @@ mod tests {
         reordered.swap(0, 1);
         assert_ne!(catalogue_digest(&reordered), first);
     }
+
+    /// `installedCatalogueDigest` is `catalogue_digest(&installed_catalogue())`
+    /// for the catalogue this repository ships, recorded here so that the value
+    /// is checkable from committed source: a reader holding an emitted artifact
+    /// compares its `catalogue_sha256` against this literal and learns whether
+    /// the run covered C06's whole catalogue, without building or running the
+    /// suite.
+    ///
+    /// It is not evidence and it is not an artifact. It is a property of the
+    /// suite's own definition, in the same way the ten-scenario and
+    /// nine-boundary lists above are.
+    ///
+    /// Derivable by hand: `catalogue_digest` hashes one
+    /// `"id\tkind\trequired_for_sc_g3\n"` record per entry in declaration
+    /// order, so
+    ///
+    /// ```text
+    /// printf 'c06.s1.backup_create\tscenario\ttrue\n...' | sha256sum
+    /// ```
+    ///
+    /// over the nineteen entries reproduces it. The value below was recomputed
+    /// that way — by piping the nineteen records through `sha256sum` — rather
+    /// than by copying what the failing test printed, because a constant
+    /// updated from the code it is meant to pin is a constant that agrees with
+    /// any code at all. This is the same literal upstream pins at
+    /// `catalogue_test.go:145`, and the two implementations must keep agreeing
+    /// on it because the emitted artifact's `catalogue_sha256` is the field a
+    /// reviewer uses to tell a full run from a narrowed one across both ports.
+    const INSTALLED_CATALOGUE_DIGEST: &str =
+        "02fa72ee32a743ab753dcea089995d8c3aa8fa4c615888ef25f7a62a67042738";
+
+    /// `TestTheInstalledCatalogueDigestIsTheRecordedValue` pins that literal.
+    /// It fails when the catalogue changes and the recorded value does not,
+    /// which is the only way the two can drift apart: a published expected
+    /// digest that silently stops describing the shipped catalogue is worse
+    /// than none, because a reviewer would read a mismatch as a truncated run
+    /// rather than as a stale constant.
+    ///
+    /// It also catches an in-module narrowing of `installed_catalogue`, which
+    /// nothing else does in one place — the runner tests that count entries
+    /// compare against the declaration itself and are therefore circular.
+    #[test]
+    fn the_installed_catalogue_digest_is_the_recorded_value() {
+        let got = catalogue_digest(&installed_catalogue());
+        assert_eq!(
+            got, INSTALLED_CATALOGUE_DIGEST,
+            "the installed catalogue digests to {got}, but the recorded value is \
+             {INSTALLED_CATALOGUE_DIGEST}; if the catalogue changed deliberately, \
+             change the recorded value in the same commit — a reviewer checking \
+             an artifact's catalogue_sha256 reads this literal"
+        );
+    }
+
+    /// `TestTheCatalogueDigestDistinguishesEveryFieldItClaimsToCover` holds
+    /// `catalogue_digest` to its own coverage claim. The digest is what makes
+    /// an emitted artifact self-describing — it is the only field that tells a
+    /// full run from a narrowed one — so a regression that quietly stopped
+    /// covering one of these fields would leave a materially different
+    /// catalogue digesting identically to C06's own, and `catalogue_sha256`
+    /// would certify a catalogue it cannot distinguish.
+    ///
+    /// The edited catalogues below are deliberately not valid: nothing
+    /// validates them, and the point is what the digest sees, not what
+    /// `validate` would reject.
+    #[test]
+    fn the_catalogue_digest_distinguishes_every_field_it_claims_to_cover() {
+        let baseline = catalogue_digest(&installed_catalogue());
+
+        struct Case {
+            name: &'static str,
+            reason: &'static str,
+            edit: fn(&mut Vec<Entry>),
+        }
+        let cases = [
+            Case {
+                name: "a scenario reclassified as a restart injection",
+                reason: "the kind decides which manifest field an entry lands in — field 10 for a scenario, field 23 for a restart injection",
+                edit: |c: &mut Vec<Entry>| c[0].kind = Kind::RestartInjection,
+            },
+            Case {
+                name: "an entry flipped out of rule E-1's scope",
+                reason: "required_for_sc_g3 decides whether a skip of that entry is a gate failure",
+                edit: |c: &mut Vec<Entry>| c[0].required_for_scg3 = !c[0].required_for_scg3,
+            },
+            Case {
+                name: "two entries transposed",
+                reason: "the digest is over the declaration order, which the census and the emitted scenario list are both built from",
+                edit: |c: &mut Vec<Entry>| c.swap(0, 1),
+            },
+        ];
+        for case in &cases {
+            let mut edited = installed_catalogue();
+            (case.edit)(&mut edited);
+            assert_ne!(
+                catalogue_digest(&edited),
+                baseline,
+                "a catalogue differing from the installed one in exactly this way \
+                 digests identically; {}, so catalogue_sha256 cannot tell the two \
+                 apart (case: {})",
+                case.reason,
+                case.name
+            );
+        }
+
+        // Anti-vacuity, and the reason the edits above are safe: every case
+        // edits a fresh copy, so a case that appeared to differ because an
+        // earlier one mutated the declaration would show up here.
+        assert_eq!(
+            catalogue_digest(&installed_catalogue()),
+            baseline,
+            "the installed catalogue's digest changed while this test ran; the \
+             cases above edited the declaration rather than a copy, so none of \
+             them proves anything"
+        );
+    }
 }
