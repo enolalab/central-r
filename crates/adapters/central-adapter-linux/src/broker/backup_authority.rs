@@ -1126,7 +1126,7 @@ impl Service {
                         if record.phase.as_str() != "accepted"
                             && record.phase.as_str() != "failed"
                             && !(record.phase.as_str() == "cleanup_required"
-                                && record.evidence.is_some()) =>
+                                && record.evidence.is_none()) =>
                     {
                         return backup_denied(&req.operation_id, CODE);
                     }
@@ -1574,7 +1574,7 @@ impl crate::helper::backup::BackupLaunchReaper for BackupAttestationClient {
         if operation_id.is_nil()
             || launch_evidence_id.is_nil()
             || target_lock_proof == [0u8; 32]
-            || reaped_at == OffsetDateTime::UNIX_EPOCH
+            || wire::is_go_zero_time(reaped_at)
         {
             return Err(client_unavailable("backup reaping"));
         }
