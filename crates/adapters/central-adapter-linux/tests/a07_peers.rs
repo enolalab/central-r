@@ -488,27 +488,21 @@ fn broker_restore_framed_transports_live_vocabularies() {
 
     // 0xc3/0xc4/0xc5 are live transports since Task 8: they answer
     // with their own refusal vocabularies, never the closed-matrix
-    // `UNSUPPORTED_IN_THIS_SLICE`. Each arm's peer gate runs first:
-    // a peer that is neither root nor the runtime uid is PEER_DENIED;
-    // a root peer is admitted and the bare-marker frame then fails
-    // the request decode — FRAME_INVALID.
+    // `UNSUPPORTED_IN_THIS_SLICE`. Each arm's peer gate runs before
+    // the request decode. For 0xc3/0xc4 that gate is the
+    // launch-record predicate — a peer without a recorded launch
+    // (root or not) is PEER_DENIED and never reaches decode. For
+    // 0xc5 the gate admits root outright, so a root peer's bare
+    // marker reaches decode and fails FRAME_INVALID.
     let root = euid() == 0;
     for (marker, reason) in [
         (
             protocol::RESTORE_CAPACITY_RESERVE_FRAME_MARKER,
-            if root {
-                "RESTORE_RESERVE_FRAME_INVALID"
-            } else {
-                "RESTORE_RESERVE_PEER_DENIED"
-            },
+            "RESTORE_RESERVE_PEER_DENIED",
         ),
         (
             protocol::RESTORE_CAPACITY_RECEIPT_FRAME_MARKER,
-            if root {
-                "RESTORE_RECEIPT_FRAME_INVALID"
-            } else {
-                "RESTORE_RECEIPT_PEER_DENIED"
-            },
+            "RESTORE_RECEIPT_PEER_DENIED",
         ),
         (
             protocol::RESTORE_CAPACITY_RESERVE_INSPECTION_FRAME_MARKER,

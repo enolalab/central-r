@@ -8,13 +8,12 @@
 //! coordinator and releases the migration credential, which no worker
 //! may ever hold.
 //!
-//! Slice boundary (R6-7c): kinds 2–6 are live. Kind 1 — the
-//! destructive `pg_restore` migration draw — remains fail-closed: its
-//! second precondition is the capacity-reserve gate
-//! (`assertRestoreCapacityReserveGate`), which needs the T8
-//! reserve/receipt stores this Service does not carry, so the gate's
-//! own nil-store `STATE_INVALID` answer is the only answer this slice
-//! can produce and the passfile is never read.
+//! Slice boundary (R6-8): all six kinds are live. Kind 1 — the
+//! destructive `pg_restore` migration draw — is admitted only after
+//! the capacity-reserve gate (`assertRestoreCapacityReserveGate`)
+//! verifies the launch's reserve set, spent receipts, device floors,
+//! and extents against the daemon's own durable records; the
+//! passfile is read only after the gate commits.
 
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};

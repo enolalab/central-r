@@ -393,8 +393,8 @@ pub fn run_helper_daemon(
         restore_abandon,
         // `restore_verify`/`restore_apply`/`restore_resume` stay
         // unset for the same chain reason: the production runner and
-        // engine launcher are the restore capacity reserve helper's
-        // composition (T8). Their dispatch arms answer upstream's
+        // engine launcher are the restore binary's composition
+        // (T9). Their dispatch arms answer upstream's
         // exact `*_UNAVAILABLE`/`RESTORE_*_AUTHORIZATION_UNAVAILABLE`.
         // `restore_verify` would mint a ticket a no-engine apply
         // cannot consume — the refusal is honest, the reach is not.

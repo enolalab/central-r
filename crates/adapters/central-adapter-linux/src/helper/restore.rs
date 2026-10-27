@@ -380,9 +380,9 @@ pub struct RestoreEngineReceipt {
 /// `RestoreEngineLauncher` runs `/usr/lib/central/central-restore`
 /// for exactly one authorized operation — a separate seam from the
 /// issuer so proving the ceremony and performing the destructive run
-/// remain distinct authorities. The T8 capacity/migration-kind-1
-/// transport (`0xc3`–`0xc5`) is a later task's production
-/// implementation; this slice ships the seam fail-closed.
+/// remain distinct authorities. The capacity transports
+/// (`0xc3`–`0xc5`) are live since T8; the launcher itself is T9's
+/// production composition — this seam ships fail-closed until then.
 pub trait RestoreEngineLauncher: Send + Sync {
     /// `LaunchRestore`.
     fn launch_restore(
