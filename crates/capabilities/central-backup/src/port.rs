@@ -452,7 +452,9 @@ pub struct VersionZeroEligibility {
 // owns the bridging, exactly as the migration ports keep `sqlx` out.
 // ---------------------------------------------------------------------------
 
-use crate::backup::capacity::{BackupContinuitySnapshot, CapacitySnapshot, RecoveryProfile};
+use crate::backup::capacity::{
+    BackupContinuitySnapshot, CapacitySnapshot, DeviceCapacitySnapshot, RecoveryProfile,
+};
 use crate::backup::inventory::{InventoryChunk, InventoryEntry, MAXIMUM_INVENTORY_CHUNK_ENTRIES};
 use crate::backup::manifest::SealRootManifest;
 use crate::backup::operation::{BackupAcceptedFacts, BackupOperation, DumpEvidence};
@@ -530,6 +532,96 @@ pub struct BackupRepositoryCensus {
     pub bytes: u64,
     /// Sealed backups in the canonical root index.
     pub sealed_backups: u64,
+}
+
+/// `port.BackupTargetExclusion` — the dedicated-connection lease held
+/// from the accepted offline point through terminal seal completion.
+pub trait BackupTargetExclusion: Send + Sync {
+    /// `AssertHeld` — re-proves the external lease is still owned by
+    /// this exact operation.
+    fn assert_held(&self) -> Result<(), Failure>;
+    /// `Release` — ends the lease; after the lock's bytes are handed
+    /// to the monitor the lease is intentionally unusable here.
+    fn release(&self) -> Result<(), Failure>;
+    /// `Proof` — the accepted-point lock proof bound into the
+    /// operation's accepted facts (a fingerprint, never a secret).
+    fn proof(&self) -> String;
+}
+
+/// `port.BackupTargetLockRetainer` — the one-way final handoff of the
+/// exact PostgreSQL session socket which owns the accepted-point
+/// advisory locks. The callback must transfer the descriptor to the
+/// trusted native monitor before returning success. After success the
+/// lease is intentionally unusable in this process; the monitor
+/// becomes its sole owner through terminal seal.
+pub trait BackupTargetLockRetainer: Send + Sync {
+    /// `RetainForPostReap`.
+    fn retain_for_post_reap(
+        &self,
+        callback: &mut dyn FnMut(std::os::fd::RawFd, [u8; 32]) -> Result<(), Failure>,
+    ) -> Result<(), Failure>;
+}
+
+/// `port.BackupTargetExcluder` — acquires the backup-time
+/// target-exclusive fence for an already-validated target identity.
+pub trait BackupTargetExcluder: Send + Sync {
+    /// `AcquireBackupTargetExclusion`.
+    fn acquire_backup_target_exclusion(
+        &self,
+        target: &TargetIdentity,
+    ) -> Result<Box<dyn BackupTargetExclusion>, Failure>;
+}
+
+/// `port.BackupDatabaseCensusReader` — reads the live target's
+/// accepted-point measurements through the dedicated recovery role.
+pub trait BackupDatabaseCensusReader: Send + Sync {
+    /// `ReadBackupCapacity`.
+    fn read_backup_capacity(&self) -> Result<BackupDatabaseCensus, Failure>;
+}
+
+/// `port.BackupRepositoryInspector` — the trusted, descriptor-bound
+/// repository observation the environment aggregates. It exposes
+/// opaque identities only — never a path.
+pub trait BackupRepositoryInspector: Send + Sync {
+    /// `CapacityCensus`.
+    fn capacity_census(&self) -> Result<BackupRepositoryCensus, Failure>;
+    /// `DeviceCapacity`.
+    fn device_capacity(&self) -> Result<DeviceCapacitySnapshot, Failure>;
+    /// `BindingID`.
+    fn binding_id(&self) -> uuid::Uuid;
+}
+
+/// `port.BackupAuthorityLease` — the broker-issued authority receipt
+/// asserted at every environment boundary.
+pub trait BackupAuthorityLease: Send + Sync {
+    /// `AssertHeld`.
+    fn assert_held(&self) -> Result<(), Failure>;
+}
+
+/// `port.BackupThroughputSource` — reads the admitted-floor throughput
+/// evidence measured against this exact environment.
+pub trait BackupThroughputSource: Send + Sync {
+    /// `ReadBackupThroughput`.
+    fn read_backup_throughput(
+        &self,
+        operation: &BackupOperation,
+        facts: &BackupAcceptedFacts,
+    ) -> Result<ThroughputEvidence, Failure>;
+}
+
+/// `port.BackupAcceptedFactsBuilder` — composes the trusted accepted
+/// facts from the same database timestamp, repository binding, and
+/// target lock proof the admission snapshot recorded. Callers supply
+/// none of the version-pinned fields.
+pub trait BackupAcceptedFactsBuilder: Send + Sync {
+    /// `BuildBackupAcceptedFacts`.
+    fn build_backup_accepted_facts(
+        &self,
+        operation: &BackupOperation,
+        database_time: time::OffsetDateTime,
+        repository_binding_id: uuid::Uuid,
+        target_lock_proof: &str,
+    ) -> Result<BackupAcceptedFacts, Failure>;
 }
 
 /// `port.RestoreAdmissionFacts` bind the protected target authority,

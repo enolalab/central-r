@@ -19,7 +19,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use central_backup::backup::capacity::{RecoveryProfile, default_recovery_profile};
+use central_backup::backup::capacity::{
+    DeviceCapacitySnapshot, RecoveryProfile, default_recovery_profile,
+};
 use central_backup::backup::inventory::{
     InventoryChunk, InventoryEntry, MAXIMUM_INVENTORY_CHUNK_ENTRIES, parse_inventory_chunk,
 };
@@ -1755,6 +1757,69 @@ pub(crate) fn effective_uid() -> u32 {
 
 pub(crate) fn effective_gid() -> u32 {
     rustix::process::getegid().as_raw()
+}
+
+impl central_backup::port::RecoveryRepositoryStore for Repository {
+    fn bind_backup(&self, operation: &BackupOperation) -> Result<(), Failure> {
+        Self::bind_backup(self, operation)
+    }
+    fn write_dump(
+        &self,
+        backup_id: Uuid,
+        source: &mut dyn std::io::Read,
+        maximum_bytes: i64,
+    ) -> Result<DumpEvidence, Failure> {
+        Self::write_dump(self, backup_id, source, maximum_bytes)
+    }
+    fn write_artifact_body(
+        &self,
+        backup_id: Uuid,
+        entry: &InventoryEntry,
+        source: &mut dyn std::io::Read,
+    ) -> Result<(), Failure> {
+        Self::write_artifact_body(self, backup_id, entry, source)
+    }
+    fn write_chunk(&self, backup_id: Uuid, chunk: &InventoryChunk) -> Result<(), Failure> {
+        Self::write_chunk(self, backup_id, chunk)
+    }
+    fn write_manifest(
+        &self,
+        manifest: &SealRootManifest,
+    ) -> Result<BackupFileTreeEvidence, Failure> {
+        Self::write_manifest(self, manifest)
+    }
+    fn write_seal_companion(
+        &self,
+        backup_id: Uuid,
+        companion: &BackupSealCompanion,
+    ) -> Result<BackupSealPublication, Failure> {
+        if companion.backup_id != backup_id {
+            return Err(invalid_repository());
+        }
+        Self::write_seal_companion(self, companion)
+    }
+    fn read_inventory_chunk(
+        &self,
+        backup_id: Uuid,
+        ordinal: u32,
+    ) -> Result<InventoryChunk, Failure> {
+        Self::read_inventory_chunk(self, backup_id, ordinal)
+    }
+    fn read_seal_root(&self, backup_id: Uuid) -> Result<Vec<u8>, Failure> {
+        Self::read_seal_root(self, backup_id)
+    }
+}
+
+impl central_backup::port::BackupRepositoryInspector for Repository {
+    fn capacity_census(&self) -> Result<central_backup::port::BackupRepositoryCensus, Failure> {
+        Self::capacity_census(self)
+    }
+    fn device_capacity(&self) -> Result<DeviceCapacitySnapshot, Failure> {
+        Self::device_capacity(self)
+    }
+    fn binding_id(&self) -> Uuid {
+        Self::binding_id(self)
+    }
 }
 
 #[cfg(test)]

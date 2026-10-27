@@ -15,6 +15,7 @@
 //! the instant `spawn` returns.
 
 pub(crate) mod capacity;
+mod environment;
 mod pg_dump;
 mod pg_restore;
 mod pgtool;
@@ -24,6 +25,7 @@ mod repository_verifier;
 mod restore_engine;
 
 pub use capacity::device_capacity_from_descriptor;
+pub use environment::{BackupEnvironment, new_backup_environment};
 pub use pg_dump::{PgDump, PgDumpConfig, PgDumpStream, SealedPassfileProvider};
 pub use pg_restore::{
     PgRestore, PgRestoreConfig, RestoreDumpSource, SealedRestorePassfileProvider,
