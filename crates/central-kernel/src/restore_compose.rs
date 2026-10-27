@@ -1538,3 +1538,427 @@ pub fn new_production_restore_engine(
         profile,
     )
 }
+
+// ---------------------------------------------------------------------------
+// Tests — `cmd/central-restore/engine_test.go`'s semantics.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use central_backup::backup::operation::BACKUP_DATABASE_SCHEMA_VERSION;
+    use central_backup::domain::TargetIdentity;
+    use central_backup::recovery::operation::new_restore_operation;
+    use time::OffsetDateTime;
+
+    /// `stateStub` — the protected-state seam's canned answers plus
+    /// the operation it was asked to resolve.
+    #[derive(Default)]
+    struct StateStub {
+        asked_op: std::sync::Mutex<Option<Uuid>>,
+        ticket: Option<Result<RestoreTicket, Failure>>,
+        authorization: Option<Result<RestoreApplyAuthorization, Failure>>,
+    }
+
+    impl ProtectedRestoreState for StateStub {
+        fn read_issued_restore_ticket_for_operation(
+            &self,
+            operation_id: Uuid,
+        ) -> Result<RestoreTicket, Failure> {
+            *self.asked_op.lock().unwrap() = Some(operation_id);
+            self.ticket
+                .clone()
+                .unwrap_or_else(|| Err(RestoreRefusalReason::EngineUnavailable.into_failure()))
+        }
+        fn read_issued_restore_apply_authorization(
+            &self,
+            _authorization_id: Uuid,
+        ) -> Result<RestoreApplyAuthorization, Failure> {
+            self.authorization
+                .clone()
+                .unwrap_or_else(|| Err(RestoreRefusalReason::EngineUnavailable.into_failure()))
+        }
+    }
+
+    struct VerifierStub {
+        result: Result<RestoreVerificationResult, Failure>,
+    }
+
+    impl RestoreVerifyPort for VerifierStub {
+        fn verify(&self, _backup_id: Uuid) -> Result<RestoreVerificationResult, Failure> {
+            self.result.clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct CoordinatorStub {
+        got_ticket: std::sync::Mutex<Option<RestoreTicket>>,
+        apply_calls: std::sync::Mutex<usize>,
+        step: std::sync::Mutex<Option<RestoreStep>>,
+    }
+
+    impl RestoreCoordinatePort for CoordinatorStub {
+        fn apply(
+            &self,
+            ticket: &RestoreTicket,
+            _authorization: &RestoreApplyAuthorization,
+        ) -> RestoreStep {
+            *self.apply_calls.lock().unwrap() += 1;
+            *self.got_ticket.lock().unwrap() = Some(ticket.clone());
+            self.step.lock().unwrap().take().unwrap_or_else(|| {
+                Err(crate::restore_compose::RestoreStepFailure {
+                    operation: None,
+                    failure: RestoreRefusalReason::EngineUnavailable.into_failure(),
+                })
+            })
+        }
+        fn resume(
+            &self,
+            _operation_id: Uuid,
+            _authorization: &RestoreApplyAuthorization,
+        ) -> RestoreStep {
+            self.step.lock().unwrap().take().unwrap_or_else(|| {
+                Err(crate::restore_compose::RestoreStepFailure {
+                    operation: None,
+                    failure: RestoreRefusalReason::EngineUnavailable.into_failure(),
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct ImporterStub {
+        calls: std::sync::Mutex<usize>,
+        asked: std::sync::Mutex<Option<Uuid>>,
+        result: Option<Result<RestoreImportResult, Failure>>,
+    }
+
+    impl RestoreImporter for ImporterStub {
+        fn import(&self, operation_id: Uuid) -> Result<RestoreImportResult, Failure> {
+            *self.calls.lock().unwrap() += 1;
+            *self.asked.lock().unwrap() = Some(operation_id);
+            self.result
+                .clone()
+                .unwrap_or_else(|| Err(RestoreRefusalReason::EngineUnavailable.into_failure()))
+        }
+    }
+
+    /// `boundPair` — a ticket plus the authorization that binds it.
+    fn bound_pair() -> (RestoreTicket, RestoreApplyAuthorization) {
+        let now = OffsetDateTime::now_utc();
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let ticket = RestoreTicket {
+            ticket_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            backup_id: Uuid::now_v7(),
+            target: TargetIdentity {
+                system_id: "7000000000000000000".to_owned(),
+                database_oid: "16384".to_owned(),
+                database: "central".to_owned(),
+                config_hash: digest.clone(),
+                epoch: 1,
+            },
+            target_fingerprint: digest.clone(),
+            manifest_digest: digest.clone(),
+            security_epoch: 3,
+            restore_epoch: 4,
+            config_fingerprint: digest.clone(),
+            payload_epoch_id: Uuid::now_v7(),
+            database_schema_version: BACKUP_DATABASE_SCHEMA_VERSION.to_owned(),
+            capacity_evidence_digest: digest,
+            tool_version: "16.14".to_owned(),
+            hidden_nonce: vec![1, 2, 3, 4],
+            issued_at: now - time::Duration::minutes(1),
+            expires_at: now + time::Duration::minutes(10),
+            hmac: String::new(),
+        };
+        let authorization = RestoreApplyAuthorization {
+            authorization_id: Uuid::now_v7(),
+            operation_id: ticket.operation_id,
+            ticket_id: ticket.ticket_id,
+            issued_at: now - time::Duration::seconds(1),
+            expires_at: now + time::Duration::minutes(1),
+        };
+        assert!(
+            authorization.binds(&ticket),
+            "test fixture is not a bound pair"
+        );
+        (ticket, authorization)
+    }
+
+    fn engine_with(
+        state: Arc<dyn ProtectedRestoreState>,
+        coordinator: Arc<dyn RestoreCoordinatePort>,
+        importer: Arc<dyn RestoreImporter>,
+    ) -> ComposedRestoreEngine {
+        new_restore_engine(
+            Some(state),
+            Some(Arc::new(VerifierStub {
+                result: Err(RestoreRefusalReason::EngineUnavailable.into_failure()),
+            })),
+            Some(coordinator),
+            Some(importer),
+        )
+        .expect("all collaborators supplied")
+    }
+
+    /// `TestApplyResolvesTheTicketFromTheOperationItWasGiven`.
+    #[test]
+    fn apply_resolves_the_ticket_from_the_operation_it_was_given() {
+        let (ticket, authorization) = bound_pair();
+        let state = Arc::new(StateStub {
+            asked_op: std::sync::Mutex::new(None),
+            ticket: Some(Ok(ticket.clone())),
+            authorization: Some(Ok(authorization)),
+        });
+        let coordinator = Arc::new(CoordinatorStub::default());
+        let operation = valid_operation_for(&ticket);
+        *coordinator.step.lock().unwrap() = Some(Ok(operation));
+        let engine = engine_with(
+            state.clone(),
+            coordinator.clone(),
+            Arc::new(ImporterStub::default()),
+        );
+        engine
+            .apply(ticket.operation_id, authorization.authorization_id)
+            .expect("bound pair refused");
+        assert_eq!(
+            *state.asked_op.lock().unwrap(),
+            Some(ticket.operation_id),
+            "resolved by a different operation than supplied"
+        );
+        assert_eq!(
+            coordinator
+                .got_ticket
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|t| t.ticket_id),
+            Some(ticket.ticket_id),
+            "coordinator did not receive the resolved ticket"
+        );
+    }
+
+    /// `TestApplyRejectsProtectedRecordsThatDoNotDescribeOneCeremony`.
+    #[test]
+    fn apply_rejects_protected_records_that_do_not_describe_one_ceremony() {
+        let (ticket, authorization) = bound_pair();
+        let (other_ticket, other_authorization) = bound_pair();
+        type Case = (
+            Option<Result<RestoreTicket, Failure>>,
+            Option<Result<RestoreApplyAuthorization, Failure>>,
+        );
+        let cases: Vec<Case> = vec![
+            // Both records are individually valid but belong to
+            // different restores.
+            (Some(Ok(ticket.clone())), Some(Ok(other_authorization))),
+            // The resolver returned a ticket that is not the
+            // requested operation's.
+            (Some(Ok(other_ticket.clone())), Some(Ok(authorization))),
+            (
+                Some(Err(Failure::unavailable("journal", "unavailable"))),
+                Some(Ok(authorization)),
+            ),
+            (
+                Some(Ok(ticket.clone())),
+                Some(Err(Failure::unavailable("journal", "unavailable"))),
+            ),
+        ];
+        for (ticket_result, auth_result) in cases {
+            let coordinator = Arc::new(CoordinatorStub::default());
+            let engine = engine_with(
+                Arc::new(StateStub {
+                    asked_op: std::sync::Mutex::new(None),
+                    ticket: ticket_result,
+                    authorization: auth_result,
+                }),
+                coordinator.clone(),
+                Arc::new(ImporterStub::default()),
+            );
+            assert!(
+                engine
+                    .apply(ticket.operation_id, other_authorization.authorization_id)
+                    .is_err(),
+                "mismatched protected records accepted"
+            );
+            assert_eq!(
+                *coordinator.apply_calls.lock().unwrap(),
+                0,
+                "destructive apply reached the coordinator"
+            );
+        }
+    }
+
+    /// `TestImportForwardsTheOperationToTheImporter`.
+    #[test]
+    fn import_forwards_the_operation_to_the_importer() {
+        let operation_id = Uuid::now_v7();
+        let importer = Arc::new(ImporterStub {
+            result: Some(Ok(RestoreImportResult {
+                operation_id,
+                plan_sha256: "plan".to_owned(),
+                dump_sha256: String::new(),
+                tables_present: 0,
+                bodies_verified: 0,
+                shape_checksum: String::new(),
+            })),
+            ..ImporterStub::default()
+        });
+        let engine = engine_with(
+            Arc::new(StateStub::default()),
+            Arc::new(CoordinatorStub::default()),
+            importer.clone(),
+        );
+        let result = engine.import(operation_id).expect("import refused");
+        assert_eq!(*importer.calls.lock().unwrap(), 1);
+        assert_eq!(*importer.asked.lock().unwrap(), Some(operation_id));
+        assert_eq!(result.operation_id, operation_id);
+    }
+
+    /// `TestImportRefusesWithoutTouchingTheImporter` — nil and non-v7
+    /// identities fail before the importer runs.
+    #[test]
+    fn import_refuses_without_touching_the_importer() {
+        let importer = Arc::new(ImporterStub::default());
+        let engine = engine_with(
+            Arc::new(StateStub::default()),
+            Arc::new(CoordinatorStub::default()),
+            importer.clone(),
+        );
+        for op in [Uuid::nil(), Uuid::new_v4()] {
+            let err = engine.import(op).expect_err("malformed identity imported");
+            assert_eq!(
+                classify_restore_refusal(Some(&err), RestoreRefusalReason::EngineUnavailable),
+                RestoreRefusalReason::StateInvalid
+            );
+        }
+        assert_eq!(
+            *importer.calls.lock().unwrap(),
+            0,
+            "refused imports reached the importer"
+        );
+    }
+
+    /// `TestResumeRequiresAnAuthorizationBoundToTheSameOperation`.
+    #[test]
+    fn resume_requires_an_authorization_bound_to_the_same_operation() {
+        let (_, authorization) = bound_pair();
+        let engine = engine_with(
+            Arc::new(StateStub {
+                asked_op: std::sync::Mutex::new(None),
+                ticket: None,
+                authorization: Some(Ok(authorization)),
+            }),
+            Arc::new(CoordinatorStub::default()),
+            Arc::new(ImporterStub::default()),
+        );
+        assert!(
+            engine
+                .resume(Uuid::now_v7(), authorization.authorization_id)
+                .is_err(),
+            "resume accepted an authorization for a different operation"
+        );
+    }
+
+    /// `TestRestoreEngineRequiresEveryCollaborator` — a nil
+    /// composition is never a working engine.
+    #[test]
+    fn engine_requires_every_collaborator() {
+        assert!(new_restore_engine(None, None, None, None).is_err());
+        let state: Arc<dyn ProtectedRestoreState> = Arc::new(StateStub::default());
+        let verifier: Arc<dyn RestoreVerifyPort> = Arc::new(VerifierStub {
+            result: Err(RestoreRefusalReason::EngineUnavailable.into_failure()),
+        });
+        let coordinator: Arc<dyn RestoreCoordinatePort> = Arc::new(CoordinatorStub::default());
+        let importer: Arc<dyn RestoreImporter> = Arc::new(ImporterStub::default());
+        for (s, v, c, i) in [
+            (
+                None,
+                Some(verifier.clone()),
+                Some(coordinator.clone()),
+                Some(importer.clone()),
+            ),
+            (
+                Some(state.clone()),
+                None,
+                Some(coordinator.clone()),
+                Some(importer.clone()),
+            ),
+            (
+                Some(state.clone()),
+                Some(verifier.clone()),
+                None,
+                Some(importer.clone()),
+            ),
+            (
+                Some(state.clone()),
+                Some(verifier.clone()),
+                Some(coordinator.clone()),
+                None,
+            ),
+        ] {
+            assert!(
+                new_restore_engine(s, v, c, i).is_err(),
+                "engine composed with a missing collaborator"
+            );
+        }
+    }
+
+    /// `newValidOperation` — the fixture upstream builds with
+    /// `NewRestoreOperation`.
+    fn valid_operation_for(ticket: &RestoreTicket) -> RestoreOperation {
+        new_restore_operation(ticket, OffsetDateTime::now_utc()).expect("valid fixture")
+    }
+
+    /// `TestRestoreLaunchGateMessageShapeMirrorsTheLauncher` — the
+    /// gate grammar upstream pins between the two packages: release
+    /// byte + exactly 16 bytes of reserve-set identity, nothing more.
+    #[test]
+    fn launch_gate_message_shape_mirrors_the_launcher() {
+        assert_eq!(RESTORE_LAUNCH_GATE_RELEASE_BYTE, 0x01);
+        assert_eq!(RESTORE_LAUNCH_GATE_MESSAGE_SIZE, 17);
+        let set_id = Uuid::now_v7();
+        // Released verify: byte + v7 bytes.
+        let mut message = vec![RESTORE_LAUNCH_GATE_RELEASE_BYTE];
+        message.extend_from_slice(set_id.as_bytes());
+        assert_eq!(
+            read_restore_launch_gate(message.as_slice()).expect("release refused"),
+            set_id
+        );
+        // Released apply/resume: nil tail.
+        let mut message = vec![RESTORE_LAUNCH_GATE_RELEASE_BYTE];
+        message.extend_from_slice(Uuid::nil().as_bytes());
+        assert_eq!(
+            read_restore_launch_gate(message.as_slice()).expect("nil release refused"),
+            Uuid::nil()
+        );
+        // Denied (EOF), wrong byte, short message, trailing byte —
+        // each fails closed.
+        assert!(read_restore_launch_gate(&b""[..]).is_err());
+        assert!(read_restore_launch_gate(&[0x02][..]).is_err());
+        let mut short = vec![RESTORE_LAUNCH_GATE_RELEASE_BYTE];
+        short.extend_from_slice(&set_id.as_bytes()[..8]);
+        assert!(read_restore_launch_gate(short.as_slice()).is_err());
+        let mut long = vec![RESTORE_LAUNCH_GATE_RELEASE_BYTE];
+        long.extend_from_slice(set_id.as_bytes());
+        long.push(0x00);
+        // The trailing byte is exactly what fails this message —
+        // simulate a writer that emits more than the grammar.
+        struct Trailing<'a> {
+            inner: &'a [u8],
+        }
+        impl std::io::Read for Trailing<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+        let mut cursor = std::io::Cursor::new(long);
+        assert!(read_restore_launch_gate(&mut cursor).is_err());
+        // A non-v7 identity in the tail fails closed.
+        let mut bad = vec![RESTORE_LAUNCH_GATE_RELEASE_BYTE];
+        bad.extend_from_slice(Uuid::new_v4().as_bytes());
+        assert!(read_restore_launch_gate(bad.as_slice()).is_err());
+        let _ = Trailing { inner: &[] };
+    }
+}

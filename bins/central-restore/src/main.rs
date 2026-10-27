@@ -403,3 +403,489 @@ impl Receipt {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `cmd/central-restore/main_test.go` — the invocation grammar and
+    //! receipt shape batteries, run against the same
+    //! [`execute_central_restore`] seam upstream injects its stub
+    //! engine through.
+
+    use super::*;
+
+    use central_backup::app::{RestoreImportResult, RestoreStepFailure};
+    use central_backup::backup::operation::BACKUP_DATABASE_SCHEMA_VERSION;
+    use central_backup::domain::TargetIdentity;
+    use central_backup::recovery::operation::new_restore_operation;
+    use central_foundation::failure::Failure;
+
+    /// `engineStub` — records calls and returns canned results.
+    #[derive(Default)]
+    struct EngineStub {
+        verify: Option<Result<RestoreVerificationResult, Failure>>,
+        apply: Option<central_backup::app::RestoreStep>,
+        resume: Option<central_backup::app::RestoreStep>,
+        import: Option<Result<RestoreImportResult, Failure>>,
+        calls: usize,
+        last_first: Option<Uuid>,
+        last_second: Option<Uuid>,
+    }
+
+    /// `&self` methods cannot record, so the stub lives behind a
+    /// shared cell: the trait is `Send + Sync`, so `Mutex` is the
+    /// honest shared-mutable shape.
+    struct SharedStub {
+        inner: std::sync::Mutex<EngineStub>,
+    }
+
+    impl SharedStub {
+        fn new() -> Self {
+            Self {
+                inner: std::sync::Mutex::new(EngineStub::default()),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.inner.lock().unwrap().calls
+        }
+        fn last(&self) -> (Option<Uuid>, Option<Uuid>) {
+            let g = self.inner.lock().unwrap();
+            (g.last_first, g.last_second)
+        }
+    }
+
+    impl RestoreEngineOps for SharedStub {
+        fn verify(&self, backup_id: Uuid) -> Result<RestoreVerificationResult, Failure> {
+            let mut g = self.inner.lock().unwrap();
+            g.calls += 1;
+            g.last_first = Some(backup_id);
+            g.verify
+                .take()
+                .unwrap_or_else(|| Err(RestoreRefusalReason::EngineUnavailable.into_failure()))
+        }
+        fn apply(
+            &self,
+            operation_id: Uuid,
+            authorization_id: Uuid,
+        ) -> central_backup::app::RestoreStep {
+            let mut g = self.inner.lock().unwrap();
+            g.calls += 1;
+            g.last_first = Some(operation_id);
+            g.last_second = Some(authorization_id);
+            g.apply.take().unwrap_or_else(|| {
+                Err(RestoreStepFailure {
+                    operation: None,
+                    failure: RestoreRefusalReason::EngineUnavailable.into_failure(),
+                })
+            })
+        }
+        fn resume(
+            &self,
+            operation_id: Uuid,
+            authorization_id: Uuid,
+        ) -> central_backup::app::RestoreStep {
+            let mut g = self.inner.lock().unwrap();
+            g.calls += 1;
+            g.last_first = Some(operation_id);
+            g.last_second = Some(authorization_id);
+            g.resume.take().unwrap_or_else(|| {
+                Err(RestoreStepFailure {
+                    operation: None,
+                    failure: RestoreRefusalReason::EngineUnavailable.into_failure(),
+                })
+            })
+        }
+        fn import(&self, operation_id: Uuid) -> Result<RestoreImportResult, Failure> {
+            let mut g = self.inner.lock().unwrap();
+            g.calls += 1;
+            g.last_first = Some(operation_id);
+            g.import
+                .take()
+                .unwrap_or_else(|| Err(RestoreRefusalReason::EngineUnavailable.into_failure()))
+        }
+    }
+
+    /// `captureReceipt` — run the dispatcher against a buffer.
+    fn run(args: &[&str], engine: &dyn RestoreEngineOps) -> (String, Result<(), Denied>) {
+        let argv: Vec<String> = std::iter::once("central-restore".to_owned())
+            .chain(args.iter().map(|s| (*s).to_owned()))
+            .collect();
+        let mut out: Vec<u8> = Vec::new();
+        let result = execute_central_restore(&argv, engine, &mut out);
+        (String::from_utf8_lossy(&out).into_owned(), result)
+    }
+
+    /// `newValidOperation` — a complete protected ticket built into an
+    /// operation exactly as upstream's fixture does.
+    fn valid_operation() -> RestoreOperation {
+        let now = time::OffsetDateTime::now_utc();
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let ticket = central_backup::recovery::operation::RestoreTicket {
+            ticket_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            backup_id: Uuid::now_v7(),
+            target: TargetIdentity {
+                system_id: "7000000000000000000".to_owned(),
+                database_oid: "16384".to_owned(),
+                database: "central".to_owned(),
+                config_hash: digest.clone(),
+                epoch: 1,
+            },
+            target_fingerprint: digest.clone(),
+            manifest_digest: digest.clone(),
+            security_epoch: 3,
+            restore_epoch: 4,
+            config_fingerprint: digest.clone(),
+            payload_epoch_id: Uuid::now_v7(),
+            database_schema_version: BACKUP_DATABASE_SCHEMA_VERSION.to_owned(),
+            capacity_evidence_digest: digest,
+            tool_version: "16.14".to_owned(),
+            hidden_nonce: vec![1, 2, 3, 4],
+            issued_at: now - time::Duration::minutes(1),
+            expires_at: now + time::Duration::minutes(10),
+            hmac: String::new(),
+        };
+        new_restore_operation(&ticket, now).expect("valid fixture")
+    }
+
+    #[test]
+    fn invocation_rejects_every_shape_outside_the_fixed_grammar() {
+        let valid = Uuid::now_v7().to_string();
+        let other = Uuid::now_v7().to_string();
+        let v4 = Uuid::new_v4().to_string();
+        let upper = valid.to_uppercase();
+        let nil = Uuid::nil().to_string();
+        let flag = format!("--backup-id={valid}");
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["rollback", &valid, &other],
+            vec!["verify"],
+            vec!["verify", &valid, &other],
+            vec!["import"],
+            vec!["import", &valid, &other],
+            vec!["import", "not-a-uuid"],
+            vec!["import", &valid, &valid],
+            vec!["import", &upper],
+            vec!["apply", &valid],
+            vec!["apply", &valid, &other, &valid],
+            vec!["resume", &valid],
+            // A repeated identity would let one protected record
+            // stand in for two.
+            vec!["apply", &valid, &valid],
+            vec!["resume", &valid, &valid],
+            vec!["apply", &v4, &other],
+            vec!["apply", &nil, &other],
+            vec!["apply", &upper, &other],
+            // Nothing resembling a path, flag, or credential may be
+            // accepted.
+            vec!["apply", "/var/lib/central-protected/v1", &other],
+            vec!["verify", &flag],
+        ];
+        for args in cases {
+            let engine = SharedStub::new();
+            let (receipt, result) = run(&args, &engine);
+            assert!(result.is_err(), "invalid invocation accepted: {args:?}");
+            assert_eq!(
+                engine.calls(),
+                0,
+                "invalid invocation reached the engine: {args:?}"
+            );
+            assert!(
+                receipt.is_empty(),
+                "invalid invocation wrote a receipt: {args:?}"
+            );
+        }
+        // `executeCentralRestore` with no mode at all.
+        let engine = SharedStub::new();
+        let argv = vec!["central-restore".to_owned()];
+        let mut out: Vec<u8> = Vec::new();
+        assert!(execute_central_restore(&argv, &engine, &mut out).is_err());
+        assert_eq!(engine.calls(), 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn verify_publishes_operation_identity_without_ticket_or_secret_material() {
+        let backup_id = Uuid::now_v7();
+        let operation_id = Uuid::now_v7();
+        let engine = SharedStub::new();
+        engine.inner.lock().unwrap().verify = Some(Ok(RestoreVerificationResult {
+            operation_id,
+            backup_id,
+            manifest_digest: "0f1e2d3c".to_owned(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(10),
+        }));
+        let (receipt, result) = run(&["verify", &backup_id.to_string()], &engine);
+        assert!(result.is_ok(), "verify refused");
+        let decoded: serde_json::Value =
+            serde_json::from_str(receipt.trim()).expect("receipt is not one JSON document");
+        assert_eq!(decoded["schema_version"], RECEIPT_SCHEMA_VERSION);
+        assert_eq!(decoded["mode"], "verify");
+        assert_eq!(decoded["operation_id"], operation_id.to_string());
+        assert_eq!(decoded["backup_id"], backup_id.to_string());
+        // The ticket ID names the record a destructive apply
+        // consumes, and the manifest digest is repository evidence:
+        // neither belongs in this receipt.
+        for forbidden in ["ticket_id", "manifest_digest", "hmac", "nonce"] {
+            assert!(
+                decoded.get(forbidden).is_none(),
+                "receipt exposed {forbidden}: {decoded}"
+            );
+        }
+        assert_eq!(engine.last().0, Some(backup_id));
+    }
+
+    #[test]
+    fn verify_rejects_result_for_a_different_backup() {
+        let requested = Uuid::now_v7();
+        let substituted = Uuid::now_v7();
+        let engine = SharedStub::new();
+        engine.inner.lock().unwrap().verify = Some(Ok(RestoreVerificationResult {
+            operation_id: Uuid::now_v7(),
+            backup_id: substituted,
+            manifest_digest: "0f1e2d3c".to_owned(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+        }));
+        let (receipt, result) = run(&["verify", &requested.to_string()], &engine);
+        assert!(result.is_err(), "substituted backup accepted");
+        let decoded: serde_json::Value =
+            serde_json::from_str(receipt.trim()).expect("refusal receipt is not one JSON document");
+        assert_eq!(decoded["mode"], "verify");
+        assert_eq!(decoded["reason"], "RESTORE_STATE_INVALID");
+        // Neither the requested nor the substituted backup identity
+        // may appear: a refusal receipt for a substitution attempt
+        // names nothing at all.
+        for forbidden in ["operation_id", "backup_id", "phase", "checkpoint"] {
+            assert!(
+                decoded.get(forbidden).is_none(),
+                "refusal receipt exposed {forbidden}: {decoded}"
+            );
+        }
+        assert!(
+            !receipt.contains(&substituted.to_string()),
+            "refusal receipt named the substituted backup: {receipt}"
+        );
+    }
+
+    #[test]
+    fn apply_and_resume_forward_exact_identities_and_emit_phase() {
+        let operation = valid_operation();
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        for mode in ["apply", "resume"] {
+            let engine = SharedStub::new();
+            let step = Ok(operation.clone());
+            {
+                let mut g = engine.inner.lock().unwrap();
+                if mode == "apply" {
+                    g.apply = Some(step);
+                } else {
+                    g.resume = Some(step);
+                }
+            }
+            let (receipt, result) = run(&[mode, &first.to_string(), &second.to_string()], &engine);
+            assert!(result.is_ok(), "{mode} refused");
+            let (got_first, got_second) = engine.last();
+            assert_eq!(got_first, Some(first), "identities reordered");
+            assert_eq!(got_second, Some(second), "identities reordered");
+            let decoded: serde_json::Value =
+                serde_json::from_str(receipt.trim()).expect("receipt is not one JSON document");
+            assert_eq!(decoded["mode"], mode);
+            assert_eq!(decoded["operation_id"], operation.operation_id.to_string());
+            assert_eq!(decoded["phase"], operation.phase.as_str());
+            assert_eq!(decoded["checkpoint"], operation.last_checkpoint.as_str());
+        }
+    }
+
+    #[test]
+    fn import_forwards_the_exact_identity_and_emits_the_terminal_vocabulary() {
+        let operation_id = Uuid::now_v7();
+        let engine = SharedStub::new();
+        engine.inner.lock().unwrap().import = Some(Ok(RestoreImportResult {
+            operation_id,
+            plan_sha256: "plan".to_owned(),
+            dump_sha256: "dump".to_owned(),
+            tables_present: 3,
+            bodies_verified: 5,
+            shape_checksum: "shape".to_owned(),
+        }));
+        let (receipt, result) = run(&["import", &operation_id.to_string()], &engine);
+        assert!(result.is_ok(), "import refused");
+        assert_eq!(engine.calls(), 1);
+        assert_eq!(engine.last().0, Some(operation_id));
+        let decoded: serde_json::Value =
+            serde_json::from_str(receipt.trim()).expect("receipt is not one JSON document");
+        assert_eq!(decoded["schema_version"], RECEIPT_SCHEMA_VERSION);
+        assert_eq!(decoded["mode"], "import");
+        assert_eq!(decoded["operation_id"], operation_id.to_string());
+        assert_eq!(decoded["phase"], "imported");
+        assert_eq!(decoded["checkpoint"], "plan_consumed");
+        assert!(
+            decoded.get("reason").is_none(),
+            "success receipt carries a reason: {decoded}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_a_result_for_a_different_operation() {
+        let operation_id = Uuid::now_v7();
+        let engine = SharedStub::new();
+        engine.inner.lock().unwrap().import = Some(Ok(RestoreImportResult {
+            operation_id: Uuid::now_v7(),
+            plan_sha256: String::new(),
+            dump_sha256: String::new(),
+            tables_present: 0,
+            bodies_verified: 0,
+            shape_checksum: String::new(),
+        }));
+        let (receipt, result) = run(&["import", &operation_id.to_string()], &engine);
+        assert!(result.is_err(), "substituted import result accepted");
+        let decoded: serde_json::Value =
+            serde_json::from_str(receipt.trim()).expect("refusal receipt is not one JSON document");
+        assert_eq!(decoded["mode"], "import");
+        assert_eq!(decoded["reason"], "RESTORE_STATE_INVALID");
+        assert!(
+            decoded.get("phase").is_none(),
+            "refusal receipt carries a phase: {decoded}"
+        );
+    }
+
+    #[test]
+    fn engine_failure_writes_only_a_sanitized_refusal_receipt() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        for mode in ["apply", "resume"] {
+            let engine = SharedStub::new();
+            // An unclassified failure — its own text may carry a
+            // locator — must fall back to engine-unavailable.
+            {
+                let mut g = engine.inner.lock().unwrap();
+                let step = Err(RestoreStepFailure {
+                    operation: None,
+                    failure: Failure::invalid(
+                        "adapter",
+                        "adapter detail naming /var/lib/central-protected/v1",
+                    ),
+                });
+                if mode == "apply" {
+                    g.apply = Some(step);
+                } else {
+                    g.resume = Some(step);
+                }
+            }
+            let (receipt, result) = run(&[mode, &first.to_string(), &second.to_string()], &engine);
+            assert!(result.is_err(), "engine failure reported as success");
+            assert!(
+                !receipt.contains("/var/lib"),
+                "adapter locator leaked: {receipt}"
+            );
+            let decoded: serde_json::Value = serde_json::from_str(receipt.trim())
+                .expect("refusal receipt is not one JSON document");
+            assert_eq!(decoded["mode"], mode);
+            assert_eq!(decoded["reason"], "RESTORE_ENGINE_UNAVAILABLE");
+            // The operation identity is exactly the one this caller
+            // already supplied (first), present so the launcher's
+            // anti-substitution match still has something to check on
+            // a refusal, not a new disclosure.
+            assert_eq!(decoded["operation_id"], first.to_string());
+            for forbidden in ["backup_id", "phase", "checkpoint", "ticket_id"] {
+                assert!(
+                    decoded.get(forbidden).is_none(),
+                    "refusal receipt exposed {forbidden}: {decoded}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn engine_failure_classifies_distinct_refusal_causes() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let cases: [(&str, RestoreRefusalReason); 3] = [
+            (
+                "restore state does not permit this",
+                RestoreRefusalReason::StateInvalid,
+            ),
+            ("recovery media invalid", RestoreRefusalReason::MediaInvalid),
+            (
+                "capacity insufficient",
+                RestoreRefusalReason::CapacityInsufficient,
+            ),
+        ];
+        for mode in ["apply", "resume"] {
+            let mut got: Vec<&'static str> = Vec::new();
+            for (name, reason) in &cases {
+                let engine = SharedStub::new();
+                {
+                    let mut g = engine.inner.lock().unwrap();
+                    let step = Err(RestoreStepFailure {
+                        operation: None,
+                        failure: (*reason).into_failure(),
+                    });
+                    if mode == "apply" {
+                        g.apply = Some(step);
+                    } else {
+                        g.resume = Some(step);
+                    }
+                }
+                let (receipt, result) =
+                    run(&[mode, &first.to_string(), &second.to_string()], &engine);
+                assert!(result.is_err(), "{mode}/{name}: engine failure as success");
+                let decoded: serde_json::Value = serde_json::from_str(receipt.trim())
+                    .expect("refusal receipt is not one JSON document");
+                assert_eq!(
+                    decoded["reason"],
+                    reason.as_str(),
+                    "{mode}/{name}: receipt reason"
+                );
+                got.push(Box::leak(
+                    decoded["reason"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                        .into_boxed_str(),
+                ));
+            }
+            assert_ne!(got[0], got[1]);
+            assert_ne!(got[1], got[2]);
+            assert_ne!(got[0], got[2]);
+        }
+    }
+
+    #[test]
+    fn invalid_operation_result_is_not_published() {
+        let engine = SharedStub::new();
+        // `validate()` fails on a nearly-empty operation — the result
+        // substitution a buggy adapter could return.
+        engine.inner.lock().unwrap().apply = Some(Err(RestoreStepFailure {
+            operation: None,
+            failure: RestoreRefusalReason::StateInvalid.into_failure(),
+        }));
+        let (receipt, result) = run(
+            &[
+                "apply",
+                &Uuid::now_v7().to_string(),
+                &Uuid::now_v7().to_string(),
+            ],
+            &engine,
+        );
+        assert!(result.is_err());
+        // A refusal receipt is the one permitted publication; the
+        // operation record itself may never ride it.
+        let decoded: serde_json::Value =
+            serde_json::from_str(receipt.trim()).expect("refusal receipt is not one JSON document");
+        assert!(decoded.get("phase").is_none());
+        assert!(decoded.get("checkpoint").is_none());
+    }
+
+    #[test]
+    fn production_composition_fails_closed() {
+        // FDs 0/1/2 are open in the test harness but are not
+        // directories, so adoption fails closed exactly as upstream's
+        // absent-descriptor run does.
+        let inherited = inherited_descriptors(false);
+        let result = new_production_restore_engine(Uuid::now_v7(), &inherited);
+        assert!(
+            result.is_err(),
+            "production engine composed without its roots"
+        );
+    }
+}
