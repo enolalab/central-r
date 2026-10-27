@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, size, checksum_value, ready_key,\n                        workspace_id, content_generation\n                    FROM central.artifacts\n                    WHERE state='ready' AND delete_intent_at IS NULL\n                    ORDER BY id ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "size",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "checksum_value",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "ready_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "workspace_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "content_generation",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "7805ea77c9689a35f80b85a025d7b9131d89ac37b63e9fd905158fb478563b71"
+}

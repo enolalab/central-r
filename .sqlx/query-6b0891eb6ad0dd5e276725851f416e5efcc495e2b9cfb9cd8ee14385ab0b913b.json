@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n                            SELECT 1 FROM central.artifact_tombstones\n                            WHERE workspace_id=$1::uuid AND artifact_id=$2::uuid\n                        ) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6b0891eb6ad0dd5e276725851f416e5efcc495e2b9cfb9cd8ee14385ab0b913b"
+}

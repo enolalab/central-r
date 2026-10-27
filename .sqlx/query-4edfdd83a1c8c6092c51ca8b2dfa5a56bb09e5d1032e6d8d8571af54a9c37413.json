@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.execution_ownership\n                        SET lease_expiry=CASE WHEN lease_expiry IS NULL THEN NULL\n                                ELSE $1::timestamptz END,\n                            lease_expires_at=$1::timestamptz,\n                            heartbeat_at=$1::timestamptz,\n                            fencing_generation=fencing_generation+1,\n                            updated_at=$1::timestamptz",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4edfdd83a1c8c6092c51ca8b2dfa5a56bb09e5d1032e6d8d8571af54a9c37413"
+}

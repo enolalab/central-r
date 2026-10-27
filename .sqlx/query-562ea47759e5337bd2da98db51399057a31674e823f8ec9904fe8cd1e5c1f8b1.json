@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifacts\n                            SET state='deleted', deleted_at=clock_timestamp(),\n                                version=version+1, updated_at=clock_timestamp()\n                            WHERE workspace_id=$1::uuid AND id=$2::uuid\n                              AND state <> 'deleted'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "562ea47759e5337bd2da98db51399057a31674e823f8ec9904fe8cd1e5c1f8b1"
+}

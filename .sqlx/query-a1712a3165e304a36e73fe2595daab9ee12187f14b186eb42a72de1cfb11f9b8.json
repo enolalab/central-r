@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.prune_log SET checkpoint_at=clock_timestamp()\n                        WHERE plan_id=$1::uuid AND batch_seq=$2 AND artifact_id=$3::uuid\n                          AND state='applying'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a1712a3165e304a36e73fe2595daab9ee12187f14b186eb42a72de1cfb11f9b8"
+}

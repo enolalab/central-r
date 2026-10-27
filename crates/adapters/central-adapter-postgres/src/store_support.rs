@@ -7,7 +7,7 @@
 //! so each store reads as one table's contract.
 
 use central_foundation::failure::Failure;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 /// Stable machine code for durable rows that fail domain
 /// reconstruction — a stored row that cannot re-validate is corrupt,
@@ -76,4 +76,72 @@ pub(crate) async fn begin_tx(pool: &PgPool) -> Result<Transaction<'static, Postg
             .map_err(|e| crate::error::classify_sqlx(&e))?;
     }
     Ok(tx)
+}
+
+// ---------------------------------------------------------------------------
+// `BlockingConn` — the backup/recovery sync-port async bridge.
+// ---------------------------------------------------------------------------
+
+/// One dedicated [`PgConnection`] plus the private single-worker runtime
+/// that drives it for the `central-backup` *synchronous* port traits.
+///
+/// Upstream binds the recovery stores to one dedicated `*pgx.Conn` (the
+/// C04 target exclusion lives on that same session); the Rust ports are
+/// deliberately synchronous (`central_backup::port` — "an adapter that
+/// needs async I/O owns the bridging"), so this wrapper is that bridge:
+/// [`Self::run`] holds the connection lock for the entire call and drives
+/// the future to completion on the store's own runtime.
+///
+/// `run` must be invoked from a thread that is **not** inside an ambient
+/// tokio runtime — `Runtime::block_on` panics inside one. The backup and
+/// restore workers drive the sync coordinators on plain OS threads, so
+/// that is the intended call context.
+pub(crate) struct BlockingConn {
+    conn: std::sync::Mutex<PgConnection>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl BlockingConn {
+    /// Wraps `conn` (a dedicated `central_migration`/`central_runtime`
+    /// session) with a private one-worker runtime.
+    ///
+    /// # Errors
+    /// `internal` when the runtime cannot be built.
+    pub(crate) fn new(conn: PgConnection) -> Result<Self, Failure> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("central-pg-backup")
+            .build()
+            .map_err(|_| {
+                Failure::internal(
+                    crate::error::codes::PG_ADAPTER_ERROR,
+                    "the backup/recovery bridge runtime is unavailable",
+                )
+            })?;
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+            runtime,
+        })
+    }
+
+    /// Runs `f(&mut PgConnection)` to completion, holding the session
+    /// lock for the whole call — the upstream dedicated-conn
+    /// serialization (`*pgx.Conn` is not concurrent-safe either). A
+    /// poisoned mutex is recovered: the connection itself is not
+    /// corrupted by a panic above it.
+    ///
+    /// # Errors
+    /// Whatever `f` returns.
+    pub(crate) fn run<T, F>(&self, f: F) -> Result<T, Failure>
+    where
+        F: for<'a> FnOnce(
+            &'a mut PgConnection,
+        ) -> core::pin::Pin<
+            Box<dyn core::future::Future<Output = Result<T, Failure>> + 'a>,
+        >,
+    {
+        let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        self.runtime.block_on(f(&mut guard))
+    }
 }

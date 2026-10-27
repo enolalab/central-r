@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.b09_authorization_decisions\n                        SET revoked_at=COALESCE(revoked_at,$1)\n                        WHERE revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8b0709c072d0b72bb9c4695984729aca621d29f6b3a50fe5730da8a3ae425a23"
+}

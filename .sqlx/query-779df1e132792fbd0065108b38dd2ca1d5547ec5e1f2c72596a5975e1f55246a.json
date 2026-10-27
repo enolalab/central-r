@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT generation AS \"generation!\" FROM central.bootstrap_generations\n                        WHERE workspace_id=$1::uuid ORDER BY generation FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "generation!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "779df1e132792fbd0065108b38dd2ca1d5547ec5e1f2c72596a5975e1f55246a"
+}

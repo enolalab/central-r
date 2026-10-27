@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.recovery_bootstrap_registrations\n                        (operation_id,draft_id,candidate_id,generation,verifier_hash,\n                         candidate_digest,broker_receipt_hash,database_receipt_hash,registered_at)\n                        VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5,$6,$7,$8,$9)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Bytea",
+        "Bytea",
+        "Bytea",
+        "Bytea",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9b525ddf6487cd9bdbd68a93e6f432a9fd92233f4a1b538e350f860e06697a62"
+}

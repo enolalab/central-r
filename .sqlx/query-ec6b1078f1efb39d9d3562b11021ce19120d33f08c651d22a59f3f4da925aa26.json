@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_operations SET\n            revision = $3, phase = $4, last_checkpoint = $5, security_epoch = $6,\n            authority_reset_receipt_hash = $7, updated_at = $8, ready_at = $9\n        WHERE operation_id = $1::uuid AND revision = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Text",
+        "Text",
+        "Int8",
+        "Bytea",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ec6b1078f1efb39d9d3562b11021ce19120d33f08c651d22a59f3f4da925aa26"
+}

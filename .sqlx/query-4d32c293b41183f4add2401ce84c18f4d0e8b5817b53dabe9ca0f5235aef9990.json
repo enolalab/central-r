@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.provider_bindings\n                        SET revoked_at=COALESCE(revoked_at,$1)\n                        WHERE revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4d32c293b41183f4add2401ce84c18f4d0e8b5817b53dabe9ca0f5235aef9990"
+}

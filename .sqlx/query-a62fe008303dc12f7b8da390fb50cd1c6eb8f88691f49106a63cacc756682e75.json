@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.workspaces\n                        SET restore_epoch=$1, security_epoch=$2, updated_at=$3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a62fe008303dc12f7b8da390fb50cd1c6eb8f88691f49106a63cacc756682e75"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT batch_seq, state FROM central.prune_log\n                        WHERE plan_id=$1::uuid ORDER BY batch_seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_seq",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "state",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e117f3df7f6fa77f0d37214155397b27f09c0c31611fbacefab541b25546776e"
+}

@@ -90,12 +90,13 @@ pub fn parse_passfile(value: &[u8]) -> Option<PgPassEntry> {
 
 /// `connectRoleFromPassfileValue` — the closed parse plus the
 /// non-caller-selectable `127.0.0.1:55432/central` connect for `role`
-/// (`"central_migration"` for the operator). Password length is
+/// (`"central_migration"` for the operator, `"central_runtime"` for the
+/// backup worker and the C02 throughput probe). Password length is
 /// bounded by [`MAXIMUM_BACKUP_PASSFILE_BYTES`].
 ///
 /// # Errors
 /// `backup_runtime_connection` on any parse/binding/connect failure.
-async fn connect_role_from_passfile_value(
+pub(crate) async fn connect_role_from_passfile_value(
     value: &[u8],
     role: &str,
     application_name: &str,

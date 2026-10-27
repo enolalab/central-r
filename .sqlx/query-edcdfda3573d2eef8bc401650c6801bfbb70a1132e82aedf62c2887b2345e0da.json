@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.approvals\n                        SET state='suspended',\n                            suspend_reason='restore_review_required',\n                            updated_at=$1\n                        WHERE state='active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "edcdfda3573d2eef8bc401650c6801bfbb70a1132e82aedf62c2887b2345e0da"
+}

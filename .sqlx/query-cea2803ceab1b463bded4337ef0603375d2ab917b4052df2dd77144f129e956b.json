@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH current_epochs AS (\n                        SELECT restore_epoch, security_epoch FROM central.epoch_markers\n                        UNION ALL\n                        SELECT restore_epoch, security_epoch FROM central.workspaces\n                    )\n                    SELECT\n                        (pg_control_system()).system_identifier::text AS \"system_id!\",\n                        d.oid::text AS \"database_oid!\",\n                        current_database() AS \"database!\",\n                        MIN(e.restore_epoch)::bigint AS \"restore_minimum!\",\n                        MAX(e.restore_epoch)::bigint AS \"restore_maximum!\",\n                        MIN(e.security_epoch)::bigint AS \"security_minimum!\",\n                        MAX(e.security_epoch)::bigint AS \"security_maximum!\",\n                        COUNT(*)::bigint AS \"marker_count!\"\n                    FROM pg_catalog.pg_database AS d\n                    CROSS JOIN current_epochs AS e\n                    WHERE d.datname = current_database()\n                    GROUP BY d.oid",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "system_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "database_oid!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "database!",
+        "type_info": "Name"
+      },
+      {
+        "ordinal": 3,
+        "name": "restore_minimum!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "restore_maximum!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "security_minimum!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "security_maximum!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "marker_count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "cea2803ceab1b463bded4337ef0603375d2ab917b4052df2dd77144f129e956b"
+}

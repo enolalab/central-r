@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_quarantines SET\n                            state='resolved',\n                            resolution=CASE WHEN reason='unexpected_artifact'\n                                THEN 'delete_finalized' ELSE 'reingested' END,\n                            resolved_at=GREATEST(clock_timestamp(), created_at)\n                        WHERE operation_id=$1::uuid AND state='open'\n                          AND NOT (artifact_id = ANY($2::uuid[]))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d36f6217718443789228cdc74fc907858f3f0596042b0f24ef4553ed49cb073e"
+}

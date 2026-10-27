@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.recovery_epoch_workspaces\n                        SET claim_expires_at=$1, updated_at=$1\n                        WHERE delivery_state='claimed'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5b953bc6eaf34af3529af80514a6f388bc4c0aceff4fffdc1d95ea59611ae29b"
+}

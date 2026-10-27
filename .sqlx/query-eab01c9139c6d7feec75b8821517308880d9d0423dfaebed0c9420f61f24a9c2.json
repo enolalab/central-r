@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT to_regclass($1)::text AS \"regclass\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "regclass",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "eab01c9139c6d7feec75b8821517308880d9d0423dfaebed0c9420f61f24a9c2"
+}

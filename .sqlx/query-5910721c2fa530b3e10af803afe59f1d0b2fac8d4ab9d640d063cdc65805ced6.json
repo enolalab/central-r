@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.provider_fence_consumptions\n                        SET delivery_state='reconciliation',\n                            handoff_failure_code='restore_authority_reset'\n                        WHERE delivery_state='delivery_pending'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "5910721c2fa530b3e10af803afe59f1d0b2fac8d4ab9d640d063cdc65805ced6"
+}

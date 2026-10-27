@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*)::bigint AS \"count!\" FROM (\n                        SELECT id FROM central.workspaces ORDER BY id FOR UPDATE\n                    ) AS ws",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "ec410f4c495a619d11d8454b70137bfa1c145d6b9fe2b0372d79388b780e73c9"
+}

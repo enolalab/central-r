@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO central.artifact_tombstones (\n                            id, workspace_id, artifact_id, object_key,\n                            staging_generation, checksum_algorithm, checksum_value,\n                            size_at_deletion, deletion_reason\n                        ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6, $7, $8, 'pruned')\n                        ON CONFLICT (workspace_id, artifact_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f74b50e0d2b628d1818687bc1f85f3f0a6c27dbc48d3a609274ee576fad69e15"
+}

@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT previous_restore_epoch, new_restore_epoch,\n            previous_security_epoch, new_security_epoch, broker_receipt_hash,\n            aggregate_receipt_hash, completed_at\n        FROM central.recovery_authority_reset_receipts\n        WHERE operation_id=$1::uuid FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "previous_restore_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "new_restore_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "previous_security_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "new_security_epoch",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "broker_receipt_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 5,
+        "name": "aggregate_receipt_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 6,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "da8e81dcfa813f802b83eda9c5cabc89266463781bfc9dfb672cdcd641c71f41"
+}

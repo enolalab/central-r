@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.artifact_reconciliation_claims\n                        SET lease_expires_at=$1, updated_at=$1\n                        WHERE lease_expires_at>$1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a6887d2290a58de8ef42dfc8d06c4d74121997723cf5def37179c4db14b5f01f"
+}

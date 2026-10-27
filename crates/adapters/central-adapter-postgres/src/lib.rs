@@ -24,6 +24,7 @@
 
 pub mod artifact;
 pub mod authorization;
+pub mod backup;
 pub mod checkpoint;
 pub mod error;
 pub mod event;
@@ -31,6 +32,7 @@ pub mod eventjournal;
 pub mod execution;
 pub mod harness;
 pub mod migrate;
+pub mod recovery;
 pub mod runview;
 pub mod scheduler;
 pub mod serve_support;

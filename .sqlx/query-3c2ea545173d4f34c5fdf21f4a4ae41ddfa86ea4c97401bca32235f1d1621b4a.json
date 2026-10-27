@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (pg_control_system()).system_identifier::text AS \"system_id!\",\n                        d.oid::text AS \"database_oid!\",\n                        current_database() AS \"database!\",\n                        COALESCE(MAX(m.restore_epoch), 0)::bigint AS \"restore_epoch!\"\n                    FROM pg_catalog.pg_database AS d\n                    CROSS JOIN central.epoch_markers AS m\n                    WHERE d.datname = current_database()\n                    GROUP BY d.oid",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "system_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "database_oid!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "database!",
+        "type_info": "Name"
+      },
+      {
+        "ordinal": 3,
+        "name": "restore_epoch!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "3c2ea545173d4f34c5fdf21f4a4ae41ddfa86ea4c97401bca32235f1d1621b4a"
+}

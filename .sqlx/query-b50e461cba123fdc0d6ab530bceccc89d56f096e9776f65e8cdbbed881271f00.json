@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.bootstrap_generations\n                        SET state='consumed',\n                            consumed_at=COALESCE(consumed_at,$1),\n                            presentation_deadline=NULL\n                        WHERE state='active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b50e461cba123fdc0d6ab530bceccc89d56f096e9776f65e8cdbbed881271f00"
+}

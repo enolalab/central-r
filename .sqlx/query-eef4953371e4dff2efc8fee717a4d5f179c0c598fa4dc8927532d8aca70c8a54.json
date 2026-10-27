@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE central.epoch_markers\n                        SET restore_epoch=$1, security_epoch=$2, updated_at=$3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eef4953371e4dff2efc8fee717a4d5f179c0c598fa4dc8927532d8aca70c8a54"
+}
