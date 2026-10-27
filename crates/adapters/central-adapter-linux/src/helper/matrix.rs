@@ -67,7 +67,7 @@ impl Matrix {
         register(verb::DOWN, true, true, false);
         register(verb::STATUS, true, false, false);
         register(verb::DOCTOR, false, false, false);
-        register(verb::WIPE, false, true, true);
+        register(verb::WIPE, true, true, true);
         register(verb::BOOTSTRAP_SHOW, true, false, false);
         register(verb::SECURITY_RESCUE_CLEANUP, false, true, false);
         register(verb::MIGRATE_LAUNCH, true, true, false);
@@ -81,8 +81,8 @@ impl Matrix {
         register(verb::RESTORE_ABANDON, true, true, true);
         register(verb::BACKUP_EXPORT, false, true, false);
         register(verb::BACKUP_IMPORT, false, true, true);
-        register(verb::BACKUP_DELETE, false, true, true);
-        register(verb::BACKUP_PRUNE, false, true, true);
+        register(verb::BACKUP_DELETE, true, true, true);
+        register(verb::BACKUP_PRUNE, true, true, true);
         register(verb::STATE_AUDIT, false, false, false);
         register(verb::SECURITY_RESCUE, false, true, false);
         register(verb::MAINTENANCE_PLAN, false, false, false);
@@ -132,10 +132,11 @@ mod tests {
         assert!(helper_verb_deadline(verb::PREPARE) > std::time::Duration::ZERO);
     }
 
-    /// The closed set: 35 verbs, 15 implemented (R5's eight plus the
-    /// conditional prepare arm, the R5T9 migration pair, and exactly
-    /// the seven R6T7 backup/restore maintenance verbs); the deferred
-    /// verbs upstream implements are closed.
+    /// The closed set: 35 verbs, 18 implemented (R5's eight plus the
+    /// conditional prepare arm, the R5T9 migration pair, the seven
+    /// R6T7 backup/restore maintenance verbs, and the three R6 Slice D
+    /// destructive verbs); the deferred verbs upstream implements are
+    /// closed.
     #[test]
     fn matrix_closes_every_later_operation() {
         let m = Matrix::new();
@@ -161,18 +162,18 @@ mod tests {
             verb::RESTORE_APPLY,
             verb::RESTORE_RESUME,
             verb::RESTORE_ABANDON,
+            verb::WIPE,
+            verb::BACKUP_DELETE,
+            verb::BACKUP_PRUNE,
         ];
         expected.sort_unstable();
         assert_eq!(implemented, expected);
         for deferred in [
-            verb::WIPE,
             verb::SECURITY_UPDATE,
             verb::SECURITY_RESCUE,
             verb::STATE_AUDIT,
             verb::BACKUP_EXPORT,
             verb::BACKUP_IMPORT,
-            verb::BACKUP_DELETE,
-            verb::BACKUP_PRUNE,
             verb::MAINTENANCE_PLAN,
             verb::MAINTENANCE_APPLY,
         ] {

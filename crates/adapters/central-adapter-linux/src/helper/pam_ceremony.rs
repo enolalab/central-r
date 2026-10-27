@@ -342,6 +342,61 @@ impl super::prepare::PreparePamConfirmer for PamConfirmer {
     }
 }
 
+/// `wipePAMConfirmer`/`deletePAMConfirmer`/`prunePAMConfirmer` — each
+/// destructive handler accepts only the exact ceremony of its kind,
+/// mapped to `Some` here and `None` in stand-ins. Upstream's failed
+/// type assertions are the `Option` returns.
+impl super::wipe::WipePamConfirmer for PamConfirmer {
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+    fn confirm_wipe(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        op_id: &str,
+    ) -> Option<Result<String, Failure>> {
+        Some(PamConfirmer::confirm_wipe(
+            self, peer, deadline, scope, op_id,
+        ))
+    }
+}
+
+impl super::delete::DeletePamConfirmer for PamConfirmer {
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+    fn confirm_backup_delete(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        op_id: &str,
+    ) -> Option<Result<String, Failure>> {
+        Some(PamConfirmer::confirm_backup_delete(
+            self, peer, deadline, scope, op_id,
+        ))
+    }
+}
+
+impl super::prune::PrunePamConfirmer for PamConfirmer {
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+    fn confirm_backup_prune(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        plan_id: &str,
+    ) -> Option<Result<String, Failure>> {
+        Some(PamConfirmer::confirm_backup_prune(
+            self, peer, deadline, scope, plan_id,
+        ))
+    }
+}
+
 macro_rules! destructive_confirms {
     ($($name:ident => ($kind:ident, $tty:ident, $err:literal, $label:literal);)*) => {
         $(

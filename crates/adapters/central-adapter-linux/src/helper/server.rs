@@ -90,6 +90,9 @@ pub fn helper_verb_deadline(verb: &str) -> Duration {
         v if v == verb::BACKUP_CREATE => BACKUP_CREATE_BUDGET,
         v if v == verb::BACKUP_VERIFY => BACKUP_VERIFY_BUDGET,
         v if v == verb::BACKUP_STATUS => BACKUP_STATUS_BUDGET,
+        v if v == verb::WIPE => CEREMONY_BUDGET + Duration::from_secs(13 * 60),
+        v if v == verb::BACKUP_DELETE => CEREMONY_BUDGET + Duration::from_secs(8 * 60),
+        v if v == verb::BACKUP_PRUNE => CEREMONY_BUDGET + Duration::from_secs(58 * 60),
         v if v == verb::BROWSER_OPEN => Duration::from_secs(30),
         v if v == verb::TRUST_INSTALL => Duration::from_secs(120),
         v if v == verb::BOOTSTRAP_SHOW => Duration::from_secs(5),
@@ -234,6 +237,15 @@ pub struct Server {
     pub restore_resume: Option<Box<dyn super::restore::RestoreResumeHandler>>,
     /// `Server.RestoreAbandon`.
     pub restore_abandon: Option<Box<dyn super::restore::RestoreAbandonHandler>>,
+    /// `Wipe` — D01, a separate seam so a composition can install wipe
+    /// without installing any other destructive verb.
+    pub wipe: Option<Box<dyn super::wipe::WipeHandler>>,
+    /// `Delete` — D04 delete, a separate seam so a composition can
+    /// substitute a stub.
+    pub delete: Option<Box<dyn super::delete::DeleteHandler>>,
+    /// `Prune` — D04 prune plan and apply, a separate seam so a
+    /// composition can substitute a stub.
+    pub prune: Option<Box<dyn super::prune::PruneHandler>>,
     pub browser: Option<super::browser::BrowserHandler>,
     pub bootstrap_show: Option<super::browser::BootstrapShowHandler>,
     /// Arms the deny-safe gate while non-empty.
@@ -259,6 +271,9 @@ impl Server {
             restore_apply: None,
             restore_resume: None,
             restore_abandon: None,
+            wipe: None,
+            delete: None,
+            prune: None,
             browser: None,
             bootstrap_show: None,
             deny_safe_dir: None,
@@ -496,6 +511,33 @@ impl Server {
                     Err(_) => {
                         Response::denied(&req.operation_id, 2, "INVALID_RESTORE_ABANDON_REQUEST")
                     }
+                }
+            }
+            v if v == verb::WIPE => {
+                let Some(handler) = &self.wipe else {
+                    return Response::deferred(&req.operation_id, "WIPE_UNAVAILABLE");
+                };
+                match super::wipe::parse_wipe_request(req) {
+                    Ok(wipe) => handler.wipe(deadline, wipe, &peer),
+                    Err(_) => Response::denied(&req.operation_id, 2, "INVALID_WIPE_REQUEST"),
+                }
+            }
+            v if v == verb::BACKUP_DELETE => {
+                let Some(handler) = &self.delete else {
+                    return Response::deferred(&req.operation_id, "DELETE_UNAVAILABLE");
+                };
+                match super::delete::parse_delete_request(req) {
+                    Ok(delete) => handler.delete(deadline, delete, &peer),
+                    Err(_) => Response::denied(&req.operation_id, 2, "INVALID_DELETE_REQUEST"),
+                }
+            }
+            v if v == verb::BACKUP_PRUNE => {
+                let Some(handler) = &self.prune else {
+                    return Response::deferred(&req.operation_id, "PRUNE_UNAVAILABLE");
+                };
+                match super::prune::parse_prune_request(req) {
+                    Ok(prune) => handler.prune(deadline, prune, &peer),
+                    Err(_) => Response::denied(&req.operation_id, 2, "INVALID_PRUNE_REQUEST"),
                 }
             }
             v if v == verb::TRUST_INSTALL => {
@@ -1118,7 +1160,14 @@ mod tests {
             "unregistered verbs deny closed"
         );
         let cases = [
-            (verb::WIPE, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
+            // Implemented but unconfigured: each destructive verb
+            // answers with its own upstream unavailable token, not the
+            // matrix's closed refusal — exactly upstream's
+            // `wipeUnavailable`/`deleteUnavailable`/`pruneUnavailable`
+            // fallbacks for a server built without the handler.
+            (verb::WIPE, "deferred", "WIPE_UNAVAILABLE"),
+            (verb::BACKUP_DELETE, "deferred", "DELETE_UNAVAILABLE"),
+            (verb::BACKUP_PRUNE, "deferred", "PRUNE_UNAVAILABLE"),
             // Implemented but unconfigured: the verb's own upstream
             // unavailable answer, not the matrix's closed refusal.
             (

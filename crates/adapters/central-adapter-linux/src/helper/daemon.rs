@@ -511,6 +511,87 @@ pub fn run_helper_daemon(
                 ),
             )),
         ))),
+        // `newProductionWipeHandler` — D01 composed from the installed
+        // composition, the shared confirmer, the B01 evaluator, and
+        // the backup-read surface. The wipe roots derive from the
+        // resolved composition (the instances parent is the state
+        // root's own parent), with production ownership. The B01
+        // evaluator is upstream's `unavailableLifecycleEvaluator`
+        // verbatim until the evaluator link lands: every verb refuses
+        // `*_DENIED_SIGNED` rather than fabricating admission.
+        wipe: Some(Box::new(super::wipe::WipeHandlerImpl::new(
+            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(super::wipe::DenyOnlyAdvisoryEvaluator)),
+            Some(Box::new(super::wipe::BackupReaderCheckpointVerifier {
+                read: Box::new(super::backup::BackupReadHandler::new(
+                    Box::new(super::backup::FixedBackupRepositorySource {
+                        root: backup_repository_root.clone(),
+                        instance_id: composition.instance_id.clone(),
+                    }),
+                    Box::new(
+                        crate::broker::backup_authority::BackupOperatorAuthorityClient::new(
+                            broker_path.clone(),
+                        ),
+                    ),
+                    central_backup::backup::capacity::default_recovery_profile(),
+                )),
+            })),
+            CeremonyScope {
+                instance_id: "default".to_owned(),
+                target_id: "postgres:central".to_owned(),
+            },
+            super::wipe::WipeRoots {
+                instances_root: std::path::PathBuf::from(&composition.authoritative_state_root)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                protected_parent: crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES.to_owned(),
+                runtime_base: "/run/central-infra".to_owned(),
+                parent_uid: 0,
+                parent_gid: 0,
+                instance_uid: central_infra::authority::CENTRAL_RUNTIME_UID,
+                instance_gid: central_infra::authority::CENTRAL_RUNTIME_GID,
+            },
+            super::wipe::production_app_armor_deps(),
+        ))),
+        // `newProductionDeleteHandler` — D04 delete. The backup source
+        // and reference checker are unavailable until the
+        // repository-delete and PG plumbing land — upstream's own
+        // `unavailableDeleteSource`/`unavailableDeleteRefs` stand-ins:
+        // the handler refuses `DELETE_UNAVAILABLE` before any ceremony
+        // rather than running degraded.
+        delete: Some(Box::new(super::delete::DeleteHandlerImpl::new(
+            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(super::delete::DenyOnlyAdvisoryEvaluator)),
+            Some(Box::new(super::delete::UnavailableDeleteSource)),
+            Some(Box::new(super::delete::UnavailableDeleteRefs)),
+            CeremonyScope {
+                instance_id: "default".to_owned(),
+                target_id: "postgres:central".to_owned(),
+            },
+            super::delete::DeleteRoots {
+                journal_dir: std::path::PathBuf::from(&composition.authoritative_state_root)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                journal_uid: 0,
+                journal_gid: 0,
+            },
+        ))),
+        // `newProductionPruneHandler` — D04 prune. The engine (PG
+        // inventory + journal as central_migration, MinIO body
+        // deletes) is not plumbed yet — upstream's nil engine made
+        // explicit: `PRUNE_UNAVAILABLE` on both plan and apply rather
+        // than inventing eligibility without PG.
+        prune: Some(Box::new(super::prune::PruneHandlerImpl::new(
+            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(super::prune::DenyOnlyAdvisoryEvaluator)),
+            None,
+            CeremonyScope {
+                instance_id: "default".to_owned(),
+                target_id: "postgres:central".to_owned(),
+            },
+        ))),
         // `lifecycle` stays unset for the same dependency-chain reason,
         // one link deeper: `infra::lifecycle::new_production_service`
         // needs (1) the B01 advisory evaluator — the same deferred seam
