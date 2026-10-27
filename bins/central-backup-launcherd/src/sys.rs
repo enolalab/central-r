@@ -247,11 +247,10 @@ pub fn wait_pid(pid: i32, no_hang: bool) -> Result<Option<i32>, Errno> {
             if e == Errno::INTR {
                 continue;
             }
-            // `ECHILD` — already reaped; upstream's `waitpid` loops
-            // treat it as done.
-            if e == Errno::CHILD {
-                return Ok(Some(0));
-            }
+            // `ECHILD` — we did not reap this pid. Upstream leaves the
+            // entry "not waited" and the outcome resolves EXITED/255;
+            // surfacing `Err` keeps every caller on that fail-closed
+            // path instead of fabricating a status-0 success.
             return Err(e);
         }
         return Ok(None);

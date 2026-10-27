@@ -206,7 +206,7 @@ pub fn valid_retained_target_socket<Fd: AsFd>(fd: Fd, peer_port: u16) -> bool {
     let Ok(local4) = std::net::SocketAddrV4::try_from(local) else {
         return false;
     };
-    if !local4.ip().is_loopback() {
+    if *local4.ip() != std::net::Ipv4Addr::LOCALHOST {
         return false;
     }
     let Ok(Some(peer)) = rustix::net::getpeername(&fd) else {
@@ -215,7 +215,7 @@ pub fn valid_retained_target_socket<Fd: AsFd>(fd: Fd, peer_port: u16) -> bool {
     let Ok(peer4) = std::net::SocketAddrV4::try_from(peer) else {
         return false;
     };
-    peer4.port() == peer_port && peer4.ip().is_loopback()
+    peer4.port() == peer_port && *peer4.ip() == std::net::Ipv4Addr::LOCALHOST
 }
 
 #[cfg(test)]
