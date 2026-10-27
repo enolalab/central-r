@@ -417,15 +417,18 @@ pub fn write_transcript(
         checksum_sha256: transcript_digest(transcript),
     };
     let path = std::path::Path::new(directory).join(&record.id);
-    let mut file = std::fs::File::create(&path)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
         .map_err(|e| format!("recovery: persisting {scenario_id}'s transcript failed: {e}"))?;
     file.write_all(transcript)
         .map_err(|e| format!("recovery: persisting {scenario_id}'s transcript failed: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     Ok(record)
 }
 

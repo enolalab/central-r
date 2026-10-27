@@ -2449,6 +2449,40 @@ fn the_seeded_ready_key_is_the_key_the_production_reader_derives() {
         "the suite composes {staging_key:?} and the adapter's STAGING_PREFIX is {staging:?}"
     );
     assert_ne!(ready, staging, "the two prefixes must differ");
+
+    // Prefix agreement alone cannot catch a segment-order or separator
+    // drift — `v1/ready/{gen}/{a}/{w}` still starts with the prefix. The
+    // domain's own derivation functions are the symbolic source: read
+    // each `format!` literal out of `ready_key_for`/`staging_key_for`,
+    // substitute the same inputs the suite composes with, and require
+    // the production template to produce exactly the suite's key.
+    let domain_path = std::path::Path::new(manifest)
+        .join("../../crates/capabilities/central-artifact/src/domain.rs");
+    let domain_src = std::fs::read_to_string(&domain_path)
+        .unwrap_or_else(|e| panic!("read the artifact domain {}: {e}", domain_path.display()));
+    let derivation = |function: &str| -> String {
+        let fn_at = domain_src
+            .find(&format!("fn {function}("))
+            .unwrap_or_else(|| panic!("the domain source no longer declares {function}; this pin would hold the key shape to nothing"));
+        let lit_at = domain_src[fn_at..]
+            .find("format!(\"")
+            .unwrap_or_else(|| panic!("{function} no longer derives through a format literal"));
+        domain_src[fn_at + lit_at + "format!(\"".len()..]
+            .split('"')
+            .next()
+            .expect("a quoted derivation")
+            .to_owned()
+    };
+    for (function, suite_key) in [("ready_key_for", &ready_key), ("staging_key", &staging_key)] {
+        let production = derivation(function)
+            .replace("{workspace_id}", "w")
+            .replace("{artifact_id}", "a")
+            .replace("{generation}", "0");
+        assert_eq!(
+            *suite_key, production,
+            "the suite composes {suite_key:?} but the domain's {function} derives {production:?} for the same inputs; the seeded corpus would seed under a key no production read can find"
+        );
+    }
 }
 
 /// `TestC06TheCorruptionPlanIsAnchoredToTheDomainSource` — the enumeration

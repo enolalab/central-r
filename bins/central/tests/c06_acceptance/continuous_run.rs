@@ -11,7 +11,7 @@
 //! its own protected root), which is the same independence upstream states.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -1202,6 +1202,22 @@ fn restart_after_abandonment(id: &str, log: &mut ScenarioLog) -> Result<(), Stri
 /// copy of scenario 7. Where the run never brought the shared stores up (no
 /// live env), there is no shared instance to have damaged and the probe is
 /// vacuous, stated rather than assumed.
+/// `SEQUENCE_BROKEN` — the port of the `t.Fatalf` upstream's
+/// `c06GateTheSequence` raises in the parent test: once a gate refuses,
+/// the continuous run produces NO further outcomes. The entry that ran
+/// the gate records its own failure through the ordinary `?` path; this
+/// flag tells the one armed driver to stop the sequence there, so the
+/// entries after the break stay unrecorded, `zz_reconcile` names them
+/// missing, and emit refuses — "a broken sequence emits no artifact".
+static SEQUENCE_BROKEN: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn sequence_broken() -> Option<String> {
+    SEQUENCE_BROKEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 pub(crate) fn gate_the_sequence(completed: &str, log: &mut ScenarioLog) -> Result<(), String> {
     match probe_the_instance_is_still_usable() {
         Ok(()) => {
@@ -1210,9 +1226,13 @@ pub(crate) fn gate_the_sequence(completed: &str, log: &mut ScenarioLog) -> Resul
             ));
             Ok(())
         }
-        Err(e) => Err(format!(
-            "after {completed} completed, the instance this continuous run shares is no longer usable: {e}.\n\nTHE ENTRY THAT LEFT IT THAT WAY IS {completed}. The remaining entries have not run and are NOT the cause; a sequence that broke in the middle evidences nothing after the break."
-        )),
+        Err(e) => {
+            let message = format!(
+                "after {completed} completed, the instance this continuous run shares is no longer usable: {e}.\n\nTHE ENTRY THAT LEFT IT THAT WAY IS {completed}. The remaining entries have not run and are NOT the cause; a sequence that broke in the middle evidences nothing after the break."
+            );
+            *SEQUENCE_BROKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
+            Err(message)
+        }
     }
 }
 
@@ -1466,6 +1486,11 @@ fn the_continuous_recovery_sequence() {
             "driver position {position} runs {id:?} and the catalogue declares {:?} there; the continuous run's ordering claim lives in this list and a misaligned one is a silent reorder",
             catalogue[position].id
         );
+        if let Some(broken) = sequence_broken() {
+            panic!(
+                "the sequence gate halted the run before {id:?} could start: {broken}\n\nentries after the break produce no outcomes — the same artifact refusal upstream's t.Fatalf leaves behind"
+            );
+        }
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
     }
     let mut failed: Vec<String> = Vec::new();

@@ -399,7 +399,11 @@ impl RecordSet {
         records: Vec<CapacityReserveRecord>,
     ) -> Result<(), String> {
         self.check_capacity_reserve(&records)?;
-        self.capacity_reserve = records;
+        // Extend, not replace: s9's `backup_admission` entry is pushed
+        // through its own path and a wholesale assignment here would
+        // silently drop it. The recorded-once guard above still makes
+        // this the single writer of `restore_reserve` records.
+        self.capacity_reserve.extend(records);
         self.capacity_reserve_recorded = true;
         Ok(())
     }

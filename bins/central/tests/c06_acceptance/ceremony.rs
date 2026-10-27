@@ -566,8 +566,18 @@ pub fn drive_ceremony(plan: &CeremonyPlan) -> Result<CeremonyOutcome, String> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // Upstream `c06DriveGrantChild` takes the exit code from the refusal
+    // envelope when the child printed one — a pre-D1 refusal reports its
+    // own code in-band while the process itself may exit 0.
+    let exit_code = if plan.grant_mode {
+        exit_code_from_envelope(&envelope)
+            .map(i64::from)
+            .unwrap_or_else(|| output.status.code().unwrap_or(-1) as i64)
+    } else {
+        output.status.code().unwrap_or(-1) as i64
+    };
     Ok(CeremonyOutcome {
-        exit_code: output.status.code().unwrap_or(-1) as i64,
+        exit_code,
         refusal_reason: reason_from_envelope(&envelope),
         envelope,
         elapsed,
@@ -942,9 +952,12 @@ fn the_grant_driver_reads_the_exit_the_envelope_reports() {
 /// makes the read return nothing, and "no authorization record" is
 /// indistinguishable from "no ceremony was performed" — which is the answer
 /// field 21 gives when it is working correctly.
-pub const RECOVERY_JOURNAL_AUTHORIZATION_DIRECTORIES: [(&str, &str); 2] = [
+pub const RECOVERY_JOURNAL_AUTHORIZATION_DIRECTORIES: [(&str, &str); 3] = [
     ("restore_apply", "restore-apply-authorizations"),
     ("restore_abandon", "restore-abandon-authorizations"),
+    // Upstream maps `restore_resume` onto the apply store — a resume
+    // authorization is a `RestoreApplyAuthorization` consumed by `Resume`.
+    ("restore_resume", "restore-apply-authorizations"),
 ];
 
 /// `c06BrokerAuthorizationDirectoryConstants` — the broker's own const
