@@ -877,6 +877,13 @@ dependencies = [
 [[package]]
 name = "central-backup-bin"
 version = "0.1.0"
+dependencies = [
+ "central-foundation",
+ "central-kernel",
+ "libc",
+ "rustix",
+ "uuid",
+]
 
 [[package]]
 name = "central-backup-launcherd"
@@ -1020,6 +1027,7 @@ dependencies = [
  "tracing",
  "uuid",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@
 # `central-backup` via the explicit target below.
 [package]
 name = "central-backup-bin"
-description = "Backup operator binary (central-backup UID) — shared/exclusive advisory lock matrix"
+description = "Backup worker binary (central-backup UID) — fixed C01/C02 grammar over inherited descriptors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,5 +13,25 @@ publish.workspace = true
 name = "central-backup"
 path = "src/main.rs"
 
-[lints]
-workspace = true
+[dependencies]
+central-foundation = { path = "../../crates/central-foundation", version = "0.1.0" }
+central-kernel = { path = "../../crates/central-kernel", version = "0.1.0" }
+rustix.workspace = true
+# `sys` is the audited descriptor boundary (F_GETFD/F_SETFD have no
+# rustix wrapper in the pinned version).
+libc = "=0.2.191"
+uuid.workspace = true
+
+# The launcher binaries are the audited `unsafe` sites (workflow
+# §5.2): `sys.rs` opts back in per module, so this crate lists the
+# workspace lints by hand (it cannot both inherit and override
+# `unsafe_code`) with `unsafe_code` at "deny" instead of "forbid".
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+dbg_macro = "deny"
