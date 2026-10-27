@@ -706,3 +706,796 @@ fn every_command_line_the_run_records_is_one_it_declares() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The flag-offered-as-confirmation negative, decided by the live surface —
+// `TestC06TheOperatorSurfaceRefusesAFlagOfferedAsConfirmation`.
+// ---------------------------------------------------------------------------
+
+/// The operator binary this test drives: `CENTRAL_C06_CENTRAL_BIN` first —
+/// the same variable scenario 1 uses, so the flagged call takes the same
+/// subprocess path s1 takes — then the binary this test target was built
+/// beside. Portable: the component that decides the negative needs neither
+/// root, nor PAM, nor a console.
+fn operator_binary() -> String {
+    std::env::var("CENTRAL_C06_CENTRAL_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_central").to_owned())
+}
+
+/// `c06DispatchRestoreWithArguments` — the real operator binary with an
+/// exact argument vector, through the same subprocess path scenario 1
+/// dispatches `central backup create` on. Returns (process exit, the parsed
+/// result envelope, the combined output).
+///
+/// The deferred operator mode refuses to run as ROOT — upstream reaches
+/// `command.Dispatch` inside `main`'s privilege check, so its portable test
+/// never meets the gate; this port drives the whole binary, so a root test
+/// host drops the child to `nobody` first. The refusal under test is the
+/// verb's own, not the mode gate's.
+fn dispatch_restore_with_arguments(arguments: &[String]) -> (i64, serde_json::Value, String) {
+    let binary = operator_binary();
+    let mut command = std::process::Command::new(&binary);
+    command.args(arguments);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        if rustix::process::geteuid().as_raw() == 0 {
+            command.uid(65534);
+        }
+    }
+    let output = command
+        .env_remove(crate::fixture::OPERATOR_SECRET_ENV)
+        .env_remove("CENTRAL_HELPER_SOCKET")
+        .env_remove(crate::fixture::GRANT_CEREMONY_ENV)
+        .output()
+        .unwrap_or_else(|e| panic!("the real central binary could not run ({binary:?}): {e}"));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = output
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .find(|v: &serde_json::Value| v.get("reason").is_some())
+        .unwrap_or_else(|| panic!("no result envelope in the operator output: {combined}"));
+    (
+        output.status.code().unwrap_or(-1) as i64,
+        envelope,
+        combined,
+    )
+}
+
+/// `TestC06TheOperatorSurfaceRefusesAFlagOfferedAsConfirmation` — one of the
+/// four negatives governance field 24 requires, decided by the real
+/// component: the grammar check admits exactly zero arguments on apply and
+/// abandon, so a `--confirm` flag never reaches consent.
+///
+/// IT IS A PAIR, NOT A REFUSAL. Each verb is driven twice — once with a flag
+/// carrying a real, correctly scoped confirmation phrase, and once with
+/// nothing else changed — and the pair must differ in exactly the way the
+/// grammar check decides: the flagged call is refused for grammar, and the
+/// unflagged call is NOT, because it reaches the service behind it (where no
+/// helper socket answers `*_DEPENDENCY_UNAVAILABLE`, which is what the
+/// grammar check having let it through looks like).
+#[test]
+fn the_operator_surface_refuses_a_flag_offered_as_confirmation() {
+    let instance_id = "c06-synthetic-instance";
+    let target_id = "c06-synthetic-target";
+    let operation_id = "c06-synthetic-operation";
+    for (subcommand, prefix, grammar_reason, absent_reason) in [
+        (
+            "apply",
+            RESTORE_APPLY_PHRASE_PREFIX,
+            "INVALID_RESTORE_APPLY_GRAMMAR",
+            "RESTORE_APPLY_DEPENDENCY_UNAVAILABLE",
+        ),
+        (
+            "abandon",
+            RESTORE_ABANDON_PHRASE_PREFIX,
+            "INVALID_RESTORE_ABANDON_GRAMMAR",
+            "RESTORE_ABANDON_DEPENDENCY_UNAVAILABLE",
+        ),
+    ] {
+        let phrase = derive_confirmation_phrase(prefix, instance_id, target_id, operation_id);
+        let flagged_args: Vec<String> = vec![
+            "restore".into(),
+            subcommand.into(),
+            format!("--confirm={phrase}"),
+        ];
+        let (flagged_exit, flagged, flagged_output) =
+            dispatch_restore_with_arguments(&flagged_args);
+        assert_eq!(
+            flagged["reason"].as_str().unwrap_or_default(),
+            grammar_reason,
+            "`restore {subcommand}` offered a confirmation phrase as a flag; it must answer {grammar_reason}. A verb that accepted a flag as consent would let an automation approve an irreversible act with no operator at a terminal, which is the whole thing the ceremony exists to prevent"
+        );
+        assert_eq!(
+            flagged_exit, 2,
+            "`restore {subcommand}` with a confirmation flag exited {flagged_exit}, want 2 (the usage class)"
+        );
+        // The phrase was handed IN. It must not come back out: the
+        // operator's terminal is the one place a phrase must never be
+        // echoed by the tool.
+        assert!(
+            !flagged_output.contains(prefix),
+            "`restore {subcommand}` echoed the confirmation phrase it refused back to the operator's terminal: {flagged_output}"
+        );
+
+        // The neighbour: the same verb, nothing else changed, no flag.
+        let unflagged_args: Vec<String> = vec!["restore".into(), subcommand.into()];
+        let (_, unflagged, _) = dispatch_restore_with_arguments(&unflagged_args);
+        let reason = unflagged["reason"].as_str().unwrap_or_default();
+        assert_ne!(
+            reason, grammar_reason,
+            "`restore {subcommand}` with NO flag also answered {grammar_reason}, so the refusal above says nothing about the flag: the verb refuses its own grammar either way and this pair does not isolate the substitution"
+        );
+        assert_eq!(
+            reason, absent_reason,
+            "`restore {subcommand}` with no flag and no helper socket answered {reason:?}, want {absent_reason:?}. This half of the pair exists to show the grammar check let it through; an answer from somewhere else means it did not get that far"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The grant driver's envelope exit — `c06ExitCodeFromEnvelope`.
+// ---------------------------------------------------------------------------
+
+/// `c06ExitCodeFromEnvelope` pulls the operator surface's exit code out of
+/// the child's output. It reports `None` when no envelope is present, so a
+/// child that died before answering keeps its process exit rather than a
+/// guess.
+pub fn exit_code_from_envelope(output: &str) -> Option<u8> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && envelope
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| !r.is_empty())
+            && let Some(code) = envelope.get("exit_code").and_then(|c| c.as_u64())
+        {
+            return Some(code as u8);
+        }
+    }
+    None
+}
+
+/// `TestC06TheGrantDriverDrivesAChildThroughTheRealSpawnPath` — the driver
+/// is exercised, not declared: a grant-mode plan over `/bin/true` (which
+/// ignores every argument and exits 0 with no envelope) proves the spawn /
+/// wait / envelope-collect machinery runs, and that a child answering no
+/// envelope keeps its process exit — `exit_code_from_envelope` reporting
+/// `None` is what makes the fallback honest.
+#[test]
+fn the_grant_driver_drives_a_child_through_the_real_spawn_path() {
+    let plan = CeremonyPlan {
+        verb: "apply".to_owned(),
+        binary: "/bin/true".to_owned(),
+        helper_socket: "/run/central/helper.sock".to_owned(),
+        operator_uid: 65534,
+        operator_gid: 65534,
+        daemon_uid: 0,
+        budget: Duration::from_secs(60),
+        grant_mode: true,
+        grant_operation_id: "c06-synthetic-operation".to_owned(),
+        tolerate_quarantine: true,
+        ..Default::default()
+    };
+    plan.validate()
+        .unwrap_or_else(|e| panic!("the clean grant plan must validate: {e}"));
+    let outcome =
+        drive_ceremony(&plan).unwrap_or_else(|e| panic!("driving the no-op child failed: {e}"));
+    assert_eq!(
+        outcome.exit_code, 0,
+        "/bin/true exits 0 under any arguments; a nonzero exit means the driver did not drive the child it was handed"
+    );
+    assert_eq!(
+        exit_code_from_envelope(&outcome.envelope),
+        None,
+        "a child that answered no envelope must not report an envelope exit; the driver keeps the process exit instead"
+    );
+}
+
+/// `TestC06GrantDriverReadsTheExitTheEnvelopeReports` — pins the run-11
+/// finding: a grant driver that read only the process exit saw 0 on every
+/// refusal and no negative could pass. The driver keeps reading the
+/// envelope, and keeps the process exit only when no envelope exists.
+#[test]
+fn the_grant_driver_reads_the_exit_the_envelope_reports() {
+    let denied = "{\"schema_version\":\"central.local-result/v1\",\"command_id\":\"restore.apply\",\"exit_code\":7,\"reason\":\"RESTORE_APPLY_AUTHORITY_DENIED\",\"details\":{}}\n";
+    assert_eq!(
+        exit_code_from_envelope(denied),
+        Some(7),
+        "a refusal envelope reports exit 7"
+    );
+    let ok = "{\"schema_version\":\"central.local-result/v1\",\"command_id\":\"restore.apply\",\"exit_code\":0,\"reason\":\"ok\",\"details\":{}}\n";
+    assert_eq!(
+        exit_code_from_envelope(ok),
+        Some(0),
+        "a success envelope reports exit 0"
+    );
+    assert_eq!(
+        exit_code_from_envelope(""),
+        None,
+        "empty output must not report an envelope exit"
+    );
+    assert_eq!(
+        exit_code_from_envelope("not json\nstill not json\n"),
+        None,
+        "output with no envelope must not report an envelope exit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The protected-authorization read governance field 21 comes from.
+// ---------------------------------------------------------------------------
+
+/// `c06RecoveryJournalAuthorizationDirectories` — the directories this suite
+/// reads performed ceremonies out of, by ceremony kind. Restated here and
+/// pinned to the broker's own constants by
+/// `the_authorization_directories_are_the_brokers_own`; a renamed directory
+/// makes the read return nothing, and "no authorization record" is
+/// indistinguishable from "no ceremony was performed" — which is the answer
+/// field 21 gives when it is working correctly.
+pub const RECOVERY_JOURNAL_AUTHORIZATION_DIRECTORIES: [(&str, &str); 2] = [
+    ("restore_apply", "restore-apply-authorizations"),
+    ("restore_abandon", "restore-abandon-authorizations"),
+];
+
+/// `c06BrokerAuthorizationDirectoryConstants` — the broker's own const
+/// declarations for each directory above: directory name → the constant in
+/// `recovery_journal.rs` that must declare it.
+pub const BROKER_AUTHORIZATION_DIRECTORY_CONSTANTS: [(&str, &str); 2] = [
+    ("restore-apply-authorizations", "RECOVERY_APPLY_DIRECTORY"),
+    (
+        "restore-abandon-authorizations",
+        "RECOVERY_ABANDON_DIRECTORY",
+    ),
+];
+
+/// `c06ConsumedAuthorizationState` — the state a record reaches once the
+/// ceremony it authorized has been used exactly once. The other two states
+/// the broker writes — "issued" and "consuming" — are a ceremony in flight,
+/// and neither is a performed one.
+pub const CONSUMED_AUTHORIZATION_STATE: &str = "consumed";
+
+/// `c06ProtectedAuthorizationRecord` — the fields of a broker authorization
+/// record field 21 needs, decoded from the broker's own wire shape (the
+/// `RestoreApplyRecordWire`/`RestoreAbandonRecordWire` layout: an
+/// `authorization` object carrying Go-named fields, a `state` string, and
+/// peer fields the read does not need).
+pub struct ProtectedAuthorizationRecord {
+    pub authorization_id: String,
+    pub operation_id: String,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub state: String,
+}
+
+/// `c06ReadProtectedAuthorizations` — the records a performed ceremony of
+/// `kind` left in `protected_root`, sorted by authorization id exactly as
+/// upstream sorts them. A missing directory is the shape an unperformed
+/// ceremony leaves and returns empty, not an error.
+pub fn read_protected_authorizations(
+    protected_root: &Path,
+    kind: &str,
+) -> Result<Vec<ProtectedAuthorizationRecord>, String> {
+    let directory = RECOVERY_JOURNAL_AUTHORIZATION_DIRECTORIES
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, d)| *d)
+        .ok_or_else(|| {
+            format!(
+                "no protected authorization directory is declared for a ceremony of kind {kind:?}"
+            )
+        })?;
+    let path = protected_root.join(directory);
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(format!(
+                "read the protected authorization records this ceremony would have left: {e}"
+            ));
+        }
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read a directory entry: {e}"))?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || !name.ends_with(".json") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(entry.path())
+            .map_err(|e| format!("read a protected authorization record: {e}"))?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("decode a protected authorization record: {e}"))?;
+        let authorization = &value["authorization"];
+        records.push(ProtectedAuthorizationRecord {
+            authorization_id: authorization["AuthorizationID"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            operation_id: authorization["OperationID"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            issued_at: authorization["IssuedAt"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            expires_at: authorization["ExpiresAt"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            state: value["state"].as_str().unwrap_or_default().to_owned(),
+        });
+    }
+    records.sort_by(|a, b| a.authorization_id.cmp(&b.authorization_id));
+    Ok(records)
+}
+
+/// `c06RecordPerformedCeremoniesFromProtectedState` — turns the
+/// authorizations one performed ceremony left behind into governance field
+/// 21 records. It records only what it read, and it records nothing at all
+/// where nothing was left: `record_performed_ceremony`'s gate refuses a
+/// ceremony with no destructive confirmation behind it, and this adds a
+/// second condition rather than relaxing the first.
+pub fn record_performed_ceremonies_from_protected_state(
+    protected_root: &Path,
+    kind: &str,
+    records: &mut crate::fixture::RecordSet,
+) -> Result<usize, String> {
+    let found = read_protected_authorizations(protected_root, kind)?;
+    let mut recorded = 0;
+    for record in &found {
+        if record.state != CONSUMED_AUTHORIZATION_STATE
+            || records
+                .ceremony_records
+                .iter()
+                .any(|c| c.authorization_id == record.authorization_id)
+        {
+            continue;
+        }
+        records.record_performed_ceremony(crate::evidence::CeremonyRecord {
+            kind: kind.to_owned(),
+            authorization_id: record.authorization_id.clone(),
+            operation_id: record.operation_id.clone(),
+            issued_at: record.issued_at.clone(),
+            expires_at: record.expires_at.clone(),
+            // The broker consumes an authorization under a lock and refuses
+            // a second consumption of the same record, so a record standing
+            // in the consumed state IS the one-use property having held. It
+            // is read from the record rather than asserted here.
+            consumed_exactly_once: true,
+        })?;
+        recorded += 1;
+    }
+    Ok(recorded)
+}
+
+/// `TestC06ThePerformedCeremonyReadTakesOnlyConsumedAuthorizations` — both
+/// directions over a protected root this test writes: a consumed
+/// authorization is returned with every field the record carries, and a
+/// record in any other state is not — an authorization still in flight is
+/// not a ceremony that was performed.
+#[test]
+fn the_performed_ceremony_read_takes_only_consumed_authorizations() {
+    let root = std::env::temp_dir().join(format!("c06-auth-read-{}", std::process::id()));
+    let directory = root.join("restore-apply-authorizations");
+    std::fs::create_dir_all(&directory).expect("create the protected authorization directory");
+    let write = |name: &str, authorization_id: &str, operation_id: &str, state: &str| {
+        let record = serde_json::json!({
+            "authorization": {
+                "AuthorizationID": authorization_id,
+                "OperationID": operation_id,
+                "IssuedAt": "2020-01-01T01:00:00Z",
+                "ExpiresAt": "2020-01-01T01:05:00Z",
+            },
+            "state": state,
+        });
+        std::fs::write(directory.join(name), serde_json::to_vec(&record).unwrap())
+            .expect("write a protected authorization record");
+    };
+    const CONSUMED_ID: &str = "00000000-0000-7000-8000-00000000000a";
+    const ISSUED_ID: &str = "00000000-0000-7000-8000-00000000000b";
+    const OPERATION_ID: &str = "00000000-0000-7000-8000-00000000000c";
+    write(
+        "consumed.json",
+        CONSUMED_ID,
+        OPERATION_ID,
+        CONSUMED_AUTHORIZATION_STATE,
+    );
+    write("issued.json", ISSUED_ID, OPERATION_ID, "issued");
+
+    let found = read_protected_authorizations(&root, "restore_apply")
+        .expect("read the protected authorizations");
+    assert_eq!(
+        found.len(),
+        2,
+        "the read returned {} records over a directory holding 2; it is not reading what the ceremony leaves",
+        found.len()
+    );
+
+    let mut records = crate::fixture::RecordSet::default();
+    records
+        .destructive_confirmations
+        .push(crate::evidence::DestructiveConfirmation {
+            operation_kind: "restore_apply".to_owned(),
+            phrase_sha256: String::new(),
+            admitted_peer_uid: 0,
+            rejected_redirected_input: false,
+            rejected_flag_substitution: false,
+            rejected_cross_ceremony_phrase: false,
+            confirmation_mode: String::new(),
+            rejected_missing_grant: false,
+            rejected_expired_grant: false,
+            rejected_spent_grant: false,
+            rejected_wrong_operation_grant: false,
+        });
+    record_performed_ceremonies_from_protected_state(&root, "restore_apply", &mut records)
+        .expect("record the performed ceremonies");
+    assert_eq!(
+        records.ceremony_records.len(),
+        1,
+        "governance field 21 carries {} records over a root holding one CONSUMED authorization and one still issued: {:?}; an authorization in flight is not a performed ceremony",
+        records.ceremony_records.len(),
+        records
+            .ceremony_records
+            .iter()
+            .map(|c| &c.authorization_id)
+            .collect::<Vec<_>>()
+    );
+    let recorded = &records.ceremony_records[0];
+    assert_eq!(recorded.authorization_id, CONSUMED_ID);
+    assert_eq!(recorded.operation_id, OPERATION_ID);
+    assert_eq!(recorded.issued_at, "2020-01-01T01:00:00Z");
+    assert_eq!(recorded.expires_at, "2020-01-01T01:05:00Z");
+    assert!(
+        recorded.consumed_exactly_once,
+        "a consumed authorization was recorded as not consumed exactly once"
+    );
+
+    // A second read of the same root records nothing further: the ceremony
+    // happened once and field 21 must not grow every time it is consulted.
+    record_performed_ceremonies_from_protected_state(&root, "restore_apply", &mut records)
+        .expect("the second read");
+    assert_eq!(
+        records.ceremony_records.len(),
+        1,
+        "a second read recorded the same performed ceremony again"
+    );
+
+    // And a root no ceremony was performed against yields nothing at all
+    // rather than failing: that is what an unperformed ceremony looks like.
+    let empty_root = std::env::temp_dir().join(format!("c06-auth-empty-{}", std::process::id()));
+    let empty =
+        read_protected_authorizations(&empty_root, "restore_apply").expect("read an empty root");
+    assert!(
+        empty.is_empty(),
+        "a root with no authorization directory returned {} records",
+        empty.len()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&empty_root);
+}
+
+/// `TestC06TheAuthorizationDirectoriesAreTheBrokersOwn` — holds the
+/// protected-state directory names this file reads governance field 21 out
+/// of to the broker's own declarations, in both directions. A restatement
+/// nothing checks is exactly the shape that fails quietly: a renamed
+/// directory makes the read return nothing, and "no authorization record" is
+/// indistinguishable from "no ceremony was performed".
+#[test]
+fn the_authorization_directories_are_the_brokers_own() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let journal_path = Path::new(manifest)
+        .join("../../crates/adapters/central-adapter-linux/src/broker/recovery_journal.rs");
+    let source = std::fs::read_to_string(&journal_path).unwrap_or_else(|e| {
+        panic!(
+            "read the broker's recovery journal {}: {e}",
+            journal_path.display()
+        )
+    });
+
+    // `pub(crate) const NAME: &str = "value";` — the broker's own string
+    // declarations, read out of its source rather than restated.
+    let mut declared: std::collections::HashMap<String, String> = Default::default();
+    for line in source.lines() {
+        let line = line.trim();
+        if !(line.starts_with("pub(crate) const ") || line.starts_with("const "))
+            || !line.contains(": &str = \"")
+        {
+            continue;
+        }
+        let rest = line.split(" const ").nth(1).unwrap_or(line);
+        let Some((name, tail)) = rest.split_once(": &str = \"") else {
+            continue;
+        };
+        let Some((value, _)) = tail.split_once('"') else {
+            continue;
+        };
+        declared.insert(name.trim().to_owned(), value.to_owned());
+    }
+    assert!(
+        !declared.is_empty(),
+        "{} declares no string constants at all, so this guard read the wrong file and would hold the directory names to nothing",
+        journal_path.display()
+    );
+
+    let mut seen: std::collections::HashSet<&str> = Default::default();
+    for (kind, directory) in RECOVERY_JOURNAL_AUTHORIZATION_DIRECTORIES {
+        let Some(constant) = BROKER_AUTHORIZATION_DIRECTORY_CONSTANTS
+            .iter()
+            .find(|(d, _)| *d == directory)
+            .map(|(_, c)| *c)
+        else {
+            panic!(
+                "ceremony kind {kind:?} reads {directory:?} and no broker constant is named for it, so nothing holds that name to the broker's own"
+            );
+        };
+        seen.insert(directory);
+        assert_eq!(
+            declared.get(constant).map(String::as_str),
+            Some(directory),
+            "this file reads a {kind} ceremony's authorization out of {directory:?} and the broker's {constant} declares {:?}; the read would return nothing, and no authorization record is exactly what an unperformed ceremony looks like",
+            declared.get(constant)
+        );
+    }
+    for (directory, constant) in BROKER_AUTHORIZATION_DIRECTORY_CONSTANTS {
+        assert!(
+            seen.contains(directory),
+            "{directory:?} ({constant}) is pinned here and no ceremony kind reads it; the pin is stale and holds nothing"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The disclosure guards — every expectation the ceremony step and scenario 5
+// state carries its scope disclosure.
+// ---------------------------------------------------------------------------
+
+/// Read one of this suite's own sources; a missing file fails the guard
+/// because a scan over nothing would pass loudest of all.
+fn own_source(file: &str) -> String {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let path = Path::new(manifest).join("tests/c06_acceptance").join(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The body of `fn name(...)` in `source`, from its `fn` keyword to the
+/// closing brace at the same indentation — enough for "does this body call
+/// X" guards without a parser.
+fn fn_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("fn {name}(");
+    let start = source.find(&needle)?;
+    let rest = &source[start..];
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (index, byte) in rest.bytes().enumerate() {
+        match byte {
+            b'{' => {
+                depth += 1;
+                opened = true;
+            }
+            b'}' => {
+                depth -= 1;
+                if opened && depth == 0 {
+                    return Some(&rest[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `TestC06EveryExpectationTheCeremonyStepStatesCarriesItsScopeDisclosure`
+/// — the port's ceremony step is scenario 5's `c06_s5_restore_apply`, whose
+/// expectations must all go through `expect5` (the only route that attaches
+/// `SCENARIO5_SCOPE_DISCLOSURE`). Both halves are checked, each for vacuity:
+/// `expect5` must reference the disclosure AND call `attach_divergence`,
+/// and the s5 body must contain `expect5`/`Disclosing` calls and no direct
+/// `attach_divergence` of its own.
+#[test]
+fn every_expectation_the_ceremony_step_states_carries_its_scope_disclosure() {
+    let source = own_source("scenario5.rs");
+    let wrapper = fn_body(&source, "expect5")
+        .expect("scenario5.rs declares no expect5, so every expectation the ceremony step states reaches the artifact with no scope on it");
+    assert!(
+        wrapper.contains("SCENARIO5_SCOPE_DISCLOSURE"),
+        "expect5 does not reference SCENARIO5_SCOPE_DISCLOSURE, so every expectation the ceremony states reaches the artifact unqualified while still going through the wrapper that is supposed to qualify it"
+    );
+    assert_eq!(
+        wrapper.matches("attach_divergence").count(),
+        1,
+        "expect5 must reach attach_divergence exactly once; zero means the wrapper attaches nothing, and more than one means it attaches something this guard has not read"
+    );
+    let body = fn_body(&source, "c06_s5_restore_apply")
+        .expect("scenario5.rs declares no c06_s5_restore_apply, so this guard is holding nothing to the rule");
+    assert!(
+        !body.contains("attach_divergence"),
+        "the ceremony step states an expectation directly rather than through expect5; the divergence it attaches reaches the evidence artifact with no record of what the ceremony did and did not establish"
+    );
+    assert!(
+        body.contains("expect5(") || body.contains("Disclosing"),
+        "no expectation in the ceremony step is stated through expect5, so this guard is passing over a step that states none -- which is itself the defect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The scenario-5 recorders' contradiction refusals —
+// `TestC06TheScenario5RecordersRefuseACensusThatContradictsItself`.
+// ---------------------------------------------------------------------------
+
+/// `TestC06TheScenario5RecordersRefuseACensusThatContradictsItself` —
+/// exercises `check_quarantine_resolutions` and `check_capacity_reserve` in
+/// both directions: an admissible census/reserve must pass first, or every
+/// refusal below is satisfied by a check that refuses everything.
+#[test]
+fn the_scenario5_recorders_refuse_a_census_that_contradicts_itself() {
+    use crate::evidence::{CapacityReserveRecord, QuarantineByReason, QuarantineResolutions};
+
+    // `TestC06TheCapacityReserveKindIsTheOneTheEmitterAdmits`, folded in:
+    // the kind the recorder admits must be inside the emitter's own
+    // vocabulary, or a recorded entry would fail the whole document at
+    // emit — the last and most expensive step of the run.
+    assert!(
+        crate::evidence::CAPACITY_RESERVE_KINDS.contains(&"restore_reserve"),
+        "the recorder admits kind \"restore_reserve\" and the emitter admits only {:?}",
+        crate::evidence::CAPACITY_RESERVE_KINDS
+    );
+
+    let admissible = QuarantineResolutions {
+        reingested: 4,
+        delete_finalized: 1,
+        by_reason: QuarantineByReason {
+            missing_body: 1,
+            checksum_mismatch: 1,
+            size_mismatch: 1,
+            unexpected_artifact: 1,
+            metadata_mismatch: 1,
+        },
+        ..Default::default()
+    };
+    let fresh = crate::fixture::RecordSet::default();
+    if let Err(e) = fresh.check_quarantine_resolutions(&admissible) {
+        panic!(
+            "the census recorder refused a census that contradicts nothing: {e}. A check that refuses everything satisfies every refusal below without catching any of them"
+        );
+    }
+    for (label, census) in [
+        (
+            "a non-zero unresolved count at ready",
+            QuarantineResolutions {
+                unresolved: 1,
+                ..admissible.clone()
+            },
+        ),
+        (
+            "findings still open at ready",
+            QuarantineResolutions {
+                open_findings_at_ready: 1,
+                ..admissible.clone()
+            },
+        ),
+        (
+            "a typed breakdown that does not total the typed resolutions",
+            QuarantineResolutions {
+                by_reason: QuarantineByReason {
+                    missing_body: 1,
+                    ..Default::default()
+                },
+                ..admissible.clone()
+            },
+        ),
+        (
+            "a census that resolved nothing",
+            QuarantineResolutions::default(),
+        ),
+    ] {
+        assert!(
+            crate::fixture::RecordSet::default()
+                .check_quarantine_resolutions(&census)
+                .is_err(),
+            "the census recorder admitted {label}"
+        );
+    }
+    let mut recorded = crate::fixture::RecordSet::default();
+    recorded
+        .record_quarantine_resolutions(admissible.clone())
+        .expect("record the admissible census");
+    assert!(
+        recorded.check_quarantine_resolutions(&admissible).is_err(),
+        "the census recorder admitted a second census, which would replace the state at ready with a later one"
+    );
+
+    // Every reserve entry below carries real byte counts except where the
+    // byte counts ARE the case, so each refusal is earned by the thing its
+    // label names and not by a zero this table left blank.
+    let closed = CapacityReserveRecord {
+        kind: "restore_reserve".to_owned(),
+        device_id: "device-a".to_owned(),
+        role: crate::evidence::CAPACITY_ROLES[0].to_owned(),
+        free_bytes: 9 << 30,
+        reserve_bytes: 4 << 30,
+        allocated_bytes: 4 << 30,
+        released: true,
+        release_confirmed_at: "2026-08-15T00:00:00Z".to_owned(),
+        floor_bytes: 0,
+        projected_demand_bytes: 0,
+    };
+    let fresh = crate::fixture::RecordSet::default();
+    if let Err(e) = fresh.check_capacity_reserve(std::slice::from_ref(&closed)) {
+        panic!("the reserve recorder refused a closed, confirmed release: {e}");
+    }
+    let altered = |mutate: fn(&mut CapacityReserveRecord)| {
+        let mut record = closed.clone();
+        mutate(&mut record);
+        vec![record]
+    };
+    for (label, entries) in [
+        ("an empty census", Vec::new()),
+        (
+            "the backup-admission kind",
+            altered(|r| r.kind = "backup_admission".to_owned()),
+        ),
+        (
+            "an entry with no device identity",
+            altered(|r| r.device_id = String::new()),
+        ),
+        (
+            "an entry outside the role vocabulary",
+            altered(|r| r.role = "scratch".to_owned()),
+        ),
+        (
+            "a release with no confirmation",
+            altered(|r| r.release_confirmed_at = String::new()),
+        ),
+        (
+            "an allocation that was never released",
+            altered(|r| {
+                r.released = false;
+                r.release_confirmed_at = String::new();
+            }),
+        ),
+        (
+            "a zero-byte entry that claims a confirmed release",
+            altered(|r| {
+                r.reserve_bytes = 0;
+                r.allocated_bytes = 0;
+            }),
+        ),
+        (
+            "an entry that reserved bytes and allocated none",
+            altered(|r| r.allocated_bytes = 0),
+        ),
+        (
+            "an entry that allocated bytes it never reserved",
+            altered(|r| r.reserve_bytes = 0),
+        ),
+    ] {
+        assert!(
+            crate::fixture::RecordSet::default()
+                .check_capacity_reserve(&entries)
+                .is_err(),
+            "the reserve recorder admitted {label}"
+        );
+    }
+    let mut recorded = crate::fixture::RecordSet::default();
+    recorded
+        .record_capacity_reserve(vec![closed.clone()])
+        .expect("record the closed reserve");
+    assert!(
+        recorded.check_capacity_reserve(&[closed]).is_err(),
+        "the reserve recorder admitted a second census"
+    );
+}

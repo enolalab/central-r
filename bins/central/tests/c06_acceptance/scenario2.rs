@@ -2412,6 +2412,45 @@ fn the_corruption_plan_covers_every_quarantine_reason_and_injures_both_surfaces(
     );
 }
 
+/// `TestC06TheSeededReadyKeyIsTheKeyTheProductionReaderDerives` — the
+/// suite composes the ready key in exactly one place, and that place must
+/// produce keys the adapter's own `READY_PREFIX`/`STAGING_PREFIX`
+/// constants admit. The constants are private, so the pin reads them out
+/// of the adapter source; a prefix that drifted would make every seeded
+/// object unreachable by the very reads the scenario performs.
+#[test]
+fn the_seeded_ready_key_is_the_key_the_production_reader_derives() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let store_path = std::path::Path::new(manifest)
+        .join("../../crates/adapters/central-adapter-s3/src/store.rs");
+    let source = std::fs::read_to_string(&store_path)
+        .unwrap_or_else(|e| panic!("read the adapter store {}: {e}", store_path.display()));
+    let declared = |name: &str| -> String {
+        let needle = format!("{name}: &str = \"");
+        let at = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{name} is not declared in the adapter source; this pin would hold the key shape to nothing"));
+        source[at + needle.len()..]
+            .split('"')
+            .next()
+            .expect("a quoted prefix")
+            .to_owned()
+    };
+    let ready = declared("READY_PREFIX");
+    let staging = declared("STAGING_PREFIX");
+    let ready_key = derive_ready_key("w", "a", "0");
+    let staging_key = derive_staging_key("w", "a", "0");
+    assert!(
+        ready_key.starts_with(&ready),
+        "the suite composes {ready_key:?} and the adapter's READY_PREFIX is {ready:?}; the seeded corpus would seed under a key no production read can find"
+    );
+    assert!(
+        staging_key.starts_with(&staging),
+        "the suite composes {staging_key:?} and the adapter's STAGING_PREFIX is {staging:?}"
+    );
+    assert_ne!(ready, staging, "the two prefixes must differ");
+}
+
 /// `TestC06TheCorruptionPlanIsAnchoredToTheDomainSource` — the enumeration
 /// the plan is written against is checked by reading the domain source, so
 /// a reason added to the domain without a case here goes red rather than

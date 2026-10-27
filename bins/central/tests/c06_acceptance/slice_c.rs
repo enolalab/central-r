@@ -510,20 +510,45 @@ fn every_expectation_scenario_10_states_carries_the_packet_divergence() {
     );
 }
 
-/// `TestC06TheAuthorizationDirectoriesAreTheBrokersOwn` — the authorization
-/// directories the performed-ceremony read walks are the broker's own,
-/// pinned by source scan of the adapter's grant store.
+/// `TestC06TheBuildCensusIsCompilePresence` — upstream's `build_tags` and
+/// `cgo_enabled` are populated by files that only compile under the tag;
+/// the port's equivalent fact is the adapter's `build.rs` `-lpam` link
+/// flag, without which the helper's PAM FFI would not link and this suite
+/// would not build at all. The test pins the emitted profile fields AND
+/// the flag the always-linked claim rests on, so neither is a bare
+/// constant nothing checks.
 #[test]
-fn the_authorization_directories_are_the_brokers_own() {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let grant =
-        Path::new(manifest).join("../../crates/adapters/central-adapter-linux/src/helper/grant.rs");
-    let source = std::fs::read_to_string(&grant).unwrap_or_default();
+fn the_build_census_is_compile_presence() {
+    let profile = fixture::measure_privilege_profile();
+    for tag in ["referencehost", "pam"] {
+        assert!(
+            profile.build_tags.iter().any(|t| t == tag),
+            "privilege_profile.build_tags {tag:?} absent from {:?}; the census must report the conditional-build set the field exists to carry",
+            profile.build_tags
+        );
+    }
     assert!(
-        source.contains("authorization") || source.contains("grant"),
-        "the broker's authorization store must live in the adapter's grant module"
+        profile.cgo_enabled,
+        "privilege_profile.cgo_enabled is false; the Rust adapter links libpam natively, so the cgo/pam distinction collapses to true -- and a census that stopped carrying it would hide a build that cannot run the ceremonies"
+    );
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let build_rs = Path::new(manifest).join("../../crates/adapters/central-adapter-linux/build.rs");
+    let source = std::fs::read_to_string(&build_rs).unwrap_or_else(|e| {
+        panic!(
+            "read the adapter build script {}: {e}; without it the always-linked claim has nothing behind it",
+            build_rs.display()
+        )
+    });
+    assert!(
+        source.contains("cargo:rustc-link-lib=pam"),
+        "the adapter's build script no longer emits -lpam; the privilege profile's cgo_enabled=true and its pam build tag are then claims about a link the build does not make"
     );
 }
+
+// `TestC06TheAuthorizationDirectoriesAreTheBrokersOwn` lives in
+// ceremony.rs beside the read it pins: it parses the broker's
+// `recovery_journal.rs` constants and holds every directory the performed-
+// ceremony read uses to the broker's own declaration, in both directions.
 
 /// `TestC06ScenarioReconciliationIsATestMainFact` — Rust has no TestMain;
 /// the equivalent is a dedicated test that reconciles what the whole run
