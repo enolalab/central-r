@@ -56,6 +56,7 @@ use super::provisioning::{
     self, ProvisioningRecord, ProvisioningStore, ReplaceProvisioningRecordRequest,
 };
 use super::recovery_journal::RecoveryJournalStore;
+use super::restore_capacity;
 use super::restore_launch::RestoreLaunchStore;
 use super::secret_bootstrap::SecretBootstrap;
 use super::signing::{Ed25519Signer, SigningService};
@@ -179,6 +180,16 @@ pub struct Service {
     pub backup_launches: Option<BackupLaunchStore>,
     /// Restore engine launch evidence (`s.restoreLaunches`).
     pub restore_launches: Option<RestoreLaunchStore>,
+    /// The restore-capacity reserve record store
+    /// (`s.restoreCapacityReserves`).
+    pub(crate) restore_capacity_reserves: Option<restore_capacity::store::ReserveStore>,
+    /// The restore-capacity receipt ledger
+    /// (`s.restoreCapacityReceipts`).
+    pub(crate) restore_capacity_receipts: Option<restore_capacity::receipt::ReceiptStore>,
+    /// The role-root layout (`s.roleRoots`) the reserve-object
+    /// resolver works beneath; `None` when this daemon was not given
+    /// one — the upstream `RoleRoots()` unavailable answer.
+    pub(crate) role_roots: Option<central_backup::backup::capacity::RoleRoots>,
     /// The C02 throughput journal (`s.throughput`).
     pub throughput: Option<Arc<ThroughputJournalStore>>,
     /// The throughput probe launch store (`s.throughputLaunches`).
@@ -298,6 +309,17 @@ impl Service {
             signing.clone(),
             recovery_journal.clone(),
         )?);
+        // `newServiceWithHelperExecutable`'s unconditional stores: the
+        // reserve record store and the receipt ledger, both rooted at
+        // the broker root upstream passes them.
+        let restore_capacity_reserves = Some(restore_capacity::store::ReserveStore::new(
+            &root_path,
+            signing.clone(),
+        )?);
+        let restore_capacity_receipts = Some(restore_capacity::receipt::ReceiptStore::new(
+            &root_path,
+            signing.clone(),
+        )?);
         Ok(Self {
             root_path,
             backend,
@@ -312,6 +334,9 @@ impl Service {
             recovery_journal: Some(recovery_journal),
             backup_launches,
             restore_launches,
+            restore_capacity_reserves,
+            restore_capacity_receipts,
+            role_roots: None,
             throughput: Some(throughput),
             throughput_launches,
             handoff,
@@ -365,6 +390,9 @@ impl Service {
             recovery_journal,
             backup_launches,
             restore_launches,
+            restore_capacity_reserves: None,
+            restore_capacity_receipts: None,
+            role_roots: None,
             throughput,
             throughput_launches,
             handoff,
@@ -377,6 +405,41 @@ impl Service {
                 bootstrap_value: Vec::new(),
             }),
         }
+    }
+
+    /// `NewServiceWithRoleRoots`'s delta — attach the role-root layout
+    /// the reserve-object resolver and allocation plan work beneath.
+    /// Upstream constructs the daemon with the layout it discovered;
+    /// `None` (the compose default) is the `RoleRoots()` unavailable
+    /// answer.
+    pub(crate) fn set_role_roots(&mut self, roots: central_backup::backup::capacity::RoleRoots) {
+        self.role_roots = Some(roots);
+    }
+
+    /// `NewServiceWithRoleRoots`'s store composition over the same
+    /// root — attach pre-built restore-capacity stores; `Service::new`
+    /// already constructs both unconditionally, so this only serves
+    /// the `compose` test seam.
+    pub(crate) fn set_restore_capacity_stores(
+        &mut self,
+        reserves: Option<restore_capacity::store::ReserveStore>,
+        receipts: Option<restore_capacity::receipt::ReceiptStore>,
+    ) {
+        self.restore_capacity_reserves = reserves;
+        self.restore_capacity_receipts = receipts;
+    }
+
+    /// `s.RoleRoots()` — the unavailable answer when no layout was
+    /// composed.
+    pub(crate) fn role_roots(
+        &self,
+    ) -> Result<&central_backup::backup::capacity::RoleRoots, Failure> {
+        self.role_roots.as_ref().ok_or_else(|| {
+            Failure::internal(
+                "broker_restore_capacity",
+                "broker: restore capacity role roots unavailable",
+            )
+        })
     }
 
     // ------------------------------------------------------------------

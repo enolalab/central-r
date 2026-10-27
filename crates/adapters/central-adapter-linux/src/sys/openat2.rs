@@ -71,7 +71,26 @@ pub fn resolve_with<Fd: AsFd>(
     oflags: OFlags,
     resolve: ResolveFlags,
 ) -> Result<OwnedFd, Errno> {
-    openat2(root, rel, oflags | OFlags::CLOEXEC, Mode::empty(), resolve)
+    resolve_with_mode(root, rel, oflags, Mode::empty(), resolve)
+}
+
+/// [`resolve_with`] plus a creation `mode`. Upstream documents the
+/// `openat2(2)` discipline (restore_capacity_reserve_store_path_linux.go):
+/// `build_open_flags()` refuses a non-zero `open_how.mode` with `EINVAL`
+/// unless `O_CREAT` or `O_TMPFILE` is present — so callers must pass a
+/// mode *only* on create flags, never unconditionally. This split keeps
+/// that rule in one audited call site.
+///
+/// # Errors
+/// The `openat2` `Errno` unchanged.
+pub fn resolve_with_mode<Fd: AsFd>(
+    root: Fd,
+    rel: &Path,
+    oflags: OFlags,
+    mode: Mode,
+    resolve: ResolveFlags,
+) -> Result<OwnedFd, Errno> {
+    openat2(root, rel, oflags | OFlags::CLOEXEC, mode, resolve)
 }
 
 /// `ResolveDirectory` — [`resolve`] with `O_DIRECTORY|O_NOFOLLOW`:
