@@ -633,7 +633,6 @@ pub(crate) struct ProductionBackupMinioPreparer {
     now: fn() -> OffsetDateTime,
 }
 
-#[allow(dead_code)] // F3 commits the daemon wiring that calls these.
 impl ProductionBackupMinioPreparer {
     /// `newProductionBackupMinioPreparer`.
     pub(crate) fn new_production(
@@ -820,7 +819,6 @@ impl ProductionBackupMinioPreparer {
     }
 }
 
-#[allow(dead_code)] // F3 commits the gate that calls this.
 impl ProductionBackupMinioPreparer {
     /// `PrepareBackupThroughputMinio` — the same read-only,
     /// operation-bound backup identity for a C02 probe. A throughput

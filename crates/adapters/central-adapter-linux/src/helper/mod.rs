@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod backup;
+pub(crate) mod backup_throughput;
 pub mod browser;
 pub mod browser_runtime;
 pub mod client;
@@ -18,6 +19,8 @@ pub mod matrix;
 pub mod migration;
 pub mod migration_launch;
 pub(crate) mod minio_provision;
+pub(crate) mod pg_credentials;
+pub(crate) mod pg_wire;
 pub mod pam_ceremony;
 pub mod prepare;
 pub mod protocol;

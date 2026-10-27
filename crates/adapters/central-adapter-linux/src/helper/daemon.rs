@@ -338,6 +338,23 @@ pub fn run_helper_daemon(
                 return 6;
             }
         };
+    // `newProductionBackupMinioPreparer` — the real provisioner
+    // chain behind `backup create`'s operation-bound MinIO handoff.
+    // Upstream fails the helper composition when it cannot be built;
+    // the same exit here rather than serving a half seam.
+    let backup_minio =
+        match crate::helper::minio_provision::ProductionBackupMinioPreparer::new_production(
+            &composition,
+            &broker_path,
+        ) {
+            Ok(preparer) => {
+                Box::new(preparer) as Box<dyn super::backup::BackupMinioCredentialPreparer>
+            }
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {}", e.message());
+                return 6;
+            }
+        };
     let resolving = Arc::new(
         super::restore_resolvers::ResolvingRestoreOperationHandler::new(
             Some(Box::new(
@@ -402,45 +419,52 @@ pub fn run_helper_daemon(
         migration_outcome: Some(Box::new(
             super::migration_launch::ProductionMigrationOutcomeReader::new(broker_socket_path(env)),
         )),
-        // `newProductionBackupCreateHandler` — the seams this slice
-        // can honestly produce are installed; the C02 throughput
-        // fixture gate and the MinIO provisioner preparer are later
-        // composition (their production chains are the same
-        // capacity-role machinery the restore engine launcher owns).
-        // `None` on those two keeps upstream's completeness gate
-        // reachable: the verb answers
-        // `BACKUP_CREATE_AUTHORIZATION_REQUIRED`, its own refusal —
-        // never `UNSUPPORTED`, never a made-up success.
-        backup_create: Some(Box::new(
-            super::backup::BackupCreateHandler::new_incomplete(
-                Some(Box::new(PamConfirmer::new())),
-                None,
-                Some(Box::new(
-                    crate::broker::backup_authority::BackupLaunchIssuer::new(broker_path.clone()),
+        // `newProductionBackupThroughputGateForComposition` — the
+        // complete C02 authority chain: PostgreSQL fixture
+        // provisioner, MinIO fixture manager, cleanup census,
+        // broker throughput authority + launch issuer, native backup
+        // process launcher, static binding builder, gate. Upstream
+        // fails helper composition when it cannot be built.
+        backup_create: {
+            let throughput = match crate::helper::backup_throughput::ProductionBackupThroughputGate::new_production_for_composition(&composition, &broker_path) {
+                Ok(gate) => gate,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {}", e.message());
+                    return 6;
+                }
+            };
+            // `newProductionBackupCreateHandler` — every seam the
+            // production handler needs is installed: confirmer, C01/
+            // C02 throughput gate, launch issuer, MinIO preparer,
+            // fixed repository source, native launcher, attestor,
+            // broker reaper + completer.
+            Some(Box::new(super::backup::BackupCreateHandler::new(
+                Box::new(PamConfirmer::new()),
+                Box::new(throughput),
+                Box::new(crate::broker::backup_authority::BackupLaunchIssuer::new(
+                    broker_path.clone(),
                 )),
-                None,
-                Some(Box::new(super::backup::FixedBackupRepositorySource {
+                backup_minio,
+                Box::new(super::backup::FixedBackupRepositorySource {
                     root: backup_repository_root.clone(),
                     instance_id: composition.instance_id.clone(),
-                })),
-                Some(Box::new(super::backup::NativeBackupProcessLauncher::new())),
-                Some(Box::new(
-                    super::backup::DescriptorBackupRepositoryAttestor {
-                        profile: central_backup::backup::capacity::default_recovery_profile(),
-                    },
-                )),
-                Some(Box::new(
+                }),
+                Box::new(super::backup::NativeBackupProcessLauncher::new()),
+                Box::new(super::backup::DescriptorBackupRepositoryAttestor {
+                    profile: central_backup::backup::capacity::default_recovery_profile(),
+                }),
+                Box::new(
                     crate::broker::backup_authority::BackupAttestationClient::new(
                         broker_path.clone(),
                     ),
-                )),
-                Some(Box::new(
+                ),
+                Box::new(
                     crate::broker::backup_authority::BackupAttestationClient::new(
                         broker_path.clone(),
                     ),
-                )),
-            ),
-        )),
+                ),
+            )))
+        },
         // `newProductionBackupReadHandler` — the fixed descriptor
         // source plus the root-helper-only broker read client and
         // the default recovery profile; every seam real.

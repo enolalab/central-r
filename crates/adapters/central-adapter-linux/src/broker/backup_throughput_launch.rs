@@ -229,8 +229,11 @@ fn de_duration_ns<'de, D: serde::Deserializer<'de>>(d: D) -> Result<time::Durati
     Ok(time::Duration::nanoseconds(ns))
 }
 
-/// `BackupThroughputLaunchStatus`.
-#[derive(Debug, Clone, Serialize)]
+/// `BackupThroughputLaunchStatus`. `Deserialize` is the
+/// root-helper's read half (`BackupThroughputLaunchIssuer.ReadState`)
+/// — `default` covers every field the omitempty rules may drop,
+/// exactly like Go's zero-value decode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupThroughputLaunchStatus {
     pub supervisor_launch_id: Uuid,
     pub launch_evidence_id: Uuid,
@@ -246,8 +249,10 @@ pub struct BackupThroughputLaunchStatus {
     pub target_locked_at: OffsetDateTime,
     #[serde(
         rename = "fixture_load_elapsed",
+        default,
         skip_serializing_if = "duration_is_zero",
-        serialize_with = "ser_duration_ns"
+        serialize_with = "ser_duration_ns",
+        deserialize_with = "de_duration_ns"
     )]
     pub fixture_load_elapsed: time::Duration,
     #[serde(default, skip_serializing_if = "String::is_empty")]
