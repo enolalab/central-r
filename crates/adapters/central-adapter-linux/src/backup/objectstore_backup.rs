@@ -67,11 +67,9 @@ fn validate_backup_credential_descriptor<Fd: AsFd>(fd: Fd) -> Result<(), Failure
 }
 
 /// `zeroBackupCredential` — the credential buffer's only dead state
-/// is zeroed bytes.
+/// is zeroed bytes. `zeroize` prevents dead-store elimination.
 fn zero_backup_credential(value: &mut [u8]) {
-    for byte in value.iter_mut() {
-        *byte = 0;
-    }
+    zeroize::Zeroize::zeroize(value);
 }
 
 /// The shared `New*FromSealedCredential` body: read the bounded sealed
@@ -108,8 +106,19 @@ fn recovery_store_from_sealed_credential(mut credential: File) -> Result<S3Objec
         zero_backup_credential(&mut value);
         return Err(backup_credential_unavailable());
     }
-    let access_key_id = String::from_utf8_lossy(&value[..separator]).into_owned();
-    let secret_access_key = String::from_utf8_lossy(&value[separator + 1..]).into_owned();
+    // Upstream passes the raw bytes into Go strings verbatim; `String`
+    // requires UTF-8, and a malformed secret must refuse rather than
+    // become a different secret via lossy conversion.
+    let Ok(access_key_id) = std::str::from_utf8(&value[..separator]) else {
+        zero_backup_credential(&mut value);
+        return Err(backup_credential_unavailable());
+    };
+    let Ok(secret_access_key) = std::str::from_utf8(&value[separator + 1..]) else {
+        zero_backup_credential(&mut value);
+        return Err(backup_credential_unavailable());
+    };
+    let access_key_id = access_key_id.to_owned();
+    let secret_access_key = secret_access_key.to_owned();
     zero_backup_credential(&mut value);
     S3ObjectStore::new(Config {
         endpoint: RECOVERY_OBJECT_ENDPOINT.into(),

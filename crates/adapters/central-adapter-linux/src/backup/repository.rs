@@ -1102,7 +1102,7 @@ pub(crate) fn verify_unsealed_backup_at(
             require_exact_directory_entries(&fanout_dir, expected_names, &BTreeSet::new())
                 .map_err(|_| corrupt_evidence())?;
             files.push(FileTreeEntryWire {
-                logical_reference: format!("bodies/sha256/{encoded}"),
+                logical_reference: format!("bodies/sha256/{}/{}", &encoded[..2], &encoded[2..]),
                 size,
                 digest_sha256: encoded.clone(),
             });
