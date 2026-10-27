@@ -719,6 +719,7 @@ dependencies = [
  "central-execution",
  "central-foundation",
  "central-harness",
+ "central-infra",
  "central-kernel",
  "central-retry",
  "central-runsubmit",
@@ -988,6 +989,7 @@ dependencies = [
  "time",
  "trait-variant",
  "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ pub mod advisory;
 pub mod app;
 pub mod authority;
 pub mod config;
+pub mod destructive;
 pub mod domain;
 pub mod lifecycle;
 pub mod port;
