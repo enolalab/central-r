@@ -263,6 +263,52 @@ pub fn run_helper_daemon(
     // the fixed instance/target scope are all real. Upstream fails
     // the whole composition when the client cannot be built, so the
     // daemon exits 6 here too rather than serving a half seam.
+    // `newProductionRestoreEngineLauncher` — the one launcher the
+    // apply/resume handler and the verify runner share, exactly as
+    // upstream's `restoreLauncher` is handed to both. A launcher that
+    // cannot resolve its protected root or repository fails the
+    // whole helper composition, upstream's `return nil, err`.
+    let restore_launcher =
+        match super::restore_launcher::ProductionRestoreEngineLauncher::new_production(
+            &composition,
+            &broker_path,
+        ) {
+            Ok(launcher) => Arc::new(launcher),
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {}", e.message());
+                return 6;
+            }
+        };
+    // `newProductionRestoreApplyHandler` — upstream composes the
+    // destructive path `WithEngine` only: the fresh ceremony's
+    // one-use authorization never leaves this root process — it is
+    // spent inside the launch, so a confirmation cannot be harvested
+    // and replayed against a differently composed engine. The one
+    // handler backs both apply and resume, upstream's
+    // `apply: restoreApply, resume: restoreApply`.
+    let restore_apply_issuer =
+        match crate::broker::recovery_authority::RestoreApplyAuthorizationIssuer::new(
+            broker_path.clone(),
+        ) {
+            Ok(issuer) => issuer,
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {}", e.message());
+                return 6;
+            }
+        };
+    let restore_operations = Arc::new(
+        super::restore::RestoreApplyAuthorizationHandler::with_engine(
+            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(restore_apply_issuer)),
+            CeremonyScope {
+                instance_id: "default".to_owned(),
+                target_id: "postgres:central".to_owned(),
+            },
+            Box::new(super::restore_launcher::SharedRestoreEngineLauncher(
+                restore_launcher.clone(),
+            )),
+        ),
+    );
     let restore_abandon =
         match crate::broker::recovery_authority::RestoreAbandonClient::new(broker_path.clone()) {
             Ok(client) => Some(Box::new(super::restore::RestoreAbandonHandlerImpl::new(
@@ -380,24 +426,35 @@ pub fn run_helper_daemon(
             ),
             central_backup::backup::capacity::default_recovery_profile(),
         ))),
-        // `newProductionRestoreAbandonHandler` — the one restore verb
-        // this slice can compose honestly: abandonment launches no
-        // engine and allocates no reserve, so it needs only the fresh
-        // ceremony confirmer, the narrow broker client, and the fixed
-        // helper-owned scope. Apply/resume stay unset: upstream
-        // composes them `WithEngine` — the authorization never leaves
-        // the root process — and the engine launcher is the T8
-        // capacity-transport machinery, so installing the no-engine
-        // form here would hand the one-use authorization to the
-        // operator, exactly the leak upstream's composition refuses.
+        // `newProductionRestoreAbandonHandler` — abandonment launches
+        // no engine and allocates no reserve, so it needs only the
+        // fresh ceremony confirmer, the narrow broker client, and the
+        // fixed helper-owned scope.
         restore_abandon,
-        // `restore_verify`/`restore_apply`/`restore_resume` stay
-        // unset for the same chain reason: the production runner and
-        // engine launcher are the restore binary's composition
-        // (T9). Their dispatch arms answer upstream's
-        // exact `*_UNAVAILABLE`/`RESTORE_*_AUTHORIZATION_UNAVAILABLE`.
-        // `restore_verify` would mint a ticket a no-engine apply
-        // cannot consume — the refusal is honest, the reach is not.
+        // `apply: restoreApply, resume: restoreApply` — upstream's
+        // exact sharing: the one `WithEngine` handler backs both
+        // destructive verbs, so a single `Arc` clones into both
+        // slots. The one-use authorization is spent inside the
+        // launch; it never reaches the operator.
+        restore_apply: Some(Box::new(restore_operations.clone())),
+        restore_resume: Some(Box::new(restore_operations)),
+        // `newProductionRestoreVerifyHandler` — the non-mutating
+        // verify path: the same engine launcher (as its
+        // `RestoreVerifyLauncher` face), the repository's own
+        // sealed-backup index as the candidate source, and nothing
+        // else — no PAM confirmer, no issuer, no abandonment
+        // authority.
+        restore_verify: Some(Box::new(super::restore::RestoreVerifyHandlerImpl::new(
+            Some(Box::new(
+                super::restore_launcher::ProductionRestoreVerifyRunner::new(
+                    restore_launcher.clone(),
+                    Box::new(super::restore_launcher::RepositoryRestoreVerifyCandidates {
+                        root: backup_repository_root.clone(),
+                        instance_id: composition.instance_id.clone(),
+                    }),
+                ),
+            )),
+        ))),
         // `lifecycle` stays unset for the same dependency-chain reason,
         // one link deeper: `infra::lifecycle::new_production_service`
         // needs (1) the B01 advisory evaluator — the same deferred seam

@@ -621,6 +621,37 @@ impl RestoreApplyAuthorizationHandler {
     }
 }
 
+/// `Arc` handles on the one [`RestoreApplyAuthorizationHandler`]
+/// satisfy both handler ports: upstream's `newHelperServer` installs
+/// the same `*helper.RestoreApplyAuthorizationHandler` as `apply` and
+/// `resume`, and the helper `Server`'s two `Box<dyn>` fields are the
+/// Rust shape of that sharing — the `Arc` clones are the sharing.
+impl RestoreApplyHandler for std::sync::Arc<RestoreApplyAuthorizationHandler> {
+    fn authorize_restore_apply(
+        &self,
+        deadline: Instant,
+        request: RestoreApplyRequest,
+        peer: &PeerIdentity,
+    ) -> Response {
+        self.as_ref()
+            .authorize_restore_apply(deadline, request, peer)
+    }
+}
+
+/// See [`RestoreApplyHandler`]'s `Arc` impl — one handler, both
+/// verbs.
+impl RestoreResumeHandler for std::sync::Arc<RestoreApplyAuthorizationHandler> {
+    fn authorize_restore_resume(
+        &self,
+        deadline: Instant,
+        request: RestoreResumeRequest,
+        peer: &PeerIdentity,
+    ) -> Response {
+        self.as_ref()
+            .authorize_restore_resume(deadline, request, peer)
+    }
+}
+
 impl RestoreApplyHandler for RestoreApplyAuthorizationHandler {
     fn authorize_restore_apply(
         &self,

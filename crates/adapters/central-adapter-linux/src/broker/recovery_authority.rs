@@ -1140,18 +1140,13 @@ fn recovery_client_denied(what: &str) -> Failure {
 
 /// `RestoreApplyAuthorizationIssuer` — asks the broker to issue a
 /// fresh one-use apply/resume authorization bound to the protected
-/// ticket record; the helper never learns the ticket HMAC.
-/// `dead_code`: the apply/resume handlers this feeds stay
-/// unconfigured until the restore engine launcher lands (upstream
-/// composes them `WithEngine` only — the authorization must never
-/// reach the operator); the type is the R6T7 wire seam that
-/// composition then wires.
-#[allow(dead_code)]
+/// ticket record; the helper never learns the ticket HMAC. The
+/// daemon composes it into the `WithEngine` apply/resume handler —
+/// the authorization never reaches the operator.
 pub struct RestoreApplyAuthorizationIssuer {
     client: LifecycleClient,
 }
 
-#[allow(dead_code)]
 impl RestoreApplyAuthorizationIssuer {
     /// `NewRestoreApplyAuthorizationIssuer`.
     pub fn new(socket_path: std::path::PathBuf) -> Result<Self, Failure> {
@@ -1373,9 +1368,7 @@ impl central_backup::port::RestoreTicketIssuer for Service {
         else {
             return Err(unavailable());
         };
-        let liveness = launches
-            .inspect_liveness(now)
-            .map_err(|_| unavailable())?;
+        let liveness = launches.inspect_liveness(now).map_err(|_| unavailable())?;
         let launch_evidence_id = if liveness.bound {
             liveness.launch_evidence_id
         } else {

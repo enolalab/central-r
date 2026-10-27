@@ -1186,3 +1186,88 @@ pub(crate) fn pg_tool_command(
         })
     };
 }
+
+/// `exec.Cmd{SysProcAttr: {Setpgid, Pdeathsig}}` plus the fixed
+/// inherited-descriptor map `cmd/central-restore` requires (upstream
+/// `restore_engine_launcher.go`'s `command.SysProcAttr` +
+/// `command.ExtraFiles`, which has no `ExtraFiles` equivalent in
+/// `std::process::Command`). The post-fork child runs, in order:
+///
+///   1. `setpgid(0, 0)` — a private process group so a bind/gate
+///      refusal can `kill(-pid)` the whole tree
+///      (`killRestoreEngineProcessGroup` upstream).
+///   2. `prctl(PR_SET_PDEATHSIG, SIGKILL)` — a partially completed
+///      recovery must never outlive the authority that admitted it.
+///   3. `getppid() != parent_pid` → `kill(getpid(), SIGKILL)` —
+///      closes the fork/exec race where the parent already died and
+///      the death signal therefore never fires.
+///   4. For each `(source, target)` in `fd_map`, in caller order:
+///      `dup2(source, target)` — `dup2` clears `CLOEXEC`, so exactly
+///      the mapped descriptors survive `execve` at the fixed numbers
+///      the engine's contract names (3 protected root, 4 repository,
+///      5–8 role roots, 9 launch gate, 10 import staging). When a
+///      source already sits on its target number there is no copy to
+///      make — its own `CLOEXEC` is cleared explicitly with
+///      `fcntl(F_SETFD, 0)` or `execve` would drop it (the
+///      `pg_tool_command` same-descriptor case, generalized).
+///
+/// `fd_map` ordering and collision freedom are the caller's contract:
+/// every source must be a distinct descriptor and every target a
+/// fixed contract number. A source that equals a later target is only
+/// impossible when sources were opened in increasing order — the
+/// launcher's open sequence (root, repository, role roots, gate)
+/// satisfies that by construction, and this wrapper is deliberately
+/// not a general fd-table rewriter.
+///
+/// Installed through `pre_exec` because `CommandExt::pre_exec` is
+/// `unsafe` and every caller lives under `forbid(unsafe_code)`.
+///
+/// SAFETY: the closure runs only in the post-fork child before exec;
+/// every call is an async-signal-safe libc entry point operating on
+/// the child's own copy-on-write pages — the same audit standard as
+/// `child_exec`/`command_run_as`/`pg_tool_command` above. `fd_map`'s
+/// `RawFd` sources name descriptors the parent keeps open until
+/// `spawn` returns; the parent's copies are dropped immediately after
+/// so only the child's fixed-number copies remain.
+pub(crate) fn restore_engine_command(
+    cmd: &mut std::process::Command,
+    fd_map: &[(std::os::fd::RawFd, i32)],
+    parent_pid: u32,
+) {
+    use std::os::unix::process::CommandExt;
+    let fd_map: Vec<(i32, i32)> = fd_map
+        .iter()
+        .map(|(source, target)| (*source, *target))
+        .collect();
+    unsafe {
+        cmd.pre_exec(move || {
+            // 1. Private process group.
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // 2. Parent-death signal.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // 3. Race check — the parent may already have exited
+            //    between fork and prctl.
+            if libc::getppid() as u32 != parent_pid {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+                return Err(std::io::Error::other("parent exited"));
+            }
+            // 4. Fixed descriptor map. `dup2` clears `CLOEXEC` on the
+            //    copy; a source already on its target number gets its
+            //    own `CLOEXEC` cleared instead, or `execve` drops it.
+            for (source, target) in &fd_map {
+                if source == target {
+                    if libc::fcntl(*target, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::dup2(*source, *target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        })
+    };
+}
