@@ -1729,8 +1729,7 @@ fn expect78(id: &str, what: impl AsRef<str>) {
 }
 
 /// `c06PostRestoreStateEquivalence` — C06 scenario 7's body.
-#[test]
-fn c06_s7_state_equivalence() {
+pub(crate) fn c06_s7_state_equivalence() {
     let runner = runner();
     if !runner.armed() {
         return;
@@ -2006,8 +2005,7 @@ pub(crate) fn measure_device_free_floor(
 }
 
 /// `c06MinimumProfileMeasurements` — C06 scenario 8's body.
-#[test]
-fn c06_s8_minimum_profile() {
+pub(crate) fn c06_s8_minimum_profile() {
     let runner = runner();
     if !runner.armed() {
         return;

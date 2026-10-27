@@ -1277,8 +1277,7 @@ pub(crate) fn probe_the_instance_is_still_usable() -> Result<(), String> {
 
 macro_rules! restart_entry {
     ($name:ident, $id:literal, $body:expr) => {
-        #[test]
-        fn $name() {
+        pub(crate) fn $name() {
             let runner = runner();
             if !runner.armed() {
                 return;
@@ -1348,6 +1347,581 @@ restart_entry!(
     "c06.r9.restart_restore_abandoned",
     restart_after_abandonment
 );
+
+// ---------------------------------------------------------------------------
+// The continuous run's one armed entry point —
+// `TestC06TheContinuousRecoverySequence`.
+// ---------------------------------------------------------------------------
+
+/// `DRIVER_SEQUENCE` — the catalogue entries this run drives, in catalogue
+/// order. libtest sees exactly one armed `#[test]`; every entry runs inside
+/// it, so `--test-threads=N` can interleave nothing between two entries and
+/// `gate_the_sequence`'s named predecessor is the ACTUAL predecessor again
+/// rather than the alphabetical one. The ordering pin below holds this list
+/// equal to the installed catalogue position for position, so the two can
+/// never drift apart silently.
+pub(crate) const DRIVER_SEQUENCE: [(&str, fn()); 19] = [
+    ("c06.s1.backup_create", slice_c::c06_s1_backup_create),
+    (
+        "c06.s2.corruption_detected",
+        scenario2::c06_s2_corruption_detected,
+    ),
+    (
+        "c06.s3.restore_verify",
+        crate::scenario34::c06_s3_restore_verify,
+    ),
+    (
+        "c06.s4.restore_ticket_one_use",
+        crate::scenario34::c06_s4_restore_ticket_one_use,
+    ),
+    (
+        "c06.s5.restore_apply",
+        crate::scenario5::c06_s5_restore_apply,
+    ),
+    (
+        "c06.s6.authority_reset",
+        crate::scenario6::c06_s6_authority_reset,
+    ),
+    (
+        "c06.s7.state_equivalence",
+        crate::scenario78::c06_s7_state_equivalence,
+    ),
+    (
+        "c06.s8.minimum_profile",
+        crate::scenario78::c06_s8_minimum_profile,
+    ),
+    (
+        "c06.s9.capacity_below_floor",
+        slice_c::c06_s9_capacity_below_floor,
+    ),
+    (
+        "c06.s10.throughput_below_floor",
+        slice_c::c06_s10_throughput_below_floor,
+    ),
+    (
+        "c06.r1.restart_backup_admitted",
+        c06_r1_restart_backup_admitted,
+    ),
+    (
+        "c06.r2.restart_backup_dumping",
+        c06_r2_restart_backup_dumping,
+    ),
+    (
+        "c06.r3.restart_backup_inventory",
+        c06_r3_restart_backup_inventory,
+    ),
+    (
+        "c06.r4.restart_backup_sealing",
+        c06_r4_restart_backup_sealing,
+    ),
+    (
+        "c06.r5.restart_ticket_consumed",
+        c06_r5_restart_ticket_consumed,
+    ),
+    (
+        "c06.r6.restart_database_replaced",
+        c06_r6_restart_database_replaced,
+    ),
+    (
+        "c06.r7.restart_inventory_verified",
+        c06_r7_restart_inventory_verified,
+    ),
+    (
+        "c06.r8.restart_authority_reset",
+        c06_r8_restart_authority_reset,
+    ),
+    (
+        "c06.r9.restart_restore_abandoned",
+        c06_r9_restart_restore_abandoned,
+    ),
+];
+
+/// `TestC06TheContinuousRecoverySequence` — upstream's single continuous
+/// test, adapted to libtest's parallel world. Each step goes through
+/// `slice_c::scenario`, which records exactly one outcome per catalogue
+/// entry — a failure is recorded before the panic reaches this driver, so
+/// the run continues and the whole catalogue is still accounted for, exactly
+/// as upstream's `t.Run`-per-entry sequence behaves. The driver itself then
+/// fails naming every entry that failed, the way upstream's parent test
+/// reports a failed subtest.
+#[test]
+fn the_continuous_recovery_sequence() {
+    let runner = runner();
+    if !runner.armed() {
+        return;
+    }
+    // Enforce the declared order by construction, not by convention: the
+    // step at each position must be the catalogue entry at that position.
+    let catalogue = runner.catalogue();
+    assert_eq!(
+        catalogue.len(),
+        DRIVER_SEQUENCE.len(),
+        "the installed catalogue declares {} entries and the driver carries {}; the sequence and the declaration have drifted apart",
+        catalogue.len(),
+        DRIVER_SEQUENCE.len()
+    );
+    for (position, (id, step)) in DRIVER_SEQUENCE.iter().enumerate() {
+        assert_eq!(
+            catalogue[position].id, *id,
+            "driver position {position} runs {id:?} and the catalogue declares {:?} there; the continuous run's ordering claim lives in this list and a misaligned one is a silent reorder",
+            catalogue[position].id
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
+    }
+    let mut failed: Vec<String> = Vec::new();
+    for outcome in runner.outcomes() {
+        if outcome.result == crate::runner::Result::Fail {
+            failed.push(outcome.id);
+        }
+    }
+    if !failed.is_empty() {
+        panic!(
+            "the continuous run recorded {} failed catalogue entr{}: {}",
+            failed.len(),
+            if failed.len() == 1 { "y" } else { "ies" },
+            failed.join(", ")
+        );
+    }
+}
+
+/// `TestC06TheContinuousRunDrivesTheCatalogueInOrder` — portable: the
+/// driver list is the catalogue's order, checked position for position over
+/// a fresh copy so a reordered declaration fails here even with no armed
+/// run.
+#[test]
+fn the_continuous_run_drives_the_catalogue_in_order() {
+    let catalogue = crate::catalogue::installed_catalogue();
+    assert_eq!(
+        catalogue.len(),
+        DRIVER_SEQUENCE.len(),
+        "the catalogue declares {} entries and DRIVER_SEQUENCE carries {}",
+        catalogue.len(),
+        DRIVER_SEQUENCE.len()
+    );
+    for (position, entry) in catalogue.iter().enumerate() {
+        assert_eq!(
+            entry.id, DRIVER_SEQUENCE[position].0,
+            "catalogue position {position} is {:?} and DRIVER_SEQUENCE drives {:?} there",
+            entry.id, DRIVER_SEQUENCE[position].0
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The emitted-artifact audit — `c06AuditTheEmittedArtifact`.
+// ---------------------------------------------------------------------------
+
+/// `c06MeasurementsNoEntryProducesYet` — upstream's declaration of the
+/// measurement fields no catalogue entry produces on any host. It is
+/// deliberately a declaration and not derived from the record set: the audit
+/// must know what SHOULD be zero rather than read what happened to be. The
+/// port's producers mirror upstream's — s8 drives the minimum-profile
+/// measurements — so the set is empty, and the audit's rule 5 is then
+/// exercised by `the_artifact_audit_*`'s not-exercised log the same way
+/// upstream's is.
+pub(crate) const MEASUREMENTS_NO_ENTRY_PRODUCES_YET: [profile_measurement::Field; 0] = [];
+
+/// Alias so the audit's wording stays close to upstream's `MeasurementField`.
+mod profile_measurement {
+    pub(crate) type Field = crate::profile::MeasurementField;
+}
+
+/// The emitted measurement for `field`, by name — the audit reads it out of
+/// the decoded artifact rather than trusting the input struct, so a field
+/// emitted under the wrong name shows up here as absent.
+fn emitted_measurement(
+    evidence: &evidence::Evidence,
+    field: crate::profile::MeasurementField,
+) -> &evidence::Measurement {
+    use crate::profile::MeasurementField as F;
+    match field {
+        F::BackupBytesPerSec => &evidence.measurements.backup_bytes_per_sec,
+        F::RestoreBytesPerSec => &evidence.measurements.restore_bytes_per_sec,
+        F::RestoreElapsedSeconds => &evidence.measurements.restore_elapsed_seconds,
+        F::RepositoryBytes => &evidence.measurements.repository_bytes,
+        F::DeviceFreeBytesMin => &evidence.measurements.device_free_bytes_min,
+    }
+}
+
+/// `c06CensusCarries`.
+fn census_carries(census: &crate::runner::Census, id: &str) -> bool {
+    census.entries.iter().any(|entry| entry.id == id)
+}
+
+/// `c06AuditTheEmittedArtifact` — the check that the document says only
+/// what the run established. A pure function over the emitted value and the
+/// record set, so every rule runs on a workstation over a fabricated
+/// artifact — `the_artifact_audit_refuses_every_claim_it_says_it_refuses`
+/// drives each one in both directions. A rule whose first execution is at
+/// the end of the expensive run it exists to protect is a rule nobody has
+/// seen work.
+///
+/// The rules, each for a thing the artifact would otherwise be able to say:
+///  1. THE CATALOGUE IT NAMES IS C06'S — `catalogue_sha256` is the only
+///     field that tells a full run from a narrowed one.
+///  2. EVERY ENTRY IS ACCOUNTED FOR, in the field its kind decides.
+///  3. EVERY RESTART OBSERVATION ANSWERS THE FIVE AND CARRIES ITS OPEN
+///     CARRY-FORWARD — the one free-text field the ratified shape emits on
+///     a PASS, so it is the only place a green artifact can say what it did
+///     not establish.
+///  4. A CEREMONY RECORD IMPLIES A PERFORMED CONFIRMATION — field 21 must
+///     never say a ceremony happened that did not.
+///  5. A MEASUREMENT WITH NO PRODUCER IS EMITTED AS ZERO — a number for a
+///     field declared unproduced would be a reading nobody took.
+///  6. A JOURNAL IN THE ARTIFACT IS ONE SOME WALK CONTRIBUTED — field 22 is
+///     accumulated by `record_journal_walk` as each walk happens; a journal
+///     present with none recorded is one somebody wrote down.
+pub(crate) fn audit_the_emitted_artifact(
+    evidence: &evidence::Evidence,
+    records: Option<&fixture::RecordSet>,
+) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    let catalogue = crate::catalogue::installed_catalogue();
+
+    // 1.
+    let want = crate::catalogue::catalogue_digest(&catalogue);
+    if evidence.catalogue_sha256 != want {
+        problems.push(format!(
+            "the artifact names catalogue {} and C06's own catalogue digests to {want}; catalogue_sha256 is the only field that tells a full run from a narrowed one",
+            evidence.catalogue_sha256
+        ));
+    }
+
+    // 2.
+    let mut accounted = std::collections::HashSet::new();
+    let mut by_id: std::collections::HashMap<&str, &evidence::RestartInjectionRecord> =
+        std::collections::HashMap::new();
+    for scenario in &evidence.scenarios {
+        accounted.insert(scenario.id.as_str());
+    }
+    for injection in &evidence.restart_injections {
+        accounted.insert(injection.id.as_str());
+        by_id.insert(injection.id.as_str(), injection);
+    }
+    for entry in &catalogue {
+        if !accounted.contains(entry.id) && !census_carries(&evidence.skip_census, entry.id) {
+            problems.push(format!(
+                "{} is declared in the catalogue and the artifact carries it neither as a result nor as a skip",
+                entry.id
+            ));
+        }
+        if entry.kind != crate::catalogue::Kind::RestartInjection {
+            continue;
+        }
+        let Some(injection) = by_id.get(entry.id) else {
+            continue;
+        };
+        if injection.boundary != entry.boundary {
+            problems.push(format!(
+                "{} is emitted at boundary {:?} and the catalogue declares {:?}",
+                entry.id, injection.boundary, entry.boundary
+            ));
+        }
+    }
+
+    // 3.
+    for injection in &evidence.restart_injections {
+        for key in RESTART_ASSERTION_KEYS {
+            if !injection
+                .observed_after_restart
+                .contains(&format!("{key}="))
+            {
+                problems.push(format!(
+                    "{}'s observed_after_restart never answers {key}; an assertion absent from the sentence reads to a skimming reader exactly like one that held",
+                    injection.id
+                ));
+            }
+        }
+        if !injection
+            .observed_after_restart
+            .contains(CARRY_FORWARD_MARKER)
+        {
+            problems.push(format!(
+                "{}'s observed_after_restart carries no {CARRY_FORWARD_MARKER:?} label. On a PASS the runner drops the divergence and ScenarioRecord has no other free-text field, so this is the only place a green artifact can tell a reader what the entry did not establish",
+                injection.id
+            ));
+        }
+    }
+
+    // 4.
+    let mut performed = std::collections::HashSet::new();
+    for confirmation in &evidence.destructive_confirmations {
+        performed.insert(confirmation.operation_kind.as_str());
+    }
+    for ceremony in &evidence.ceremony_records {
+        if !performed.contains(ceremony.kind.as_str()) {
+            problems.push(format!(
+                "the artifact carries a {} ceremony record and no destructive confirmation of that kind, so it asserts a ceremony this run did not perform. Every restore operation this suite stands up is begun from an authorization RECORDED against the broker -- scenario 4's disclosed shortcut, still open -- and field 21 must never be readable as evidence that one was performed",
+                ceremony.kind
+            ));
+        }
+    }
+
+    // 5.
+    for field in crate::profile::MEASUREMENT_FIELDS {
+        let measurement = emitted_measurement(evidence, field);
+        if MEASUREMENTS_NO_ENTRY_PRODUCES_YET.contains(&field) && measurement.observed != 0 {
+            problems.push(format!(
+                "{} is declared as having no producer on any host and the artifact carries {} for it; a reading nobody took must not reach a reviewer as a number",
+                field.as_str(),
+                measurement.observed
+            ));
+        }
+    }
+
+    // The record set is the source of everything above; an audit run against
+    // none would be an audit of the document against itself.
+    match records {
+        None => problems.push(
+            "the audit was given no record set, so nothing it checked was compared against what the run recorded"
+                .to_owned(),
+        ),
+        Some(records) => {
+            if evidence.restart_injections.len() != records.restart_observations.len() {
+                problems.push(format!(
+                    "the artifact carries {} restart injections and the run recorded {} observations",
+                    evidence.restart_injections.len(),
+                    records.restart_observations.len()
+                ));
+            }
+            // 6. A JOURNAL IN THE ARTIFACT IS ONE SOME WALK CONTRIBUTED.
+            // `protected_journal_recorded` is set by `record_journal_walk`
+            // and by nothing else. Field 22 is the one field assembled by
+            // accumulation rather than taken whole at the end, precisely so
+            // that it is what the walks contributed; an artifact carrying
+            // operations no walk recorded would be a journal somebody wrote
+            // down.
+            if !evidence.protected_journal.operation_ids.is_empty()
+                && !records.protected_journal_recorded
+            {
+                problems.push(format!(
+                    "the artifact carries a protected journal naming {} operation(s) and the run recorded no journal walk at all; field 22 is accumulated by record_journal_walk as each walk happens, so a journal present here with none recorded is one that reached the document from somewhere other than a walk",
+                    evidence.protected_journal.operation_ids.len()
+                ));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    problems.sort();
+    Err(format!("  - {}", problems.join("\n  - ")))
+}
+
+/// `c06SoundArtifactFixture` — an artifact the audit must accept, and the
+/// record set it must be audited against. Derived from the installed
+/// catalogue rather than written out, so an entry added to C06 appears here
+/// without anyone remembering this fixture — and rule 2 is then genuinely
+/// checked over C06's own catalogue rather than over a frozen copy of it.
+fn sound_artifact_fixture() -> (evidence::Evidence, fixture::RecordSet) {
+    let catalogue = crate::catalogue::installed_catalogue();
+    let assertions: Vec<RestartAssertion> = RESTART_ASSERTION_KEYS
+        .iter()
+        .map(|key| {
+            assertion(
+                key,
+                ASSERTION_HELD,
+                "the fabricated reason this fixture carries",
+            )
+        })
+        .collect();
+    let mut scenarios = Vec::new();
+    let mut injections = Vec::new();
+    let mut records = fixture::RecordSet::default();
+    for entry in &catalogue {
+        if entry.kind == crate::catalogue::Kind::Scenario {
+            scenarios.push(evidence::ScenarioRecord {
+                id: entry.id.to_owned(),
+                packet: entry.packet.as_str().to_owned(),
+                attribution: entry.attribution.as_str().to_owned(),
+                result: evidence::SCENARIO_PASSED,
+                started_at: String::new(),
+                completed_at: String::new(),
+                log_sha256: String::new(),
+                divergence: None,
+            });
+            continue;
+        }
+        let observation = compose_restart_observation(
+            entry.boundary,
+            &assertions,
+            RECORDED_AUTHORIZATION_CARRY_FORWARD,
+        )
+        .unwrap_or_default();
+        injections.push(evidence::RestartInjectionRecord {
+            id: entry.id.to_owned(),
+            boundary: entry.boundary.to_owned(),
+            process: RESTARTED_PROCESS.to_owned(),
+            observed_after_restart: observation.clone(),
+            result: evidence::SCENARIO_PASSED,
+            log_sha256: String::new(),
+            divergence: None,
+        });
+        records
+            .record_restart_observation(entry.id, RESTARTED_PROCESS, &observation)
+            .unwrap_or_else(|e| panic!("the fixture's own observation was refused: {e}"));
+    }
+    (
+        evidence::Evidence {
+            schema: evidence::EVIDENCE_SCHEMA.to_owned(),
+            packet: evidence::EVIDENCE_PACKET.to_owned(),
+            generated_at: String::new(),
+            candidate_commit: String::new(),
+            worktree_clean: true,
+            privilege_profile: Default::default(),
+            tool_versions: Default::default(),
+            catalogue_sha256: crate::catalogue::catalogue_digest(&catalogue),
+            scenarios,
+            skip_census: crate::runner::Census {
+                count: 0,
+                entries: Vec::new(),
+            },
+            measurements: evidence::measurements_from(&Default::default()),
+            capacity_reserve: Vec::new(),
+            ceremony_records: Vec::new(),
+            protected_journal: Default::default(),
+            restart_injections: injections,
+            destructive_confirmations: Vec::new(),
+            quarantine_resolutions: None,
+            authority_reset: Default::default(),
+            image_digests: None,
+            fixture_sha256: Default::default(),
+            dependency_lock_sha256: String::new(),
+            commands: None,
+            artifacts: Vec::new(),
+        },
+        records,
+    )
+}
+
+/// `TestC06TheArtifactAuditRefusesEveryClaimItSaysItRefuses` — portable:
+/// the audit accepts a sound artifact and refuses each named mutation, so
+/// a rule that refused everything (or validated only self-generated values)
+/// is caught here rather than at the end of the armed run it protects.
+#[test]
+fn the_artifact_audit_refuses_every_claim_it_says_it_refuses() {
+    let (sound, records) = sound_artifact_fixture();
+    if let Err(e) = audit_the_emitted_artifact(&sound, Some(&records)) {
+        panic!(
+            "the audit refused a sound artifact:\n{e}\nEvery negative below would then be showing that it refuses everything"
+        );
+    }
+
+    // Upstream derives the "no producer" fabrication from the declaration
+    // rather than hardcoding it. The port's declaration is empty today —
+    // every field has a producer — so the case names itself aloud instead
+    // of passing: "not exercised" must never read as "passed".
+    if MEASUREMENTS_NO_ENTRY_PRODUCES_YET.is_empty() {
+        eprintln!(
+            "NOT EXERCISED, not passed: \"a number for a measurement no entry produces\" -- no measurement is declared as having no producer, so rule 5 has nothing to refuse; the case reactivates when the declaration gains a field"
+        );
+    }
+
+    struct Case {
+        name: &'static str,
+        edit: fn(&mut evidence::Evidence),
+    }
+    for case in [
+        Case {
+            name: "a catalogue digest that is not C06's",
+            edit: |e| {
+                e.catalogue_sha256 = "00".repeat(32);
+            },
+        },
+        Case {
+            name: "a catalogue entry carried neither as a result nor as a skip",
+            edit: |e| {
+                e.scenarios.remove(0);
+            },
+        },
+        Case {
+            name: "a restart injection emitted at a boundary the catalogue does not declare for it",
+            edit: |e| {
+                e.restart_injections[0].boundary = "a boundary nobody declared".to_owned();
+            },
+        },
+        Case {
+            name: "an observation that stops answering one of the five",
+            edit: |e| {
+                e.restart_injections[0].observed_after_restart = e.restart_injections[0]
+                    .observed_after_restart
+                    .replace("no_ticket_replay=", "something_else=");
+            },
+        },
+        Case {
+            name: "an observation that drops its carry-forward label",
+            edit: |e| {
+                e.restart_injections[0].observed_after_restart = e.restart_injections[0]
+                    .observed_after_restart
+                    .replace(CARRY_FORWARD_MARKER, "note:");
+            },
+        },
+        Case {
+            name: "a ceremony record with no performed confirmation behind it",
+            edit: |e| {
+                e.ceremony_records = vec![evidence::CeremonyRecord {
+                    kind: evidence::CEREMONY_KINDS[0].to_owned(),
+                    authorization_id: String::new(),
+                    operation_id: String::new(),
+                    issued_at: String::new(),
+                    expires_at: String::new(),
+                    consumed_exactly_once: false,
+                }];
+                e.destructive_confirmations = Vec::new();
+            },
+        },
+    ] {
+        let (mut edited, fixture_records) = sound_artifact_fixture();
+        (case.edit)(&mut edited);
+        if audit_the_emitted_artifact(&edited, Some(&fixture_records)).is_ok() {
+            panic!("the audit admitted an artifact carrying {}", case.name);
+        }
+    }
+
+    if audit_the_emitted_artifact(&sound, None).is_ok() {
+        panic!(
+            "the audit admitted an artifact with no record set behind it, so nothing it checked was compared against what a run recorded"
+        );
+    }
+
+    // Rule 6, in both directions: a journal over a run that recorded no
+    // walk is refused, and the same artifact over a run that DID record one
+    // is accepted — otherwise the refusal would just be a rule that refuses
+    // every journal.
+    let walk = fixture::JournalWalk {
+        operation_id: Uuid::now_v7().to_string(),
+        phases: vec!["applying".to_owned()],
+        checkpoints: vec![RestoreCheckpoint::TicketConsumed.as_str().to_owned()],
+        ticket_issued: 1,
+        ticket_consumed: 1,
+        boundary: RestoreCheckpoint::TicketConsumed.as_str().to_owned(),
+        state_after_restart: "applying".to_owned(),
+    };
+    let (mut journalled, records) = sound_artifact_fixture();
+    journalled.protected_journal = evidence::ProtectedJournal {
+        operation_ids: vec![walk.operation_id.clone()],
+        ..Default::default()
+    };
+    if audit_the_emitted_artifact(&journalled, Some(&records)).is_ok() {
+        panic!(
+            "the audit admitted an artifact carrying a protected journal over a run that recorded no walk at all; field 22 is accumulated as each walk happens precisely so that it is what the walks contributed"
+        );
+    }
+    let (mut walked, mut walked_records) = sound_artifact_fixture();
+    walked.protected_journal = evidence::ProtectedJournal {
+        operation_ids: vec![walk.operation_id.clone()],
+        ..Default::default()
+    };
+    walked_records
+        .record_journal_walk(walk)
+        .unwrap_or_else(|e| panic!("the fixture's own journal walk was refused: {e}"));
+    if let Err(e) = audit_the_emitted_artifact(&walked, Some(&walked_records)) {
+        panic!(
+            "the audit refused an artifact carrying a protected journal over a run that DID record a walk:\n{e}\nThe refusal above would then be a rule that refuses every journal"
+        );
+    }
+}
 
 // --- CI-PORTABLE entry points. --------------------------------------------
 

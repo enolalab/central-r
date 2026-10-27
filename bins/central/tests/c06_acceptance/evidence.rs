@@ -74,7 +74,7 @@ impl<'de> Deserialize<'de> for ScenarioResult {
 }
 
 /// `PrivilegeProfile` — manifest field 16, measured at run start.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrivilegeProfile {
     pub uid: i64,
     pub gid: i64,
@@ -91,7 +91,7 @@ pub struct PrivilegeProfile {
 }
 
 /// `ToolVersions` — manifest field 17, parsed from the tools' own output.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolVersions {
     pub pg_dump: String,
     pub pg_restore: String,
@@ -122,7 +122,7 @@ pub struct BinaryDigests {
 }
 
 /// `ScenarioRecord` — one entry of manifest field 10.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioRecord {
     pub id: String,
     pub packet: String,
@@ -136,7 +136,7 @@ pub struct ScenarioRecord {
 }
 
 /// `Measurement` — one observation beside the bound it is checked against.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Measurement {
     pub observed: i64,
     pub bound: i64,
@@ -144,7 +144,7 @@ pub struct Measurement {
 }
 
 /// `Measurements` — manifest field 11.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Measurements {
     pub backup_bytes_per_sec: Measurement,
     pub restore_bytes_per_sec: Measurement,
@@ -164,7 +164,7 @@ pub struct ObservedMeasurements {
 }
 
 /// `CapacityReserveRecord` — manifest field 20.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapacityReserveRecord {
     pub kind: String,
     pub device_id: String,
@@ -179,7 +179,7 @@ pub struct CapacityReserveRecord {
 }
 
 /// `CeremonyRecord` — manifest field 21. Opaque UUIDs only; never a nonce.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CeremonyRecord {
     pub kind: String,
     pub authorization_id: String,
@@ -190,7 +190,7 @@ pub struct CeremonyRecord {
 }
 
 /// `ProtectedJournal` — manifest field 22.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProtectedJournal {
     pub operation_ids: Vec<String>,
     pub phase_sequences: HashMap<String, Vec<String>>,
@@ -201,7 +201,7 @@ pub struct ProtectedJournal {
 }
 
 /// `RestartInjectionRecord` — manifest field 23.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestartInjectionRecord {
     pub id: String,
     pub boundary: String,
@@ -220,7 +220,7 @@ pub struct RestartObservation {
 }
 
 /// `DestructiveConfirmation` — manifest field 24. Phrase as digest only.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DestructiveConfirmation {
     pub operation_kind: String,
     pub phrase_sha256: String,
@@ -240,7 +240,7 @@ pub const CONFIRMATION_MODE_TYPED_PHRASE: &str = "typed_phrase";
 pub const CONFIRMATION_MODE_GRANT: &str = "grant";
 
 /// `QuarantineResolutions` — manifest field 25.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuarantineResolutions {
     pub reingested: i64,
     pub delete_finalized: i64,
@@ -249,7 +249,7 @@ pub struct QuarantineResolutions {
     pub by_reason: QuarantineByReason,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuarantineByReason {
     pub missing_body: i64,
     pub checksum_mismatch: i64,
@@ -259,7 +259,7 @@ pub struct QuarantineByReason {
 }
 
 /// `AuthorityReset` — manifest field 26.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthorityReset {
     pub restore_epoch_before: i64,
     pub restore_epoch_after: i64,
@@ -271,7 +271,7 @@ pub struct AuthorityReset {
     pub aggregate_receipt_sha256: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InvalidatedCounts {
     pub sessions: i64,
     pub grants: i64,
@@ -284,7 +284,7 @@ pub struct InvalidatedCounts {
 
 /// `CommandRecord` — manifest field 9: literal command line, env NAMES only,
 /// exit code, result, log digest.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandRecord {
     pub id: String,
     pub command_line: String,
@@ -295,7 +295,7 @@ pub struct CommandRecord {
 }
 
 /// `ArtifactRecord` — one entry of governance field 12.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRecord {
     pub id: String,
     pub checksum_sha256: String,
@@ -309,7 +309,7 @@ pub struct RepoFacts {
 
 /// `EvidenceInputs` — everything the live run measured that the emitter
 /// cannot derive from the runner. `repo_root` never reaches the artifact.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EvidenceInputs {
     pub generated_at: Option<SystemTime>,
     pub repo_root: String,
@@ -322,17 +322,28 @@ pub struct EvidenceInputs {
     pub protected_journal: ProtectedJournal,
     pub restart_observations: HashMap<String, RestartObservation>,
     pub destructive_confirmations: Vec<DestructiveConfirmation>,
-    pub quarantine_resolutions: QuarantineResolutions,
+    /// Governance field 25 — `None` is the not-measured marker: the census
+    /// upstream runs against the recovery audit store is only emitted when a
+    /// run actually recorded it through
+    /// [`crate::fixture::RecordSet::record_quarantine_resolutions`]. A zeroed
+    /// struct would read as "measured, all zero", which is a claim.
+    pub quarantine_resolutions: Option<QuarantineResolutions>,
     pub authority_reset: AuthorityReset,
-    pub image_digests: HashMap<String, String>,
+    /// Governance field 7 — `None` when the run named no containers for the
+    /// emitter's `docker inspect` measurement; `{}` is a MEASURED-empty map
+    /// and is not the same statement.
+    pub image_digests: Option<HashMap<String, String>>,
     pub fixture_sha256: HashMap<String, String>,
-    pub commands: Vec<CommandRecord>,
+    /// Governance field 9 — `None` when nothing was recorded through
+    /// [`crate::fixture::RecordSet::record_command`]; `[]` would claim the
+    /// run recorded its commands and found none.
+    pub commands: Option<Vec<CommandRecord>>,
 }
 
 /// `Evidence` — slice-c-recovery-acceptance.json. Field order is the emitted
 /// key order: serde writes struct fields in declaration order, so this
 /// declaration is the artifact's canonical shape.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Evidence {
     pub schema: String,
     pub packet: String,
@@ -352,12 +363,16 @@ pub struct Evidence {
     pub protected_journal: ProtectedJournal,
     pub restart_injections: Vec<RestartInjectionRecord>,
     pub destructive_confirmations: Vec<DestructiveConfirmation>,
-    pub quarantine_resolutions: QuarantineResolutions,
+    /// `null` (not a zeroed struct) when no census was recorded — the
+    /// not-measured marker, distinct from "measured, all zero".
+    pub quarantine_resolutions: Option<QuarantineResolutions>,
     pub authority_reset: AuthorityReset,
-    pub image_digests: HashMap<String, String>,
+    /// `null` (not `{}`) when the run named no containers to inspect.
+    pub image_digests: Option<HashMap<String, String>>,
     pub fixture_sha256: HashMap<String, String>,
     pub dependency_lock_sha256: String,
-    pub commands: Vec<CommandRecord>,
+    /// `null` (not `[]`) when the run recorded no commands.
+    pub commands: Option<Vec<CommandRecord>>,
     /// Governance field 12 — makes every `log_sha256` dereferenceable.
     pub artifacts: Vec<ArtifactRecord>,
 }
@@ -1449,7 +1464,7 @@ pub fn validate_evidence_inputs(input: &EvidenceInputs) -> Result<(), String> {
             ));
         }
     }
-    for (index, command) in input.commands.iter().enumerate() {
+    for (index, command) in input.commands.iter().flatten().enumerate() {
         if command.command_line.trim().is_empty() {
             return Err(format!(
                 "recovery: commands[{index}] records no command line; governance field 9 requires the literal executed command line"
@@ -1470,12 +1485,16 @@ pub fn validate_evidence_inputs(input: &EvidenceInputs) -> Result<(), String> {
     }
     validate_authority_reset(&input.authority_reset)?;
     validate_protected_journal(&input.protected_journal)?;
-    validate_quarantine_resolutions(&input.quarantine_resolutions)?;
-    for name in sorted_keys(&input.image_digests) {
-        if !is_image_digest(&input.image_digests[name]) {
-            return Err(format!(
-                "recovery: image_digests[{name:?}] is not an @sha256-pinned reference; governance field 7 requires every image pinned by digest with no mutable tag anywhere"
-            ));
+    if let Some(resolutions) = &input.quarantine_resolutions {
+        validate_quarantine_resolutions(resolutions)?;
+    }
+    if let Some(digests) = &input.image_digests {
+        for name in sorted_keys(digests) {
+            if !is_image_digest(&digests[name]) {
+                return Err(format!(
+                    "recovery: image_digests[{name:?}] is not an @sha256-pinned reference; governance field 7 requires every image pinned by digest with no mutable tag anywhere"
+                ));
+            }
         }
     }
     for name in sorted_keys(&input.fixture_sha256) {
@@ -1596,19 +1615,23 @@ fn build(runner: &Runner, input: &EvidenceInputs) -> Result<Evidence, String> {
                 rejected_wrong_operation_grant: d.rejected_wrong_operation_grant,
             })
             .collect(),
-        quarantine_resolutions: QuarantineResolutions {
-            reingested: input.quarantine_resolutions.reingested,
-            delete_finalized: input.quarantine_resolutions.delete_finalized,
-            unresolved: input.quarantine_resolutions.unresolved,
-            open_findings_at_ready: input.quarantine_resolutions.open_findings_at_ready,
-            by_reason: QuarantineByReason {
-                missing_body: input.quarantine_resolutions.by_reason.missing_body,
-                checksum_mismatch: input.quarantine_resolutions.by_reason.checksum_mismatch,
-                size_mismatch: input.quarantine_resolutions.by_reason.size_mismatch,
-                unexpected_artifact: input.quarantine_resolutions.by_reason.unexpected_artifact,
-                metadata_mismatch: input.quarantine_resolutions.by_reason.metadata_mismatch,
-            },
-        },
+        // None passes straight through — a not-measured census emits null,
+        // never a zeroed struct that would read as "measured, all zero".
+        quarantine_resolutions: input.quarantine_resolutions.as_ref().map(|r| {
+            QuarantineResolutions {
+                reingested: r.reingested,
+                delete_finalized: r.delete_finalized,
+                unresolved: r.unresolved,
+                open_findings_at_ready: r.open_findings_at_ready,
+                by_reason: QuarantineByReason {
+                    missing_body: r.by_reason.missing_body,
+                    checksum_mismatch: r.by_reason.checksum_mismatch,
+                    size_mismatch: r.by_reason.size_mismatch,
+                    unexpected_artifact: r.by_reason.unexpected_artifact,
+                    metadata_mismatch: r.by_reason.metadata_mismatch,
+                },
+            }
+        }),
         authority_reset: AuthorityReset {
             restore_epoch_before: input.authority_reset.restore_epoch_before,
             restore_epoch_after: input.authority_reset.restore_epoch_after,
@@ -1630,18 +1653,19 @@ fn build(runner: &Runner, input: &EvidenceInputs) -> Result<Evidence, String> {
         image_digests: input.image_digests.clone(),
         fixture_sha256: input.fixture_sha256.clone(),
         dependency_lock_sha256: lock_digest,
-        commands: input
-            .commands
-            .iter()
-            .map(|c| CommandRecord {
-                id: c.id.clone(),
-                command_line: c.command_line.clone(),
-                env_names: c.env_names.clone(),
-                exit_code: c.exit_code,
-                result: c.result,
-                log_sha256: c.log_sha256.clone(),
-            })
-            .collect(),
+        commands: input.commands.as_ref().map(|commands| {
+            commands
+                .iter()
+                .map(|c| CommandRecord {
+                    id: c.id.clone(),
+                    command_line: c.command_line.clone(),
+                    env_names: c.env_names.clone(),
+                    exit_code: c.exit_code,
+                    result: c.result,
+                    log_sha256: c.log_sha256.clone(),
+                })
+                .collect()
+        }),
         artifacts,
     };
     // Governance rule E-5: a dirty-worktree run is implementation evidence

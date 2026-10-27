@@ -596,12 +596,6 @@ fn run_quarantine_class_battery(narrator: &mut dyn Narrator) -> Result<(), Strin
 // Battery 4 — the capacity reserve's release triggers.
 // ---------------------------------------------------------------------------
 
-fn rfc3339_now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
-}
-
 fn reserve_role_roots(tmp: &TempRoot) -> RoleRoots {
     RoleRoots {
         postgres_data: tmp.0.join("pgdata").to_string_lossy().into_owned(),
@@ -663,26 +657,13 @@ fn run_capacity_reserve_release_battery(narrator: &mut dyn Narrator) -> Result<(
             report.records_intact, report.bytes_released
         ));
     }
-    // The measured reserve records go into the shared record set.
-    {
-        let mut records = crate::fixture::records();
-        if records.capacity_reserve.is_empty() {
-            records
-                .capacity_reserve
-                .push(crate::evidence::CapacityReserveRecord {
-                    kind: "reserve_sweep".to_owned(),
-                    device_id: String::new(),
-                    role: "reserve-helper".to_owned(),
-                    free_bytes: 0,
-                    reserve_bytes: 0,
-                    floor_bytes: 0,
-                    projected_demand_bytes: 0,
-                    allocated_bytes: 0,
-                    released: report.bytes_released > 0,
-                    release_confirmed_at: rfc3339_now(),
-                });
-        }
-    }
+    // NO capacity_reserve record is pushed here: field 20's emitted shape
+    // carries only entries the emitter's own vocabulary admits — kind in
+    // CAPACITY_RESERVE_KINDS, role in CAPACITY_ROLES, a real device
+    // identity — and an empty-root sweep has none of those to report.
+    // Fabricating kind/role/device strings to make the field non-empty is
+    // exactly the emission this suite exists to prevent; the s9 admission
+    // measurement is field 20's honest entry in this port.
     narrator.record(
         "reserve battery: the Reconciliation trigger is refused to a named caller, the five caller-known triggers are exercised against a missing set, and the empty-root sweep published an intact empty report".to_owned()
     );
@@ -696,8 +677,7 @@ fn run_capacity_reserve_release_battery(narrator: &mut dyn Narrator) -> Result<(
 /// `c06.s5.restore_apply` — portable decision batteries plus the apply
 /// ceremony PLAN over the production phrase helpers; the performed child
 /// ceremony is disclosed absent (see the file header).
-#[test]
-fn c06_s5_restore_apply() {
+pub(crate) fn c06_s5_restore_apply() {
     let runner = runner();
     if !runner.armed() {
         return;

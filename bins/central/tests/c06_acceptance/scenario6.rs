@@ -1756,8 +1756,7 @@ fn measure_the_authority_reset(
 
 /// `c06.s6.authority_reset` — batteries 1/2/3 always (armed); the DSN live
 /// leg measures the real reset and records governance field 26.
-#[test]
-fn c06_s6_authority_reset() {
+pub(crate) fn c06_s6_authority_reset() {
     let runner = runner();
     if !runner.armed() {
         return;

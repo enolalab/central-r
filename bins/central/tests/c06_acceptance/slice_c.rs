@@ -183,8 +183,7 @@ pub(crate) fn unmet_precondition(
 /// weakened: a nil throughput gate surfaces as
 /// `BACKUP_CREATE_AUTHORIZATION_REQUIRED`, and a worker-internal capacity
 /// failure renders as `BACKUP_WORKER_FAILED`.
-#[test]
-fn c06_s1_backup_create() {
+pub(crate) fn c06_s1_backup_create() {
     let runner = runner();
     if !runner.armed() {
         return;
@@ -253,6 +252,25 @@ fn c06_s1_backup_create() {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            // Governance field 9, recorded where the invocation is made —
+            // upstream's RecordCommand site for this command. No variable is
+            // set FOR this command: the operator secret is deliberately
+            // STRIPPED from its environment rather than passed, so it is not
+            // a variable that was set and does not appear here.
+            let exit_code = output.status.code().unwrap_or(-1) as i64;
+            let reason = crate::ceremony::reason_from_envelope(&envelope);
+            fixture::records().record_command(
+                id,
+                "central backup create",
+                Vec::new(),
+                exit_code,
+                if exit_code == 0 && reason == "ok" {
+                    crate::evidence::SCENARIO_PASSED
+                } else {
+                    crate::evidence::SCENARIO_FAILED
+                },
+                &crate::evidence::evidence_digest(envelope.as_bytes()),
+            );
             let _ = s;
             let _ = started;
             if output.status.success() {
@@ -272,8 +290,7 @@ fn c06_s1_backup_create() {
 /// refuse before any mutation, observed from the production admission path.
 /// The portable differential (`verify_capacity_refusal_is_about_free_space`)
 /// runs unprivileged in `profile.rs`'s own tests; this is the live half.
-#[test]
-fn c06_s9_capacity_below_floor() {
+pub(crate) fn c06_s9_capacity_below_floor() {
     let runner = runner();
     if !runner.armed() {
         return;
@@ -326,8 +343,12 @@ fn c06_s9_capacity_below_floor() {
                     reserve_bytes: recovery_profile.survival_reserve,
                     floor_bytes: recovery_profile.free_floor,
                     projected_demand_bytes: snapshot.database_bytes + snapshot.object_bytes,
+                    // An admission MEASUREMENT, not a released reserve:
+                    // nothing allocated, nothing released — `released: true`
+                    // with an empty confirmation is the exact shape
+                    // `check_capacity_reserve` exists to refuse.
                     allocated_bytes: 0,
-                    released: true,
+                    released: false,
                     release_confirmed_at: String::new(),
                 });
             let _ = s;
@@ -339,8 +360,7 @@ fn c06_s9_capacity_below_floor() {
 
 /// `c06.s10.throughput_below_floor` — a genuinely slow device produces the
 /// typed outside-profile result the production path actually returns.
-#[test]
-fn c06_s10_throughput_below_floor() {
+pub(crate) fn c06_s10_throughput_below_floor() {
     let runner = runner();
     if !runner.armed() {
         return;
@@ -547,9 +567,17 @@ fn measure_binary_digests() -> evidence::BinaryDigests {
     }
 }
 
-/// `c06EmitEvidence` — writes `slice-c-recovery-acceptance.json` beside the
-/// transcripts under [`fixture::evidence_directory`], after reconciliation.
-/// Armed runs only.
+/// `c06EmitTheEvidenceArtifact` — drives the emitter for real and proves
+/// what it emitted corresponds to what ran.
+///
+/// The order matters, kept verbatim from upstream. The inputs are validated
+/// through the EMITTER'S OWN shape rules first, so a value composed wrong
+/// fails naming the field rather than failing the whole emit at the end.
+/// The census is checked before the emit, so a required skip is reported as
+/// a skip rather than as a reconciliation error. The document is then
+/// emitted twice and required to be byte identical, audited against the run
+/// that produced it, and only then written — to a location outside the
+/// repository, never into it.
 #[test]
 fn zz_emit_the_evidence() {
     let runner = runner();
@@ -561,17 +589,27 @@ fn zz_emit_the_evidence() {
     runner.await_completeness(crate::runner::completeness_wait());
     // Upstream's last gate — after the restart injections and before
     // emission: an instance a restart left unusable must not be covered by
-    // an artifact that reads clean. In this port's parallel schedule the
-    // blame cannot be narrowed to a name the way the sequential upstream
-    // run narrows it to the restart batch; the refusal is the same.
+    // an artifact that reads clean. Under the sequential driver the damage
+    // belongs to the restart batch, exactly as upstream attributes it.
     if let Err(e) = crate::continuous_run::probe_the_instance_is_still_usable() {
         panic!(
-            "after the restart injections' catalogue entries completed, the instance this continuous run shares is no longer usable: {e}.\n\nIn the sequential upstream run the damage belongs to the restart batch; in this port's schedule it belongs to some entry that ran before this probe. Emission is refused either way — an artifact over a damaged instance would carry a health claim the run no longer holds."
+            "after the restart injections' catalogue entries completed, the instance this continuous run shares is no longer usable: {e}.\n\nIn the sequential run the damage belongs to the restart batch. Emission is refused either way — an artifact over a damaged instance would carry a health claim the run no longer holds."
         );
     }
+    // A transcript that could not be persisted during a body's unwind is a
+    // digest committed to bytes that do not exist; refuse rather than write
+    // an artifacts array naming files that are not there.
+    let persist_failures = fixture::take_transcript_failures();
+    if !persist_failures.is_empty() {
+        panic!(
+            "the run committed transcript digests whose bytes could not be persisted:\n  - {}",
+            persist_failures.join("\n  - ")
+        );
+    }
+    let generated_at = std::time::SystemTime::now();
     let records = fixture::records();
     let inputs = EvidenceInputs {
-        generated_at: Some(std::time::SystemTime::now()),
+        generated_at: Some(generated_at),
         repo_root: env!("CARGO_MANIFEST_DIR")
             .trim_end_matches("/bins/central")
             .to_owned(),
@@ -584,23 +622,175 @@ fn zz_emit_the_evidence() {
         protected_journal: records.protected_journal.clone(),
         restart_observations: records.restart_observations.clone(),
         destructive_confirmations: records.destructive_confirmations.clone(),
-        quarantine_resolutions: records.quarantine_resolutions.clone(),
+        // Fields 25, 7 and 9 are Option-typed on the input: None emits the
+        // explicit null not-measured marker, never a zeroed struct, an empty
+        // map, or an empty array that would read as a measurement.
+        quarantine_resolutions: records
+            .quarantine_resolutions_recorded
+            .then(|| records.quarantine_resolutions.clone()),
         authority_reset: records.authority_reset.clone(),
-        image_digests: records.image_digests.clone(),
+        image_digests: measure_image_digests()
+            .unwrap_or_else(|e| panic!("governance field 7 could not be measured: {e}")),
         fixture_sha256: records.fixture_sha256.clone(),
-        commands: records.commands.clone(),
+        commands: records.commands_recorded.then(|| records.commands.clone()),
     };
-    match evidence::emit(runner, inputs) {
-        Ok(document) => {
-            let dir = fixture::evidence_directory().unwrap();
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("slice-c-recovery-acceptance.json");
-            std::fs::write(&path, &document).unwrap();
-            eprintln!("C06 evidence emitted: {}", path.display());
+    if let Err(e) = evidence::validate_evidence_inputs(&inputs) {
+        panic!("the inputs this run assembled are not ones the emitter admits: {e}");
+    }
+    for entry in &runner.census().entries {
+        if entry.required_for_sc_g3 {
+            panic!(
+                "{} is required for SC-G3 and this run recorded a skip for it (reason_class={}): {}. Governance rule E-1: a skip recorded where the gate requires a run is a gate failure, not a caveat",
+                entry.id, entry.reason_class, entry.detail
+            );
         }
+    }
+    let document = match evidence::emit(runner, inputs.clone()) {
+        Ok(document) => document,
         // An armed run whose evidence cannot be emitted fails loudly —
         // upstream's ReconcileTestMain exits non-zero on the same refusal;
         // printing and passing would let a green run mask it.
-        Err(e) => panic!("C06 evidence not emitted: {e}"),
+        Err(e) => panic!("emitting the C06 evidence artifact failed: {e}"),
+    };
+    let again = match evidence::emit(runner, inputs) {
+        Ok(document) => document,
+        Err(e) => panic!("the second emit of the same run failed: {e}"),
+    };
+    if document != again {
+        panic!(
+            "two emits of the same run produced different bytes ({} and {}); governance field 12 recomputes this document's digest, and a document that is not a function of the run is one no reviewer can recompute",
+            evidence::evidence_digest(&document),
+            evidence::evidence_digest(&again)
+        );
     }
+    if let Err(e) = evidence::scan_prohibitions(&document) {
+        panic!("the emitted artifact carries material governance section 3.1 forbids: {e}");
+    }
+    let decoded: evidence::Evidence = match serde_json::from_slice(&document) {
+        Ok(evidence) => evidence,
+        Err(e) => panic!("the emitted artifact cannot be read back: {e}"),
+    };
+    // `&*records` — the audit takes the record SET, not the shared guard.
+    if let Err(e) = crate::continuous_run::audit_the_emitted_artifact(&decoded, Some(&*records)) {
+        panic!("the emitted artifact does not correspond to the run that produced it:\n{e}");
+    }
+    drop(records);
+
+    let dir = fixture::evidence_directory()
+        .unwrap_or_else(|e| panic!("resolve the directory this run's evidence is written to: {e}"));
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("create the evidence directory {}: {e}", dir.display()));
+    let target = dir.join("slice-c-recovery-acceptance.json");
+    // Mode 0600 — the artifact names transcripts a reviewer reads beside
+    // it; nothing else may read or replace what the run attested.
+    std::fs::write(&target, &document)
+        .unwrap_or_else(|e| panic!("write the emitted artifact: {e}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(EVIDENCE_FILE_MODE))
+            .unwrap_or_else(|e| panic!("mode the emitted artifact 0600: {e}"));
+        let mode = std::fs::metadata(&target)
+            .unwrap_or_else(|e| panic!("stat the emitted artifact: {e}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, EVIDENCE_FILE_MODE,
+            "the emitted artifact must be readable by the run's user only; mode {mode:o} is not 0600"
+        );
+    }
+    let dir_str = dir
+        .to_str()
+        .unwrap_or_else(|| panic!("the evidence directory {} is not UTF-8", dir.display()));
+
+    // FINAL-REVIEW I-2, decided where it can be decided: the artifacts
+    // array is re-read against the directory it was just written into.
+    // Every entry's file must exist and recompute to the digest the entry
+    // registers AND to the log_sha256 the scenario itself recorded, for
+    // every scenario, pass or fail. Emitting the array is a claim; this is
+    // the check of it, and it runs against the same bytes a reviewer would
+    // be handed.
+    if let Err(e) = evidence::verify_transcripts(dir_str, &decoded) {
+        panic!("the emitted artifact registers transcripts this run cannot produce:\n{e}");
+    }
+    eprintln!(
+        "C06 evidence: {} transcript(s) registered in the artifacts array, each re-read beside the artifact and recomputed to the log_sha256 its scenario recorded",
+        decoded.artifacts.len()
+    );
+    eprintln!(
+        "C06 evidence artifact emitted: {} bytes, sha256 {}, {} scenarios, {} restart injections, {} skips, catalogue {}",
+        document.len(),
+        evidence::evidence_digest(&document),
+        decoded.scenarios.len(),
+        decoded.restart_injections.len(),
+        decoded.skip_census.count,
+        decoded.catalogue_sha256
+    );
+    eprintln!(
+        "C06 evidence artifact written to the directory named by {}, or to the suite's default under target/c06-evidence when it is unset. It is NOT written into the repository: a committed instance would be evidence this suite does not ship.",
+        fixture::EVIDENCE_OUTPUT_ENV
+    );
+}
+
+/// `c06EvidenceWrittenMode` — the artifact's required file mode.
+#[cfg(unix)]
+pub(crate) const EVIDENCE_FILE_MODE: u32 = 0o600;
+
+/// `c06MeasureImageDigests` — governance field 7: each container image the
+/// run used, resolved to its digest-pinned reference through `docker
+/// inspect`, upstream's own two-step. It is measured from the RUNNING
+/// CONTAINERS rather than read off a fixture, because field 7 is about the
+/// images the run used: the reference a container was started with is asked
+/// of the container, and its digest-pinned form is then asked of the image —
+/// a mutable tag is not a weaker pin, it is no pin.
+///
+/// The port's containers are named by `CENTRAL_C06_POSTGRES_CONTAINER` and
+/// `CENTRAL_C06_MINIO_CONTAINER` — the port has no self-provisioning
+/// composition to derive names from the way upstream's bring-up does. A run
+/// that names no containers emits `null` (the not-measured marker), never
+/// `{}`, which would read as a measured-empty map.
+fn measure_image_digests() -> Result<Option<std::collections::HashMap<String, String>>, String> {
+    let mut digests = std::collections::HashMap::new();
+    for (service, env) in [
+        ("postgres", "CENTRAL_C06_POSTGRES_CONTAINER"),
+        ("minio", "CENTRAL_C06_MINIO_CONTAINER"),
+    ] {
+        let Some(container) = crate::scenario2::require_env(env) else {
+            continue;
+        };
+        let inspect = |args: &[&str]| -> Result<String, String> {
+            let output = std::process::Command::new("docker")
+                .args(args)
+                .output()
+                .map_err(|e| format!("docker {} could not run: {e}", args.join(" ")))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "docker {} exited {}: {}",
+                    args.join(" "),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        };
+        let reference = inspect(&["inspect", &container, "--format", "{{.Config.Image}}"])?;
+        let pinned = inspect(&[
+            "inspect",
+            "image",
+            &reference,
+            "--format",
+            "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}",
+        ])?;
+        if pinned.is_empty() {
+            return Err(format!(
+                "the {service} image {reference:?} carries no repository digest, so governance field 7's pin cannot be recorded as a fact about it"
+            ));
+        }
+        digests.insert(service.to_owned(), pinned);
+    }
+    if digests.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(digests))
 }

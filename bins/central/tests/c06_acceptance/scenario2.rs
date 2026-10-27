@@ -116,17 +116,43 @@ pub(crate) fn expect(id: &str, what: impl AsRef<str>) {
 /// `c06ScenarioLog` — one scenario's transcript. The digest is attached on
 /// every record, so a body that fails still carries the digest of the
 /// transcript up to the failure — upstream's cleanup ordering, reproduced by
-/// attaching eagerly on each write rather than at teardown.
+/// attaching eagerly on each write rather than at teardown. The BYTES
+/// persist on drop (`c06PersistTranscript`), beside where the emit step
+/// writes the artifact, so every `log_sha256` the document commits to is
+/// dereferenceable there — a digest naming a file nothing wrote is a
+/// transcript that exists only inside the dropped allocation.
 pub(crate) struct ScenarioLog {
     id: String,
     transcript: Vec<u8>,
+    /// Whether this log belongs to an armed catalogue entry: armed logs
+    /// attach their digest to the runner and persist their bytes on drop.
+    /// Portable batteries run unarmed on any workstation and record no
+    /// catalogue outcome, so their logs attach nothing and persist nothing
+    /// — an attach from one would still write the shared digest slot of a
+    /// catalogue entry, which is exactly the shared-record race the armed
+    /// body is protected from.
+    armed: bool,
 }
 
 impl ScenarioLog {
+    /// The armed constructor, for a declared catalogue entry's body.
     pub(crate) fn new(id: &str) -> Self {
         Self {
             id: id.to_owned(),
             transcript: Vec::new(),
+            armed: true,
+        }
+    }
+
+    /// The portable constructor — `recordf` still accumulates the
+    /// transcript so a battery's narration is exercisable, but nothing is
+    /// attached and nothing is persisted: a portable check records no
+    /// catalogue outcome, so its transcript has no artifact to be named by.
+    pub(crate) fn portable(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            transcript: Vec::new(),
+            armed: false,
         }
     }
 
@@ -134,7 +160,58 @@ impl ScenarioLog {
         use std::io::Write as _;
         let _ = self.transcript.write_fmt(args);
         let _ = self.transcript.write_all(b"\n");
-        runner().attach_log(&self.id, &transcript_digest(&self.transcript));
+        if self.armed {
+            runner().attach_log(&self.id, &transcript_digest(&self.transcript));
+        }
+    }
+}
+
+impl Drop for ScenarioLog {
+    /// `c06PersistTranscript` — writes the transcript into the evidence
+    /// directory at mode 0600 through the same helper the emit step
+    /// verifies against. This runs at body end AND during an unwind, so a
+    /// failed entry still leaves the bytes its recorded `log_sha256`
+    /// committed to — upstream's cleanup ordering, kept.
+    ///
+    /// A persist failure on the normal path is the scenario's own failure.
+    /// A persist failure during unwind cannot panic a second time; it is
+    /// recorded through [`crate::fixture::record_transcript_failure`] and
+    /// the emit step refuses instead — an artifact must not be written
+    /// over transcripts that do not exist.
+    fn drop(&mut self) {
+        if !self.armed || self.transcript.is_empty() {
+            return;
+        }
+        let outcome = (|| -> Result<(), String> {
+            let dir = crate::fixture::evidence_directory()?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("create the evidence directory: {e}"))?;
+            let record = crate::evidence::write_transcript(
+                dir.to_str()
+                    .ok_or_else(|| "the evidence directory is not UTF-8".to_owned())?,
+                &self.id,
+                &self.transcript,
+            )?;
+            // The checksum the write returned is recomputed from the bytes
+            // written; it must be the digest the last recordf attached,
+            // or the file and the committed value disagree.
+            let attached = transcript_digest(&self.transcript);
+            if record.checksum_sha256 != attached {
+                return Err(format!(
+                    "the persisted transcript recomputes to {} and the attached log digest is {attached}",
+                    record.checksum_sha256
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            let message = format!("{}: {e}", self.id);
+            if std::thread::panicking() {
+                crate::fixture::record_transcript_failure(message);
+            } else {
+                panic!("persisting this entry's transcript failed: {message}");
+            }
+        }
     }
 }
 
@@ -1927,8 +2004,7 @@ fn capture_fingerprint_of_corrupted_instance(
 /// `c06.s2.corruption_detected` — inject database row deletion and each
 /// object-corruption shape; the application detects the inconsistency
 /// through its own path.
-#[test]
-fn c06_s2_corruption_detected() {
+pub(crate) fn c06_s2_corruption_detected() {
     let runner = runner();
     if !runner.armed() {
         return;

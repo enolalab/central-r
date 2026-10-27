@@ -113,7 +113,7 @@ pub struct Outcome {
 }
 
 /// `CensusEntry` — one skip, with the reason class it was filed under.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct CensusEntry {
     pub id: String,
     pub reason_class: String,
@@ -122,7 +122,7 @@ pub struct CensusEntry {
 }
 
 /// `Census` — governance field 18's shape, derived from recorded outcomes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Census {
     pub count: usize,
     pub entries: Vec<CensusEntry>,

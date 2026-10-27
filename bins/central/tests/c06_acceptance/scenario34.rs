@@ -645,8 +645,7 @@ pub(crate) fn begin_a_real_restore(
 
 /// `c06.s3.restore_verify` — the verify handler battery plus the
 /// live-operation cardinality battery over a real protected journal.
-#[test]
-fn c06_s3_restore_verify() {
+pub(crate) fn c06_s3_restore_verify() {
     let runner = runner();
     if !runner.armed() {
         return;
@@ -1132,8 +1131,7 @@ fn mutation_plan() -> Vec<TicketMutation> {
 /// `c06.s4.restore_ticket_one_use` — the ticket is recorded in protected
 /// state, is one-use, and its replay, expiry and mismatch negatives are
 /// each refused beside an admitted neighbour.
-#[test]
-fn c06_s4_restore_ticket_one_use() {
+pub(crate) fn c06_s4_restore_ticket_one_use() {
     let runner = runner();
     if !runner.armed() {
         return;
@@ -1861,7 +1859,10 @@ fn run_defence_in_depth_pairs(
 #[test]
 fn c06_s34_portable_verify_resolution_battery() {
     let id = "c06.s3.restore_verify";
-    let mut log = ScenarioLog::new(id);
+    // `ScenarioLog::portable`: this battery runs unarmed on any workstation
+    // and records no catalogue outcome, so its transcript must not attach a
+    // digest to the shared runner slot the armed body's owns.
+    let mut log = ScenarioLog::portable(id);
     log.recordf(format_args!("{SCENARIO3_SCOPE_DISCLOSURE}"));
     run_verify_and_resolver_battery(&mut log, id, "16.14").unwrap();
 }
@@ -1869,7 +1870,7 @@ fn c06_s34_portable_verify_resolution_battery() {
 #[test]
 fn c06_s34_portable_ticket_battery() {
     let id = "c06.s4.restore_ticket_one_use";
-    let mut log = ScenarioLog::new(id);
+    let mut log = ScenarioLog::portable(id);
     log.recordf(format_args!("{SCENARIO4_SCOPE_DISCLOSURE}"));
     let facts = admission_facts("16.14");
     run_ticket_recorded_and_one_use(&mut log, id, &facts).unwrap();

@@ -249,6 +249,10 @@ pub struct RecordSet {
     pub corrupted: Option<crate::fingerprint::StateFingerprint>,
     pub observed: ObservedMeasurements,
     pub capacity_reserve: Vec<CapacityReserveRecord>,
+    /// `capacityReserveRecorded` — set by
+    /// [`RecordSet::record_capacity_reserve`] only; scenario 5's census is a
+    /// single reading and a second one is refused.
+    pub capacity_reserve_recorded: bool,
     pub ceremony_records: Vec<CeremonyRecord>,
     pub protected_journal: ProtectedJournal,
     /// `protectedJournalRecorded` — set by [`RecordSet::record_journal_walk`]
@@ -258,6 +262,11 @@ pub struct RecordSet {
     pub restart_observations: HashMap<String, RestartObservation>,
     pub destructive_confirmations: Vec<DestructiveConfirmation>,
     pub quarantine_resolutions: QuarantineResolutions,
+    /// `quarantineResolutionsRecorded` — set by
+    /// [`RecordSet::record_quarantine_resolutions`] only: field 25 emits
+    /// `null` (not measured) until a real census is recorded, never a zeroed
+    /// struct that would read as "measured, all zero".
+    pub quarantine_resolutions_recorded: bool,
     pub authority_reset: AuthorityReset,
     /// `AuthorityResetFootprint` — the table names scenario 6 measured the
     /// mandated C05 reset moving, captured through the same fingerprint path
@@ -268,7 +277,12 @@ pub struct RecordSet {
     /// emitter (upstream's record-raw rule: a pre-parsed caller records an
     /// assertion where field 17 asks for a measurement).
     pub tool_version_output: crate::evidence::ToolVersionOutput,
-    pub image_digests: HashMap<String, String>,
+    /// `commandsRecorded` — set by [`RecordSet::record_command`] only:
+    /// field 9 emits `null` (not measured) until a command is recorded,
+    /// never `[]`, which would claim the run recorded its commands and
+    /// found none. Field 7's image digests are measured at emit time
+    /// (`c06MeasureImageDigests`), not recorded here.
+    pub commands_recorded: bool,
     pub fixture_sha256: HashMap<String, String>,
     pub commands: Vec<CommandRecord>,
 }
@@ -288,6 +302,8 @@ pub struct JournalWalk {
 impl RecordSet {
     /// `RecordCommand` — the literal command line, env NAMES only, exit code,
     /// result and log digest. The command line must be one the run declares.
+    /// Recording is also what marks field 9 measured: an emitted `[]` with
+    /// `commands_recorded` false would be a claim, not a census.
     pub fn record_command(
         &mut self,
         id: &str,
@@ -297,6 +313,7 @@ impl RecordSet {
         result: ScenarioResult,
         log_sha256: &str,
     ) {
+        self.commands_recorded = true;
         self.commands.push(CommandRecord {
             id: id.to_owned(),
             command_line: command_line.to_owned(),
@@ -305,6 +322,150 @@ impl RecordSet {
             result,
             log_sha256: log_sha256.to_owned(),
         });
+    }
+
+    /// `RecordQuarantineResolutions` — the census governance field 25
+    /// carries, recorded by whichever scenario measures the recovery audit
+    /// store. A second record is refused: the census is a single reading at
+    /// run end, and silently replacing it is how a field ends up naming a
+    /// measurement nobody made. Until this is called the field emits the
+    /// explicit `null` not-measured marker.
+    pub fn record_quarantine_resolutions(
+        &mut self,
+        resolutions: QuarantineResolutions,
+    ) -> Result<(), String> {
+        self.check_quarantine_resolutions(&resolutions)?;
+        self.quarantine_resolutions_recorded = true;
+        self.quarantine_resolutions = resolutions;
+        Ok(())
+    }
+
+    /// `checkQuarantineResolutions` — the decision the recorder makes,
+    /// upstream's verbatim: a second census, a non-zero unresolved or
+    /// still-open count at ready, a typed breakdown that does not total the
+    /// typed resolutions, and a census that resolved nothing at all are each
+    /// refused — the last because zero resolutions over zero findings is a
+    /// run that never quarantined, not evidence that quarantine resolves.
+    pub fn check_quarantine_resolutions(
+        &self,
+        resolutions: &QuarantineResolutions,
+    ) -> Result<(), String> {
+        if self.quarantine_resolutions_recorded {
+            return Err(
+                "the quarantine census was recorded twice; the second census describes a run whose findings something has already reconciled, and the emitter would carry it as the state at ready"
+                    .to_owned(),
+            );
+        }
+        if resolutions.unresolved != 0 {
+            return Err(format!(
+                "refusing to record a quarantine census with {} unresolved findings at ready: a non-zero unresolved count at ready is a contradiction of the design, because Ready is unreachable while any quarantine is open",
+                resolutions.unresolved
+            ));
+        }
+        if resolutions.open_findings_at_ready != 0 {
+            return Err(format!(
+                "refusing to record a quarantine census with {} findings still open at ready",
+                resolutions.open_findings_at_ready
+            ));
+        }
+        let by_reason = resolutions.by_reason.missing_body
+            + resolutions.by_reason.checksum_mismatch
+            + resolutions.by_reason.size_mismatch
+            + resolutions.by_reason.unexpected_artifact
+            + resolutions.by_reason.metadata_mismatch;
+        let resolved = resolutions.reingested + resolutions.delete_finalized;
+        if by_reason != resolved {
+            return Err(format!(
+                "refusing to record a quarantine census whose typed breakdown totals {by_reason} and whose typed resolutions total {resolved}: the two count the same findings, and a census where they disagree is one where a finding was resolved under a reason nobody recorded"
+            ));
+        }
+        if resolved == 0 {
+            return Err(
+                "refusing to record a quarantine census that resolved nothing at all; an unresolved count of zero over zero findings says the run never quarantined anything, which is not evidence that quarantine can be resolved"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// `RecordCapacityReserve` — governance field 20's per-device entries,
+    /// recorded through the check rather than appended, because the two
+    /// refusals it exists to make — a release with no confirmation and an
+    /// allocation with no release — are exactly what an unguarded append
+    /// would carry. This is scenario 5's recorder: the kind it admits is
+    /// `restore_reserve`.
+    pub fn record_capacity_reserve(
+        &mut self,
+        records: Vec<CapacityReserveRecord>,
+    ) -> Result<(), String> {
+        self.check_capacity_reserve(&records)?;
+        self.capacity_reserve = records;
+        self.capacity_reserve_recorded = true;
+        Ok(())
+    }
+
+    /// `checkCapacityReserve` — the decision scenario 5's reserve recorder
+    /// makes, upstream's verbatim: nonempty, restore-reserve kind, a device
+    /// identity, a declared role, a confirmation for every claimed release,
+    /// nonzero reserve and allocation bytes (the zero-byte guard exists for
+    /// the reader that lost the durable record's byte field), and no
+    /// allocation that was never released. The s9 backup-admission entry is
+    /// pushed through a different path by design — this recorder is s5's.
+    pub fn check_capacity_reserve(&self, records: &[CapacityReserveRecord]) -> Result<(), String> {
+        if self.capacity_reserve_recorded {
+            return Err(
+                "the capacity reserve census was recorded twice; the second describes a store something has already swept"
+                    .to_owned(),
+            );
+        }
+        if records.is_empty() {
+            return Err(
+                "refusing to record an empty capacity reserve census: a restore that allocated nothing evidences no reserve, and an empty array reads in the artifact exactly like a reserve that was cleanly released"
+                    .to_owned(),
+            );
+        }
+        for (index, record) in records.iter().enumerate() {
+            if record.kind != "restore_reserve" {
+                return Err(format!(
+                    "refusing to record capacity_reserve[{index}] with kind {:?}: scenario 5 emits the restore reserve, and an entry carrying the backup-admission kind would attribute a C04 effect to C02",
+                    record.kind
+                ));
+            }
+            if record.device_id.trim().is_empty() {
+                return Err(format!(
+                    "refusing to record capacity_reserve[{index}] with no device identity: field 20 is per device, and an entry naming none cannot be attributed to one"
+                ));
+            }
+            if !crate::evidence::CAPACITY_ROLES.contains(&record.role.as_str()) {
+                return Err(format!(
+                    "refusing to record capacity_reserve[{index}] with role {:?}, which is outside {:?}",
+                    record.role,
+                    crate::evidence::CAPACITY_ROLES
+                ));
+            }
+            if record.released && record.release_confirmed_at.trim().is_empty() {
+                return Err(format!(
+                    "refusing to record capacity_reserve[{index}] as released with no confirmation: a release nothing confirms is a claim about the releasing process and not about the record it left behind"
+                ));
+            }
+            // The zero-byte refusal precedes the unreleased one on purpose:
+            // a field-name drift in the reader produces zeros rather than an
+            // error, and zero-byte entries must be loud at record time, not
+            // silent as a cleanly closed reserve.
+            if record.reserve_bytes == 0 || record.allocated_bytes == 0 {
+                return Err(format!(
+                    "refusing to record capacity_reserve[{index}] with a {}-byte reserve and a {}-byte allocation: a reserve of no bytes is not a reserve, and an all-zero entry is what a reader that lost the record's byte field produces -- it must never pass as a closed effect",
+                    record.reserve_bytes, record.allocated_bytes
+                ));
+            }
+            if !record.released {
+                return Err(format!(
+                    "refusing to record capacity_reserve[{index}], which allocated {} bytes and was never released: an allocation with no confirmed release is an unclosed effect, not a pass",
+                    record.allocated_bytes
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// `RecordPreCorruptionFingerprint` — the baseline capture (upstream's
@@ -728,6 +889,33 @@ pub fn records() -> std::sync::MutexGuard<'static, RecordSet> {
         .get_or_init(|| std::sync::Mutex::new(RecordSet::default()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Transcript-persist failures collected where a panic cannot go: a
+/// `ScenarioLog` drop running during a scenario body's own unwind. Each is
+/// the digest-committed bytes of one catalogue entry having failed to reach
+/// the disk — an artifact emitted over them would register transcripts that
+/// do not exist, so the emit step drains this list and refuses.
+static TRANSCRIPT_FAILURES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+/// `recordTranscriptFailure` — a persist failure observed mid-unwind.
+pub(crate) fn record_transcript_failure(message: String) {
+    TRANSCRIPT_FAILURES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(message);
+}
+
+/// `takeTranscriptFailures` — drains the collected failures; the emit step
+/// refuses when any entry's transcript bytes could not be persisted.
+pub(crate) fn take_transcript_failures() -> Vec<String> {
+    TRANSCRIPT_FAILURES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .split_off(0)
 }
 
 /// `declared_command_lines` — the closed vocabulary of command lines the run
