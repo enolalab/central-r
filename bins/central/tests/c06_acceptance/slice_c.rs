@@ -195,6 +195,51 @@ fn c06_s1_backup_create() {
         |profile| unmet_precondition(id, profile),
         |s| {
             runner.attach_divergence(id, "production composition may refuse before the throughput gate (BACKUP_CREATE_AUTHORIZATION_REQUIRED) or collapse a worker capacity failure into BACKUP_WORKER_FAILED; either is the recorded divergence, not a silent pass");
+            let mut log = crate::scenario2::ScenarioLog::new(id);
+            // Governance field 17's four tool readings, taken the way
+            // upstream takes them: the server and toolchain at bring-up
+            // (this body is the first catalogue entry), the two pg tools
+            // inside scenario 1's own body — every one from the tool's own
+            // output, through recorders that refuse a second capture so a
+            // re-reading taken after the environment changed cannot
+            // silently replace the reading this run restored under.
+            let dsn = crate::scenario2::require_env(fixture::PG_DSN_ENV).ok_or_else(|| {
+                format!(
+                    "{} unset; the server version governance field 17 carries cannot be read",
+                    fixture::PG_DSN_ENV
+                )
+            })?;
+            let server = crate::scenario2::connect_pg(&dsn)?
+                .run(|c| {
+                    Box::pin(async move {
+                        sqlx::query_scalar::<sqlx::Postgres, String>("SELECT version()")
+                            .fetch_one(&mut *c)
+                            .await
+                            .map_err(|e| {
+                                central_foundation::failure::Failure::internal(
+                                    "c06",
+                                    format!("read the migrated server's own version: {e}"),
+                                )
+                            })
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            let toolchain_out = std::process::Command::new("rustc")
+                .arg("--version")
+                .output()
+                .map_err(|e| format!("rustc --version could not run: {e}"))?;
+            let toolchain = format!(
+                "{}{}",
+                String::from_utf8_lossy(&toolchain_out.stdout),
+                String::from_utf8_lossy(&toolchain_out.stderr)
+            );
+            fixture::records().record_server_tool_versions(&server, &toolchain)?;
+            let pg_dump = fixture::pg_tool_version_output("pg_dump")?;
+            let pg_restore = fixture::pg_tool_version_output("pg_restore")?;
+            fixture::records().record_pg_tool_versions(&pg_dump, &pg_restore)?;
+            log.recordf(format_args!(
+                "tool versions recorded from each tool's own output: server, rustc, pg_dump, pg_restore"
+            ));
             let binary =
                 std::env::var("CENTRAL_C06_CENTRAL_BIN").unwrap_or_else(|_| "central".to_owned());
             let started = Instant::now();
@@ -239,6 +284,8 @@ fn c06_s9_capacity_below_floor() {
         |profile| unmet_precondition(id, profile),
         |s| {
             runner.attach_divergence(id, "a below-floor device must produce AdmissionFailure{CAPACITY_INSUFFICIENT} from the production admission path BEFORE any mutation; the differential holds every other admission fact constant");
+            let mut log = crate::scenario2::ScenarioLog::new(id);
+            crate::continuous_run::gate_the_sequence("c06.s8.minimum_profile", &mut log)?;
             let root = std::env::var("CENTRAL_C06_REPO_ROOT")
                 .unwrap_or_else(|_| "/var/lib/central/repository".to_owned());
             if !Path::new(&root).exists() {
@@ -304,6 +351,8 @@ fn c06_s10_throughput_below_floor() {
         |profile| unmet_precondition(id, profile),
         |s| {
             runner.attach_divergence(id, "the packet's wording predicts an outside-profile refusal; the production path's ACTUAL class is recorded — ProfileDiagnostic or AdmissionFailure{THROUGHPUT_EVIDENCE_REQUIRED} — rather than the expected one being asserted");
+            let mut log = crate::scenario2::ScenarioLog::new(id);
+            crate::continuous_run::gate_the_sequence("c06.s9.capacity_below_floor", &mut log)?;
             // A genuinely slow device: CENTRAL_C06_SLOW_MOUNT names a mounted
             // constrained filesystem (loop+ext4, optionally dm-delay). Without
             // it the probe cannot measure real timings — an honest skip, not a
@@ -477,6 +526,27 @@ fn zz_reconcile_the_run() {
     }
 }
 
+/// `c06MeasureBinaryDigests` — governance field 17's two build digests,
+/// measured over the binaries the operator names for the run: the restore
+/// engine and the launcher daemon, upstream's `harness.EngineSHA256` and
+/// its out-of-worktree build. An unset or unreadable name leaves the field
+/// empty and the emitter refuses it — a digest that could not be taken is
+/// no digest at all.
+fn measure_binary_digests() -> evidence::BinaryDigests {
+    use sha2::Digest as _;
+    let digest_of = |env: &str| -> String {
+        std::env::var(env)
+            .ok()
+            .and_then(|path| std::fs::read(&path).ok())
+            .map(|body| crate::hex_lower(sha2::Sha256::digest(&body)))
+            .unwrap_or_default()
+    };
+    evidence::BinaryDigests {
+        central_restore_build_sha256: digest_of("CENTRAL_C06_RESTORE_BIN"),
+        launcher_daemon_build_sha256: digest_of("CENTRAL_C06_LAUNCHERD_BIN"),
+    }
+}
+
 /// `c06EmitEvidence` — writes `slice-c-recovery-acceptance.json` beside the
 /// transcripts under [`fixture::evidence_directory`], after reconciliation.
 /// Armed runs only.
@@ -489,12 +559,24 @@ fn zz_emit_the_evidence() {
     // Same structural wait as reconcile — the emitted scenario set derives
     // from the recorded outcomes, so emission must see the finished run.
     runner.await_completeness(crate::runner::completeness_wait());
+    // Upstream's last gate — after the restart injections and before
+    // emission: an instance a restart left unusable must not be covered by
+    // an artifact that reads clean. In this port's parallel schedule the
+    // blame cannot be narrowed to a name the way the sequential upstream
+    // run narrows it to the restart batch; the refusal is the same.
+    if let Err(e) = crate::continuous_run::probe_the_instance_is_still_usable() {
+        panic!(
+            "after the restart injections' catalogue entries completed, the instance this continuous run shares is no longer usable: {e}.\n\nIn the sequential upstream run the damage belongs to the restart batch; in this port's schedule it belongs to some entry that ran before this probe. Emission is refused either way — an artifact over a damaged instance would carry a health claim the run no longer holds."
+        );
+    }
     let records = fixture::records();
     let inputs = EvidenceInputs {
         generated_at: Some(std::time::SystemTime::now()),
         repo_root: env!("CARGO_MANIFEST_DIR")
             .trim_end_matches("/bins/central")
             .to_owned(),
+        tool_version_output: records.tool_version_output.clone(),
+        binary_digests: measure_binary_digests(),
         privilege_profile: fixture::measure_privilege_profile(),
         observed: records.observed.clone(),
         capacity_reserve: records.capacity_reserve.clone(),
@@ -507,7 +589,6 @@ fn zz_emit_the_evidence() {
         image_digests: records.image_digests.clone(),
         fixture_sha256: records.fixture_sha256.clone(),
         commands: records.commands.clone(),
-        ..Default::default()
     };
     match evidence::emit(runner, inputs) {
         Ok(document) => {

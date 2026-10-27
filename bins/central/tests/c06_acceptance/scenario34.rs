@@ -658,6 +658,7 @@ fn c06_s3_restore_verify() {
         |_s| {
             let mut log = ScenarioLog::new(id);
             log.recordf(format_args!("{SCENARIO3_SCOPE_DISCLOSURE}"));
+            crate::continuous_run::gate_the_sequence("c06.s2.corruption_detected", &mut log)?;
             run_verify_and_resolver_battery(&mut log, id, &measured_pg_tool_version())
         },
     );
@@ -1144,6 +1145,7 @@ fn c06_s4_restore_ticket_one_use() {
         |_s| {
             let mut log = ScenarioLog::new(id);
             log.recordf(format_args!("{SCENARIO4_SCOPE_DISCLOSURE}"));
+            crate::continuous_run::gate_the_sequence("c06.s3.restore_verify", &mut log)?;
             let tool_version = measured_pg_tool_version();
             run_ticket_recorded_and_one_use(&mut log, id, &admission_facts(&tool_version))?;
             let facts = admission_facts(&tool_version);

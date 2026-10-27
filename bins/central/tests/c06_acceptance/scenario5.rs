@@ -170,13 +170,20 @@ pub(crate) fn carry_to_inventory_verified(
 
 /// `c06SyntheticAuthorityResetReceipt` — a receipt the domain's own validator
 /// accepts for `operation`, with obviously synthetic hashes.
-fn synthetic_authority_reset_receipt(operation: &RestoreOperation) -> AuthorityResetReceipt {
+pub(crate) fn synthetic_authority_reset_receipt(
+    operation: &RestoreOperation,
+    at: OffsetDateTime,
+) -> AuthorityResetReceipt {
     let digest = |label: &str| {
         use sha2::Digest as _;
         format!(
             "sha256:{}",
             crate::hex_lower(sha2::Sha256::digest(
-                format!("c06-scenario-5-synthetic-{label}").as_bytes()
+                format!(
+                    "c06-scenario-5-synthetic-{label}-{}",
+                    operation.operation_id
+                )
+                .as_bytes()
             ))
         )
     };
@@ -192,7 +199,7 @@ fn synthetic_authority_reset_receipt(operation: &RestoreOperation) -> AuthorityR
         bootstrap_generation: 1,
         bootstrap_activation_receipt_hash: digest("activation"),
         aggregate_receipt_hash: digest("aggregate"),
-        completed_at: operation.updated_at + time::Duration::seconds(1),
+        completed_at: at,
     }
 }
 
@@ -288,7 +295,8 @@ fn run_quarantine_barrier_battery(narrator: &mut dyn Narrator) -> Result<(), Str
     walk = resumed;
 
     // Ready requires the receipt-bound authority reset, then mark_ready.
-    let receipt = synthetic_authority_reset_receipt(&walk);
+    let receipt =
+        synthetic_authority_reset_receipt(&walk, walk.updated_at + time::Duration::seconds(1));
     let reset = walk
         .record_authority_reset(&receipt)
         .map_err(|e| format!("the domain refused the authority-reset edge: {e}"))?;
@@ -369,7 +377,8 @@ fn run_restore_journal_edge_battery(narrator: &mut dyn Narrator) -> Result<(), S
     // From-terminal: complete the walk to ready, then every further edge
     // must refuse.
     let mut walk = current;
-    let receipt = synthetic_authority_reset_receipt(&walk);
+    let receipt =
+        synthetic_authority_reset_receipt(&walk, walk.updated_at + time::Duration::seconds(1));
     let reset = walk
         .record_authority_reset(&receipt)
         .map_err(|e| format!("authority-reset edge refused: {e}"))?;
@@ -700,6 +709,7 @@ fn c06_s5_restore_apply() {
         |_s| {
             let mut log = ScenarioLog::new(id);
             log.recordf(format_args!("{SCENARIO5_SCOPE_DISCLOSURE}"));
+            crate::continuous_run::gate_the_sequence("c06.s4.restore_ticket_one_use", &mut log)?;
             {
                 let mut narrator = Disclosing { id, log: &mut log };
                 run_quarantine_barrier_battery(&mut narrator)?;

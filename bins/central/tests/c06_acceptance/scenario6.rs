@@ -72,7 +72,7 @@ use crate::scenario34::{
     TempRoot, admission_facts, begin_a_real_restore, synthetic_manifest_digest,
 };
 
-pub(crate) const SCENARIO6_SCOPE_DISCLOSURE: &str = "SCOPE, CARRIED ON EVERY DIVERGENCE THIS SCENARIO EMITS: the batteries prove production DECISIONS — the domain receipt validator, the aggregate-hash binding against the real producer constructor, the real broker's re-key/single-candidate/single-activation behaviour, and the recorder's refusal rules — and the DSN-gated live leg measures the real C05 reset through AuthorityResetCoordinator + RecoveryAuditStore. Adaptations: census totality is pinned to the emitter's serde fields and the reset's own statement-text constants (no AST walk exists for Rust); the session-token leg reads through PgSessionStore on a dedicated pool; the fingerprint bracket upstream opens for scenario 7 is deferred to T10d and recorded, not asserted. Ticket admission facts are synthetic (no sealed backup can be produced).";
+pub(crate) const SCENARIO6_SCOPE_DISCLOSURE: &str = "SCOPE, CARRIED ON EVERY DIVERGENCE THIS SCENARIO EMITS: the batteries prove production DECISIONS — the domain receipt validator, the aggregate-hash binding against the real producer constructor, the real broker's re-key/single-candidate/single-activation behaviour, and the recorder's refusal rules — and the DSN-gated live leg measures the real C05 reset through AuthorityResetCoordinator + RecoveryAuditStore. Adaptations: census totality is pinned to the emitter's serde fields and the reset's own statement-text constants (no AST walk exists for Rust); the session-token leg reads through PgSessionStore on a dedicated pool; the fingerprint bracket upstream opens for scenario 7 is this leg's measurement — the moved-table set is captured across the real reset and recorded for c06.s7, never declared. Ticket admission facts are synthetic (no sealed backup can be produced).";
 
 fn expect6(id: &str, what: impl AsRef<str>) {
     runner().attach_divergence(
@@ -1075,6 +1075,10 @@ struct AuthorityResetMeasurement {
     generations_before: i64,
     generations_after: i64,
     aggregate_receipt_hash: String,
+    /// The tables whose rows the measured reset moved — scenario 7's
+    /// exemption set, empty in the synthetic battery measurements because
+    /// `check_authority_reset` does not read it.
+    moved_tables: Vec<String>,
 }
 
 fn honest_measurement() -> AuthorityResetMeasurement {
@@ -1098,6 +1102,7 @@ fn honest_measurement() -> AuthorityResetMeasurement {
         generations_before: 1,
         generations_after: 2,
         aggregate_receipt_hash: s6_digest("recorder-fixture"),
+        moved_tables: Vec::new(),
     }
 }
 
@@ -1464,6 +1469,21 @@ fn measure_the_authority_reset(
     }
     narrator.record(format!("before the reset: {}", format_census(&before)));
 
+    // --- The fingerprint bracket for scenario 7. ------------------------
+    // Upstream opens the instance fingerprint here and closes it after the
+    // reset; the tables whose ROWS moved across the bracket are the
+    // authority-reset footprint c06.s7 exempts from its post-restore
+    // comparison, and that set is measured here, never declared. Only the
+    // table axis is captured: `content_divergent_tables` reads nothing
+    // else, and the seeded subjects must be inside the bracket's base so
+    // the footprint is what the reset moved and not what the seeds added.
+    narrator.expect("the instance's table state is captured BEFORE the reset and AGAIN after it; the tables whose rows moved across that bracket are the footprint scenario 7 will hold equal");
+    crate::scenario2::pin_fingerprint_session(conn_ref)?;
+    let fingerprint_before = crate::fingerprint::StateFingerprint {
+        tables: crate::scenario2::fingerprint_tables(conn_ref)?,
+        ..crate::fingerprint::StateFingerprint::default()
+    };
+
     // --- The real reset. ---------------------------------------------------
     let coordinator = AuthorityResetCoordinator::new(&service, &store);
     narrator.expect("the production authority reset coordinator performs the real C05 reset and returns a receipt the domain's own validator accepts");
@@ -1696,6 +1716,24 @@ fn measure_the_authority_reset(
         operation.security_epoch + 1
     ));
 
+    // --- Close the fingerprint bracket and name what moved. -------------
+    let fingerprint_after = crate::fingerprint::StateFingerprint {
+        tables: crate::scenario2::fingerprint_tables(conn_ref)?,
+        ..crate::fingerprint::StateFingerprint::default()
+    };
+    let moved_tables =
+        crate::fingerprint::content_divergent_tables(&fingerprint_before, &fingerprint_after);
+    if moved_tables.is_empty() {
+        return Err(
+            "the reset moved no table's rows at all; a footprint of nothing would have scenario 7 hold the post-restore instance equal to pre-corruption state on every row, which a real reset cannot satisfy"
+                .to_owned(),
+        );
+    }
+    narrator.record(format!(
+        "authority-reset footprint, measured as the {} table(s) whose rows the reset moved: {moved_tables:?}",
+        moved_tables.len()
+    ));
+
     let tls_after = broker_tls_fingerprints(&root)?;
     Ok(AuthorityResetMeasurement {
         before,
@@ -1708,6 +1746,7 @@ fn measure_the_authority_reset(
         generations_before,
         generations_after,
         aggregate_receipt_hash: receipt.aggregate_receipt_hash.clone(),
+        moved_tables,
     })
 }
 
@@ -1730,6 +1769,7 @@ fn c06_s6_authority_reset() {
         |_s| {
             let mut log = ScenarioLog::new(id);
             log.recordf(format_args!("{SCENARIO6_SCOPE_DISCLOSURE}"));
+            crate::continuous_run::gate_the_sequence("c06.s5.restore_apply", &mut log)?;
             let dsn = std::env::var(crate::fixture::PG_DSN_ENV).map_err(|_| {
                 format!(
                     "{} unset; the measured reset leg cannot run",
@@ -1748,6 +1788,10 @@ fn c06_s6_authority_reset() {
                     let mut records = crate::fixture::records();
                     if records.authority_reset.aggregate_receipt_sha256.is_empty() {
                         records.authority_reset = reset.clone();
+                    }
+                    if !records.authority_reset_footprint_recorded() {
+                        records
+                            .record_authority_reset_footprint(measurement.moved_tables.clone())?;
                     }
                 }
                 narrator.record(format!(

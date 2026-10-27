@@ -42,6 +42,7 @@ pub(crate) fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
 
 mod catalogue;
 mod ceremony;
+mod continuous_run;
 mod evidence;
 mod fingerprint;
 mod fixture;
@@ -51,5 +52,6 @@ mod scenario2;
 mod scenario34;
 mod scenario5;
 mod scenario6;
+mod scenario78;
 
 mod slice_c;

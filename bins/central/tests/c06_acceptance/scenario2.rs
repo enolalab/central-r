@@ -102,7 +102,7 @@ pub(crate) const SCENARIO2_SCOPE_DISCLOSURE: &str = "SCOPE, CARRIED ON EVERY DIV
 /// `c06Expect` — every expectation this scenario states, with the scope
 /// disclosure attached, as upstream requires (`s.Expect` is never called
 /// bare).
-fn expect(id: &str, what: impl AsRef<str>) {
+pub(crate) fn expect(id: &str, what: impl AsRef<str>) {
     runner().attach_divergence(
         id,
         &format!("{}. {}", what.as_ref(), SCENARIO2_SCOPE_DISCLOSURE),
@@ -150,7 +150,7 @@ pub(crate) const S3_TLS_ENV: &str = "CENTRAL_C06_S3_TLS";
 
 /// One env var, required; `None` when unset-or-empty so the caller can skip
 /// naming it.
-fn require_env(name: &str) -> Option<String> {
+pub(crate) fn require_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -431,7 +431,7 @@ impl InventoryRow {
 /// `c06ReadInventorySnapshot` — the production predicate, character for
 /// character: `state = 'ready' AND delete_intent_at IS NULL`, in identity
 /// order.
-fn read_inventory_snapshot(conn: &BlockingConn) -> Result<Vec<InventoryRow>, String> {
+pub(crate) fn read_inventory_snapshot(conn: &BlockingConn) -> Result<Vec<InventoryRow>, String> {
     conn.run(|c| {
         Box::pin(async move {
             let rows: Vec<InventoryRowTuple> = sqlx::query_as(
@@ -649,16 +649,16 @@ fn reason_index(reason: QuarantineReason) -> usize {
 // streamed subject is spooled through a temp file, never held (SC-DEF-92).
 // ---------------------------------------------------------------------------
 
-struct CorruptionKit {
-    conn: Arc<BlockingConn>,
-    store: Arc<S3ObjectStore>,
-    runtime: Arc<tokio::runtime::Runtime>,
+pub(crate) struct CorruptionKit {
+    pub(crate) conn: Arc<BlockingConn>,
+    pub(crate) store: Arc<S3ObjectStore>,
+    pub(crate) runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl CorruptionKit {
     /// Read a body whole through the injection store — ordinary bodies only;
     /// the streamed subject goes through [`Self::spool_body_to_temp`].
-    fn read_body(&self, key: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn read_body(&self, key: &str) -> Result<Vec<u8>, String> {
         let (mut stream, _info) = self
             .runtime
             .block_on(self.store.read(ObjectRef {
@@ -686,7 +686,7 @@ impl CorruptionKit {
     /// `SpoolBodyToTemp` — streams a body into a temp file (SC-DEF-92):
     /// injuries on the 1.5 GiB body must not hold it in RAM. The caller
     /// removes the file when the injection is repaired.
-    fn spool_body_to_temp(&self, key: &str) -> Result<(PathBuf, i64), String> {
+    pub(crate) fn spool_body_to_temp(&self, key: &str) -> Result<(PathBuf, i64), String> {
         use std::io::Write as _;
         let (mut stream, _info) = self
             .runtime
@@ -725,7 +725,7 @@ impl CorruptionKit {
 
     /// Delete the ready object at `key`; a missing object is not an error —
     /// a write that follows it still lands under create-only.
-    fn remove_body(&self, key: &str) -> Result<(), String> {
+    pub(crate) fn remove_body(&self, key: &str) -> Result<(), String> {
         self.runtime
             .block_on(self.store.remove_ready_for_delete(ObjectRef {
                 key: key.to_owned(),
@@ -736,13 +736,13 @@ impl CorruptionKit {
     /// Write `body` at `key` through staging + create-only promote — the
     /// production object-creation path, so the injury lands exactly where
     /// the application reads.
-    fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), String> {
+    pub(crate) fn put_body(&self, key: &str, body: Vec<u8>) -> Result<(), String> {
         let size = body.len() as i64;
         self.put_body_streaming(key, Box::new(std::io::Cursor::new(body)), size)
     }
 
     /// Write a body at `key` from a reader — the streamed subjects' path.
-    fn put_body_streaming(
+    pub(crate) fn put_body_streaming(
         &self,
         key: &str,
         body: Box<dyn std::io::Read + Send>,
@@ -778,7 +778,7 @@ impl CorruptionKit {
     }
 
     /// `PutBodyFromFile` — write exactly the spooled file's bytes at `key`.
-    fn put_body_from_file(
+    pub(crate) fn put_body_from_file(
         &self,
         key: &str,
         path: &std::path::Path,
@@ -789,7 +789,7 @@ impl CorruptionKit {
         self.put_body_streaming(key, Box::new(file), size)
     }
 
-    fn exec(&self, what: &str, statement: &str, binds: &[Bind]) -> Result<(), String> {
+    pub(crate) fn exec(&self, what: &str, statement: &str, binds: &[Bind]) -> Result<(), String> {
         let what = what.to_owned();
         let statement = statement.to_owned();
         let binds = binds.to_vec();
@@ -815,7 +815,12 @@ impl CorruptionKit {
             .map_err(|e| e.to_string())
     }
 
-    fn query_scalar_i64(&self, what: &str, statement: &str, binds: &[Bind]) -> Result<i64, String> {
+    pub(crate) fn query_scalar_i64(
+        &self,
+        what: &str,
+        statement: &str,
+        binds: &[Bind],
+    ) -> Result<i64, String> {
         let what = what.to_owned();
         let statement = statement.to_owned();
         let binds = binds.to_vec();
@@ -840,10 +845,41 @@ impl CorruptionKit {
             })
             .map_err(|e| e.to_string())
     }
+
+    pub(crate) fn query_scalar_bool(
+        &self,
+        what: &str,
+        statement: &str,
+        binds: &[Bind],
+    ) -> Result<bool, String> {
+        let what = what.to_owned();
+        let statement = statement.to_owned();
+        let binds = binds.to_vec();
+        self.conn
+            .run(|c| {
+                Box::pin(async move {
+                    let mut query = sqlx::query_scalar(&statement);
+                    for bind in binds {
+                        query = match bind {
+                            Bind::Uuid(v) => query.bind(v),
+                            Bind::I64(v) => query.bind(v),
+                            Bind::Text(v) => query.bind(v),
+                            Bind::Bytes(v) => query.bind(v),
+                        };
+                    }
+                    let value: bool = query
+                        .fetch_one(&mut *c)
+                        .await
+                        .map_err(|e| Failure::internal("c06", format!("{what}: {e}")))?;
+                    Ok(value)
+                })
+            })
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Clone)]
-enum Bind {
+pub(crate) enum Bind {
     Uuid(Uuid),
     I64(i64),
     Text(String),
@@ -1507,7 +1543,7 @@ const SCHEMA_OBJECT_DIGEST_SQL: &str = r#"SELECT kind, name, encode(sha256(conve
 	) AS schema_objects
 	ORDER BY kind, name"#;
 
-fn pin_fingerprint_session(conn: &BlockingConn) -> Result<(), String> {
+pub(crate) fn pin_fingerprint_session(conn: &BlockingConn) -> Result<(), String> {
     conn.run(|c| {
         Box::pin(async move {
             for statement in [
@@ -1532,7 +1568,7 @@ fn pin_fingerprint_session(conn: &BlockingConn) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-fn fingerprint_tables(conn: &BlockingConn) -> Result<Vec<TableFingerprint>, String> {
+pub(crate) fn fingerprint_tables(conn: &BlockingConn) -> Result<Vec<TableFingerprint>, String> {
     let relations: Vec<(String, String)> = conn
         .run(|c| {
             Box::pin(async move {
@@ -1688,19 +1724,19 @@ impl ArtifactMetadata<'_> {
     }
 }
 
-struct ArtifactRow {
-    id: String,
-    size: i64,
-    checksum: String,
-    generation: String,
-    ready_key: String,
-    state: String,
-    media_type: String,
-    sensitivity: String,
-    disposition: String,
+pub(crate) struct ArtifactRow {
+    pub(crate) id: String,
+    pub(crate) size: i64,
+    pub(crate) checksum: String,
+    pub(crate) generation: String,
+    pub(crate) ready_key: String,
+    pub(crate) state: String,
+    pub(crate) media_type: String,
+    pub(crate) sensitivity: String,
+    pub(crate) disposition: String,
 }
 
-fn ready_artifact_rows(conn: &BlockingConn) -> Result<Vec<ArtifactRow>, String> {
+pub(crate) fn ready_artifact_rows(conn: &BlockingConn) -> Result<Vec<ArtifactRow>, String> {
     conn.run(|c| {
         Box::pin(async move {
             let rows: Vec<ArtifactRowTuple> = sqlx::query_as(
@@ -1800,7 +1836,7 @@ fn fingerprint_artifacts(
 /// a body the store cannot return is OMITTED and counted, never replaced by
 /// a placeholder (a zero-length body has the same digest whatever the store
 /// returns, so it would be a fingerprint of nothing wearing an identity).
-fn fingerprint_artifacts_as_the_store_answers(
+pub(crate) fn fingerprint_artifacts_as_the_store_answers(
     conn: &BlockingConn,
     objects: &S3BackupObjectSource,
     occasion: &str,
@@ -1856,7 +1892,7 @@ fn fingerprint_artifacts_as_the_store_answers(
 
 /// `c06CaptureStateFingerprint` — the pre-corruption capture: every table,
 /// every artifact body, every schema object.
-fn capture_state_fingerprint(
+pub(crate) fn capture_state_fingerprint(
     conn: &BlockingConn,
     objects: &S3BackupObjectSource,
 ) -> Result<StateFingerprint, String> {
@@ -1908,6 +1944,7 @@ fn c06_s2_corruption_detected() {
             // strongest place the ratified shape gives this text (upstream's
             // own reasoning, kept).
             log.recordf(format_args!("{SCENARIO2_SCOPE_DISCLOSURE}"));
+            crate::continuous_run::gate_the_sequence("c06.s1.backup_create", &mut log)?;
 
             expect(
                 id,
@@ -1980,6 +2017,17 @@ fn c06_s2_corruption_detected() {
                     "the instance this scenario was handed cannot be fingerprinted well enough to be compared against later ({e}); every difference the last step reports would then be a fact about the capture rather than about the corruption"
                 ));
             }
+            // Upstream's `beforeAnything` is this scenario's own control and
+            // is never recorded; the baseline scenario 7 compares against is
+            // scenario 1's capture. THIS PORT records this capture as that
+            // baseline instead: scenario 1 here dispatches the operator
+            // command only and takes no fingerprint, and under this port's
+            // unordered armed schedule there is no earlier point the
+            // baseline could be taken at — the idempotent seed above and
+            // this capture precede every injection by construction order
+            // inside this body, so the state recorded is the state before
+            // the corruption, which is what the baseline names.
+            fixture::records().record_pre_corruption(before_anything.clone())?;
 
             // The detector: the production restored-inventory verifier over
             // a REAL connection and the real object-store adapter, against
