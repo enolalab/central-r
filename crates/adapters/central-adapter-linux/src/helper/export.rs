@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use central_foundation::failure::Failure;
 use central_infra::portable as domain;
@@ -542,11 +543,14 @@ impl ExportHandlerImpl {
         if tar_ok.is_err() {
             return unavailable(&request.operation_id);
         }
-        let mut nonce = [0u8; 32];
-        if rustix::rand::getrandom(&mut nonce, rustix::rand::GetRandomFlags::empty()).is_err() {
+        // The nonce is the bundle-DEK preimage — possession equals
+        // decryption capability — so it and everything derived from it
+        // are scrubbed on drop.
+        let mut nonce = Zeroizing::new([0u8; 32]);
+        if rustix::rand::getrandom(&mut *nonce, rustix::rand::GetRandomFlags::empty()).is_err() {
             return unavailable(&request.operation_id);
         }
-        let Some(key) = domain::derive_bundle_key(&nonce) else {
+        let Some(key) = domain::derive_bundle_key(&nonce[..]).map(Zeroizing::new) else {
             return unavailable(&request.operation_id);
         };
         let bundle_file = format!("central-export-{bundle_id}.tar.gz.bx1");
@@ -581,7 +585,7 @@ impl ExportHandlerImpl {
             }
         };
         let bundle_bytes = fs::metadata(&bundle_path).map(|m| m.len()).unwrap_or(0);
-        let Some(seed) = domain::hex_decode(&identity.private_seed_hex) else {
+        let Some(seed) = domain::hex_decode(&identity.private_seed_hex).map(Zeroizing::new) else {
             remove_partial(&partial);
             return export_response(
                 &request.operation_id,
@@ -601,7 +605,7 @@ impl ExportHandlerImpl {
                 None,
             );
         }
-        let mut seed_arr = [0u8; 32];
+        let mut seed_arr = Zeroizing::new([0u8; 32]);
         seed_arr.copy_from_slice(&seed);
         let token_id = (self.new_id)();
         if token_id.is_nil() {
@@ -616,7 +620,7 @@ impl ExportHandlerImpl {
             domain::EXPORT_PURPOSE,
             (self.now)(),
             domain::TOKEN_EXPIRY_SECONDS,
-            &nonce,
+            &nonce[..],
         ) else {
             remove_partial(&partial);
             return export_response(
@@ -650,10 +654,12 @@ impl ExportHandlerImpl {
         // nonce and authenticate every segment before reporting success.
         let self_ok = (|| -> Result<(), PortableError> {
             let decoded = domain::b64_url_raw_decode(&token.nonce_b64)
+                .map(Zeroizing::new)
                 .ok_or_else(|| PortableError("nonce".to_owned()))?;
             let derived = domain::derive_bundle_key(&decoded)
+                .map(Zeroizing::new)
                 .ok_or_else(|| PortableError("derive".to_owned()))?;
-            if !ct_eq(&derived, &key) {
+            if !ct_eq(&derived[..], &key[..]) {
                 return Err(PortableError("key mismatch".to_owned()));
             }
             let file =

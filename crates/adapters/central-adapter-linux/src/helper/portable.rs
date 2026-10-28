@@ -22,6 +22,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use zeroize::Zeroizing;
 
 use central_infra::portable as domain;
 use central_infra::portable::{ExportManifest, ManifestFile};
@@ -81,7 +82,8 @@ pub fn encrypt_stream(
     w.write_all(domain::CHUNKED_MAGIC)
         .and_then(|()| w.write_all(&base))
         .map_err(|e| PortableError::msg(format!("header write: {e}")))?;
-    let mut buf = vec![0u8; domain::CHUNK_SIZE];
+    // Plaintext staging buffer — scrubbed on drop (beyond Go parity).
+    let mut buf = Zeroizing::new(vec![0u8; domain::CHUNK_SIZE]);
     let mut index: u64 = 0;
     loop {
         // Go uses io.ReadFull: n>0 with ErrUnexpectedEOF is still a
@@ -151,11 +153,13 @@ pub fn decrypt_stream(
         if read_full(&mut ciphertext, &mut sealed)? != Fill::Full {
             return err("bundle truncated");
         }
-        let opened = gcm
-            .decrypt(&segment_nonce(&base, index), Payload::from(&sealed[..]))
-            .map_err(|_| {
-                PortableError::msg(format!("bundle authentication failed at segment {index}"))
-            })?;
+        // `opened` holds plaintext — scrub it on drop (beyond Go parity).
+        let opened = Zeroizing::new(
+            gcm.decrypt(&segment_nonce(&base, index), Payload::from(&sealed[..]))
+                .map_err(|_| {
+                    PortableError::msg(format!("bundle authentication failed at segment {index}"))
+                })?,
+        );
         w.write_all(&opened)
             .map_err(|e| PortableError::msg(format!("plain write: {e}")))?;
         index += 1;

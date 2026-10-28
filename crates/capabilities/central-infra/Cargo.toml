@@ -17,6 +17,7 @@ ed25519-dalek.workspace = true
 time.workspace = true
 trait-variant.workspace = true
 unicode-normalization.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

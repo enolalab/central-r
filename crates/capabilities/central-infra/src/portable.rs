@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Reason vocabulary — upstream `internal/portable/bundle.go` constants.
@@ -91,16 +92,18 @@ pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], okm_len: usize) -> Opti
     };
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(salt).ok()?;
     mac.update(ikm);
-    let prk = mac.finalize().into_bytes();
-    let mut okm = Vec::with_capacity(okm_len);
-    let mut prev: Vec<u8> = Vec::new();
+    // PRK, the chaining block, and the over-long OKM tail are all key
+    // material — scrub them on drop (Go parity plus hardening).
+    let prk = Zeroizing::new(mac.finalize().into_bytes().to_vec());
+    let mut okm = Zeroizing::new(Vec::with_capacity(okm_len));
+    let mut prev: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     let mut i: u8 = 1;
     while okm.len() < okm_len {
         let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&prk).ok()?;
-        mac.update(&prev);
+        mac.update(&prev[..]);
         mac.update(info);
         mac.update(&[i]);
-        prev = mac.finalize().into_bytes().to_vec();
+        prev = Zeroizing::new(mac.finalize().into_bytes().to_vec());
         okm.extend_from_slice(&prev);
         if i == 255 {
             break;
@@ -116,7 +119,7 @@ pub fn derive_bundle_key(nonce: &[u8]) -> Option<[u8; 32]> {
     if nonce.len() != 32 {
         return None;
     }
-    let okm = hkdf_sha256(&[], nonce, DEK_INFO, 32)?;
+    let okm = Zeroizing::new(hkdf_sha256(&[], nonce, DEK_INFO, 32)?);
     let mut key = [0u8; 32];
     key.copy_from_slice(&okm);
     Some(key)

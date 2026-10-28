@@ -1027,6 +1027,7 @@ dependencies = [
  "trait-variant",
  "unicode-normalization",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

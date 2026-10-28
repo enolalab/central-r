@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use central_foundation::failure::Failure;
 use central_foundation::identity::InstanceId;
@@ -439,8 +440,11 @@ impl ImportHandlerImpl {
             };
             return import_response(&request.operation_id, "denied", 2, reason, None);
         }
+        // The decoded nonce is the DEK preimage — scrub it and the
+        // derived bundle key on drop.
         let key = domain::b64_url_raw_decode(&token.nonce_b64)
-            .and_then(|nonce| domain::derive_bundle_key(&nonce));
+            .map(Zeroizing::new)
+            .and_then(|nonce| domain::derive_bundle_key(&nonce).map(Zeroizing::new));
         let Some(key) = key else {
             return import_response(
                 &request.operation_id,
