@@ -168,7 +168,7 @@ impl RescueHandler for RescueHandlerImpl {
     /// `Rescue` — upstream ordering verbatim: request and seams, then
     /// the installed verdict branches (current-and-calm no-op,
     /// non-expired refusal, full sequence otherwise).
-    fn rescue(&self, peer: PeerIdentity, _deadline: Instant, request: RescueRequest) -> Response {
+    fn rescue(&self, peer: PeerIdentity, deadline: Instant, request: RescueRequest) -> Response {
         let op = request.operation_id.as_str();
         let valid_id = uuid::Uuid::parse_str(op).is_ok()
             && uuid::Uuid::parse_str(op)
@@ -214,7 +214,7 @@ impl RescueHandler for RescueHandlerImpl {
             // these.
             return rescue_response(op, "denied", 7, advisory::REASON_RESCUE_NOT_APPLICABLE);
         }
-        self.rescue_from_deny_safe(peer, request, active)
+        self.rescue_from_deny_safe(peer, deadline, request, active)
     }
 }
 
@@ -225,6 +225,7 @@ impl RescueHandlerImpl {
     fn rescue_from_deny_safe(
         &self,
         peer: PeerIdentity,
+        deadline: Instant,
         request: RescueRequest,
         was_active: bool,
     ) -> Response {
@@ -247,7 +248,7 @@ impl RescueHandlerImpl {
             return rescue_response(op, "denied", 7, advisory::REASON_RESCUE_CEREMONY_REQUIRED);
         };
         let confirmation = pam
-            .confirm_security_rescue(peer, None, &self.scope, &request.operation_id)
+            .confirm_security_rescue(peer, Some(deadline), &self.scope, &request.operation_id)
             .ok()
             .filter(|token| pam.verify_and_consume(token));
         if confirmation.is_none() {

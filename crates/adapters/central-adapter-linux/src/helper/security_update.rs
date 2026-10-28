@@ -121,7 +121,7 @@ impl SecurityUpdateHandler {
     pub fn install_security_update(
         &self,
         peer: PeerIdentity,
-        _deadline: Instant,
+        deadline: Instant,
         request: SecurityUpdateRequest,
     ) -> Response {
         let op = request.operation_id.as_str();
@@ -151,7 +151,7 @@ impl SecurityUpdateHandler {
         }
         let mut envelope = request.envelope;
         let confirmation = pam
-            .confirm(peer, None, &request.operation_id)
+            .confirm(peer, Some(deadline), &request.operation_id)
             .ok()
             .filter(|token| pam.verify_and_consume(token));
         if confirmation.is_none() {
@@ -213,10 +213,7 @@ impl std::error::Error for SecurityUpdateClientError {}
 fn retained_security_update_reason(reason: &str) -> String {
     match reason {
         central_infra::advisory::REASON_DENY_SAFE_ACTIVE
-        | REASON_INVALID_SECURITY_UPDATE_REQUEST
         | REASON_SECURITY_UPDATE_AUTHORIZATION_REQUIRED
-        | REASON_SECURITY_UPDATE_INSTALL_FAILED
-        | REASON_SECURITY_UPDATE_UNAVAILABLE
         | REASON_AUTHORITY_DENIED => reason.to_owned(),
         _ => String::new(),
     }

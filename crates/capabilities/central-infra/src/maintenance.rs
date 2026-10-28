@@ -971,7 +971,13 @@ impl Store {
         };
         let key = self.key()?;
         let mut out = Vec::new();
-        for line in raw.split(|b| *b == b'\n') {
+        // Only `\n`-terminated records are consumed — a crash-torn
+        // trailing append is ignored upstream-fashion; the latest
+        // complete row wins.
+        for line in raw.split_inclusive(|b| *b == b'\n') {
+            let Some(line) = line.strip_suffix(b"\n") else {
+                continue;
+            };
             if line.is_empty() {
                 continue;
             }

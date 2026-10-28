@@ -199,7 +199,7 @@ impl MaintenanceHandler for MaintenanceHandlerImpl {
             if result.forbidden > 0 {
                 m::REASON_UNLISTED
             } else {
-                "ok"
+                ""
             },
         );
         resp.with_result(&result)
@@ -374,19 +374,22 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
     fn maintenance_apply(
         &self,
         peer: PeerIdentity,
-        _deadline: Instant,
+        deadline: Instant,
         request: MaintenanceApplyRequest,
     ) -> Response {
         let op = request.operation_id.as_str();
         if !valid_operation_id(op)
             || !peer.available()
             || self.store.is_none()
+            || self.pam.is_none()
             || self.scope.instance_id.is_empty()
             || self.scope.target_id.is_empty()
         {
             return maintenance_response(op, "denied", 7, REASON_AUTHORITY_DENIED);
         }
         let Some(pam) = &self.pam else {
+            // Upstream's narrow-interface assertion — unreachable once
+            // the AUTHORITY_DENIED gate above has run.
             return maintenance_response(op, "deferred", 5, REASON_MAINTENANCE_UNAVAILABLE);
         };
         let Some(store) = &self.store else {
@@ -428,7 +431,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
                         .with_result(&MaintenanceApplyResult {
                             operation_id: op.to_owned(),
                             attempt_id: pending.attempt_id,
-                            completed_at: now_rfc3339(),
+                            completed_at: String::new(),
                             ..MaintenanceApplyResult::default()
                         });
                 }
@@ -457,7 +460,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
                     &MaintenanceApplyResult {
                         operation_id: op.to_owned(),
                         attempt_id: found.attempt_id,
-                        completed_at: now_rfc3339(),
+                        completed_at: String::new(),
                         ..MaintenanceApplyResult::default()
                     },
                 );
@@ -503,7 +506,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
                     &MaintenanceApplyResult {
                         operation_id: op.to_owned(),
                         attempt_id: found.attempt_id,
-                        completed_at: now_rfc3339(),
+                        completed_at: String::new(),
                         ..MaintenanceApplyResult::default()
                     },
                 );
@@ -519,7 +522,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
                         operation_id: op.to_owned(),
                         mode: "rollback".to_owned(),
                         attempt_id: found.attempt_id,
-                        completed_at: now_rfc3339(),
+                        completed_at: String::new(),
                         ..MaintenanceApplyResult::default()
                     });
             }
@@ -532,7 +535,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
                         .with_result(&MaintenanceApplyResult {
                             operation_id: op.to_owned(),
                             attempt_id: pending.attempt_id,
-                            completed_at: now_rfc3339(),
+                            completed_at: String::new(),
                             ..MaintenanceApplyResult::default()
                         });
                 }
@@ -566,7 +569,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
                             operation_id: op.to_owned(),
                             mode: "abandon".to_owned(),
                             attempt_id: found.attempt_id,
-                            completed_at: now_rfc3339(),
+                            completed_at: String::new(),
                             ..MaintenanceApplyResult::default()
                         });
                 }
@@ -574,7 +577,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
             // Abandoning an authorized-but-unresolved attempt is an
             // authority act — the ceremony runs here too.
             let confirmation = pam
-                .confirm_maintenance_apply(peer, None, &self.scope, &request.operation_id)
+                .confirm_maintenance_apply(peer, Some(deadline), &self.scope, &request.operation_id)
                 .ok()
                 .filter(|token| pam.verify_and_consume(token));
             if confirmation.is_none() {
@@ -598,7 +601,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
             if result.matrix_digest.is_empty() {
                 result.matrix_digest = String::new();
             }
-            return maintenance_response(op, "success", 0, "ok").with_result(&result);
+            return maintenance_response(op, "success", 0, "").with_result(&result);
         }
 
         // Refuse unimplemented gate verbs before the ceremony: an
@@ -609,7 +612,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
         }
 
         let confirmation = pam
-            .confirm_maintenance_apply(peer, None, &self.scope, &request.operation_id)
+            .confirm_maintenance_apply(peer, Some(deadline), &self.scope, &request.operation_id)
             .ok()
             .filter(|token| pam.verify_and_consume(token));
         if confirmation.is_none() {
@@ -672,7 +675,7 @@ impl MaintenanceApplyHandler for MaintenanceApplyHandlerImpl {
         }
         result.sequence_num = matrix.sequence_num;
         result.matrix_digest = matrix.digest().unwrap_or_default();
-        maintenance_response(op, "success", 0, "ok").with_result(&result)
+        maintenance_response(op, "success", 0, "").with_result(&result)
     }
 }
 
@@ -762,20 +765,29 @@ impl std::fmt::Display for MaintenanceClientError {
 }
 impl std::error::Error for MaintenanceClientError {}
 
+/// `retainedMaintenanceReason` — the plan client's complete whitelist.
 fn retained_maintenance_reason(reason: &str) -> String {
     match reason {
         central_infra::advisory::REASON_DENY_SAFE_ACTIVE
-        | REASON_AUTHORITY_DENIED
-        | REASON_MAINTENANCE_UNAVAILABLE
-        | REASON_MAINTENANCE_MATRIX_TAMPERED
-        | REASON_INVALID_MAINTENANCE_REQUEST
         | m::REASON_UNLISTED
+        | REASON_MAINTENANCE_MATRIX_TAMPERED => reason.to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// `retainedMaintenanceApplyReason` — the apply client's complete
+/// whitelist.
+fn retained_maintenance_apply_reason(reason: &str) -> String {
+    match reason {
+        central_infra::advisory::REASON_DENY_SAFE_ACTIVE
+        | m::REASON_UNLISTED
+        | REASON_MAINTENANCE_MATRIX_TAMPERED
         | m::REASON_PATCH_PENDING
         | m::REASON_PATCH_UNKNOWN
         | m::REASON_PATCH_CLOSED
-        | m::REASON_ROLLBACK_STALE
+        | m::REASON_GATE_FAILED
         | m::REASON_GATE_UNKNOWN
-        | m::REASON_GATE_FAILED => reason.to_owned(),
+        | m::REASON_ROLLBACK_STALE => reason.to_owned(),
         _ => String::new(),
     }
 }
@@ -791,6 +803,12 @@ fn new_maintenance_client_error(exit_code: i64, reason: &str) -> MaintenanceClie
         reason: retained_maintenance_reason(reason),
         result: None,
     }
+}
+
+fn new_maintenance_apply_client_error(exit_code: i64, reason: &str) -> MaintenanceClientError {
+    let mut err = new_maintenance_client_error(exit_code, "");
+    err.reason = retained_maintenance_apply_reason(reason);
+    err
 }
 
 fn decode_exact<T: for<'de> Deserialize<'de> + Serialize>(
@@ -862,7 +880,11 @@ impl MaintenanceClient {
             .map_or(&b""[..], |r| r.get().as_bytes());
         if response.outcome != "success" || response.exit_code != 0 {
             let mut err = new_maintenance_client_error(response.exit_code, &response.reason);
-            if let Ok(denied) = decode_exact::<MaintenanceResult>(raw, "maintenance") {
+            // A denied plan still carries its violations — decode them
+            // so the CLI can echo the refused transitions.
+            if response.outcome == "denied"
+                && let Ok(denied) = decode_exact::<MaintenanceResult>(raw, "maintenance")
+            {
                 err.result = Some(Box::new(denied));
             }
             return Err(err);
@@ -903,8 +925,17 @@ impl MaintenanceApplyClient {
         operation_id: &str,
         request: &MaintenanceApplyRequest,
     ) -> Result<MaintenanceApplyClientResult, MaintenanceClientError> {
-        if self.socket_path.is_empty() || operation_id.is_empty() {
-            return Err(new_maintenance_client_error(3, ""));
+        let filled = [
+            &request.set,
+            &request.resume,
+            &request.rollback,
+            &request.abandon,
+        ]
+        .iter()
+        .filter(|v| !v.is_empty())
+        .count();
+        if self.socket_path.is_empty() || operation_id.is_empty() || filled != 1 {
+            return Err(new_maintenance_apply_client_error(3, ""));
         }
         let mut payload = serde_json::Map::new();
         if !request.set.is_empty() {
@@ -928,26 +959,34 @@ impl MaintenanceApplyClient {
             )
             .ok(),
         };
-        write_request(&mut conn, &msg).map_err(|_| new_maintenance_client_error(3, ""))?;
-        let response = read_response(&mut conn).map_err(|_| new_maintenance_client_error(3, ""))?;
+        write_request(&mut conn, &msg).map_err(|_| new_maintenance_apply_client_error(3, ""))?;
+        let response =
+            read_response(&mut conn).map_err(|_| new_maintenance_apply_client_error(3, ""))?;
         let raw = response
             .result
             .as_ref()
             .map_or(&b""[..], |r| r.get().as_bytes());
         if response.outcome != "success" || response.exit_code != 0 {
-            let mut err = new_maintenance_client_error(response.exit_code, &response.reason);
-            if let Ok(denied) = decode_exact::<MaintenanceApplyResult>(raw, "maintenance apply") {
+            let mut err = new_maintenance_apply_client_error(response.exit_code, &response.reason);
+            // A denied apply still carries the attempt identity and
+            // gate detail — decode them so the CLI can echo them.
+            if !raw.is_empty()
+                && let Ok(denied) = decode_exact::<MaintenanceApplyResult>(raw, "maintenance apply")
+            {
                 err.result = Some(Box::new(denied));
             }
             return Err(err);
         }
         if raw.is_empty() {
-            return Err(new_maintenance_client_error(6, ""));
+            return Err(new_maintenance_apply_client_error(6, ""));
         }
         let result: MaintenanceApplyResult = decode_exact(raw, "maintenance apply")
-            .map_err(|_| new_maintenance_client_error(6, ""))?;
-        if result.operation_id != operation_id || result.completed_at.is_empty() {
-            return Err(new_maintenance_client_error(
+            .map_err(|_| new_maintenance_apply_client_error(6, ""))?;
+        if result.operation_id != operation_id
+            || result.completed_at.is_empty()
+            || result.attempt_id.is_empty()
+        {
+            return Err(new_maintenance_apply_client_error(
                 response.exit_code,
                 &response.reason,
             ));

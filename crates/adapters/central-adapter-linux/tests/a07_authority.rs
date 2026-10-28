@@ -77,6 +77,14 @@ fn req(op: &str, v: &str) -> Request {
     }
 }
 
+fn req_payload(op: &str, v: &str, payload: &str) -> Request {
+    Request {
+        operation_id: op.to_owned(),
+        verb: v.to_owned(),
+        payload: RawValue::from_string(payload.to_owned()).ok(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The closed matrix — every unsupported verb answers exit 5
 // ---------------------------------------------------------------------------
@@ -300,6 +308,58 @@ fn deny_safe_gate_denies_mutating_and_admits_readonly() {
     let resp = helper_request(&server, &req("op-safe", verb::STATUS));
     assert_eq!(resp.outcome, "deferred");
     assert_eq!(resp.reason, "LIFECYCLE_SERVICE_UNAVAILABLE");
+
+    // The rest of upstream's `denySafeAdmitsHelper` table: rescue and
+    // maintenance-plan admit unconditionally; audit admits unless it
+    // asks for a repair — and an unparseable audit payload still
+    // passes the gate because dispatch denies it more precisely.
+    for (req, reason) in [
+        (
+            req("op-safe", verb::SECURITY_RESCUE),
+            advisory::REASON_RESCUE_UNAVAILABLE,
+        ),
+        (
+            req("op-safe", verb::MAINTENANCE_PLAN),
+            "MAINTENANCE_UNAVAILABLE",
+        ),
+        (
+            req_payload("op-safe", verb::STATE_AUDIT, "{}"),
+            "AUDIT_UNAVAILABLE",
+        ),
+        (
+            req_payload("op-safe", verb::STATE_AUDIT, "{\"repair\":false}"),
+            "AUDIT_UNAVAILABLE",
+        ),
+        (
+            // Valid wire JSON that `parse_audit_request` cannot
+            // decode — upstream's `{oops` case, expressed on the wire.
+            req_payload("op-safe", verb::STATE_AUDIT, "\"x\""),
+            "AUDIT_UNAVAILABLE",
+        ),
+    ] {
+        let resp = helper_request(&server, &req);
+        assert_eq!(resp.outcome, "deferred", "verb {}", req.verb);
+        assert_eq!(resp.reason, reason, "verb {}", req.verb);
+    }
+
+    // The deny side: every mutating verb — including the Task-13
+    // security-update/maintenance-apply pair and a repair audit —
+    // collapses to DENY_SAFE_ACTIVE before reaching a handler.
+    for req in [
+        req("op-safe", verb::DOWN),
+        req("op-safe", verb::WIPE),
+        req("op-safe", verb::BACKUP_EXPORT),
+        req("op-safe", verb::BACKUP_DELETE),
+        req("op-safe", verb::BACKUP_PRUNE),
+        req("op-safe", verb::SECURITY_UPDATE),
+        req("op-safe", verb::MAINTENANCE_APPLY),
+        req_payload("op-safe", verb::STATE_AUDIT, "{\"repair\":true}"),
+    ] {
+        let resp = helper_request(&server, &req);
+        assert_eq!(resp.outcome, "denied", "verb {}", req.verb);
+        assert_eq!(resp.exit_code, 7, "verb {}", req.verb);
+        assert_eq!(resp.reason, "DENY_SAFE_ACTIVE", "verb {}", req.verb);
+    }
 
     // `is_deny_safe_active` itself: absent → inactive; active →
     // active; corrupt → ACTIVE (the gate fails closed — a lock that
