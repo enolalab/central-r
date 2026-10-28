@@ -906,7 +906,10 @@ impl Service {
         // `json.Unmarshal` refuses a non-object request — serde's
         // derived `visit_seq` would happily take `[{…}]` or `[]`, so
         // the shape is pinned first; `null` still reaches the no-op
-        // arm below exactly as upstream.
+        // arm below exactly as upstream. Deliberate strictness kept:
+        // serde denies duplicate keys where Go is last-wins — that
+        // only ever denies, never admits more than upstream, and the
+        // sole caller is the trusted root helper.
         let trimmed_req = raw.get().trim();
         if !trimmed_req.starts_with('{') && trimmed_req != "null" {
             return denied("invalid request");

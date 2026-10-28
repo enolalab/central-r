@@ -66,6 +66,18 @@ fn b04_uuid(operation_id: &str) -> String {
         .to_owned()
 }
 
+/// `postgresServiceRoleBindRequest` — the `bind_postgres_service_role`
+/// wire shape. Field names serialize snake_case verbatim: upstream's
+/// `json:"instance_id"`/`"purpose"`/`"value"` tags — a PascalCase
+/// marshal decodes to the zero struct server-side and denies
+/// `unsupported purpose`.
+#[derive(serde::Serialize)]
+struct BindRequest<'a> {
+    instance_id: &'a str,
+    purpose: &'a str,
+    value: String,
+}
+
 impl LifecycleClient {
     /// `NewLifecycleClient`.
     #[must_use]
@@ -383,12 +395,6 @@ impl LifecycleClient {
         purpose: &str,
         value: &[u8],
     ) -> Result<(), Failure> {
-        #[derive(serde::Serialize)]
-        struct BindRequest<'a> {
-            instance_id: &'a str,
-            purpose: &'a str,
-            value: String,
-        }
         self.call_unit(
             protocol::POSTGRES_SERVICE_ROLE_BIND_RPC,
             &BindRequest {
@@ -488,4 +494,31 @@ fn read_response_line(conn: &mut UnixStream) -> Result<BrokerResponse, Failure> 
         return Err(internal("broker lifecycle: read: connection closed"));
     }
     serde_json::from_str(&line).map_err(|e| internal(format!("broker lifecycle: read: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `bind_postgres_service_role` payload marshals the exact
+    /// snake_case keys `postgresServiceRoleBindRequest` carries
+    /// upstream — a PascalCase drift decodes to the zero struct and
+    /// denies `unsupported purpose` (the `0d3f09f` defect this pins).
+    #[test]
+    fn bind_postgres_service_role_request_serializes_snake_case() {
+        let req = BindRequest {
+            instance_id: "inst-1",
+            purpose: "postgres_runtime_v1",
+            value: "cGFzc2ZpbGU".to_owned(),
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "instance_id": "inst-1",
+                "purpose": "postgres_runtime_v1",
+                "value": "cGFzc2ZpbGU",
+            })
+        );
+    }
 }

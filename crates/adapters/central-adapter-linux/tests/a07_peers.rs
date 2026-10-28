@@ -543,9 +543,12 @@ fn broker_json_transport_wrong_peer_denied() {
 
 /// `dispatch` reaches the purpose ladder only after admission: an
 /// admitted peer (the runtime uid) gets the purpose-level denials —
-/// `"unknown purpose"` for unregistered names and the closed
-/// `BROKER_AUTHORITY_DENIED: UNSUPPORTED_IN_THIS_SLICE` for the R6
-/// surface — never `authority denied`.
+/// `"unknown purpose"` for unregistered names — never `authority
+/// denied`. The in-process `Dispatch` switch has no R6-closed cases
+/// left: every connection-only RPC (Postgres service-role bind,
+/// advisory append, backup/restore helper RPCs) is peer-gated
+/// `HandleConn` work upstream never registers, so `Dispatch` answers
+/// its generic `default` — `"unknown purpose"` — for all of them.
 #[test]
 fn broker_dispatch_denies_unknown_and_r6_purposes_exact() {
     let scratch = Scratch::new("broker-dispatch");
@@ -557,10 +560,11 @@ fn broker_dispatch_denies_unknown_and_r6_purposes_exact() {
     );
     assert_eq!(resp.evidence.message, "unknown purpose");
 
-    // R6 surface: a registered-but-closed purpose name — only the
-    // Postgres service-role RPC remains closed in this slice; the
-    // advisory-evaluation RPC is live (peer-gated `HandleConn`), and
-    // the backup/recovery surface is live.
+    // Connection-only purposes `HandleConn` serves peer-gated are not
+    // registered in upstream's `Dispatch` switch — the Postgres
+    // service-role RPC is live on the connection (LC-T1), so the
+    // generic path answers `"unknown purpose"` like any unregistered
+    // name.
     let resp = svc.dispatch(&broker_request(
         "op-d-2",
         protocol::POSTGRES_SERVICE_ROLE_BIND_RPC,
@@ -569,13 +573,7 @@ fn broker_dispatch_denies_unknown_and_r6_purposes_exact() {
         resp.outcome,
         central_infra::authority::BrokerOutcome::Denied
     );
-    assert_eq!(
-        resp.evidence.message,
-        format!(
-            "BROKER_AUTHORITY_DENIED: {}",
-            protocol::UNSUPPORTED_IN_THIS_SLICE
-        )
-    );
+    assert_eq!(resp.evidence.message, "unknown purpose");
 
     // Connection-only purposes `HandleConn` serves (peer-gated backup
     // helper and restore-launch RPCs) are not registered in upstream's
