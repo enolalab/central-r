@@ -211,6 +211,12 @@ fn dispatch(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -
     if command_id.starts_with("restore.") {
         return restore_cli::restore(command_id, tokens, stdout, stderr);
     }
+    // `runBootstrapShow` — the B06 sibling verb shares the
+    // browser-open client; it lives with it like upstream's
+    // `b06_serve.go` pairs them.
+    if command_id == "bootstrap.show" {
+        return local_cli::bootstrap_show(stdout, stderr);
+    }
     let result = LocalResult::unsupported(command_id);
     match result.write_json_line(stdout) {
         Ok(()) => result.exit_code,
@@ -332,7 +338,6 @@ mod tests {
                 &["local", "dependency", "upgrade", "apply"],
                 "local.dependency-upgrade-plan",
             ),
-            (&["bootstrap", "show"], "bootstrap.show"),
         ];
         for (argv, want_id) in deferred {
             let (code, stdout, _) = invoke(argv);
@@ -422,6 +427,12 @@ mod tests {
             (
                 &["local", "browser", "open"][..],
                 "local.browser.open",
+                3,
+                "DEPENDENCY_UNAVAILABLE",
+            ),
+            (
+                &["bootstrap", "show"][..],
+                "bootstrap.show",
                 3,
                 "DEPENDENCY_UNAVAILABLE",
             ),

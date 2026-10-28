@@ -13,7 +13,11 @@
 //! audit (security_cli). `local.browser.open` is the B06 verb — the
 //! real `helperB06Client` call runs, so a helper-less host is the
 //! client's "helper unavailable" class on upstream's
-//! `DEPENDENCY_UNAVAILABLE` envelope.
+//! `DEPENDENCY_UNAVAILABLE` envelope. `central bootstrap show` shares
+//! the file because upstream colocates it with `runBrowserOpen` in
+//! `b06_serve.go` and it is the same client call on a sibling verb;
+//! `dispatch` routes `bootstrap.show` here since the id is not
+//! `local.*`.
 //!
 //! Every other registered `local` id — `local.trust.install`,
 //! `local.dependency-upgrade-plan` — stays deferred to its owning
@@ -553,6 +557,34 @@ fn run_browser_open_with(
         "BROWSER_OPENED",
         "CENTRAL_BOOTSTRAP_SHOW",
         "CHECK_READY_PROOF",
+        stdout,
+        stderr,
+    )
+}
+
+/// Ports `runBootstrapShow` — the same `helperB06Client` composition
+/// on verb `bootstrap-show`; upstream takes args and ignores them.
+/// `pub(crate)` for `dispatch`: the command id is `bootstrap.show`,
+/// not `local.*`, so it never reaches `local()`.
+pub(crate) fn bootstrap_show(stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
+    let client =
+        central_adapter_linux::helper::client::B06Client::from_env(&|key| std::env::var(key).ok());
+    run_bootstrap_show_with(&client, stdout, stderr)
+}
+
+/// The `runBootstrapShow` mapping over an injected client — upstream's
+/// `bootstrapShowClient` package-var seam.
+fn run_bootstrap_show_with(
+    client: &central_adapter_linux::helper::client::B06Client,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    run_b06(
+        client.show(),
+        "bootstrap.show",
+        "BOOTSTRAP_PRESENTED",
+        "OPEN_LOCAL_BOOTSTRAP_PAGE",
+        "CHECK_BROWSER_AND_TTY",
         stdout,
         stderr,
     )
@@ -1396,6 +1428,76 @@ mod tests {
         assert_eq!(
             parsed["details"]["safe_next_action"],
             "CENTRAL_BOOTSTRAP_SHOW"
+        );
+    }
+
+    /// `bootstrap show` — the same outcome table on the sibling
+    /// command id with its own reason/action strings; a helper-less
+    /// host is `DEPENDENCY_UNAVAILABLE` + `START_CENTRAL_HELPER` again.
+    #[test]
+    fn bootstrap_show_without_helper_is_dependency_unavailable_exit_3() {
+        let client = central_adapter_linux::helper::client::B06Client::new(
+            format!("/nonexistent-central-b06-{}.sock", std::process::id()),
+            1000,
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_bootstrap_show_with(&client, &mut out, &mut err);
+        assert_eq!(code, 3);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "bootstrap.show");
+        assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "START_CENTRAL_HELPER"
+        );
+    }
+
+    /// The `bootstrap.show` denied/success arms carry their own
+    /// strings — `CHECK_BROWSER_AND_TTY` on denial,
+    /// `OPEN_LOCAL_BOOTSTRAP_PAGE` on `BOOTSTRAP_PRESENTED`.
+    #[test]
+    fn bootstrap_show_outcome_table_denied_and_success() {
+        use central_adapter_linux::helper::client::B06Error;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_b06(
+            Err(B06Error::Denied),
+            "bootstrap.show",
+            "BOOTSTRAP_PRESENTED",
+            "OPEN_LOCAL_BOOTSTRAP_PAGE",
+            "CHECK_BROWSER_AND_TTY",
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 7);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "bootstrap.show");
+        assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "CHECK_BROWSER_AND_TTY"
+        );
+
+        let mut out = Vec::new();
+        let code = run_b06(
+            Ok(()),
+            "bootstrap.show",
+            "BOOTSTRAP_PRESENTED",
+            "OPEN_LOCAL_BOOTSTRAP_PAGE",
+            "CHECK_BROWSER_AND_TTY",
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["reason"], "BOOTSTRAP_PRESENTED");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "OPEN_LOCAL_BOOTSTRAP_PAGE"
         );
     }
 
