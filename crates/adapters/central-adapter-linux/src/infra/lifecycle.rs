@@ -35,10 +35,10 @@ use central_infra::port::{
 };
 
 use super::compose::{
-    BROKER_SOCKET_TARGET, CommandExecutor, ComposeRunner, POSTGRES_INIT_SCRIPT_SQL, Policy,
-    REQUIRED_SERVICE_MODES, RenderedFile, closed_docker_environment, durable_service_data_root,
-    durable_service_root, image_reference, load_default_policy, parse_rendered_model,
-    policy_digest, postgres_init_script_host_path, render, validate_model,
+    BROKER_SOCKET_TARGET, CommandExecutor, ComposeRunner, Policy, REQUIRED_SERVICE_MODES,
+    RenderedFile, closed_docker_environment, durable_service_data_root, durable_service_root,
+    image_reference, load_default_policy, parse_rendered_model, policy_digest, render,
+    validate_model,
 };
 use super::prepare::OpDeadline;
 
@@ -493,27 +493,14 @@ impl<B: LifecycleBootstrap + B04Bootstrap> Topology<B> {
                 format!("topology: B04 secret bootstrap adoption failed: {e}"),
             )
         })?;
-        // The init-script mount source must exist before `compose up`,
-        // or Docker auto-creates it as an empty directory and initdb
-        // aborts. Upstream's `postgresFirstBootBootstrap` performs this
-        // write inside `Materialize`, before delegating to the file
-        // bootstrap — the same pre-up window, on the same hardcoded
-        // instance anchor.
-        let init_path = postgres_init_script_host_path("", &binding.instance_id);
-        if let Some(init_dir) = Path::new(&init_path).parent() {
-            std::fs::create_dir_all(init_dir).map_err(|e| {
-                Failure::internal("TOPOLOGY", format!("topology: create init dir: {e}"))
-            })?;
-            set_mode(&init_dir.to_string_lossy(), 0o700).map_err(|e| {
-                Failure::internal("TOPOLOGY", format!("topology: init dir mode: {e}"))
-            })?;
-        }
-        std::fs::write(&init_path, POSTGRES_INIT_SCRIPT_SQL).map_err(|e| {
-            Failure::internal("TOPOLOGY", format!("topology: write init script: {e}"))
-        })?;
-        set_mode(&init_path, 0o600).map_err(|e| {
-            Failure::internal("TOPOLOGY", format!("topology: init script mode: {e}"))
-        })?;
+        // ADR 0019 §3's first-boot role-topology init script is NOT
+        // written here — the injectable bootstrap seam owns it:
+        // upstream's `postgresFirstBootBootstrap` runs the superuser
+        // store's `writeInitScript` inside `Materialize` before
+        // delegating to the file bootstrap (`lifecycle_linux.go`'s
+        // "the materialization step owns it"), at dir 0755/file 0644.
+        // A topology-side write would double-materialize the same
+        // path at divergent modes whenever the decorator is injected.
         let handoff = BootstrapHandoff {
             instance_id: binding.instance_id.clone(),
             purpose: BootstrapPurpose::FirstSetup,
@@ -2833,7 +2820,10 @@ impl<B: B04Bootstrap> B04Bootstrap for FileBootstrap<B> {
         &self,
         handoff: BootstrapHandoff,
     ) -> Result<MountProof, Failure> {
-        self.b04.materialize_minio_root(handoff).await
+        // Upstream routes `MaterializeMinioRoot` back through
+        // `Materialize` — handoff validation and the `used` tracking
+        // `Cleanup` consults both live there.
+        self.materialize(handoff).await
     }
     async fn issue_lifecycle_proof(
         &self,
