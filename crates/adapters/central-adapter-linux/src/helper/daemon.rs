@@ -375,16 +375,59 @@ pub fn run_helper_daemon(
     let srv = Arc::new(Server {
         peer_policy: Some(peer),
         socket: Some(socket),
+        // `newProductionPrepareHandlerWithConfirmer` — the shared
+        // confirmer, the shared B01 evaluator, the verified lock's
+        // `helper_release` identity, and the confirmation binding
+        // minted over the composition's own `config_binding` (the
+        // sha256 of the protected config — never request input).
+        // `prepareRootsFor`: the work dir is a sibling of the
+        // dependency store, `<state_root>/dependency-prepare`.
+        //
         // A host that cannot compose the prepare graph still serves
-        // every other verb; it refuses explicitly rather than being
-        // left unset — upstream's `unavailablePrepareHandler`. The real
-        // pipeline exists at `infra::prepare::new_prepare_handler`
-        // (service + handler, `PreparePamConfirmer` implemented on
-        // `PamConfirmer`); what this daemon still lacks is a production
-        // `EvaluateService` (advisory evaluation is a later task's
-        // seam), so the handler stays the explicit refusal until that
-        // composition can complete — upstream's rule verbatim.
-        prepare: Some(Box::new(UnavailablePrepareHandler)),
+        // every other verb: it refuses explicitly rather than being
+        // left unset — upstream's `unavailablePrepareHandler` — and
+        // the reason is journalled at startup, never onto the wire.
+        // A confirmer that cannot compose is fatal exactly as
+        // upstream's shared-confirmer construction is.
+        prepare: {
+            let handler: Box<dyn super::server::PrepareHandler> =
+                match helper_confirmer(&composition) {
+                    Ok(confirmer) => {
+                        match crate::infra::prepare::LockAdapter::new().and_then(|lock| {
+                            let source = super::prepare::PrepareConfirmationSource {
+                                config_binding: composition.config_binding.clone(),
+                                helper_release: super::prepare::helper_release_identity(
+                                    &lock.lock().helper_release_digest,
+                                ),
+                                boot_id: String::new(),
+                                now: None,
+                            };
+                            crate::infra::prepare::new_prepare_handler(
+                                std::path::PathBuf::from(&composition.authoritative_state_root)
+                                    .join("dependency-prepare"),
+                                Box::new(helper_advisory_evaluator(&composition, &broker_path)),
+                                Box::new(confirmer),
+                                source,
+                            )
+                        }) {
+                            Ok(handler) => Box::new(handler),
+                            Err(e) => {
+                                let _ = writeln!(
+                                    stderr,
+                                    "helper: dependency prepare is unavailable on this host: {}",
+                                    e.message()
+                                );
+                                Box::new(UnavailablePrepareHandler)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = writeln!(stderr, "helper: composition: {e}");
+                        return 6;
+                    }
+                };
+            Some(handler)
+        },
         // `newPresentInitHandler` — the ordinary server's init:
         // the resolved instance's three IDs with no ceremony and no
         // mutation.
@@ -516,12 +559,16 @@ pub fn run_helper_daemon(
         // the backup-read surface. The wipe roots derive from the
         // resolved composition (the instances parent is the state
         // root's own parent), with production ownership. The B01
-        // evaluator is upstream's `unavailableLifecycleEvaluator`
-        // verbatim until the evaluator link lands: every verb refuses
-        // `*_DENIED_SIGNED` rather than fabricating admission.
+        // evaluator is the shared production resolution — a
+        // composition failure inside it is the deny-only
+        // `unavailableLifecycleEvaluator` answer, never a fabricated
+        // admission.
         wipe: Some(Box::new(super::wipe::WipeHandlerImpl::new(
             Some(Box::new(PamConfirmer::new())),
-            Some(Box::new(super::wipe::DenyOnlyAdvisoryEvaluator)),
+            Some(Box::new(helper_advisory_evaluator(
+                &composition,
+                &broker_path,
+            ))),
             Some(Box::new(super::wipe::BackupReaderCheckpointVerifier {
                 read: Box::new(super::backup::BackupReadHandler::new(
                     Box::new(super::backup::FixedBackupRepositorySource {
@@ -642,13 +689,16 @@ pub fn run_helper_daemon(
         // and reference checker are unavailable until the
         // repository-delete and PG plumbing land — upstream's own
         // `unavailableDeleteSource`/`unavailableDeleteRefs` stand-ins.
-        // The deny-only advisory evaluates first, so the handler's
-        // actual first refusal is `DELETE_DENIED_SIGNED`; the
-        // unavailable seams refuse `DELETE_UNAVAILABLE` only after a
-        // signed admission, either way before any ceremony.
+        // The shared B01 evaluator runs first: a non-`current` verdict
+        // (or an uncomposed evaluator) refuses `DELETE_DENIED_SIGNED`
+        // before any ceremony; the unavailable seams refuse
+        // `DELETE_UNAVAILABLE` only after a signed admission.
         delete: Some(Box::new(super::delete::DeleteHandlerImpl::new(
             Some(Box::new(PamConfirmer::new())),
-            Some(Box::new(super::delete::DenyOnlyAdvisoryEvaluator)),
+            Some(Box::new(helper_advisory_evaluator(
+                &composition,
+                &broker_path,
+            ))),
             Some(Box::new(super::delete::UnavailableDeleteSource)),
             Some(Box::new(super::delete::UnavailableDeleteRefs)),
             CeremonyScope {
@@ -668,10 +718,14 @@ pub fn run_helper_daemon(
         // inventory + journal as central_migration, MinIO body
         // deletes) is not plumbed yet — upstream's nil engine made
         // explicit: `PRUNE_UNAVAILABLE` on both plan and apply rather
-        // than inventing eligibility without PG.
+        // than inventing eligibility without PG. The shared B01
+        // evaluator gates both actions on a `current` verdict first.
         prune: Some(Box::new(super::prune::PruneHandlerImpl::new(
             Some(Box::new(PamConfirmer::new())),
-            Some(Box::new(super::prune::DenyOnlyAdvisoryEvaluator)),
+            Some(Box::new(helper_advisory_evaluator(
+                &composition,
+                &broker_path,
+            ))),
             None,
             CeremonyScope {
                 instance_id: "default".to_owned(),
@@ -878,19 +932,21 @@ pub fn run_helper_daemon(
         )
         .ok()
         .map(|root| root.to_string_lossy().into_owned()),
-        // `lifecycle` stays unset for the same dependency-chain reason,
-        // one link deeper: `infra::lifecycle::new_production_service`
-        // needs (1) the B01 advisory evaluator — the same deferred seam
-        // as prepare — (2) the B02 active-receipt reader, (3) the OCI
-        // receipt inspector, (4) a `ComposeRunner`, (5) the typed B04
-        // broker authority (SCM_RIGHTS custody path), (6) the broker
+        // `lifecycle` stays unset for the remaining dependency-chain
+        // reason: `infra::lifecycle::new_production_service` needs
+        // (1) the B01 advisory evaluator — now landed as
+        // `HelperAdvisoryEvaluator`'s `infra::lifecycle::AdvisoryEvaluator`
+        // impl, upstream's `newHelperAdvisoryEvaluator` resolution —
+        // (2) the B02 active-receipt reader, (3) the OCI receipt
+        // inspector, (4) a `ComposeRunner`, (5) the typed B04 broker
+        // authority (SCM_RIGHTS custody path), (6) the broker
         // rendezvous for the minio-provision socket, and (7) the
         // dead-owner verifier the lock takeover consults. The port of
         // upstream's handler exists — `infra::lifecycle`'s
         // `LifecycleApplicationBridge` + `production_lifecycle_handler`
         // — but installing it without the full chain would be a
         // made-up success, so the matrix's `LIFECYCLE_SERVICE_UNAVAILABLE`
-        // answer stands until the evaluator link lands. This is
+        // answer stands until the remaining links land. This is
         // upstream's production status verbatim, not dead code: the
         // bridge drives the domain service synchronously and maps its
         // result onto the wire shape once composed.
@@ -1030,20 +1086,135 @@ struct HelperAdvisoryEvaluator {
 }
 
 impl HelperAdvisoryEvaluator {
-    /// The installed advisory's verdict, or the evaluator's own
-    /// failure — both surfaces upstream's `(Result, error)` return.
-    fn outcome(
+    /// `Service.Evaluate` — upstream's `(Result, Admission, error)`
+    /// triple: the verdict plus the journaled admission the destructive
+    /// and prepare seams carry through. `service: None` is upstream's
+    /// `unavailableLifecycleEvaluator{}` refusal verbatim — a `Denied`
+    /// answer, never a fabricated admission.
+    fn evaluate_pair(
         &self,
-    ) -> Result<central_infra::advisory::Outcome, central_foundation::failure::Failure> {
+    ) -> Result<
+        (
+            central_infra::advisory::Outcome,
+            central_infra::advisory::Admission,
+        ),
+        central_foundation::failure::Failure,
+    > {
         let Some(service) = &self.service else {
             return Err(central_foundation::failure::Failure::unavailable(
                 "advisory_evaluator_unavailable",
                 "B01 lifecycle admission evaluator is unavailable",
             ));
         };
-        crate::infra::lifecycle::block_on(service.evaluate())
-            .map(|(outcome, _)| outcome)
-            .map_err(|e| e.source)
+        crate::infra::lifecycle::block_on(service.evaluate()).map_err(|e| e.source)
+    }
+
+    /// The installed advisory's verdict, or the evaluator's own
+    /// failure — both surfaces upstream's `(Result, error)` return.
+    fn outcome(
+        &self,
+    ) -> Result<central_infra::advisory::Outcome, central_foundation::failure::Failure> {
+        self.evaluate_pair().map(|(outcome, _)| outcome)
+    }
+
+    /// The narrowed `(AdvisoryResult, AdvisoryAdmission)` pair every
+    /// non-lifecycle consumer takes — upstream's helper interfaces all
+    /// reduce `Service.Evaluate` to these two strings plus the receipt
+    /// id.
+    fn narrowed(
+        &self,
+    ) -> Result<
+        (
+            super::prepare::AdvisoryResult,
+            super::prepare::AdvisoryAdmission,
+        ),
+        central_foundation::failure::Failure,
+    > {
+        let (outcome, admission) = self.evaluate_pair()?;
+        Ok((
+            super::prepare::AdvisoryResult {
+                state: outcome.state.as_str().to_owned(),
+                code: outcome.code.as_str().to_owned(),
+            },
+            super::prepare::AdvisoryAdmission {
+                receipt_id: admission.receipt_id().to_owned(),
+            },
+        ))
+    }
+}
+
+impl crate::infra::lifecycle::AdvisoryEvaluator for HelperAdvisoryEvaluator {
+    /// The lifecycle handler's B01 boundary — the same one resolution
+    /// upstream hands `NewProductionService`. Composed when the rest of
+    /// the lifecycle chain lands; the seam is in place now.
+    fn evaluate(
+        &self,
+    ) -> Result<
+        (
+            central_infra::advisory::Outcome,
+            central_infra::advisory::Admission,
+        ),
+        central_foundation::failure::Failure,
+    > {
+        self.evaluate_pair()
+    }
+}
+
+impl super::prepare::EvaluateService for HelperAdvisoryEvaluator {
+    /// The dependency-prepare evaluator seam — upstream hands the same
+    /// helper evaluator to `NewPrepareHandlerWithPAM`.
+    fn evaluate(
+        &self,
+    ) -> Result<
+        (
+            super::prepare::AdvisoryResult,
+            super::prepare::AdvisoryAdmission,
+        ),
+        central_foundation::failure::Failure,
+    > {
+        self.narrowed()
+    }
+}
+
+impl super::wipe::WipeAdvisoryEvaluator for HelperAdvisoryEvaluator {
+    fn evaluate(
+        &self,
+    ) -> Result<
+        (
+            super::prepare::AdvisoryResult,
+            super::prepare::AdvisoryAdmission,
+        ),
+        central_foundation::failure::Failure,
+    > {
+        self.narrowed()
+    }
+}
+
+impl super::delete::DeleteAdvisoryEvaluator for HelperAdvisoryEvaluator {
+    fn evaluate(
+        &self,
+    ) -> Result<
+        (
+            super::prepare::AdvisoryResult,
+            super::prepare::AdvisoryAdmission,
+        ),
+        central_foundation::failure::Failure,
+    > {
+        self.narrowed()
+    }
+}
+
+impl super::prune::PruneAdvisoryEvaluator for HelperAdvisoryEvaluator {
+    fn evaluate(
+        &self,
+    ) -> Result<
+        (
+            super::prepare::AdvisoryResult,
+            super::prepare::AdvisoryAdmission,
+        ),
+        central_foundation::failure::Failure,
+    > {
+        self.narrowed()
     }
 }
 
@@ -1067,9 +1238,22 @@ impl super::audit::AuditAdvisoryEvaluator for HelperAdvisoryEvaluator {
 }
 
 /// `newHelperAdvisoryEvaluator` — the one B01 evaluator this helper
-/// process admits work with; both audit and rescue take it from here
-/// rather than each resolving their own, upstream's single-resolution
-/// rule.
+/// process admits work with; lifecycle, prepare, wipe, delete, prune,
+/// audit, and rescue all take it from here rather than each resolving
+/// their own: a second resolution is a second place for a deny-only
+/// default to be swapped for something more permissive, and prepare's
+/// promotion gate re-runs exactly the evaluation that admitted the
+/// request.
+///
+/// Outside `CENTRAL_DEVELOPMENT_LOCAL_ONLY` this composes the real
+/// production evaluator (`newProductionAdvisoryEvaluator`). A
+/// production evaluator that fails to compose — most often a fresh
+/// instance whose authoritative state root does not exist yet — falls
+/// back to the deny-only `None` arm rather than taking the whole
+/// helper down with it: every other verb (lifecycle status, backup,
+/// restore) has nothing to do with B01, the same reasoning
+/// `newProductionPrepareHandlerWithConfirmer`'s
+/// `unavailablePrepareHandler` precedent already established.
 fn helper_advisory_evaluator(
     composition: &crate::broker::daemon::ProductionInstanceComposition,
     broker_path: &std::path::Path,
@@ -1448,6 +1632,61 @@ mod tests {
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             "helper: composition: operator UID policy is not provisioned\n"
+        );
+    }
+
+    /// `newHelperAdvisoryEvaluator`'s fallback arm: an instance
+    /// composition without a state root/instance id yields the
+    /// deny-only evaluator — every narrow trait impl surfaces
+    /// upstream's `unavailableLifecycleEvaluator` refusal rather than
+    /// a fabricated admission. A host that cannot compose the
+    /// evaluator still serves every other verb.
+    #[test]
+    fn advisory_evaluator_falls_back_deny_only() {
+        let empty = crate::broker::daemon::ProductionInstanceComposition {
+            instance_id: String::new(),
+            config_binding: String::new(),
+            authoritative_state_root: String::new(),
+            dependency_root: String::new(),
+            role_roots: Default::default(),
+            backup_repository_root: String::new(),
+            compose_path: String::new(),
+            object_store_bucket: String::new(),
+            backup_policy_digest: String::new(),
+            restore_policy_digest: String::new(),
+            import_policy_digest: String::new(),
+        };
+        let evaluator =
+            helper_advisory_evaluator(&empty, std::path::Path::new("/nonexistent.sock"));
+        let err = evaluator.narrowed().unwrap_err();
+        assert_eq!(
+            err.message(),
+            "B01 lifecycle admission evaluator is unavailable"
+        );
+        let err = crate::helper::wipe::WipeAdvisoryEvaluator::evaluate(&evaluator).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "B01 lifecycle admission evaluator is unavailable"
+        );
+        let err = crate::helper::delete::DeleteAdvisoryEvaluator::evaluate(&evaluator).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "B01 lifecycle admission evaluator is unavailable"
+        );
+        let err = crate::helper::prune::PruneAdvisoryEvaluator::evaluate(&evaluator).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "B01 lifecycle admission evaluator is unavailable"
+        );
+        let err = crate::helper::prepare::EvaluateService::evaluate(&evaluator).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "B01 lifecycle admission evaluator is unavailable"
+        );
+        let err = crate::infra::lifecycle::AdvisoryEvaluator::evaluate(&evaluator).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "B01 lifecycle admission evaluator is unavailable"
         );
     }
 }

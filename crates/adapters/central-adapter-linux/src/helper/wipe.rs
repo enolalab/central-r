@@ -173,41 +173,11 @@ pub trait WipeCheckpointVerifier: Send + Sync {
     ) -> Result<(), Failure>;
 }
 
-/// `unavailableLifecycleEvaluator` — deny-only until B01's
-/// authoritative evaluator is wired into the composition. It is not a
-/// success stand-in: it makes the missing authority explicit.
-pub struct DenyOnlyAdvisoryEvaluator;
-
-impl DenyOnlyAdvisoryEvaluator {
-    fn evaluate_inner(
-        &self,
-    ) -> Result<
-        (
-            super::prepare::AdvisoryResult,
-            super::prepare::AdvisoryAdmission,
-        ),
-        Failure,
-    > {
-        Err(Failure::unavailable(
-            "lifecycle_admission",
-            "B01 lifecycle admission evaluator is unavailable",
-        ))
-    }
-}
-
-impl WipeAdvisoryEvaluator for DenyOnlyAdvisoryEvaluator {
-    fn evaluate(
-        &self,
-    ) -> Result<
-        (
-            super::prepare::AdvisoryResult,
-            super::prepare::AdvisoryAdmission,
-        ),
-        Failure,
-    > {
-        self.evaluate_inner()
-    }
-}
+// `unavailableLifecycleEvaluator` — upstream's deny-only stub moved to
+// the shared `daemon::HelperAdvisoryEvaluator` when B01's evaluator was
+// wired into the composition (upstream newHelperAdvisoryEvaluator): one
+// evaluator, one fail-closed arm — never a second place for a deny-only
+// default to be swapped for something more permissive.
 
 /// `wipeCheckpointAdapter` — answers the wipe handler's one checkpoint
 /// question through the backup-read surface: `verify_backup` on the

@@ -142,26 +142,10 @@ pub trait DeleteAdvisoryEvaluator: Send + Sync {
     >;
 }
 
-/// `unavailableLifecycleEvaluator` — deny-only until B01's evaluator is
-/// wired; see `wipe.rs`'s copy for the precedent.
-pub struct DenyOnlyAdvisoryEvaluator;
-
-impl DeleteAdvisoryEvaluator for DenyOnlyAdvisoryEvaluator {
-    fn evaluate(
-        &self,
-    ) -> Result<
-        (
-            super::prepare::AdvisoryResult,
-            super::prepare::AdvisoryAdmission,
-        ),
-        Failure,
-    > {
-        Err(Failure::unavailable(
-            "lifecycle_admission",
-            "B01 lifecycle admission evaluator is unavailable",
-        ))
-    }
-}
+// `unavailableLifecycleEvaluator`'s deny-only slot moved to the shared
+// `daemon::HelperAdvisoryEvaluator` with B01 wired (upstream
+// newHelperAdvisoryEvaluator): one evaluator, one fail-closed arm —
+// never a second place for a deny-only default to be swapped.
 
 /// `deleteBackupSource` — the sealed-backup read/delete seam.
 /// Production needs the repository index rewrite plus the sealed tree;

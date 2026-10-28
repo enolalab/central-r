@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use central_foundation::identity::InstanceId;
 use central_infra::authority::{CENTRAL_RUNTIME_GID, CENTRAL_RUNTIME_UID};
 use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+use sha2::Digest as _;
 
 use super::server::{Service, serve, serve_on_path};
 
@@ -57,6 +58,11 @@ pub struct ProductionInstanceComposition {
     /// The instance's validated identity — the directory name,
     /// `InstanceId`-parsed and config-verified.
     pub instance_id: String,
+    /// `"sha256:" + hex(sha256(config.json))` — upstream
+    /// `productionInstanceComposition.ConfigBinding`. The prepare
+    /// confirmation binds to it; it is read from the protected config
+    /// here and never accepted from a request.
+    pub config_binding: String,
     /// `<instances_root>/<instance_id>` — upstream
     /// `productionInstanceComposition.AuthoritativeStateRoot`.
     pub authoritative_state_root: String,
@@ -209,6 +215,13 @@ pub fn load_production_instance_composition_for_owner(
     if raw.is_empty() || raw.len() as u64 > MAX_CONFIG_BYTES {
         return Err(INSTANCE_UNAVAILABLE);
     }
+    // `sha256.Sum256(raw)` → `ConfigBinding = "sha256:%x"` — the raw
+    // bytes' digest, computed before `parse` so the binding always
+    // names the exact file the authority read.
+    let config_binding = format!(
+        "sha256:{}",
+        crate::broker::wire::hex_encode(&sha2::Sha256::digest(&raw))
+    );
     let cfg = central_infra::config::parse(&raw).map_err(|_| INSTANCE_UNAVAILABLE)?;
     let state_root = format!("{instances_root}/{instance_id}");
     if cfg.instance_id.to_string() != instance_id
@@ -222,6 +235,7 @@ pub fn load_production_instance_composition_for_owner(
         crate::infra::capacity_roles::role_roots(&instance_id).map_err(|_| INSTANCE_UNAVAILABLE)?;
     Ok(ProductionInstanceComposition {
         instance_id: instance_id.clone(),
+        config_binding,
         authoritative_state_root: state_root.clone(),
         dependency_root: format!("{state_root}/dependencies"),
         role_roots,
@@ -623,6 +637,14 @@ mod tests {
         )
         .expect("resolves");
         assert_eq!(comp.instance_id, id);
+        // `ConfigBinding = "sha256:" + hex(sha256(config.json))` — the
+        // digest of the exact bytes the authority read.
+        let raw = std::fs::read(root.join(&id).join("config.json")).expect("config");
+        let want = format!(
+            "sha256:{}",
+            crate::broker::wire::hex_encode(&sha2::Sha256::digest(&raw))
+        );
+        assert_eq!(comp.config_binding, want);
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -834,6 +856,7 @@ mod tests {
         let id = InstanceId::new().to_string();
         let comp = ProductionInstanceComposition {
             instance_id: id.clone(),
+            config_binding: String::new(),
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
             role_roots: Default::default(),

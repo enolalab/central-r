@@ -1105,6 +1105,7 @@ mod tests {
     fn import_preparer_rejects_incomplete_composition() {
         let empty = crate::broker::daemon::ProductionInstanceComposition {
             instance_id: String::new(),
+            config_binding: String::new(),
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
             role_roots: central_backup::backup::capacity::RoleRoots::default(),
