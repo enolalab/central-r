@@ -239,21 +239,32 @@ fn d07_acceptance() {
         evidence_profile: "docker",
         tier,
         scenarios: verdicts,
-        completed_at: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default(),
+        completed_at: central_adapter_linux::helper::audit::format_rfc3339nano(
+            time::OffsetDateTime::now_utc(),
+        ),
     };
     let encoded = serde_json::to_string_pretty(&bundle).expect("encode bundle");
+    let ephemeral;
     let dir = match std::env::var(D07_EVIDENCE_ENV) {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => std::env::temp_dir().join(format!(
-            "central-d07-bundle-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        )),
+        Ok(dir) if !dir.is_empty() => {
+            ephemeral = false;
+            PathBuf::from(dir)
+        }
+        _ => {
+            ephemeral = true;
+            std::env::temp_dir().join(format!(
+                "central-d07-bundle-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ))
+        }
     };
     mkdir_mode(&dir, 0o700).expect("create bundle dir");
     let path = dir.join("slice-d-acceptance.json");
     write_mode(&path, format!("{encoded}\n").as_bytes(), 0o644).expect("write bundle");
     eprintln!("D07 acceptance bundle: {}", path.display());
+    if ephemeral {
+        // Upstream's `t.TempDir` auto-cleans the no-EVIDENCE_DIR case.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
