@@ -1394,26 +1394,12 @@ mod tests {
             assert_eq!(code, 7);
             let parsed: serde_json::Value =
                 serde_json::from_str(String::from_utf8(out.clone()).unwrap().trim_end()).unwrap();
+            assert_eq!(parsed["command_id"], "local.browser.open");
             assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
             assert_eq!(parsed["details"]["safe_next_action"], "CHECK_READY_PROOF");
             out.clear();
             err.clear();
         }
-        let code = run_b06(
-            Err(B06Error::Denied),
-            "local.browser.open",
-            "BROWSER_OPENED",
-            "CENTRAL_BOOTSTRAP_SHOW",
-            "CHECK_READY_PROOF",
-            &mut out,
-            &mut err,
-        );
-        assert_eq!(code, 7);
-        let parsed: serde_json::Value =
-            serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
-        assert_eq!(parsed["command_id"], "local.browser.open");
-        assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
-        assert_eq!(parsed["details"]["safe_next_action"], "CHECK_READY_PROOF");
 
         let mut out = Vec::new();
         let code = run_b06(

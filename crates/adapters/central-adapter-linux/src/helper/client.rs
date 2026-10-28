@@ -294,11 +294,13 @@ impl PrepareClient {
     }
 }
 
-/// `B06Error` — the two upstream `helperB06Client.call` error values,
-/// kept as classes because that is all the dispatch reads: every
-/// pre-response failure is `errors.New("helper unavailable")`; a
-/// refused, non-zero, or unreadable answer is
-/// `errors.New("authority denied")`.
+/// `B06Error` — the two upstream `helperB06Client.call` error values
+/// as classes: every pre-response failure is
+/// `errors.New("helper unavailable")`; a refused, non-zero, or
+/// unreadable answer is `errors.New("authority denied")`. The dispatch
+/// folds both into its `err != nil` arm exactly like upstream; the
+/// classes stay so client-layer callers and tests keep the
+/// distinction `call` itself makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum B06Error {
     /// "helper unavailable" — socket-policy, dial, or write failure.
@@ -341,7 +343,7 @@ impl B06Client {
         let gid = env("CENTRAL_OPERATOR_GID")
             .and_then(|v| super::daemon::parse_u32_strict(&v))
             .filter(|v| *v != 0)
-            .unwrap_or_else(|| rustix::process::getegid().as_raw());
+            .unwrap_or_else(|| rustix::process::getgid().as_raw());
         Self::new(super::daemon::helper_socket_path(env), gid)
     }
 
