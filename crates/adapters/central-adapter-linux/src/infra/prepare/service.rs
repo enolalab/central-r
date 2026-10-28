@@ -1,341 +1,449 @@
-//! `service.go`'s adapter-side composition — the concrete
-//! [`helper::prepare::DependencyPrepareService`] the helper's
-//! `DependencyPrepareHandler` dispatches to. What lives here is the
-//! whole *boundary* half of upstream's operation: verified lock →
-//! capacity → fetch → verified stage → module cache → isolated
-//! BuildKit build → inventory-from-output — plus the import path's
-//! release staging and OCI inventory reads.
+//! `PrepareService` + `NewPrepareHandler` — the port of upstream
+//! `factory_linux.go`: the helper-facing driver that owns the
+//! unsettled-operation guard and iterates the selectors, while every
+//! selector's actual work is the [`PrepareState`] machine's.
 //!
-//! What deliberately does *not* live here yet is the durable half of
-//! upstream's `app.Service`: the operation journal that makes
-//! `--resume` lawful, the attestation signing that makes a built
-//! inventory promotable, and the `CandidateStore` promotion those two
-//! gate. Rather than fabricate a success a caller would act on, the
-//! pipeline runs every implemented stage in upstream's order and ends
-//! at an explicit `PREPARE_PROMOTION_UNAVAILABLE` denial — the same
-//! fail-closed shape upstream's import-only composition produces when
-//! the host lacks a signing key, only earlier in the graph.
-//! `resume`/`prepare_export_release` refuse for the same reason: the
-//! journal and export halves are later work, and an explicit refusal
-//! is the only honest answer a missing stage may give.
+//! Composition (`new_prepare_handler`): the verified lock, the operator's
+//! attestation key (a MISSING key yields an import-only handler — releases
+//! import, nothing builds, fresh prepares refuse immediately instead of
+//! after a fetch and two builds; any other key failure refuses the
+//! composition), the real advisory-currency verifier over the same evaluator
+//! the handler uses, the file journal, the protected candidate store, the
+//! docker image loader, and the release import/export services.
+//!
+//! The work directory and the dependency root are deliberately separate: the
+//! work directory is scratch the operation owns (fetches, builder roots, the
+//! journal); the dependency root is the protected store B03 reads its active
+//! receipt from. They must differ — the protected store is not scratch space.
 
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use central_foundation::failure::Failure;
-use central_infra::domain::{AcquisitionKind, PreparePhase, acquisition_kind_for};
-use central_infra::prepare::{self, Lock};
+use central_infra::domain::PreparePhase;
+use central_infra::prepare::{PrepareResult, prepare_codes, with_safe_next_action};
 
 use crate::helper::prepare::{
     AdvisoryAdmission, DependencyPrepareHandler, DependencyPrepareService, EvaluateService,
     PrepareConfirmationSource, PrepareOpResult, PreparePamConfirmer,
 };
-use crate::helper::protocol::StageTiming;
+use crate::helper::protocol::{ResourceCounters, StageTiming};
 
 use super::OpDeadline;
+use super::admission::{AdvisoryAdmissionVerifier, SharedEvaluate};
+use super::attestation::{
+    AttestationService, AttestationSigner, AttestationVerifier, Attestor, attestation_key_path,
+    load_attestation_signer,
+};
 use super::buildkit::BuildKit;
 use super::capacity::CapacityChecker;
+use super::export::ReleaseExportService;
 use super::fetch::Fetcher;
+use super::image_load::{DockerImageLoader, ImageLoader, image_loader_for};
+use super::journal::FileJournal;
 use super::lock::LockAdapter;
-use super::release_stage;
+use super::oci::Comparator;
+use super::release::ReleaseImportService;
+use super::state_machine::PrepareState;
+use super::store::CandidateStore;
 
-/// The helper's per-operation budget — upstream runs prepare inside a
-/// twenty-minute, non-resetting deadline.
-const OP_BUDGET: Duration = Duration::from_secs(20 * 60);
+/// `preparedSelectors` — what this helper can actually prepare: the
+/// selectors with a hermetic build path. PostgreSQL is deliberately absent:
+/// it is admitted as the accepted published OCI identity chain, a different
+/// acquisition. The state machine refuses a published selector on its own
+/// too, so a future list cannot smuggle one back in.
+const PREPARED_SELECTORS: [&str; 1] = ["minio"];
 
-/// `PrepareService` — upstream's `dependencyprepare.Service` narrowed
-/// to the stages this slice owns. Construction verifies the embedded
-/// lock once; every stage re-verifies what it consumes.
-pub struct PrepareService {
-    lock: Lock,
-    work_dir: PathBuf,
-    fetcher: Fetcher,
-    capacity: CapacityChecker,
-    builder: BuildKit,
+/// `PrepareRoots` — the two directories a prepare handler works in.
+#[derive(Debug, Clone)]
+pub struct PrepareRoots {
+    /// Scratch the operation owns: fetches, builder roots, the journal.
+    pub work_dir: PathBuf,
+    /// The protected store B03 reads its active receipt from.
+    pub dependency_root: PathBuf,
 }
 
-impl PrepareService {
-    /// `NewPrepareService` — `work_dir` is the operation scratch root
-    /// (fetched archives, build contexts, builder roots); the lock is
-    /// loaded and verified now so a host whose assets drifted refuses
-    /// at composition, not mid-operation.
-    ///
-    /// # Errors
-    /// Any lock verification failure refuses construction.
-    pub fn new(work_dir: impl Into<PathBuf>) -> Result<Self, Failure> {
-        let work_dir = work_dir.into();
-        let lock = LockAdapter::new()?.lock().clone();
-        Ok(Self {
-            fetcher: Fetcher::new(&lock, work_dir.join("fetch")),
-            capacity: CapacityChecker::new(&work_dir),
-            builder: BuildKit::with_work_dir(work_dir.join("builder")),
-            lock,
-            work_dir,
-        })
-    }
-
-    /// `with_fetcher` — binds a concrete fetch transport (the
-    /// helper-side seam); the default `HttpTransport` fails closed.
-    #[must_use]
-    pub fn with_fetcher(mut self, fetcher: Fetcher) -> Self {
-        self.fetcher = fetcher;
-        self
-    }
-
-    /// `with_builder` — a non-default builder root (tests).
-    #[must_use]
-    pub fn with_builder(mut self, builder: BuildKit) -> Self {
-        self.builder = builder;
-        self
-    }
-
-    /// One operation's scratch dir — fresh per call, never a sibling
-    /// it could confuse a prior operation's tree with.
-    fn operation_dir(&self) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        self.work_dir
-            .join(format!("op-{}-{nanos}", std::process::id()))
-    }
-
-    /// `denial` — a `PrepareOpResult` carrying only the safe surface:
-    /// a reason code, the failed phase, the derived next action. No
-    /// path, OS error, or builder output crosses.
-    fn denial(
-        operation_id: &str,
-        admission: &AdvisoryAdmission,
-        code: &str,
-        started: Instant,
-        timings: Vec<StageTiming>,
-    ) -> PrepareOpResult {
-        let mut r = PrepareOpResult {
-            exit_code: 5,
-            reason: format!("{code}: stage refused"),
-            operation_id: operation_id.to_owned(),
-            phase: PreparePhase::Failed.as_str().to_owned(),
-            admission_id: admission.receipt_id.clone(),
-            stage_timings: timings,
-            elapsed_ms: started.elapsed().as_millis() as i64,
-            ..PrepareOpResult::default()
-        };
-        r.safe_next_action = serde_json::to_string(&prepare::SafeNextAction::Terminal)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_owned();
-        r
-    }
-
-    /// `failure_denial` — map a stage's [`Failure`] onto the wire
-    /// result: the machine code crosses, the message does not (it can
-    /// name a path or an OS error).
-    fn failure_denial(
-        operation_id: &str,
-        admission: &AdvisoryAdmission,
-        failure: &Failure,
-        started: Instant,
-        timings: Vec<StageTiming>,
-    ) -> PrepareOpResult {
-        let exit_code = match failure.kind() {
-            central_foundation::failure::FailureKind::Cancelled => 128 + 2,
-            _ => 5,
-        };
-        let code = failure.code();
-        let mut r = Self::denial(operation_id, admission, code, started, timings);
-        r.exit_code = exit_code;
-        r.reason = format!("{code}: stage refused");
-        r
-    }
-
-    /// The fetch→stage→module-cache→build→inventory half of upstream
-    /// `Prepare`, for the one selector acquired by build. Returns the
-    /// produced inventory so the (later) comparison/promotion stages
-    /// have their proven fact; every earlier stage's refusal ends the
-    /// operation where upstream ends it.
-    fn build_pipeline(
-        &self,
-        deadline: OpDeadline,
-        op_dir: &std::path::Path,
-    ) -> Result<(), Failure> {
-        for selector in ["minio", "postgresql"] {
-            deadline.check()?;
-            if acquisition_kind_for(selector)? != AcquisitionKind::Built {
-                // Published images are admitted as pulled images, not
-                // fetched archives — the lifecycle side loads them.
-                continue;
-            }
-            if !self.capacity.has_capacity(deadline, selector)? {
-                return Err(Failure::unavailable(
-                    "CAPACITY_CHECK_FAILED",
-                    format!("dependencyprepare: capacity check failed for {selector:?}"),
-                ));
-            }
-            self.fetcher.fetch(deadline, selector)?;
-            // The build request's context is `root_b/context` — the
-            // verified source lands exactly where the isolated builder
-            // reads it.
-            let root_a = op_dir.join("build-a");
-            let root_b = op_dir.join("build-b");
-            self.fetcher
-                .stage_source(deadline, selector, &root_b.join("context"))?;
-            let recipe = self.lock.minio_recipe();
-            let request = prepare::new_build_request(
-                selector,
-                recipe,
-                &root_a.display().to_string(),
-                &root_b.display().to_string(),
-                false,
-            )?;
-            self.builder.build(deadline, &request)?;
+impl PrepareRoots {
+    fn validate(&self) -> Result<(), Failure> {
+        let bad = |m: &str| Failure::invalid("PREPARE_FACTORY", format!("factory: {m}"));
+        if self.work_dir.as_os_str().is_empty() {
+            return Err(bad("work directory is required"));
+        }
+        if self.dependency_root.as_os_str().is_empty() {
+            return Err(bad("dependency root is required"));
+        }
+        if self.work_dir == self.dependency_root {
+            return Err(bad(
+                "work directory and dependency root must differ; the protected store is not scratch space",
+            ));
         }
         Ok(())
     }
 }
 
-impl DependencyPrepareService for PrepareService {
-    /// `Prepare` — the acquisition/build half, then the explicit
-    /// promotion-boundary refusal. Every stage before the boundary is
-    /// real and runs in upstream's order.
-    fn prepare(&self, admission: &AdvisoryAdmission) -> PrepareOpResult {
-        let started = Instant::now();
-        let operation_id = format!("prepare-{}", std::process::id());
-        let deadline = OpDeadline::after(OP_BUDGET);
-        let mut timings = Vec::new();
-        let mark = |timings: &mut Vec<StageTiming>, phase: PreparePhase, at: Instant| {
-            timings.push(StageTiming {
-                phase: phase.as_str().to_owned(),
-                duration_ms: at.elapsed().as_millis() as f64,
-            });
-        };
-        let op_dir = self.operation_dir();
-        let acquiring = Instant::now();
-        if let Err(e) = std::fs::create_dir_all(&op_dir) {
-            return Self::failure_denial(
-                &operation_id,
-                admission,
-                &Failure::internal(
-                    "PREPARE_WORKDIR",
-                    format!("dependencyprepare: operation dir: {e}"),
-                ),
-                started,
-                timings,
-            );
-        }
-        match self.build_pipeline(deadline, &op_dir) {
-            Ok(()) => {
-                mark(&mut timings, PreparePhase::Building, acquiring);
-                Self::denial(
-                    &operation_id,
-                    admission,
-                    "PREPARE_PROMOTION_UNAVAILABLE",
-                    started,
-                    timings,
-                )
-            }
-            Err(e) => {
-                mark(&mut timings, PreparePhase::Acquiring, acquiring);
-                Self::failure_denial(&operation_id, admission, &e, started, timings)
-            }
-        }
-    }
+/// `PrepareService`.
+pub struct PrepareService {
+    journal: Arc<FileJournal>,
+    state: PrepareState,
+    selectors: Vec<String>,
+    exporter: Option<ReleaseExportService>,
+    keyless: bool,
+}
 
-    /// `Resume` — there is no operation journal in this slice, so no
-    /// operation can lawfully resume: the refusal is explicit rather
-    /// than a guessed-at state.
-    fn resume(&self, id: &str) -> PrepareOpResult {
-        let mut r = PrepareOpResult {
-            exit_code: 5,
-            reason: "PREPARE_UNAVAILABLE: no resumable operation journal".to_owned(),
-            operation_id: id.to_owned(),
-            phase: PreparePhase::Failed.as_str().to_owned(),
-            safe_next_action: "PREPARATION_REQUIRED".to_owned(),
-            ..PrepareOpResult::default()
-        };
-        r.selector.clear();
-        r
-    }
-
-    /// `PrepareFromRelease` — the import half is fully real: stage the
-    /// operator's release tree under caps and a closed entry set, then
-    /// read the MinIO OCI inventory and the docker-save config back
-    /// from the staged bytes. The promotion the inventory would feed
-    /// is the same unbuilt seam `prepare` ends at.
-    fn prepare_from_release(&self, admission: &AdvisoryAdmission, dir: &str) -> PrepareOpResult {
-        let started = Instant::now();
-        let operation_id = format!("prepare-release-{}", std::process::id());
-        let deadline = OpDeadline::after(OP_BUDGET);
-        let op_dir = self.operation_dir();
-        if let Err(e) = std::fs::create_dir_all(&op_dir) {
-            return Self::failure_denial(
-                &operation_id,
-                admission,
-                &Failure::internal(
-                    "PREPARE_WORKDIR",
-                    format!("dependencyprepare: operation dir: {e}"),
-                ),
-                started,
-                Vec::new(),
-            );
-        }
-        let result = (|| {
-            let paths =
-                release_stage::stage_release_dir(deadline, std::path::Path::new(dir), &op_dir)?;
-            let scratch = op_dir.join("read-scratch");
-            let _minio = release_stage::read_release_minio_inventory(
-                std::path::Path::new(&paths.minio_tar),
-                &scratch,
-            )?;
-            let _infra = release_stage::read_infra_save_config(
-                std::path::Path::new(&paths.infra_tar),
-                &scratch,
-            )?;
-            Ok::<(), Failure>(())
-        })();
-        match result {
-            Ok(()) => Self::denial(
-                &operation_id,
-                admission,
-                "PREPARE_PROMOTION_UNAVAILABLE",
-                started,
-                Vec::new(),
-            ),
-            Err(e) => Self::failure_denial(&operation_id, admission, &e, started, Vec::new()),
-        }
-    }
-
-    /// `PrepareExportRelease` — writing a release bundle is the
-    /// attestation half of the operation; without signing it would be
-    /// an unverifiable bundle, so the verb refuses explicitly.
-    fn prepare_export_release(&self, admission: &AdvisoryAdmission, _dir: &str) -> PrepareOpResult {
-        Self::denial(
-            &format!("prepare-export-{}", std::process::id()),
-            admission,
-            "RELEASE_EXPORT_FAILED",
-            Instant::now(),
-            Vec::new(),
-        )
+fn to_op_result(r: &PrepareResult) -> PrepareOpResult {
+    PrepareOpResult {
+        exit_code: i64::from(r.exit_code),
+        reason: r.reason.clone(),
+        operation_id: r.operation_id.clone(),
+        receipt_id: r.receipt_id.clone(),
+        phase: r.phase.as_str().to_owned(),
+        resume_required: r.resume_required,
+        reused: r.reused,
+        acquired: r.acquired,
+        safe_next_action: r.safe_next_action.as_str().to_owned(),
+        stage_timings: r
+            .stage_timings
+            .iter()
+            .map(|t| StageTiming {
+                phase: t.phase.clone(),
+                duration_ms: t.duration_ms,
+            })
+            .collect(),
+        counters: ResourceCounters {
+            fetched: r.counters.fetched,
+            built: r.counters.built,
+            compared: r.counters.compared,
+            staged: r.counters.staged,
+            bytes_read: r.counters.bytes_read,
+        },
+        elapsed_ms: r.elapsed_ms,
+        admission_id: r.admission_id.clone(),
+        selector: r.selector.clone(),
     }
 }
 
-/// `NewPrepareHandlerWithPAM` — upstream's factory: the prepare verb's
-/// full handler = the real pipeline service + the advisory evaluator
-/// seam + the binding-bound PAM confirmer + the helper-minted
-/// confirmation source. The daemon installs
-/// `unavailablePrepareHandler` when it cannot compose all four — a
-/// host without an advisory evaluator refuses the verb explicitly
-/// rather than answering a made-up success, exactly upstream's
-/// composition-failure rule.
+fn failed(reason: impl Into<String>, extra: impl FnOnce(&mut PrepareResult)) -> PrepareOpResult {
+    let mut r = base_result(PreparePhase::Failed);
+    r.exit_code = 1;
+    r.reason = reason.into();
+    extra(&mut r);
+    to_op_result(&with_safe_next_action(r))
+}
+
+fn base_result(phase: PreparePhase) -> PrepareResult {
+    PrepareResult {
+        exit_code: 0,
+        reason: String::new(),
+        operation_id: String::new(),
+        receipt_id: String::new(),
+        phase,
+        resume_required: false,
+        reused: 0,
+        acquired: 0,
+        safe_next_action: central_infra::prepare::SafeNextAction::None,
+        stage_timings: Vec::new(),
+        counters: central_infra::prepare::ResourceCounters::default(),
+        elapsed_ms: 0,
+        admission_id: String::new(),
+        selector: String::new(),
+        deadline: time::OffsetDateTime::UNIX_EPOCH,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+impl PrepareService {
+    fn unsettled_result(&self) -> Option<PrepareOpResult> {
+        let op = self.journal.unsettled()?;
+        let mut r = base_result(super::state_machine::map_authority_phase(op.phase));
+        r.operation_id = op.operation_id.clone();
+        r.receipt_id = op.receipt_id.clone();
+        r.selector = op.selector.clone();
+        r.resume_required = true;
+        r.reason = format!(
+            "unsettled operation {} at phase {}",
+            op.operation_id,
+            op.phase.as_str()
+        );
+        Some(to_op_result(&with_safe_next_action(r)))
+    }
+
+    /// Drives every selector through `one`, aggregating exactly as upstream:
+    /// the first failure returns; the last selector's measurements are
+    /// carried through (this driver runs no phases itself, so the only
+    /// honest timings and counters are the ones the operation it drove
+    /// recorded).
+    fn drive(
+        &self,
+        admission: &AdvisoryAdmission,
+        one: impl Fn(&str) -> PrepareResult,
+    ) -> PrepareOpResult {
+        let mut last: Option<PrepareResult> = None;
+        let mut acquired = 0;
+        let mut elapsed_ms = 0;
+        for selector in &self.selectors {
+            let result = one(selector);
+            if result.phase == PreparePhase::Failed {
+                return to_op_result(&result);
+            }
+            if result.phase == PreparePhase::Skipped {
+                continue;
+            }
+            acquired = result.acquired;
+            elapsed_ms += result.elapsed_ms;
+            last = Some(result);
+        }
+        let Some(last) = last.filter(|_| acquired != 0) else {
+            // No operation ran, so there is no operation to name: a minted
+            // identifier no journal had ever heard of could never be resumed.
+            let mut r = base_result(PreparePhase::Skipped);
+            r.reason = "NO_SELECTORS".to_owned();
+            return to_op_result(&with_safe_next_action(r));
+        };
+        let mut r = base_result(PreparePhase::Ready);
+        r.operation_id = last.operation_id;
+        r.receipt_id = last.receipt_id;
+        r.selector = last.selector;
+        r.acquired = acquired;
+        r.admission_id.clone_from(&admission.receipt_id);
+        r.stage_timings = last.stage_timings;
+        r.counters = last.counters;
+        r.elapsed_ms = elapsed_ms;
+        to_op_result(&with_safe_next_action(r))
+    }
+}
+
+impl DependencyPrepareService for PrepareService {
+    fn prepare(&self, admission: &AdvisoryAdmission) -> PrepareOpResult {
+        if self.keyless {
+            // No attestation key: a build is impossible, so the refusal is
+            // immediate rather than after a fetch and two twenty-minute
+            // builds. From-release imports bypass this (no key needed).
+            return failed("PREPARE_UNAVAILABLE", |_| {});
+        }
+        if let Some(unsettled) = self.unsettled_result() {
+            return unsettled;
+        }
+        self.drive(admission, |selector| {
+            self.state.prepare_one(admission, selector)
+        })
+    }
+
+    fn resume(&self, id: &str) -> PrepareOpResult {
+        to_op_result(&self.state.resume(id))
+    }
+
+    fn prepare_from_release(&self, admission: &AdvisoryAdmission, dir: &str) -> PrepareOpResult {
+        if let Some(unsettled) = self.unsettled_result() {
+            return unsettled;
+        }
+        self.drive(admission, |selector| {
+            self.state
+                .prepare_one_from_release(admission, selector, Path::new(dir))
+        })
+    }
+
+    /// `PrepareExportRelease` — runs the standard full prepare to
+    /// completion, then assembles a release from that operation's
+    /// artifacts. The prepare keeps its journaling and resume behavior; only
+    /// the post-completion assembly is new, and it is unjournalled — a failed
+    /// assembly names the completed prepare it could not export, and a re-run
+    /// re-prepares.
+    fn prepare_export_release(&self, admission: &AdvisoryAdmission, dir: &str) -> PrepareOpResult {
+        let Some(exporter) = &self.exporter else {
+            return failed("EXPORT_UNCONFIGURED", |_| {});
+        };
+        if let Err(e) = exporter.check_export_dir(Path::new(dir)) {
+            return failed(format!("EXPORT_DIR_UNUSABLE: {}", e.message()), |_| {});
+        }
+        let result = self.prepare(admission);
+        if result.phase != PreparePhase::Ready.as_str() {
+            return result;
+        }
+        if result.selector != "minio" {
+            // Unreachable today (the selector list pins ["minio"]); a future
+            // selector would silently export the wrong operation's artifacts.
+            return failed(
+                format!(
+                    "EXPORT_FAILED: no minio operation to export (selector {:?})",
+                    result.selector
+                ),
+                |r| {
+                    r.operation_id.clone_from(&result.operation_id);
+                    r.selector.clone_from(&result.selector);
+                },
+            );
+        }
+        match exporter.export_release(
+            OpDeadline::after(central_infra::prepare::OPERATION_BUDGET),
+            &result.operation_id,
+            Path::new(dir),
+        ) {
+            Ok(()) => result,
+            Err(e) => {
+                let label = if e.code() == prepare_codes::RELEASE_EXPORT_DIR_UNUSABLE {
+                    "EXPORT_DIR_UNUSABLE"
+                } else {
+                    "EXPORT_FAILED"
+                };
+                failed(format!("{label}: {}", e.message()), |r| {
+                    r.operation_id.clone_from(&result.operation_id);
+                    r.receipt_id.clone_from(&result.receipt_id);
+                    r.selector.clone_from(&result.selector);
+                })
+            }
+        }
+    }
+}
+
+/// `NewPrepareHandlerWithSigner` — composes the whole prepare graph around
+/// an optional attestation signer (`None` → import-only).
+///
+/// # Errors
+/// An invalid root pair, a lock or trust-policy verification failure, an
+/// untrusted signing key, or an uncreatable work directory.
+pub fn compose_prepare_service(
+    roots: &PrepareRoots,
+    eval: Arc<dyn EvaluateService>,
+    signer: Option<AttestationSigner>,
+) -> Result<PrepareService, Failure> {
+    roots.validate()?;
+    let lock = LockAdapter::new()?.lock().clone();
+    let policy = lock.attestation_trust.clone();
+    policy.validate().map_err(|e| {
+        Failure::invalid(
+            "PREPARE_FACTORY",
+            format!("factory: attestation trust: {}", e.message()),
+        )
+    })?;
+    let keyless = signer.is_none();
+    let build_dir = roots.work_dir.join("build");
+    let attestor: Option<Arc<dyn Attestor>> = match signer {
+        Some(s) => Some(Arc::new(
+            AttestationService::new(s, policy.clone())?.with_artifact_dir(&build_dir),
+        )),
+        None => None,
+    };
+    let fetches_dir = roots.work_dir.join("fetches");
+    std::fs::create_dir_all(&fetches_dir).map_err(|e| {
+        Failure::internal(
+            "PREPARE_FACTORY",
+            format!("factory: create fetches dir: {e}"),
+        )
+    })?;
+    let journal = Arc::new(FileJournal::new(roots.work_dir.join("journal"))?);
+    // The loader is never left absent: a host with no docker is not an
+    // unconfigured service, it is a host that cannot prepare. It gets a loader
+    // that fails closed at the capacity checkpoint, naming the missing binary,
+    // in seconds. The infra side takes the deliberate `None` instead: every
+    // use fails closed on it, and the Supported gate runs before any import
+    // reaches the infra load.
+    let loader: Arc<dyn ImageLoader> = Arc::from(image_loader_for(DockerImageLoader::from_path()));
+    let release_verifier = AttestationVerifier::new(policy);
+    let importer = ReleaseImportService::new(
+        lock.clone(),
+        release_verifier.clone(),
+        Arc::new(DockerImageLoaderShim::new()),
+        DockerImageLoader::from_path().ok(),
+    );
+    let exporter = DockerImageLoader::from_path().ok().map(|docker| {
+        ReleaseExportService::new(lock.clone(), release_verifier.clone(), docker, &build_dir)
+    });
+    let verifier = Arc::new(AdvisoryAdmissionVerifier::new(eval));
+    let store = Arc::new(CandidateStore::new(
+        Some(LockAdapter::with_lock(lock.clone())),
+        &roots.dependency_root,
+    ));
+    let mut state = PrepareState::new(
+        Arc::clone(&journal),
+        verifier,
+        Arc::new(BuildKit::with_work_dir(&build_dir)),
+        store,
+        lock.clone(),
+        Arc::new(Fetcher::new(&lock, &fetches_dir)),
+        Arc::new(CapacityChecker::new(&roots.work_dir)),
+        PREPARED_SELECTORS.map(str::to_owned).to_vec(),
+        &build_dir,
+    )
+    .with_image_loader(loader)
+    .with_release_importer(Arc::new(importer));
+    if let Some(attestor) = attestor {
+        state = state.with_attestation(Arc::new(Comparator), attestor);
+    }
+    Ok(PrepareService {
+        journal,
+        state,
+        selectors: PREPARED_SELECTORS.map(str::to_owned).to_vec(),
+        exporter,
+        keyless,
+    })
+}
+
+/// A second, independent image loader for the import service (the state
+/// machine owns the first); both resolve docker the same way.
+struct DockerImageLoaderShim(Box<dyn ImageLoader>);
+
+impl DockerImageLoaderShim {
+    fn new() -> Self {
+        Self(image_loader_for(DockerImageLoader::from_path()))
+    }
+}
+
+impl ImageLoader for DockerImageLoaderShim {
+    fn supported(&self, deadline: OpDeadline) -> Result<(), Failure> {
+        self.0.supported(deadline)
+    }
+
+    fn load(
+        &self,
+        deadline: OpDeadline,
+        req: &central_infra::prepare::ImageLoadRequest,
+    ) -> Result<central_infra::prepare::LoadedImage, Failure> {
+        self.0.load(deadline, req)
+    }
+}
+
+/// `NewPrepareHandlerWithPAM` — loads the attestation signing key from the
+/// operator's state directory. The key is never generated here and never
+/// lives in the work directory. A MISSING key yields an import-only handler;
+/// any other key failure (corrupt file, untrusted key) fails the factory
+/// rather than silently going keyless.
+///
+/// # Errors
+/// Any composition failure; the daemon then installs the unavailable
+/// handler and journals the reason at startup, never onto the wire.
 pub fn new_prepare_handler(
-    work_dir: impl Into<PathBuf>,
+    roots: &PrepareRoots,
     eval: Box<dyn EvaluateService>,
     pam: Box<dyn PreparePamConfirmer>,
     source: PrepareConfirmationSource,
 ) -> Result<DependencyPrepareHandler, Failure> {
-    let service = PrepareService::new(work_dir)?;
+    let eval: Arc<dyn EvaluateService> = Arc::from(eval);
+    let key_path = attestation_key_path();
+    let signer = match std::fs::symlink_metadata(&key_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "factory: no attestation signing key at {}: import-only prepare handler",
+                key_path.display()
+            );
+            None
+        }
+        _ => Some(load_attestation_signer(&key_path).map_err(|e| {
+            Failure::invalid(
+                "PREPARE_FACTORY",
+                format!(
+                    "factory: attestation signing key ({}, override with {}): {}",
+                    key_path.display(),
+                    super::attestation::ATTESTATION_KEY_ENV,
+                    e.message()
+                ),
+            )
+        })?),
+    };
+    let service =
+        compose_prepare_service(roots, Arc::new(SharedEvaluate(Arc::clone(&eval))), signer)?;
     Ok(DependencyPrepareHandler::new(
         Box::new(service),
-        eval,
+        Box::new(SharedEvaluate(eval)),
         pam,
         source,
     ))
@@ -344,9 +452,26 @@ pub fn new_prepare_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helper::prepare::AdvisoryResult;
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+    struct Eval;
+
+    impl EvaluateService for Eval {
+        fn evaluate(&self) -> Result<(AdvisoryResult, AdvisoryAdmission), Failure> {
+            Ok((
+                AdvisoryResult {
+                    state: "current".to_owned(),
+                    code: String::new(),
+                },
+                AdvisoryAdmission {
+                    receipt_id: "fresh".to_owned(),
+                },
+            ))
+        }
+    }
+
+    fn roots(tag: &str) -> PrepareRoots {
+        let base = std::env::temp_dir().join(format!(
             "central-prepare-svc-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -354,72 +479,128 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::create_dir_all(&dir).expect("tempdir");
-        dir
+        PrepareRoots {
+            work_dir: base.join("work"),
+            dependency_root: base.join("deps"),
+        }
     }
 
-    /// The service composes against the shipped lock — a host whose
-    /// embedded assets cannot verify never serves the verb.
-    #[test]
-    fn service_composes_with_verified_lock() {
-        let dir = tempdir("compose");
-        let svc = PrepareService::new(&dir).expect("compose");
-        assert!(svc.lock.fetch_capability.contains_key("minio"));
-        std::fs::remove_dir_all(&dir).ok();
+    fn keyless(tag: &str) -> (PrepareRoots, PrepareService) {
+        let r = roots(tag);
+        std::fs::create_dir_all(&r.work_dir).expect("work");
+        let svc = compose_prepare_service(&r, Arc::new(Eval), None).expect("compose");
+        (r, svc)
     }
 
-    /// `resume` refuses explicitly — no journal means no lawful resume.
-    #[test]
-    fn resume_is_explicit_denial() {
-        let dir = tempdir("resume");
-        let svc = PrepareService::new(&dir).expect("compose");
-        let r = svc.resume("op-x");
-        assert_eq!(r.exit_code, 5);
-        assert_eq!(r.phase, "failed");
-        assert!(r.reason.starts_with("PREPARE_UNAVAILABLE"));
-        std::fs::remove_dir_all(&dir).ok();
+    fn cleanup(r: &PrepareRoots) {
+        if let Some(base) = r.work_dir.parent() {
+            let _ = std::fs::remove_dir_all(base);
+        }
     }
 
-    /// `prepare` reaches the transport seam or a stage refusal — it
-    /// never answers success without the promotion half existing.
-    #[test]
-    fn prepare_never_fakes_success() {
-        let dir = tempdir("prep");
-        let svc = PrepareService::new(&dir).expect("compose");
-        let admission = AdvisoryAdmission {
-            receipt_id: "receipt-1".to_owned(),
-        };
-        let r = svc.prepare(&admission);
-        assert_ne!(r.exit_code, 0);
-        assert_eq!(r.phase, "failed");
-        assert!(!r.reason.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
+    fn admission() -> AdvisoryAdmission {
+        AdvisoryAdmission {
+            receipt_id: "adm".to_owned(),
+        }
     }
 
-    /// `prepare_from_release` refuses a hostile tree through the real
-    /// staging boundary, not a stub.
     #[test]
-    fn from_release_refuses_missing_tree() {
-        let dir = tempdir("from-rel");
-        let svc = PrepareService::new(&dir).expect("compose");
-        let admission = AdvisoryAdmission {
-            receipt_id: "receipt-1".to_owned(),
-        };
-        let r = svc.prepare_from_release(&admission, "/nonexistent/release");
-        assert_eq!(r.exit_code, 5);
-        assert!(r.reason.starts_with("RELEASE_") || r.reason.starts_with("PREPARE_"));
-        std::fs::remove_dir_all(&dir).ok();
+    fn roots_must_be_distinct_and_present() {
+        let r = roots("roots");
+        for bad in [
+            PrepareRoots {
+                work_dir: PathBuf::new(),
+                ..r.clone()
+            },
+            PrepareRoots {
+                dependency_root: PathBuf::new(),
+                ..r.clone()
+            },
+            PrepareRoots {
+                dependency_root: r.work_dir.clone(),
+                ..r.clone()
+            },
+        ] {
+            assert!(compose_prepare_service(&bad, Arc::new(Eval), None).is_err());
+        }
     }
 
-    /// `prepare_export_release` refuses — export without signing is
-    /// not a release.
     #[test]
-    fn export_release_is_explicit_denial() {
-        let dir = tempdir("export");
-        let svc = PrepareService::new(&dir).expect("compose");
-        let admission = AdvisoryAdmission::default();
-        let r = svc.prepare_export_release(&admission, "/tmp/x");
-        assert_eq!(r.exit_code, 5);
-        std::fs::remove_dir_all(&dir).ok();
+    fn keyless_host_refuses_a_fresh_prepare_immediately() {
+        let (r, svc) = keyless("keyless");
+        let res = svc.prepare(&admission());
+        assert_eq!(res.exit_code, 1);
+        assert_eq!(res.phase, "failed");
+        assert_eq!(res.reason, "PREPARE_UNAVAILABLE");
+        assert_eq!(res.safe_next_action, "TERMINAL_FAILURE");
+        cleanup(&r);
+    }
+
+    #[test]
+    fn resume_goes_through_the_state_machine_not_a_blanket_denial() {
+        let (r, svc) = keyless("resume");
+        let res = svc.resume("../escape");
+        assert_eq!(res.exit_code, 1);
+        assert!(
+            res.reason.starts_with("INVALID_INVOCATION"),
+            "{}",
+            res.reason
+        );
+        let res = svc.resume("never-recorded");
+        assert!(
+            res.reason.starts_with("INVALID_INVOCATION"),
+            "{}",
+            res.reason
+        );
+        cleanup(&r);
+    }
+
+    #[test]
+    fn an_unsettled_operation_makes_prepare_from_release_require_resume() {
+        let (r, svc) = keyless("unsettled");
+        let now = time::OffsetDateTime::now_utc();
+        svc.journal
+            .record(&central_infra::authority::PrepareOperation {
+                operation_id: "prepare-live".to_owned(),
+                phase: central_infra::authority::PrepareOperationPhase::BuildOne,
+                admission_id: "adm".to_owned(),
+                selector: "minio".to_owned(),
+                deadline: now + time::Duration::minutes(5),
+                reason: String::new(),
+                reused: 0,
+                acquired: 1,
+                receipt_id: String::new(),
+                created_at: now,
+            })
+            .expect("seed");
+        let res = svc.prepare_from_release(&admission(), "/rel");
+        assert!(res.resume_required);
+        assert_eq!(res.operation_id, "prepare-live");
+        assert_eq!(res.safe_next_action, "RESUME_REQUIRED");
+        cleanup(&r);
+    }
+
+    #[test]
+    fn from_release_refuses_a_missing_tree_through_the_real_boundary() {
+        let (r, svc) = keyless("from-rel");
+        let res = svc.prepare_from_release(&admission(), "/nonexistent/release");
+        assert_eq!(res.exit_code, 1);
+        assert_eq!(res.phase, "failed");
+        assert!(!res.reason.is_empty());
+        cleanup(&r);
+    }
+
+    #[test]
+    fn export_refuses_an_unusable_dir_before_any_prepare() {
+        let (r, svc) = keyless("export");
+        let res = svc.prepare_export_release(&admission(), "relative/dir");
+        assert_eq!(res.exit_code, 1);
+        assert!(
+            res.reason.starts_with("EXPORT_DIR_UNUSABLE")
+                || res.reason.starts_with("EXPORT_UNCONFIGURED"),
+            "{}",
+            res.reason
+        );
+        cleanup(&r);
     }
 }

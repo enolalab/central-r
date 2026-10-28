@@ -47,7 +47,7 @@ Already ported (consumed, not redone): `central_infra::prepare` domain
 - `infra/prepare/state_machine.rs` (+ `CandidateStore::recover`, deferred since R5). Ports as traits with fakes in tests; `attestation_materials`, `prepared_dependency_set`, `persist_op_artifacts` live here. `prepare_one_from_release` is PP-T6.
 ### PP-T6 (DONE) — release path: verify, import (`PrepareOneFromRelease`), export
 - `infra/prepare/release.rs`: `verify_release`, `reverify_manifest_envelopes`, `ReleaseImportService`, `infra_pin_manifests`; `PrepareState::prepare_one_from_release`. Export: `infra/prepare/export.rs` (`ReleaseExportService`, self-checks through `verify_release` before publishing; shared fixtures in `release_fixture.rs`).
-### PP-T7 — factory wiring: replace `PREPARE_PROMOTION_UNAVAILABLE`, real
+### PP-T7 (DONE) — factory wiring: replace `PREPARE_PROMOTION_UNAVAILABLE`, real
 `resume` and `prepare_export_release` in `infra/prepare/service.rs`
 ### PP-T8 — closeout: task record, `current-phase.md`, README, dashboard
 
