@@ -523,9 +523,10 @@ fn e04_exclusion_scan() {
         let path = manifest.join(rel);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("exclusion scan: read {}: {e}", path.display()));
-        // Everything before the test module is production code; the
-        // module itself is the `_test.go` exclusion.
-        let production = raw.split("#[cfg(test)]").next().unwrap_or(&raw);
+        // `#[cfg(test)]` items are the `_test.go` exclusion — dropped
+        // wherever they appear, including mid-file test-only helpers,
+        // so the production tail after them stays scanned.
+        let production = production_region(&raw);
         for token in forbidden {
             assert!(
                 !production.contains(token),
@@ -534,4 +535,66 @@ fn e04_exclusion_scan() {
             );
         }
     }
+}
+
+/// `production_region` — the source with every `#[cfg(test)]`-gated
+/// item removed, wherever it appears. An item's extent is the first
+/// `{`-opened balanced brace body (fn/impl/mod) or a `;`-terminated
+/// statement; line and block comments are skipped while locating the
+/// item's head so a `;` inside a doc comment cannot truncate it.
+fn production_region(raw: &str) -> String {
+    const MARK: &str = "#[cfg(test)]";
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(idx) = rest.find(MARK) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + MARK.len()..];
+        let bytes = after.as_bytes();
+        let mut i = 0;
+        let end = loop {
+            match bytes.get(i) {
+                None => break after.len(),
+                Some(b'/') if bytes.get(i + 1) == Some(&b'/') => {
+                    i += bytes[i..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(bytes.len(), |p| i + p);
+                }
+                Some(b'/') if bytes.get(i + 1) == Some(&b'*') => {
+                    let close = after[i + 2..]
+                        .find("*/")
+                        .map_or(bytes.len(), |p| i + 2 + p + 2);
+                    i = close;
+                }
+                Some(b';') => break i + 1,
+                Some(b'{') => {
+                    let mut depth = 1usize;
+                    let mut j = i + 1;
+                    while j < bytes.len() && depth > 0 {
+                        match bytes[j] {
+                            b'{' => depth += 1,
+                            b'}' => depth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    break j;
+                }
+                Some(_) => i += 1,
+            }
+        };
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn production_region_drops_test_items_but_keeps_the_tail() {
+    let raw = "fn live_a() {}\n    #[cfg(test)]\n    fn helper() -> &'static str { \"x;y\" }\nfn live_b() {}\n#[cfg(test)]\nmod tests {\n    fn t() { {}\n    }\n}\n";
+    let production = production_region(raw);
+    assert!(production.contains("fn live_a()"));
+    assert!(production.contains("fn live_b()"));
+    assert!(!production.contains("helper"));
+    assert!(!production.contains("mod tests"));
 }

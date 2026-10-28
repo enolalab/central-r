@@ -25,11 +25,11 @@ use std::time::Duration;
 use central_foundation::failure::Failure;
 use central_foundation::identity::{HandoffReceiptId, OperationId, SecretBindingId};
 use central_infra::authority::{
-    B04AdoptRequest, B04AdoptResult, B04IssueProofRequest, B04MaterializeRequest,
-    B04MaterializeResult, B05MaterializePostgresMigrationRequest,
-    B05MaterializePostgresMigrationResult, B05MigrationLaunchResult, BrokerEvidence, BrokerOutcome,
-    BrokerRequest, BrokerResponse, LifecycleAuthorization, LifecycleAuthorizationRequest,
-    ProtectedGeneration,
+    AdvisoryAdmissionEvidence, AuthorityTransitionPayload, B04AdoptRequest, B04AdoptResult,
+    B04IssueProofRequest, B04MaterializeRequest, B04MaterializeResult,
+    B05MaterializePostgresMigrationRequest, B05MaterializePostgresMigrationResult,
+    B05MigrationLaunchResult, BrokerEvidence, BrokerOutcome, BrokerRequest, BrokerResponse,
+    LifecycleAuthorization, LifecycleAuthorizationRequest, ProtectedGeneration,
 };
 use central_infra::domain::{
     AdoptRequest, HandoffReceipt, HandoffRequest, MigrationLaunchBinding, Purpose,
@@ -129,6 +129,34 @@ fn marshal_result<T: serde::Serialize + ?Sized>(value: &T) -> Box<serde_json::va
         serde_json::value::RawValue::from_string("null".to_owned())
             .unwrap_or_else(|_| unreachable!("null is valid JSON"))
     })
+}
+
+/// `maxAdvisoryEvaluationEvidenceBytes` — the broker's own
+/// independent bound on the evidence wire payload (upstream
+/// `advisory_evaluation_journal.go`), the same defense-in-depth every
+/// root-helper RPC applies.
+const MAX_ADVISORY_EVALUATION_EVIDENCE_BYTES: usize = 16 * 1024;
+
+/// `advisoryEvaluationAppendRequest` — `{"evidence": <raw json>}`.
+/// `default` maps an absent field to JSON `null`, matching the
+/// upstream `json.RawMessage` zero value the handler then refuses.
+#[derive(serde::Deserialize)]
+struct AdvisoryEvaluationAppendRequest {
+    #[serde(default = "null_raw_value")]
+    evidence: Box<serde_json::value::RawValue>,
+}
+
+fn null_raw_value() -> Box<serde_json::value::RawValue> {
+    serde_json::value::RawValue::from_string("null".to_owned())
+        .unwrap_or_else(|_| unreachable!("null is valid JSON"))
+}
+
+/// `advisoryEvaluationAppendResult` — `receipt_id` +
+/// `receipt_sequence` in declaration order (upstream's field order).
+#[derive(serde::Serialize)]
+struct AdvisoryEvaluationAppendResult {
+    receipt_id: String,
+    receipt_sequence: u64,
 }
 
 /// `BrokerError` outcome — upstream's non-denial failure class
@@ -667,6 +695,71 @@ impl Service {
                 result: None,
                 evidence: BrokerEvidence::default(),
             },
+        }
+    }
+
+    /// `dispatchAppendAdvisoryEvaluation` — persists exactly the
+    /// evidence the helper's `TransitionRecorder` built. The broker
+    /// checks shape and size but never interprets or re-derives
+    /// provenance; the helper-provided bytes land verbatim in the
+    /// `advisory-evaluation` stream as the `Payload` of a
+    /// `central.authority-transition/v1` record. Every failure denies
+    /// with an `ADVISORY_EVALUATION_APPEND_DENIED`-prefixed message.
+    fn dispatch_append_advisory_evaluation(&self, req: &BrokerRequest) -> BrokerResponse {
+        let denied = |message: &str| {
+            migration_denied(
+                &req.operation_id,
+                format!("ADVISORY_EVALUATION_APPEND_DENIED: {message}"),
+            )
+        };
+        let Some(payload) = &req.payload else {
+            return denied("empty payload");
+        };
+        let Some(raw) = payload.get("request") else {
+            return denied("missing request field");
+        };
+        let wire_req =
+            match serde_json::from_str::<Option<AdvisoryEvaluationAppendRequest>>(raw.get()) {
+                Ok(Some(w)) => w,
+                // `json.Unmarshal` on a JSON `null` request is a no-op —
+                // the struct stays at its zero value, so the evidence-size
+                // check below is what reports the denial, exactly upstream.
+                Ok(None) => AdvisoryEvaluationAppendRequest {
+                    evidence: null_raw_value(),
+                },
+                Err(_) => return denied("invalid request"),
+            };
+        let trimmed = wire_req.evidence.get().trim();
+        // A JSON-absent field decodes to the 4-byte literal `null`,
+        // not an absent value — refuse it rather than committing a
+        // zero-value record, exactly as upstream.
+        if trimmed.is_empty()
+            || trimmed == "null"
+            || trimmed.len() > MAX_ADVISORY_EVALUATION_EVIDENCE_BYTES
+        {
+            return denied("invalid evidence size");
+        }
+        if serde_json::from_str::<AdvisoryAdmissionEvidence>(wire_req.evidence.get()).is_err() {
+            return denied("invalid evidence shape");
+        }
+        let Some(journal) = &self.journal else {
+            return denied("unavailable");
+        };
+        let mut transition = AuthorityTransitionPayload {
+            schema_version: "central.authority-transition/v1".to_owned(),
+            operation: "advisory_evaluation".to_owned(),
+            payload: Some(wire_req.evidence),
+            ..Default::default()
+        };
+        match journal.append_committed("advisory-evaluation", &mut transition) {
+            Ok(receipt) => success(
+                &req.operation_id,
+                marshal_result(&AdvisoryEvaluationAppendResult {
+                    receipt_id: receipt.id,
+                    receipt_sequence: receipt.sequence,
+                }),
+            ),
+            Err(e) => denied(e.message()),
         }
     }
 
@@ -2381,11 +2474,8 @@ fn dispatch_json(
                 "broker: denied advisory evaluation append peer",
             ));
         }
-        protocol::write_deny(
-            conn,
-            &req.operation_id,
-            &format!("ADVISORY_EVALUATION_APPEND_DENIED: {UNSUPPORTED_IN_THIS_SLICE}"),
-        );
+        let resp = svc.dispatch_append_advisory_evaluation(req);
+        let _ = protocol::write_response(conn, &resp);
         return Ok(());
     }
     if is_backup_helper_authority_purpose(&req.purpose) {
@@ -2742,7 +2832,6 @@ mod tests {
             MATERIALIZE_DEPENDENCY_HANDOFF_RPC,
             // The closed set — upstream RPCs this slice does not port.
             "bind_postgres_service_role",
-            "append_advisory_evaluation",
         ] {
             // Live purposes may succeed on an empty request (e.g.
             // `hmac_fingerprint` fingerprints empty domain+data) or
@@ -2777,6 +2866,10 @@ mod tests {
             BACKUP_THROUGHPUT_WORKER_TARGET_RPC,
             BACKUP_THROUGHPUT_WORKER_STAGE_RPC,
             MIGRATION_REPORT_OUTCOME_RPC,
+            // `append_advisory_evaluation` is connection-only upstream
+            // too — `HandleConn` serves it behind the peer gate, so
+            // `Dispatch` answers its `default` text.
+            "append_advisory_evaluation",
         ] {
             let resp = svc.dispatch(&request(purpose, None));
             assert_eq!(resp.outcome, BrokerOutcome::Denied, "{purpose}");
@@ -3004,21 +3097,126 @@ mod tests {
         }
     }
 
+    /// Upstream `advisory_evaluation_journal_test.go` — the denial
+    /// ladder ahead of the journal append.
+    #[test]
+    fn dispatch_append_advisory_evaluation_denial_ladder() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        let purpose = "append_advisory_evaluation";
+        type Payload = Option<BTreeMap<String, Box<serde_json::value::RawValue>>>;
+        let cases: Vec<(Payload, &str)> = vec![
+            (None, "empty payload"),
+            (Some(BTreeMap::new()), "missing request field"),
+            (request_raw("null"), "invalid evidence size"),
+            (request_raw("42"), "invalid request"),
+            (request_raw("{}"), "invalid evidence size"),
+            (request_raw("{\"evidence\": null}"), "invalid evidence size"),
+            // `" "` keeps its quotes on the raw bytes — `trim` sees a
+            // 3-byte non-empty value, so the shape check reports it,
+            // exactly as upstream's `bytes.TrimSpace` does.
+            (
+                request_raw("{\"evidence\":\" \"}"),
+                "invalid evidence shape",
+            ),
+            (request_raw("{\"evidence\": 4}"), "invalid evidence shape"),
+        ];
+        for (payload, message) in cases {
+            let resp = svc.dispatch_append_advisory_evaluation(&request(purpose, payload));
+            assert_eq!(resp.outcome, BrokerOutcome::Denied);
+            assert_eq!(
+                resp.evidence.message,
+                format!("ADVISORY_EVALUATION_APPEND_DENIED: {message}")
+            );
+        }
+        // Oversized: a shaped evidence record padded past 16 KiB.
+        let big = format!(
+            "{{\"generation_id\":\"{}\",\"selector_digest\":\"s\",\"canonical_bundle_digest\":\"c\",\"key_id\":\"k\",\"state\":\"Current\",\"code\":\"ADVISORY_CURRENT\",\"evaluation_time\":\"2026-01-01T00:00:00Z\",\"policy_version\":\"p\",\"time_witness_state\":\"w\"}}",
+            "g".repeat(17 * 1024)
+        );
+        let resp = svc.dispatch_append_advisory_evaluation(&request(
+            purpose,
+            request_raw(&format!("{{\"evidence\": {big}}}")),
+        ));
+        assert_eq!(
+            resp.evidence.message,
+            "ADVISORY_EVALUATION_APPEND_DENIED: invalid evidence size"
+        );
+        // Journal unavailable.
+        let mut svc = service(&dir);
+        svc.journal = None;
+        let evidence = "{\"generation_id\":\"g\",\"selector_digest\":\"s\",\"canonical_bundle_digest\":\"c\",\"key_id\":\"k\",\"state\":\"Current\",\"code\":\"ADVISORY_CURRENT\",\"evaluation_time\":\"2026-01-01T00:00:00Z\",\"policy_version\":\"p\",\"time_witness_state\":\"w\"}";
+        let resp = svc.dispatch_append_advisory_evaluation(&request(
+            purpose,
+            request_raw(&format!("{{\"evidence\": {evidence}}}")),
+        ));
+        assert_eq!(
+            resp.evidence.message,
+            "ADVISORY_EVALUATION_APPEND_DENIED: unavailable"
+        );
+    }
+
+    /// Upstream's happy path — verbatim evidence bytes land in the
+    /// `advisory-evaluation` stream, the receipt round-trips.
+    #[test]
+    fn dispatch_append_advisory_evaluation_commits_verbatim_evidence() {
+        let dir = TempDir::new("server");
+        let mut svc = service(&dir);
+        // Rebind the journal inside the scratch root — `Service::new`
+        // roots it at `root_path.parent()`, which is the shared
+        // process temp dir here.
+        svc.journal = Some(Arc::new(Journal::new(
+            dir.join("journal"),
+            svc.signing.clone(),
+            svc.signer.clone(),
+        )));
+        let evidence = "{\"generation_id\":\"g1\",\"selector_digest\":\"s\",\"canonical_bundle_digest\":\"c\",\"key_id\":\"k\",\"state\":\"Current\",\"code\":\"ADVISORY_CURRENT\",\"evaluation_time\":\"2026-01-01T00:00:00Z\",\"policy_version\":\"p\",\"time_witness_state\":\"w\",\"check\":\"x\",\"host_facts\":{\"os_release\":\"v\"}}";
+        let resp = svc.dispatch_append_advisory_evaluation(&request(
+            "append_advisory_evaluation",
+            request_raw(&format!("{{\"evidence\": {evidence}}}")),
+        ));
+        assert_eq!(resp.outcome, BrokerOutcome::Success);
+        let result = result_value(&resp);
+        assert!(!result["receipt_id"].as_str().unwrap().is_empty());
+        assert_eq!(result["receipt_sequence"].as_u64().unwrap(), 1);
+        // The durable record: verbatim payload, advisory operation,
+        // the pinned schema.
+        let stream = dir
+            .join("journal")
+            .join("authority-records")
+            .join("advisory-evaluation");
+        let seq_dir = stream.join("00000000000000000001-advisory_evaluation");
+        let committed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(seq_dir.join("committed.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            committed["schema_version"],
+            "central.authority-transition/v1"
+        );
+        assert_eq!(committed["operation"], "advisory_evaluation");
+        // `Value` re-encoding sorts keys, so pin the raw verbatim
+        // bytes through the raw file text instead — the evidence must
+        // land byte-identical, not semantically equal.
+        let committed_text = std::fs::read_to_string(seq_dir.join("committed.json")).unwrap();
+        assert!(
+            committed_text.contains(&format!("\"payload\":{evidence}")),
+            "verbatim evidence bytes not in committed record"
+        );
+    }
+
     #[test]
     fn dispatch_denies_every_r6_purpose_closed() {
         let dir = TempDir::new("server");
         let svc = service(&dir);
-        // Only the two upstream RPCs this slice does not port keep the
-        // closed denial — everything else is live or connection-only.
-        for purpose in ["bind_postgres_service_role", "append_advisory_evaluation"] {
-            let resp = svc.dispatch(&request(purpose, None));
-            assert_eq!(resp.outcome, BrokerOutcome::Denied, "{purpose}");
-            assert_eq!(
-                resp.evidence.message,
-                format!("BROKER_AUTHORITY_DENIED: {}", UNSUPPORTED_IN_THIS_SLICE),
-                "{purpose}"
-            );
-        }
+        // `bind_postgres_service_role` is the one upstream RPC this
+        // slice still does not port — everything else is live or
+        // connection-only.
+        let resp = svc.dispatch(&request("bind_postgres_service_role", None));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(
+            resp.evidence.message,
+            format!("BROKER_AUTHORITY_DENIED: {}", UNSUPPORTED_IN_THIS_SLICE)
+        );
         // The live recovery arms answer through their own denial
         // ladders on an empty request — never the closed text.
         for purpose in [

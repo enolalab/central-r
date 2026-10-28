@@ -269,8 +269,12 @@ pub fn is_advisory_evaluation_authority_purpose(purpose: &str) -> bool {
 /// owns every live dispatch.
 #[must_use]
 pub fn is_r6_purpose(purpose: &str) -> bool {
+    // `append_advisory_evaluation` is live now: `HandleConn` serves it
+    // behind the root-backup-helper peer gate, and upstream's
+    // `Dispatch` answers `"unknown purpose"` for it like every other
+    // connection-only purpose — so it no longer belongs to the closed
+    // R6 set.
     is_postgres_service_role_authority_purpose(purpose)
-        || is_advisory_evaluation_authority_purpose(purpose)
 }
 
 // ---------------------------------------------------------------------------
@@ -917,9 +921,12 @@ mod tests {
         // in the closed table — everything else is either a live
         // `Dispatch` arm or a connection-only purpose upstream's
         // `default` answers `"unknown purpose"` for.
-        for purpose in ["bind_postgres_service_role", "append_advisory_evaluation"] {
-            assert!(is_r6_purpose(purpose), "unregistered R6 purpose {purpose}");
-        }
+        assert!(is_r6_purpose("bind_postgres_service_role"));
+        // `append_advisory_evaluation` is live — `HandleConn` serves it
+        // behind the root-backup-helper peer gate, and `Dispatch`'s
+        // `default` answers `"unknown purpose"`, like every other
+        // connection-only purpose.
+        assert!(!is_r6_purpose("append_advisory_evaluation"));
         for handled in [
             // Live RPCs and the purposes with a real Dispatch arm are
             // never R6-classified — the arm owns them.

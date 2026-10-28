@@ -558,8 +558,9 @@ fn broker_dispatch_denies_unknown_and_r6_purposes_exact() {
     assert_eq!(resp.evidence.message, "unknown purpose");
 
     // R6 surface: a registered-but-closed purpose name — only the
-    // Postgres service-role and advisory-evaluation RPCs remain
-    // closed in this slice; the backup/recovery surface is live.
+    // Postgres service-role RPC remains closed in this slice; the
+    // advisory-evaluation RPC is live (peer-gated `HandleConn`), and
+    // the backup/recovery surface is live.
     let resp = svc.dispatch(&broker_request(
         "op-d-2",
         protocol::POSTGRES_SERVICE_ROLE_BIND_RPC,

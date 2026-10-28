@@ -1245,8 +1245,10 @@ impl super::audit::AuditAdvisoryEvaluator for HelperAdvisoryEvaluator {
 /// promotion gate re-runs exactly the evaluation that admitted the
 /// request.
 ///
-/// Outside `CENTRAL_DEVELOPMENT_LOCAL_ONLY` this composes the real
-/// production evaluator (`newProductionAdvisoryEvaluator`). A
+/// There is no development-admission path in this slice — this always
+/// composes the real production evaluator
+/// (`newProductionAdvisoryEvaluator`, upstream's post-
+/// `CENTRAL_DEVELOPMENT_LOCAL_ONLY` arm). A
 /// production evaluator that fails to compose — most often a fresh
 /// instance whose authoritative state root does not exist yet — falls
 /// back to the deny-only `None` arm rather than taking the whole

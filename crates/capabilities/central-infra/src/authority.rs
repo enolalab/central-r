@@ -879,7 +879,7 @@ pub struct AdvisoryHostFacts {
 /// Port of `authority.AuthorityTransitionPayload`.
 /// (`RawValue` has no `PartialEq`; compare `.get()` bytes in tests,
 /// matching Go's `bytes.Equal` on `json.RawMessage`.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthorityTransitionPayload {
     /// `central.authority-transition/v1`.
     pub schema_version: String,
