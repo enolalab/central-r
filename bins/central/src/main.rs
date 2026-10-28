@@ -422,19 +422,20 @@ mod tests {
                 2,
                 "INVALID_MAINTENANCE_GRAMMAR",
             ),
-            // Helper-dial failures (exit 3) on a helper-less host —
-            // the B06 client's "helper unavailable" class included.
+            // Helper-dial failures — exit 3 for the lifecycle-era
+            // clients; the B06 client folds every `call` error into
+            // upstream's `err != nil` arm (exit 7).
             (
                 &["local", "browser", "open"][..],
                 "local.browser.open",
-                3,
-                "DEPENDENCY_UNAVAILABLE",
+                7,
+                "AUTHORITY_DENIED",
             ),
             (
                 &["bootstrap", "show"][..],
                 "bootstrap.show",
-                3,
-                "DEPENDENCY_UNAVAILABLE",
+                7,
+                "AUTHORITY_DENIED",
             ),
             (&["local", "audit"][..], "local.audit", 3, "AUDIT_FAILED"),
             (

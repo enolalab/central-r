@@ -11,9 +11,9 @@
 //! `local.wipe` is the D01 verb (destructive_cli), `local.security-*`
 //! the D06 update/rescue pair and `local.audit` the D05 protected-state
 //! audit (security_cli). `local.browser.open` is the B06 verb — the
-//! real `helperB06Client` call runs, so a helper-less host is the
-//! client's "helper unavailable" class on upstream's
-//! `DEPENDENCY_UNAVAILABLE` envelope. `central bootstrap show` shares
+//! real `helperB06Client` call runs, so a helper-less host takes
+//! upstream's `AUTHORITY_DENIED` envelope (`b06_serve.go` folds every
+//! `Open()` error there). `central bootstrap show` shares
 //! the file because upstream colocates it with `runBrowserOpen` in
 //! `b06_serve.go` and it is the same client call on a sibling verb;
 //! `dispatch` routes `bootstrap.show` here since the id is not
@@ -490,12 +490,11 @@ fn b06_details(safe_next_action: &str) -> serde_json::Value {
 }
 
 /// The shared B06 outcome table — upstream's `runBrowserOpen` /
-/// `runBootstrapShow` keep the same three envelopes. The client's
-/// "helper unavailable" class takes the `DEPENDENCY_UNAVAILABLE` exit
-/// 3 envelope upstream's nil-client branch writes (the real binary
-/// always installs the client, so the client's own unavailable class
-/// is that envelope's reachable cause); the "authority denied" class
-/// and success map verbatim.
+/// `runBootstrapShow` map any `Open()`/`Show()` error to the
+/// `AUTHORITY_DENIED` exit 7 envelope verbatim; the
+/// `DEPENDENCY_UNAVAILABLE` exit 3 envelope is the nil-client arm,
+/// unreachable since the process always installs the client — exactly
+/// like this one, which is never nil.
 fn run_b06(
     outcome: Result<(), central_adapter_linux::helper::client::B06Error>,
     command_id: &str,
@@ -505,7 +504,6 @@ fn run_b06(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> u8 {
-    use central_adapter_linux::helper::client::B06Error;
     match outcome {
         Ok(()) => emit(
             command_id,
@@ -515,15 +513,7 @@ fn run_b06(
             Some(success_reason),
             Some(b06_details(success_action)),
         ),
-        Err(B06Error::Unavailable) => emit(
-            command_id,
-            stdout,
-            stderr,
-            ExitClass::Unavailable,
-            Some("DEPENDENCY_UNAVAILABLE"),
-            Some(b06_details("START_CENTRAL_HELPER")),
-        ),
-        Err(B06Error::Denied) => emit(
+        Err(_) => emit(
             command_id,
             stdout,
             stderr,
@@ -1344,13 +1334,14 @@ mod tests {
 
     // -- `local browser open` (B06) -----------------------------------------
 
-    /// A helper-less host is `helperB06Client.call`'s "helper
-    /// unavailable" class — `DEPENDENCY_UNAVAILABLE` exit 3 with
-    /// `START_CENTRAL_HELPER`. The injected client is upstream's
-    /// `browserOpenClient` package-var seam; a socket path nothing
-    /// answers fails `SocketPolicy::validate` before any dial.
+    /// A helper-less host makes `helperB06Client.call` fail "helper
+    /// unavailable" — which upstream's `err != nil` arm folds into
+    /// `AUTHORITY_DENIED` exit 7 with `CHECK_READY_PROOF`. The injected
+    /// client is upstream's `browserOpenClient` package-var seam; a
+    /// socket path nothing answers fails `SocketPolicy::validate`
+    /// before any dial.
     #[test]
-    fn browser_open_without_helper_is_dependency_unavailable_exit_3() {
+    fn browser_open_without_helper_is_authority_denied_exit_7() {
         let client = central_adapter_linux::helper::client::B06Client::new(
             format!("/nonexistent-central-b06-{}.sock", std::process::id()),
             1000,
@@ -1358,42 +1349,56 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_browser_open_with(&client, &mut out, &mut err);
-        assert_eq!(code, 3);
+        assert_eq!(code, 7);
         let parsed: serde_json::Value =
             serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
         assert_eq!(parsed["command_id"], "local.browser.open");
-        assert_eq!(parsed["exit_code"], 3);
-        assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE");
-        assert_eq!(
-            parsed["details"]["safe_next_action"],
-            "START_CENTRAL_HELPER"
-        );
+        assert_eq!(parsed["exit_code"], 7);
+        assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
+        assert_eq!(parsed["details"]["safe_next_action"], "CHECK_READY_PROOF");
     }
 
     /// The env-composed path lands on the same envelope — this test
     /// makes the same no-live-helper assumption the lifecycle
     /// helper-less test does.
     #[test]
-    fn browser_open_composed_client_is_unavailable_without_a_socket() {
+    fn browser_open_composed_client_is_denied_without_a_socket() {
         let (code, stdout, _) = invoke("local.browser.open", &["open"]);
-        assert_eq!(code, 3);
+        assert_eq!(code, 7);
         let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
         assert_eq!(parsed["command_id"], "local.browser.open");
-        assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE");
-        assert_eq!(
-            parsed["details"]["safe_next_action"],
-            "START_CENTRAL_HELPER"
-        );
+        assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
+        assert_eq!(parsed["details"]["safe_next_action"], "CHECK_READY_PROOF");
     }
 
-    /// The other two arms of the shared `run_b06` table: the denied
-    /// class is `AUTHORITY_DENIED` exit 7 with `CHECK_READY_PROOF`;
-    /// success is `BROWSER_OPENED` exit 0 with `CENTRAL_BOOTSTRAP_SHOW`.
+    /// The other two arms of the shared `run_b06` table: every error
+    /// class folds into `AUTHORITY_DENIED` exit 7 with
+    /// `CHECK_READY_PROOF` — the upstream `err != nil` arm, whose
+    /// `Open()` wraps both `call` error values — while success is
+    /// `BROWSER_OPENED` exit 0 with `CENTRAL_BOOTSTRAP_SHOW`.
     #[test]
     fn browser_open_outcome_table_denied_and_success() {
         use central_adapter_linux::helper::client::B06Error;
         let mut out = Vec::new();
         let mut err = Vec::new();
+        for err_class in [B06Error::Unavailable, B06Error::Denied] {
+            let code = run_b06(
+                Err(err_class),
+                "local.browser.open",
+                "BROWSER_OPENED",
+                "CENTRAL_BOOTSTRAP_SHOW",
+                "CHECK_READY_PROOF",
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(code, 7);
+            let parsed: serde_json::Value =
+                serde_json::from_str(String::from_utf8(out.clone()).unwrap().trim_end()).unwrap();
+            assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
+            assert_eq!(parsed["details"]["safe_next_action"], "CHECK_READY_PROOF");
+            out.clear();
+            err.clear();
+        }
         let code = run_b06(
             Err(B06Error::Denied),
             "local.browser.open",
@@ -1433,9 +1438,10 @@ mod tests {
 
     /// `bootstrap show` — the same outcome table on the sibling
     /// command id with its own reason/action strings; a helper-less
-    /// host is `DEPENDENCY_UNAVAILABLE` + `START_CENTRAL_HELPER` again.
+    /// host folds into `AUTHORITY_DENIED` + `CHECK_BROWSER_AND_TTY`
+    /// exactly like upstream's `Show()` error arm.
     #[test]
-    fn bootstrap_show_without_helper_is_dependency_unavailable_exit_3() {
+    fn bootstrap_show_without_helper_is_authority_denied_exit_7() {
         let client = central_adapter_linux::helper::client::B06Client::new(
             format!("/nonexistent-central-b06-{}.sock", std::process::id()),
             1000,
@@ -1443,14 +1449,14 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run_bootstrap_show_with(&client, &mut out, &mut err);
-        assert_eq!(code, 3);
+        assert_eq!(code, 7);
         let parsed: serde_json::Value =
             serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
         assert_eq!(parsed["command_id"], "bootstrap.show");
-        assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE");
+        assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
         assert_eq!(
             parsed["details"]["safe_next_action"],
-            "START_CENTRAL_HELPER"
+            "CHECK_BROWSER_AND_TTY"
         );
     }
 
