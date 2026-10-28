@@ -330,14 +330,14 @@ pub(crate) fn stand_up() -> Option<D07Env> {
     let candidate = D07CandidateState::new(Outcome::current());
     let cleanup_calls = Arc::new(AtomicI32::new(0));
 
-    let new_pam = |dir: &Path| -> PamConfirmer {
-        PamConfirmer::with_grants(
-            GrantStore::open(dir.to_str().expect("grant dir utf8"), uid, gid)
-                .expect("reopen grant store"),
-            CEREMONY_INSTANCE_ID,
-            CEREMONY_TARGET_ID,
-        )
-    };
+    // Upstream's harness hands every handler the same confirmer
+    // instance; `clone` shares the one-use ledger and grant store.
+    let pam = PamConfirmer::with_grants(
+        GrantStore::open(grant_dir.to_str().expect("grant dir utf8"), uid, gid)
+            .expect("reopen grant store"),
+        CEREMONY_INSTANCE_ID,
+        CEREMONY_TARGET_ID,
+    );
 
     let apparmor = AppArmorDeps {
         attr_current_path: attr_current.to_string_lossy().into_owned(),
@@ -346,7 +346,7 @@ pub(crate) fn stand_up() -> Option<D07Env> {
         run: unavailable_run,
     };
     let wipe = WipeHandlerImpl::new(
-        Some(Box::new(new_pam(&grant_dir))),
+        Some(Box::new(pam.clone())),
         Some(Box::new(evaluator.clone())),
         Some(Box::new(D07Checkpoint { repo: repo.clone() })),
         ceremony_scope(),
@@ -362,7 +362,7 @@ pub(crate) fn stand_up() -> Option<D07Env> {
         apparmor,
     );
     let export = ExportHandlerImpl::new(
-        Some(Box::new(new_pam(&grant_dir))),
+        Some(Box::new(pam.clone())),
         ceremony_scope(),
         ExportRoots {
             instance_id: instance_id.clone(),
@@ -381,7 +381,7 @@ pub(crate) fn stand_up() -> Option<D07Env> {
         })),
     );
     let import = ImportHandlerImpl::new(
-        Some(Box::new(new_pam(&grant_dir))),
+        Some(Box::new(pam.clone())),
         ceremony_scope(),
         ImportRoots {
             instance_id: instance_id.clone(),
@@ -395,7 +395,7 @@ pub(crate) fn stand_up() -> Option<D07Env> {
         },
     );
     let delete = DeleteHandlerImpl::new(
-        Some(Box::new(new_pam(&grant_dir))),
+        Some(Box::new(pam.clone())),
         Some(Box::new(evaluator.clone())),
         Some(Box::new(UnavailableDeleteSource)),
         Some(Box::new(UnavailableDeleteRefs)),
@@ -407,13 +407,13 @@ pub(crate) fn stand_up() -> Option<D07Env> {
         },
     );
     let prune = PruneHandlerImpl::new(
-        Some(Box::new(new_pam(&grant_dir))),
+        Some(Box::new(pam.clone())),
         Some(Box::new(evaluator.clone())),
         None,
         ceremony_scope(),
     );
     let audit = AuditHandlerImpl {
-        pam: Some(Box::new(new_pam(&grant_dir))),
+        pam: Some(Box::new(pam.clone())),
         advisory: Some(Box::new(evaluator.clone())),
         scope: ceremony_scope(),
         roots: AuditRoots {
@@ -425,7 +425,7 @@ pub(crate) fn stand_up() -> Option<D07Env> {
         },
     };
     let rescue = RescueHandlerImpl {
-        pam: Some(Box::new(new_pam(&grant_dir))),
+        pam: Some(Box::new(pam.clone())),
         installed: Some(Box::new(installed.clone())),
         candidate: Some(Box::new(candidate.clone())),
         cleanup: Some(Box::new(D07Cleanup::new(cleanup_calls.clone()))),
