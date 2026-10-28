@@ -451,7 +451,6 @@ fn alter_login_statement(role_name: &str, new_password: &str) -> String {
 /// itself to `verify_as`.
 pub(crate) struct PostgresServiceRoleSyncer;
 
-#[allow(dead_code)] // wired by the service-role store's `new_production` (LC-T4 consumer)
 impl PostgresServiceRoleSyncer {
     /// `pgxPostgresServiceRoleSyncer{hostPort}` — the endpoint is the
     /// compose policy's pinned constant here, so no field.

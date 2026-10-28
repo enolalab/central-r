@@ -454,7 +454,7 @@ fn lifecycle_arm() -> LifecycleArm {
         Box::new(confirmer.clone()),
     );
     let mut server = operator_server();
-    server.lifecycle = Some(Box::new(handler));
+    server.lifecycle = Some(Arc::new(handler));
     LifecycleArm {
         server,
         service,
@@ -592,7 +592,7 @@ fn helper_lifecycle_authorization_failure_paths() {
     // `NewProductionLifecycleHandler` — no authorizer, no confirmer:
     // `up`/`down` refuse the required ceremony; `status` still runs.
     let mut server = operator_server();
-    server.lifecycle = Some(Box::new(ProductionLifecycleHandler::new(
+    server.lifecycle = Some(Arc::new(ProductionLifecycleHandler::new(
         Box::new(CapturingLifecycle::default()),
         resolver(),
     )));
@@ -643,7 +643,7 @@ fn helper_lifecycle_authorization_failure_paths() {
     ] {
         let service = CapturingLifecycle::default();
         let mut server = operator_server();
-        server.lifecycle = Some(Box::new(ProductionLifecycleHandler::new_authorized(
+        server.lifecycle = Some(Arc::new(ProductionLifecycleHandler::new_authorized(
             Box::new(service.clone()),
             resolver(),
             Box::new(authorizer),

@@ -43,9 +43,12 @@ pub trait RescueCandidateEvaluator: Send + Sync {
 /// `rescueCleanup` — stops services, terminates sandboxes, and drains
 /// connections without destroying state. Must be idempotent: a crash
 /// between cleanup steps re-runs the whole cleanup on the next
-/// attempt.
+/// attempt. `peer`/`deadline` are the rescue caller's own identity
+/// and budget — upstream carries them through `ctx`
+/// (`withLifecyclePeer`), so the cleanup's lifecycle `down` ceremony
+/// runs under the same caller, not the helper's.
 pub trait RescueCleanup: Send + Sync {
-    fn cleanup(&self) -> Result<(), Failure>;
+    fn cleanup(&self, peer: PeerIdentity, deadline: Instant) -> Result<(), Failure>;
 }
 
 /// `RescueRequest` — the operator-carried candidate advisory bytes.
@@ -258,7 +261,9 @@ impl RescueHandlerImpl {
             let Some(cleanup) = &self.cleanup else {
                 return rescue_response(op, "denied", 7, advisory::REASON_RESCUE_CLEANUP_FAILED);
             };
-            if cleanup.cleanup().is_err() || store.mark_deny_safe_cleanup_done().is_err() {
+            if cleanup.cleanup(peer, deadline).is_err()
+                || store.mark_deny_safe_cleanup_done().is_err()
+            {
                 return rescue_response(op, "denied", 7, advisory::REASON_RESCUE_CLEANUP_FAILED);
             }
         }

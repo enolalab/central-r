@@ -259,6 +259,35 @@ pub fn run_helper_daemon(
     let broker_path: std::path::PathBuf = broker_socket_path(env).into();
     let backup_repository_root =
         std::path::PathBuf::from(&composition.authoritative_state_root).join("backups");
+    // `newHelperConfirmer` — ONE confirmer in the instance's installed
+    // ceremony mode, shared across every handler slot (upstream
+    // main.go:510-514) so handlers cannot disagree about whether this
+    // instance confirms at a console or against a grant. `clone()`
+    // hands each slot a handle on the same logical confirmer, never a
+    // second instance; a composition refusal exits 6 exactly like the
+    // per-slot construction did.
+    let confirmer = match helper_confirmer(&composition) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(stderr, "helper: composition: {e}");
+            return 6;
+        }
+    };
+    // `newHelperLifecycleHandler` — hoisted ahead of the Server
+    // literal because TWO slots share this instance: the `lifecycle`
+    // verb itself and the rescue cleanup, which delegates `down`
+    // through it as a second ceremony (upstream's
+    // `newProductionRescueHandler(composition, confirmer, lifecycle)`).
+    // A composition refusal exits 6 — the daemon never serves a
+    // half-composed lifecycle.
+    let lifecycle_handler: Arc<dyn super::lifecycle::LifecycleHandler> =
+        match helper_lifecycle_handler(&composition, &broker_path, confirmer.clone(), stderr) {
+            Ok(h) => Arc::new(h),
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {e}");
+                return 6;
+            }
+        };
     // `newProductionRestoreAbandonHandler` — composable in this
     // slice: the PAM confirmer, the one-purpose broker client, and
     // the fixed instance/target scope are all real. Upstream fails
@@ -299,7 +328,7 @@ pub fn run_helper_daemon(
         };
     let restore_operations = Arc::new(
         super::restore::RestoreApplyAuthorizationHandler::with_engine(
-            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(confirmer.clone())),
             Some(Box::new(restore_apply_issuer)),
             CeremonyScope {
                 instance_id: "default".to_owned(),
@@ -313,7 +342,7 @@ pub fn run_helper_daemon(
     let restore_abandon =
         match crate::broker::recovery_authority::RestoreAbandonClient::new(broker_path.clone()) {
             Ok(client) => Some(Box::new(super::restore::RestoreAbandonHandlerImpl::new(
-                Some(Box::new(PamConfirmer::new())),
+                Some(Box::new(confirmer.clone())),
                 Some(Box::new(client)),
                 CeremonyScope {
                     instance_id: "default".to_owned(),
@@ -392,39 +421,35 @@ pub fn run_helper_daemon(
         // upstream's shared-confirmer construction is.
         prepare: {
             let handler: Box<dyn super::server::PrepareHandler> =
-                match helper_confirmer(&composition) {
-                    Ok(confirmer) => {
-                        match crate::infra::prepare::LockAdapter::new().and_then(|lock| {
-                            let source = super::prepare::PrepareConfirmationSource {
-                                config_binding: composition.config_binding.clone(),
-                                helper_release: super::prepare::helper_release_identity(
-                                    &lock.lock().helper_release_digest,
-                                ),
-                                boot_id: String::new(),
-                                now: None,
-                            };
-                            crate::infra::prepare::new_prepare_handler(
-                                std::path::PathBuf::from(&composition.authoritative_state_root)
-                                    .join("dependency-prepare"),
-                                Box::new(helper_advisory_evaluator(&composition, &broker_path)),
-                                Box::new(confirmer),
-                                source,
-                            )
-                        }) {
-                            Ok(handler) => Box::new(handler),
-                            Err(e) => {
-                                let _ = writeln!(
-                                    stderr,
-                                    "helper: dependency prepare is unavailable on this host: {}",
-                                    e.message()
-                                );
-                                Box::new(UnavailablePrepareHandler)
-                            }
-                        }
-                    }
+                match crate::infra::prepare::LockAdapter::new().and_then(|lock| {
+                    let source = super::prepare::PrepareConfirmationSource {
+                        config_binding: composition.config_binding.clone(),
+                        helper_release: super::prepare::helper_release_identity(
+                            &lock.lock().helper_release_digest,
+                        ),
+                        boot_id: String::new(),
+                        now: None,
+                    };
+                    crate::infra::prepare::new_prepare_handler(
+                        std::path::PathBuf::from(&composition.authoritative_state_root)
+                            .join("dependency-prepare"),
+                        Box::new(helper_advisory_evaluator(
+                            &composition,
+                            &broker_path,
+                            stderr,
+                        )),
+                        Box::new(confirmer.clone()),
+                        source,
+                    )
+                }) {
+                    Ok(handler) => Box::new(handler),
                     Err(e) => {
-                        let _ = writeln!(stderr, "helper: composition: {e}");
-                        return 6;
+                        let _ = writeln!(
+                            stderr,
+                            "helper: dependency prepare is unavailable on this host: {}",
+                            e.message()
+                        );
+                        Box::new(UnavailablePrepareHandler)
                     }
                 };
             Some(handler)
@@ -446,7 +471,7 @@ pub fn run_helper_daemon(
         // composition identity, never request input.
         migration: {
             let mut handler = super::migration_launch::MigrationLaunchHandler::new(
-                Box::new(PamConfirmer::new()),
+                Box::new(confirmer.clone()),
                 Box::new(super::migration_launch::BrokerLaunchEvidenceIssuer::new(
                     broker_socket_path(env),
                 )),
@@ -483,7 +508,7 @@ pub fn run_helper_daemon(
             // fixed repository source, native launcher, attestor,
             // broker reaper + completer.
             Some(Box::new(super::backup::BackupCreateHandler::new(
-                Box::new(PamConfirmer::new()),
+                Box::new(confirmer.clone()),
                 Box::new(throughput),
                 Box::new(crate::broker::backup_authority::BackupLaunchIssuer::new(
                     broker_path.clone(),
@@ -565,10 +590,11 @@ pub fn run_helper_daemon(
         // `unavailableLifecycleEvaluator` answer, never a fabricated
         // admission.
         wipe: Some(Box::new(super::wipe::WipeHandlerImpl::new(
-            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(confirmer.clone())),
             Some(Box::new(helper_advisory_evaluator(
                 &composition,
                 &broker_path,
+                stderr,
             ))),
             Some(Box::new(super::wipe::BackupReaderCheckpointVerifier {
                 read: Box::new(super::backup::BackupReadHandler::new(
@@ -620,7 +646,7 @@ pub fn run_helper_daemon(
                 }
             };
             Some(Box::new(super::export::ExportHandlerImpl::new(
-                Some(Box::new(PamConfirmer::new())),
+                Some(Box::new(confirmer.clone())),
                 CeremonyScope {
                     instance_id: "default".to_owned(),
                     target_id: "postgres:central".to_owned(),
@@ -663,7 +689,7 @@ pub fn run_helper_daemon(
                 }
             };
             Some(Box::new(super::import::ImportHandlerImpl::with_engine(
-                Some(Box::new(PamConfirmer::new())),
+                Some(Box::new(confirmer.clone())),
                 CeremonyScope {
                     instance_id: "default".to_owned(),
                     target_id: "postgres:central".to_owned(),
@@ -695,10 +721,11 @@ pub fn run_helper_daemon(
         // before any ceremony; the unavailable seams refuse
         // `DELETE_UNAVAILABLE` only after a signed admission.
         delete: Some(Box::new(super::delete::DeleteHandlerImpl::new(
-            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(confirmer.clone())),
             Some(Box::new(helper_advisory_evaluator(
                 &composition,
                 &broker_path,
+                stderr,
             ))),
             Some(Box::new(super::delete::UnavailableDeleteSource)),
             Some(Box::new(super::delete::UnavailableDeleteRefs)),
@@ -722,10 +749,11 @@ pub fn run_helper_daemon(
         // than inventing eligibility without PG. The shared B01
         // evaluator gates both actions on a `current` verdict first.
         prune: Some(Box::new(super::prune::PruneHandlerImpl::new(
-            Some(Box::new(PamConfirmer::new())),
+            Some(Box::new(confirmer.clone())),
             Some(Box::new(helper_advisory_evaluator(
                 &composition,
                 &broker_path,
+                stderr,
             ))),
             None,
             CeremonyScope {
@@ -738,20 +766,14 @@ pub fn run_helper_daemon(
         // envelope beneath the authoritative state root, bound to the
         // instance id. `newHelperConfirmer` fails composition on a
         // mis-provisioned ceremony mode, upstream-exact.
-        security_update: match helper_confirmer(&composition) {
-            Ok(confirmer) => Some(super::security_update::SecurityUpdateHandler {
-                pam: Some(Box::new(confirmer)),
-                install: Some(Box::new(|root, binding, envelope| {
-                    crate::infra::advisory_fetch::install_active_bundle(root, binding, envelope)
-                })),
-                root_path: composition.authoritative_state_root.clone(),
-                binding_id: composition.instance_id.clone(),
-            }),
-            Err(e) => {
-                let _ = writeln!(stderr, "helper: composition: {e}");
-                return 6;
-            }
-        },
+        security_update: Some(super::security_update::SecurityUpdateHandler {
+            pam: Some(Box::new(confirmer.clone())),
+            install: Some(Box::new(|root, binding, envelope| {
+                crate::infra::advisory_fetch::install_active_bundle(root, binding, envelope)
+            })),
+            root_path: composition.authoritative_state_root.clone(),
+            binding_id: composition.instance_id.clone(),
+        }),
         // `newProductionAuditHandler` — D05: the B01 evaluator, the
         // D01 wipe ceremony scope (repair runs under it), and the
         // broker protected root as the audited hierarchy. The deny-safe
@@ -770,38 +792,34 @@ pub fn run_helper_daemon(
                     return 6;
                 }
             };
-            match helper_confirmer(&composition) {
-                Ok(confirmer) => Some(Box::new(super::audit::AuditHandlerImpl {
-                    pam: Some(Box::new(confirmer)),
-                    advisory: Some(Box::new(helper_advisory_evaluator(
-                        &composition,
-                        &broker_path,
-                    ))),
-                    scope: CeremonyScope {
-                        instance_id: "default".to_owned(),
-                        target_id: "postgres:central".to_owned(),
-                    },
-                    roots: super::audit::Roots {
-                        protected_dir: broker_root.to_string_lossy().into_owned(),
-                        audit_dir: broker_root.join("audit").to_string_lossy().into_owned(),
-                        instance_id: composition.instance_id.clone(),
-                        audit_uid: 0,
-                        audit_gid: 0,
-                    },
-                }) as Box<dyn super::audit::AuditHandler>),
-                Err(e) => {
-                    let _ = writeln!(stderr, "helper: composition: {e}");
-                    return 6;
-                }
-            }
+            Some(Box::new(super::audit::AuditHandlerImpl {
+                pam: Some(Box::new(confirmer.clone())),
+                advisory: Some(Box::new(helper_advisory_evaluator(
+                    &composition,
+                    &broker_path,
+                    stderr,
+                ))),
+                scope: CeremonyScope {
+                    instance_id: "default".to_owned(),
+                    target_id: "postgres:central".to_owned(),
+                },
+                roots: super::audit::Roots {
+                    protected_dir: broker_root.to_string_lossy().into_owned(),
+                    audit_dir: broker_root.join("audit").to_string_lossy().into_owned(),
+                    instance_id: composition.instance_id.clone(),
+                    audit_uid: 0,
+                    audit_gid: 0,
+                },
+            }) as Box<dyn super::audit::AuditHandler>)
         },
         // `newProductionRescueHandler` — D06: the B01 evaluator
         // (installed verdicts are branches, never gates), the
         // candidate evaluator over the same facts/witness/trust minus
-        // the recorder, and the bounded compose-down cleanup the
-        // lifecycle handler would otherwise carry. The deny-safe
-        // record sits in the broker protected root — the same dir the
-        // transport gate arms on below.
+        // the recorder, and the lifecycle-down cleanup — the same
+        // composed `lifecycle` handler, invoked for a second ceremony
+        // (upstream passes `lifecycle` into the rescue handler). The
+        // deny-safe record sits in the broker protected root — the
+        // same dir the transport gate arms on below.
         rescue: {
             let broker_root = match crate::broker::daemon::production_broker_root_at(
                 &composition,
@@ -810,13 +828,6 @@ pub fn run_helper_daemon(
                 0,
             ) {
                 Ok(root) => root,
-                Err(e) => {
-                    let _ = writeln!(stderr, "helper: composition: {e}");
-                    return 6;
-                }
-            };
-            let confirmer = match helper_confirmer(&composition) {
-                Ok(c) => c,
                 Err(e) => {
                     let _ = writeln!(stderr, "helper: composition: {e}");
                     return 6;
@@ -832,18 +843,19 @@ pub fn run_helper_daemon(
                 }
             };
             Some(Box::new(super::rescue::RescueHandlerImpl {
-                pam: Some(Box::new(confirmer)),
+                pam: Some(Box::new(confirmer.clone())),
                 installed: Some(Box::new(helper_advisory_evaluator(
                     &composition,
                     &broker_path,
+                    stderr,
                 ))),
                 candidate: Some(Box::new(ProductionCandidateEvaluator {
                     facts: crate::infra::advisory_fetch::HostFactsCollector::new(),
                     witness,
                     verifier: central_infra::advisory::Verifier::production(),
                 })),
-                cleanup: Some(Box::new(ComposeDownRescueCleanup {
-                    instance_id: composition.instance_id.clone(),
+                cleanup: Some(Box::new(LifecycleDownRescueCleanup {
+                    lifecycle: Arc::clone(&lifecycle_handler),
                 })),
                 store: Some(crate::infra::advisory_fetch::FileDenySafeStore::new(
                     &broker_root,
@@ -901,23 +913,17 @@ pub fn run_helper_daemon(
                     return 6;
                 }
             };
-            match helper_confirmer(&composition) {
-                Ok(confirmer) => Some(Box::new(super::maintenance::MaintenanceApplyHandlerImpl {
-                    store: Some(central_infra::maintenance::new_store(&broker_root)),
-                    probes: maintenance_probes(false),
-                    images: Some(Box::new(maintenance_image_probe)),
-                    pam: Some(Box::new(confirmer)),
-                    scope: CeremonyScope {
-                        instance_id: "default".to_owned(),
-                        target_id: "postgres:central".to_owned(),
-                    },
-                })
-                    as Box<dyn super::maintenance::MaintenanceApplyHandler>),
-                Err(e) => {
-                    let _ = writeln!(stderr, "helper: composition: {e}");
-                    return 6;
-                }
-            }
+            Some(Box::new(super::maintenance::MaintenanceApplyHandlerImpl {
+                store: Some(central_infra::maintenance::new_store(&broker_root)),
+                probes: maintenance_probes(false),
+                images: Some(Box::new(maintenance_image_probe)),
+                pam: Some(Box::new(confirmer.clone())),
+                scope: CeremonyScope {
+                    instance_id: "default".to_owned(),
+                    target_id: "postgres:central".to_owned(),
+                },
+            })
+                as Box<dyn super::maintenance::MaintenanceApplyHandler>)
         },
         // `denySafeDirForComposition` — the same broker protected dir
         // the rescue handler records to. Resolution failure disables
@@ -942,18 +948,11 @@ pub fn run_helper_daemon(
         // service-role-decorated runner, the first-boot-decorated
         // bootstrap, and the broker rendezvous — sealed by the
         // per-request active-receipt resolver and the authorized
-        // handler bound to the shared confirmer. A composition refusal
-        // exits 6, upstream's own `return nil, err`: the daemon never
+        // handler bound to the shared confirmer. Composed once above
+        // and shared with the rescue cleanup; a composition refusal
+        // already exited 6 before this literal — the daemon never
         // serves a half seam.
-        lifecycle: match helper_confirmer(&composition)
-            .and_then(|confirmer| helper_lifecycle_handler(&composition, &broker_path, confirmer))
-        {
-            Ok(handler) => Some(Box::new(handler) as Box<dyn super::lifecycle::LifecycleHandler>),
-            Err(e) => {
-                let _ = writeln!(stderr, "helper: composition: {e}");
-                return 6;
-            }
-        },
+        lifecycle: Some(lifecycle_handler),
         ..Server::new()
     });
     // `runHelperRestoreCapacityReserveStartupSweep` — the sweep's
@@ -1263,24 +1262,25 @@ impl super::audit::AuditAdvisoryEvaluator for HelperAdvisoryEvaluator {
 fn helper_advisory_evaluator(
     composition: &crate::broker::daemon::ProductionInstanceComposition,
     broker_path: &std::path::Path,
+    stderr: &mut dyn Write,
 ) -> HelperAdvisoryEvaluator {
     if composition.authoritative_state_root.is_empty() || composition.instance_id.is_empty() {
         return HelperAdvisoryEvaluator { service: None };
     }
-    let service = (|| {
+    let service = (|| -> Result<_, String> {
         let source = crate::infra::advisory_fetch::ActiveBundleSource::new(
             &composition.authoritative_state_root,
             &composition.instance_id,
         )
-        .ok()?;
+        .map_err(|e| e.message().to_string())?;
         let witness = crate::infra::advisory_fetch::TimeWitnessStore::new(
             &composition.authoritative_state_root,
         )
-        .ok()?;
+        .map_err(|e| e.message().to_string())?;
         let journal = crate::infra::advisory_fetch::AdvisoryEvaluationJournalClient::new(
             broker_path.to_path_buf(),
         );
-        Some(HelperEvaluationService {
+        Ok(HelperEvaluationService {
             source,
             facts: crate::infra::advisory_fetch::HostFactsCollector::new(),
             clock: crate::infra::advisory_fetch::SystemAdvisoryClock,
@@ -1290,12 +1290,21 @@ fn helper_advisory_evaluator(
             deny_safe: None,
         })
     })();
-    if service.is_none() {
-        // Upstream logs to stderr and falls back deny-only; the call
-        // site reports through the daemon's own composition path.
-        return HelperAdvisoryEvaluator { service: None };
+    match service {
+        Ok(service) => HelperAdvisoryEvaluator {
+            service: Some(service),
+        },
+        Err(e) => {
+            // Upstream main.go logs the composition error and falls
+            // back deny-only; the evaluator still answers, it just
+            // never admits.
+            let _ = writeln!(
+                stderr,
+                "helper: B01 advisory evaluator is unavailable on this host: {e}"
+            );
+            HelperAdvisoryEvaluator { service: None }
+        }
     }
-    HelperAdvisoryEvaluator { service }
 }
 
 /// `newHelperLifecycleHandler` — the complete B03 chain in upstream's
@@ -1313,6 +1322,7 @@ fn helper_lifecycle_handler(
     composition: &crate::broker::daemon::ProductionInstanceComposition,
     broker_path: &std::path::Path,
     confirmer: PamConfirmer,
+    stderr: &mut dyn Write,
 ) -> Result<super::lifecycle::ProductionLifecycleHandler, String> {
     // `cmd`'s pinned literals: the host's docker binary, and
     // `ProductionServiceConfig.RuntimeRoot` = `/run/central-infra` —
@@ -1334,7 +1344,7 @@ fn helper_lifecycle_handler(
     let receipts: Arc<dyn crate::infra::lifecycle::ActiveReceiptReader> = Arc::new(
         crate::infra::prepare::CandidateStore::new(None, &dependency_root),
     );
-    let evaluator = helper_advisory_evaluator(composition, broker_path);
+    let evaluator = helper_advisory_evaluator(composition, broker_path, stderr);
     let broker_client = Arc::new(crate::broker::lifecycle_client::LifecycleClient::new(
         broker_path.to_path_buf(),
     ));
@@ -1450,45 +1460,50 @@ impl super::rescue::RescueCandidateEvaluator for ProductionCandidateEvaluator {
     }
 }
 
-/// `lifecycleDownCleanup` — the deny-safe cleanup, bounded to a direct
-/// `docker compose down --remove-orphans` over the instance's
-/// protected runtime path: the same mechanical effect the composed
-/// lifecycle handler's down path produces, minus the lifecycle verb's
-/// own ceremony (the rescue ceremony alone carries the authorization
-/// here — upstream's rescue cleanup is likewise a direct compose
-/// down, not a second trip through `local down`). Sandboxes and
-/// database connections die with the stopped service containers;
-/// state is preserved: down stops, it never deletes.
-struct ComposeDownRescueCleanup {
-    instance_id: String,
+/// `lifecycleDownCleanup` — the deny-safe cleanup delegates to the
+/// composed lifecycle handler with verb `down`: the rescue ceremony is
+/// followed by a second, full lifecycle-down ceremony — peer
+/// availability, PAM/grant confirmation, bound broker
+/// authorization/consume, lifecycle journaling, lock custody, and
+/// stopped-topology verification all run, D01's precedent (upstream
+/// `Cleanup` calls `lifecycle.HandleLifecycle` on the same instance
+/// the `lifecycle` verb serves, never a bare compose down). The
+/// caller's own peer/deadline carry through, the operation id is a
+/// freshly minted uuidv7, and `config_binding` stays empty exactly as
+/// upstream's `helper.LifecycleRequest{}`. Idempotent by
+/// construction: `down` on a stopped project is a no-op.
+struct LifecycleDownRescueCleanup {
+    lifecycle: Arc<dyn super::lifecycle::LifecycleHandler>,
 }
 
-impl super::rescue::RescueCleanup for ComposeDownRescueCleanup {
-    /// `Cleanup` — the two-minute machine share of the rescue budget,
-    /// the closed docker environment, and idempotent-by-construction
-    /// semantics (`down` on a stopped project is a no-op).
-    fn cleanup(&self) -> Result<(), central_foundation::failure::Failure> {
-        let file = crate::infra::compose::RenderedFile {
-            path: format!(
-                "/run/central-infra/{}/docker-compose.yaml",
-                self.instance_id
-            ),
-            content: Vec::new(),
+impl super::rescue::RescueCleanup for LifecycleDownRescueCleanup {
+    /// `Cleanup` — `HandleLifecycle(ctx, Request{uuidv7, "down"},
+    /// LifecycleRequest{})`: any non-success outcome or nonzero exit
+    /// is `rescue: lifecycle down failed: <reason>`, upstream
+    /// verbatim.
+    fn cleanup(
+        &self,
+        peer: super::PeerIdentity,
+        deadline: std::time::Instant,
+    ) -> Result<(), central_foundation::failure::Failure> {
+        let request = super::protocol::Request {
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            verb: super::verb::DOWN.to_owned(),
+            payload: None,
         };
-        use crate::infra::compose::ComposeRunner;
-        let runner =
-            crate::infra::compose::CommandComposeRunner::new("/usr/bin/docker", None, None);
-        runner
-            .down(
-                &file,
-                crate::infra::prepare::OpDeadline::after(std::time::Duration::from_secs(120)),
-            )
-            .map_err(|e| {
-                central_foundation::failure::Failure::unavailable(
-                    "rescue_cleanup",
-                    format!("rescue: lifecycle down failed: {e}"),
-                )
-            })
+        let resp = self.lifecycle.handle_lifecycle(
+            peer,
+            deadline,
+            &request,
+            super::protocol::LifecycleRequest::default(),
+        );
+        if resp.outcome != "success" || resp.exit_code != 0 {
+            return Err(central_foundation::failure::Failure::unavailable(
+                "rescue_cleanup",
+                format!("rescue: lifecycle down failed: {}", resp.reason),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1788,8 +1803,11 @@ mod tests {
             restore_policy_digest: String::new(),
             import_policy_digest: String::new(),
         };
-        let evaluator =
-            helper_advisory_evaluator(&empty, std::path::Path::new("/nonexistent.sock"));
+        let evaluator = helper_advisory_evaluator(
+            &empty,
+            std::path::Path::new("/nonexistent.sock"),
+            &mut Vec::new(),
+        );
         let err = evaluator.narrowed().unwrap_err();
         assert_eq!(
             err.message(),

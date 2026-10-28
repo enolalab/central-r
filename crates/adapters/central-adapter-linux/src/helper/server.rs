@@ -23,6 +23,7 @@ use super::verb;
 use crate::sys::peercred::{PeerCred, peercred};
 use std::os::unix::io::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// `maxConcurrentHelperConnections`.
@@ -244,7 +245,7 @@ pub struct Server {
     pub peer_policy: Option<PeerPolicy>,
     pub socket: Option<SocketPolicy>,
     pub prepare: Option<Box<dyn PrepareHandler>>,
-    pub lifecycle: Option<Box<dyn LifecycleHandler>>,
+    pub lifecycle: Option<Arc<dyn LifecycleHandler>>,
     pub init: Option<Box<dyn InitHandler>>,
     /// `Server.Migration` — the `migrate-launch` handler.
     pub migration: Option<Box<dyn super::migration_launch::MigrationLauncher>>,

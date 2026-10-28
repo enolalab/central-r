@@ -159,7 +159,7 @@ impl D07Cleanup {
 }
 
 impl RescueCleanup for D07Cleanup {
-    fn cleanup(&self) -> Result<(), Failure> {
+    fn cleanup(&self, _peer: PeerIdentity, _deadline: std::time::Instant) -> Result<(), Failure> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }

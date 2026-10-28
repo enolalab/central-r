@@ -11,7 +11,7 @@ use super::{PeerIdentity, read_boot_id};
 use crate::sys::{pam, tty};
 use central_foundation::failure::Failure;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// `PAMSession`.
@@ -74,10 +74,16 @@ struct ConfirmationRecord {
 }
 
 /// `pamConfirmer` — `NewPAMConfirmer` in physical mode,
-/// `NewPAMConfirmerWithGrants` in grant mode.
+/// `NewPAMConfirmerWithGrants` in grant mode. Upstream composes ONE
+/// confirmer shared across every handler slot so handlers cannot
+/// disagree about whether this instance confirms at a console or
+/// against a grant; `Clone` here is a handle on that same logical
+/// confirmer (`used` ledger and grant store shared through `Arc`),
+/// never a second instance.
+#[derive(Clone)]
 pub struct PamConfirmer {
-    used: Mutex<HashMap<String, ConfirmationRecord>>,
-    grants: Option<GrantStore>,
+    used: Arc<Mutex<HashMap<String, ConfirmationRecord>>>,
+    grants: Option<Arc<GrantStore>>,
     grant_scope: GrantScope,
 }
 
@@ -91,7 +97,7 @@ impl PamConfirmer {
     /// `NewPAMConfirmer` — physical_tty mode.
     pub fn new() -> Self {
         PamConfirmer {
-            used: Mutex::new(HashMap::new()),
+            used: Arc::new(Mutex::new(HashMap::new())),
             grants: None,
             grant_scope: GrantScope::default(),
         }
@@ -101,8 +107,8 @@ impl PamConfirmer {
     /// composition's, the same identities the TTY phrases are built from.
     pub fn with_grants(store: GrantStore, instance_id: &str, target_id: &str) -> Self {
         PamConfirmer {
-            used: Mutex::new(HashMap::new()),
-            grants: Some(store),
+            used: Arc::new(Mutex::new(HashMap::new())),
+            grants: Some(Arc::new(store)),
             grant_scope: GrantScope {
                 instance_id: instance_id.to_owned(),
                 target_id: target_id.to_owned(),
