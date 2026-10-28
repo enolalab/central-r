@@ -385,11 +385,8 @@ impl LifecycleClient {
     ) -> Result<(), Failure> {
         #[derive(serde::Serialize)]
         struct BindRequest<'a> {
-            #[serde(rename = "InstanceID")]
             instance_id: &'a str,
-            #[serde(rename = "Purpose")]
             purpose: &'a str,
-            #[serde(rename = "Value")]
             value: String,
         }
         self.call_unit(
