@@ -24,6 +24,8 @@ Phase R6 delivered, per roadmap §9 and the [R6 plan](../internal/superpowers/pl
 - Slice E verification and acceptance: `tests/e05_runbook` (runbook grammar/token parity) and `tests/e06_acceptance` (the E-slice authority cycle end-to-end on the real store, apply handler, and Journal; physical-tier criteria recorded `deferred-physical`).
 - Committed `.sqlx/` offline query metadata for the `b25`–`b29` stores and every new checked statement; the §7 fail-fast pipeline is green — the `CENTRAL_TEST_DSN`/`CENTRAL_TEST_HELPER_SOCKET`-gated e2e suites and the root/Tier-3 platform legs skip cleanly as designed.
 
+Documented boundaries deferred past the `R0`–`R6` sequence: `bind_postgres_service_role` (writer half lives inside `local up` lifecycle composition — every Postgres credential draw stays fail-closed until it lands; recorded in `docs/internal/tasks/r6-t16-postgres-service-role-bind-deferral.md`), broker-backed lifecycle composition in the helper daemon, `local browser open`, prepare promotion/attestation (`PREPARE_PROMOTION_UNAVAILABLE`), `security-rescue-cleanup` (also unimplemented upstream), and the physical/Tier-3 evidence tiers requiring a root-capable reference host.
+
 ## Completed: Phase R5 — Host Authority, Broker & Compose Topology
 
 Phase R5 delivered, per roadmap §8 and the [R5 plan](../internal/superpowers/plans/2026-10-23-phase-r5-host-authority-broker-compose.md):
