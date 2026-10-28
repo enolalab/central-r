@@ -616,12 +616,19 @@ impl ImportHandlerImpl {
         .map_err(|_| ())?;
         let config_path = state_root.join("config.json");
         let staged_config = PathBuf::from(format!("{}.import", config_path.display()));
-        write_import_owned(
+        // Upstream removes the staged `.import` file when the chown half
+        // of writeImportOwned fails, not just when rename does.
+        if write_import_owned(
             &staged_config,
             &rebound,
             self.roots.instance_uid,
             self.roots.instance_gid,
-        )?;
+        )
+        .is_err()
+        {
+            let _ = fs::remove_file(&staged_config);
+            return Err(());
+        }
         if fs::rename(&staged_config, &config_path).is_err() {
             let _ = fs::remove_file(&staged_config);
             return Err(());
