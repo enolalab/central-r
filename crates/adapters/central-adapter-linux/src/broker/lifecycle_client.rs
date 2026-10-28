@@ -18,7 +18,6 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use central_foundation::failure::Failure;
 use central_infra::authority::{
@@ -447,10 +446,10 @@ impl LifecycleClient {
         }
         let data = serde_json::to_vec(payload)
             .map_err(|e| internal(format!("broker lifecycle: marshal: {e}")))?;
+        // Upstream sets no read deadline on this socket — a broker
+        // that never answers blocks the caller exactly as Go's does.
         let mut conn = UnixStream::connect(&self.socket_path)
             .map_err(|e| internal(format!("broker lifecycle: dial: {e}")))?;
-        conn.set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| internal(format!("broker lifecycle: dial timeout: {e}")))?;
         let value: Box<serde_json::value::RawValue> = serde_json::from_slice(&data)
             .map_err(|e| internal(format!("broker lifecycle: marshal: {e}")))?;
         let req = BrokerRequest {

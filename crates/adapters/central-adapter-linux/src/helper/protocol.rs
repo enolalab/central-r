@@ -224,8 +224,12 @@ struct LifecycleLoose {
 }
 
 pub fn parse_lifecycle_request(req: &Request) -> Result<LifecycleRequest, String> {
-    let payload = trim_ascii(req.payload_bytes());
-    if payload.is_empty() {
+    let payload = req.payload_bytes();
+    // Go's `json.Unmarshal`: absent payload → empty request; `null`
+    // (with optional whitespace) → no-op success, also empty; a
+    // whitespace-only body is a syntax error upstream, so it is not
+    // folded into the empty case here.
+    if payload.is_empty() || trim_ascii(payload) == b"null" {
         return Ok(LifecycleRequest::default());
     }
     let decoded: LifecycleLoose = strict_decode(payload)

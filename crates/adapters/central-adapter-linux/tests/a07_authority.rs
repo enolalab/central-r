@@ -255,6 +255,26 @@ fn helper_lifecycle_invalid_request_denied() {
     assert_eq!(resp.reason, "INVALID_LIFECYCLE_REQUEST");
 }
 
+/// Go's `json.Unmarshal` edge on the lifecycle payload: a literal
+/// `null` is a tolerated no-op producing the empty request (parses —
+/// the refusal falls through to the unset handler). A whitespace-only
+/// body would be a syntax error upstream; it cannot reach this parser
+/// anyway since `RawValue` refuses it before it can become a payload.
+#[test]
+fn helper_lifecycle_payload_null_edge() {
+    let server = operator_server();
+    let nul = helper_request(
+        &server,
+        &Request {
+            operation_id: "op-null".to_owned(),
+            verb: verb::UP.to_owned(),
+            payload: RawValue::from_string(" null ".to_owned()).ok(),
+        },
+    );
+    assert_eq!(nul.outcome, "deferred");
+    assert_eq!(nul.reason, "LIFECYCLE_SERVICE_UNAVAILABLE");
+}
+
 /// A malformed prepare payload refuses `INVALID_PREPARE_REQUEST`
 /// when the prepare arm is installed — the parse runs before the
 /// handler, upstream's order.
