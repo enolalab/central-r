@@ -323,7 +323,6 @@ mod tests {
             (&["local", "init", "--status"], "local.init.status"),
             (&["local", "init", "--resume=abc"], "local.init.resume"),
             (&["local", "init", "--abandon=abc"], "local.init.abandon"),
-            (&["local", "browser", "open"], "local.browser.open"),
             (&["local", "trust", "install"], "local.trust.install"),
             (
                 &["local", "dependency", "upgrade", "plan"],
@@ -349,7 +348,7 @@ mod tests {
 
         // R6 task 13 — the D05/D06 + Slice E verbs resolve and run
         // their own grammar gates and helper dials instead of the
-        // deferred envelope.
+        // deferred envelope; `local browser open` (B06) joins them.
         let r6_13: &[(&[&str], &str, u8, &str)] = &[
             // Grammar gates (exit 2) run before the helper dial.
             (
@@ -418,7 +417,14 @@ mod tests {
                 2,
                 "INVALID_MAINTENANCE_GRAMMAR",
             ),
-            // Helper-dial failures (exit 3) on a helper-less host.
+            // Helper-dial failures (exit 3) on a helper-less host —
+            // the B06 client's "helper unavailable" class included.
+            (
+                &["local", "browser", "open"][..],
+                "local.browser.open",
+                3,
+                "DEPENDENCY_UNAVAILABLE",
+            ),
             (&["local", "audit"][..], "local.audit", 3, "AUDIT_FAILED"),
             (
                 &["maintenance", "plan"][..],

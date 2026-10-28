@@ -10,12 +10,14 @@
 //!
 //! `local.wipe` is the D01 verb (destructive_cli), `local.security-*`
 //! the D06 update/rescue pair and `local.audit` the D05 protected-state
-//! audit (security_cli).
+//! audit (security_cli). `local.browser.open` is the B06 verb — the
+//! real `helperB06Client` call runs, so a helper-less host is the
+//! client's "helper unavailable" class on upstream's
+//! `DEPENDENCY_UNAVAILABLE` envelope.
 //!
-//! Every other registered `local` id — `local.browser.open`,
-//! `local.trust.install`, `local.dependency-upgrade-plan` — stays
-//! deferred to its owning slice through the exact
-//! `UNSUPPORTED_IN_THIS_SLICE` envelope.
+//! Every other registered `local` id — `local.trust.install`,
+//! `local.dependency-upgrade-plan` — stays deferred to its owning
+//! slice through the exact `UNSUPPORTED_IN_THIS_SLICE` envelope.
 
 use std::io::Write;
 use std::time::Instant;
@@ -60,6 +62,8 @@ pub(crate) fn local(
         "local.init" => run_init(tokens, stdout, stderr),
         "local.up" | "local.down" | "local.status" => run_lifecycle(command_id, stdout, stderr),
         "local.prepare" => run_prepare(command_id, tokens, stdout, stderr),
+        // `runBrowserOpen` — the B06 verb; upstream ignores its args.
+        "local.browser.open" => run_browser_open(stdout, stderr),
         // `runLocalWipe` — the D01 verb: checkpoint, wipe, evidence.
         "local.wipe" => crate::destructive_cli::local_wipe(command_id, tokens, stdout, stderr),
         // `runLocalSecurity` — the shared `("local","security")` key
@@ -471,6 +475,87 @@ fn lifecycle_details(
         details["safe_next_action"] = serde_json::json!(safe_next_action);
     }
     details
+}
+
+// -- B06: `local browser open` ---------------------------------------------
+
+/// `pendingB06Details` — the one detail shape the B06 verbs ever
+/// write: a safe next action and nothing else.
+fn b06_details(safe_next_action: &str) -> serde_json::Value {
+    serde_json::json!({ "safe_next_action": safe_next_action })
+}
+
+/// The shared B06 outcome table — upstream's `runBrowserOpen` /
+/// `runBootstrapShow` keep the same three envelopes. The client's
+/// "helper unavailable" class takes the `DEPENDENCY_UNAVAILABLE` exit
+/// 3 envelope upstream's nil-client branch writes (the real binary
+/// always installs the client, so the client's own unavailable class
+/// is that envelope's reachable cause); the "authority denied" class
+/// and success map verbatim.
+fn run_b06(
+    outcome: Result<(), central_adapter_linux::helper::client::B06Error>,
+    command_id: &str,
+    success_reason: &str,
+    success_action: &str,
+    denied_action: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    use central_adapter_linux::helper::client::B06Error;
+    match outcome {
+        Ok(()) => emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Success,
+            Some(success_reason),
+            Some(b06_details(success_action)),
+        ),
+        Err(B06Error::Unavailable) => emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Unavailable,
+            Some("DEPENDENCY_UNAVAILABLE"),
+            Some(b06_details("START_CENTRAL_HELPER")),
+        ),
+        Err(B06Error::Denied) => emit(
+            command_id,
+            stdout,
+            stderr,
+            ExitClass::Denied,
+            Some("AUTHORITY_DENIED"),
+            Some(b06_details(denied_action)),
+        ),
+    }
+}
+
+/// Ports `runBrowserOpen` (`internal/command/b06_serve.go`) on the
+/// real `helperB06Client` composition — `newHelperB06Client` resolves
+/// `CENTRAL_HELPER_SOCKET`/`CENTRAL_OPERATOR_GID` inside the client.
+/// Upstream takes args and ignores them.
+fn run_browser_open(stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
+    let client =
+        central_adapter_linux::helper::client::B06Client::from_env(&|key| std::env::var(key).ok());
+    run_browser_open_with(&client, stdout, stderr)
+}
+
+/// The `runBrowserOpen` mapping over an injected client — the same
+/// seam upstream's `browserOpenClient` package var provides.
+fn run_browser_open_with(
+    client: &central_adapter_linux::helper::client::B06Client,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    run_b06(
+        client.open(),
+        "local.browser.open",
+        "BROWSER_OPENED",
+        "CENTRAL_BOOTSTRAP_SHOW",
+        "CHECK_READY_PROOF",
+        stdout,
+        stderr,
+    )
 }
 
 // -- `local prepare` ------------------------------------------------------
@@ -1225,6 +1310,95 @@ mod tests {
         assert_eq!(code, 7);
     }
 
+    // -- `local browser open` (B06) -----------------------------------------
+
+    /// A helper-less host is `helperB06Client.call`'s "helper
+    /// unavailable" class — `DEPENDENCY_UNAVAILABLE` exit 3 with
+    /// `START_CENTRAL_HELPER`. The injected client is upstream's
+    /// `browserOpenClient` package-var seam; a socket path nothing
+    /// answers fails `SocketPolicy::validate` before any dial.
+    #[test]
+    fn browser_open_without_helper_is_dependency_unavailable_exit_3() {
+        let client = central_adapter_linux::helper::client::B06Client::new(
+            format!("/nonexistent-central-b06-{}.sock", std::process::id()),
+            1000,
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_browser_open_with(&client, &mut out, &mut err);
+        assert_eq!(code, 3);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "local.browser.open");
+        assert_eq!(parsed["exit_code"], 3);
+        assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "START_CENTRAL_HELPER"
+        );
+    }
+
+    /// The env-composed path lands on the same envelope — this test
+    /// makes the same no-live-helper assumption the lifecycle
+    /// helper-less test does.
+    #[test]
+    fn browser_open_composed_client_is_unavailable_without_a_socket() {
+        let (code, stdout, _) = invoke("local.browser.open", &["open"]);
+        assert_eq!(code, 3);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "local.browser.open");
+        assert_eq!(parsed["reason"], "DEPENDENCY_UNAVAILABLE");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "START_CENTRAL_HELPER"
+        );
+    }
+
+    /// The other two arms of the shared `run_b06` table: the denied
+    /// class is `AUTHORITY_DENIED` exit 7 with `CHECK_READY_PROOF`;
+    /// success is `BROWSER_OPENED` exit 0 with `CENTRAL_BOOTSTRAP_SHOW`.
+    #[test]
+    fn browser_open_outcome_table_denied_and_success() {
+        use central_adapter_linux::helper::client::B06Error;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_b06(
+            Err(B06Error::Denied),
+            "local.browser.open",
+            "BROWSER_OPENED",
+            "CENTRAL_BOOTSTRAP_SHOW",
+            "CHECK_READY_PROOF",
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 7);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "local.browser.open");
+        assert_eq!(parsed["reason"], "AUTHORITY_DENIED");
+        assert_eq!(parsed["details"]["safe_next_action"], "CHECK_READY_PROOF");
+
+        let mut out = Vec::new();
+        let code = run_b06(
+            Ok(()),
+            "local.browser.open",
+            "BROWSER_OPENED",
+            "CENTRAL_BOOTSTRAP_SHOW",
+            "CHECK_READY_PROOF",
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8(out).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["command_id"], "local.browser.open");
+        assert_eq!(parsed["reason"], "BROWSER_OPENED");
+        assert_eq!(
+            parsed["details"]["safe_next_action"],
+            "CENTRAL_BOOTSTRAP_SHOW"
+        );
+    }
+
     // -- doctor -----------------------------------------------------------
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1244,11 +1418,7 @@ mod tests {
 
     #[test]
     fn other_registered_local_ids_stay_unsupported() {
-        for id in [
-            "local.browser.open",
-            "local.trust.install",
-            "local.dependency-upgrade-plan",
-        ] {
+        for id in ["local.trust.install", "local.dependency-upgrade-plan"] {
             let (code, stdout, _) = invoke(id, &["x"]);
             assert_eq!(code, 5, "id {id}");
             let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();

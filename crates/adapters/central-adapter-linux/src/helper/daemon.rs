@@ -42,7 +42,7 @@ use std::time::Duration;
 ///
 /// Upstream's `strconv.ParseUint(_, 10, 32)` accepts a leading `+`
 /// but no whitespace or sign-minus; nonzero required.
-fn parse_u32_strict(raw: &str) -> Option<u32> {
+pub(crate) fn parse_u32_strict(raw: &str) -> Option<u32> {
     if raw.is_empty() {
         return None;
     }
