@@ -144,6 +144,22 @@ impl DockerImageLoader {
         }
     }
 
+    /// Whether the loader holds an absolute docker path (the exporter's
+    /// "is configured" check).
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.docker_path.starts_with('/')
+    }
+
+    /// One docker invocation under the closed environment — the narrow
+    /// surface the release exporter shares with the loader.
+    ///
+    /// # Errors
+    /// A redacted failure string.
+    pub fn run_args(&self, deadline: OpDeadline, args: &[&str]) -> Result<Vec<u8>, String> {
+        self.run(deadline, args)
+    }
+
     fn run(&self, deadline: OpDeadline, args: &[&str]) -> Result<Vec<u8>, String> {
         let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
         (self.exec)(

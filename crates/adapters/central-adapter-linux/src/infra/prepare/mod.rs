@@ -20,6 +20,7 @@
 pub mod attestation;
 pub mod buildkit;
 pub mod capacity;
+pub mod export;
 pub mod fetch;
 pub mod image_load;
 pub mod journal;
@@ -27,6 +28,8 @@ pub mod lock;
 pub mod module_cache;
 pub mod oci;
 pub mod release;
+#[cfg(test)]
+pub(crate) mod release_fixture;
 pub mod release_stage;
 pub mod service;
 pub mod state_machine;
@@ -51,6 +54,7 @@ pub use buildkit::{
     inventory_from_oci_layout, parse_build_recipe,
 };
 pub use capacity::{CapacityChecker, RESERVED_CAPACITY_BYTES};
+pub use export::{ReleaseExportService, release_export_tag};
 pub use fetch::{
     ArtifactInfo, FetchTransport, Fetcher, HttpTransport, TransportFailure, archive_entry_path,
     fetch_url, is_public_unicast, is_transient_fetch_error, lock_artifact, url_port,
