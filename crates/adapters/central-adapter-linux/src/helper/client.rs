@@ -16,7 +16,7 @@ use std::time::Duration;
 /// which `SocketPolicy::validate` enforces at startup.
 pub const PRODUCTION_SOCKET_PATH: &str = "/run/central-operator/helper.sock";
 
-const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `LifecycleResult` — the typed result the lifecycle client returns.
 #[derive(Debug, Clone, Default)]

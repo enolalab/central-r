@@ -57,7 +57,7 @@ impl Matrix {
         // prepare is conditionally implemented through Server::prepare;
         // the row stays `false`, exactly as upstream.
         register(verb::PREPARE, false, true, false);
-        register(verb::SECURITY_UPDATE, false, true, false);
+        register(verb::SECURITY_UPDATE, true, true, false);
         register(verb::TRUST_INSTALL, false, true, false);
         register(verb::BROWSER_OPEN, true, true, false);
         register(verb::RUNTIME_STAGE, false, true, false);
@@ -83,10 +83,10 @@ impl Matrix {
         register(verb::BACKUP_IMPORT, true, true, true);
         register(verb::BACKUP_DELETE, true, true, true);
         register(verb::BACKUP_PRUNE, true, true, true);
-        register(verb::STATE_AUDIT, false, false, false);
-        register(verb::SECURITY_RESCUE, false, true, false);
-        register(verb::MAINTENANCE_PLAN, false, false, false);
-        register(verb::MAINTENANCE_APPLY, false, true, false);
+        register(verb::STATE_AUDIT, true, false, false);
+        register(verb::SECURITY_RESCUE, true, true, false);
+        register(verb::MAINTENANCE_PLAN, true, false, false);
+        register(verb::MAINTENANCE_APPLY, true, true, false);
         m
     }
 
@@ -132,11 +132,12 @@ mod tests {
         assert!(helper_verb_deadline(verb::PREPARE) > std::time::Duration::ZERO);
     }
 
-    /// The closed set: 35 verbs, 18 implemented (R5's eight plus the
+    /// The closed set: 35 verbs, 25 implemented (R5's eight plus the
     /// conditional prepare arm, the R5T9 migration pair, the seven
-    /// R6T7 backup/restore maintenance verbs, and the three R6 Slice D
-    /// destructive verbs); the deferred verbs upstream implements are
-    /// closed.
+    /// R6T7 backup/restore maintenance verbs, the three R6 Slice D
+    /// destructive verbs, and R6-13's audit/rescue/security-update/
+    /// maintenance-plan/apply quintet); the deferred verbs upstream
+    /// implements are closed.
     #[test]
     fn matrix_closes_every_later_operation() {
         let m = Matrix::new();
@@ -167,15 +168,21 @@ mod tests {
             verb::BACKUP_IMPORT,
             verb::BACKUP_DELETE,
             verb::BACKUP_PRUNE,
-        ];
-        expected.sort_unstable();
-        assert_eq!(implemented, expected);
-        for deferred in [
             verb::SECURITY_UPDATE,
             verb::SECURITY_RESCUE,
             verb::STATE_AUDIT,
             verb::MAINTENANCE_PLAN,
             verb::MAINTENANCE_APPLY,
+        ];
+        expected.sort_unstable();
+        assert_eq!(implemented, expected);
+        for deferred in [
+            verb::TRUST_INSTALL,
+            verb::SECURITY_RESCUE_CLEANUP,
+            verb::RUNTIME_STAGE,
+            verb::RUNTIME_START,
+            verb::RUNTIME_STOP,
+            verb::DOCTOR,
         ] {
             assert!(
                 !m.lookup(deferred).unwrap().implemented,

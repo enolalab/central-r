@@ -678,6 +678,206 @@ pub fn run_helper_daemon(
                 target_id: "postgres:central".to_owned(),
             },
         ))),
+        // `newProductionSecurityUpdateHandler` — B01's write path:
+        // `install_active_bundle` installs the operator's signed
+        // envelope beneath the authoritative state root, bound to the
+        // instance id. `newHelperConfirmer` fails composition on a
+        // mis-provisioned ceremony mode, upstream-exact.
+        security_update: match helper_confirmer(&composition) {
+            Ok(confirmer) => Some(super::security_update::SecurityUpdateHandler {
+                pam: Some(Box::new(confirmer)),
+                install: Some(Box::new(|root, binding, envelope| {
+                    crate::infra::advisory_fetch::install_active_bundle(root, binding, envelope)
+                })),
+                root_path: composition.authoritative_state_root.clone(),
+                binding_id: composition.instance_id.clone(),
+            }),
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {e}");
+                return 6;
+            }
+        },
+        // `newProductionAuditHandler` — D05: the B01 evaluator, the
+        // D01 wipe ceremony scope (repair runs under it), and the
+        // broker protected root as the audited hierarchy. The deny-safe
+        // record lives in that same root, hashed like every protected
+        // file.
+        audit: {
+            let broker_root = match crate::broker::daemon::production_broker_root_at(
+                &composition,
+                crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+                0,
+                0,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            };
+            match helper_confirmer(&composition) {
+                Ok(confirmer) => Some(Box::new(super::audit::AuditHandlerImpl {
+                    pam: Some(Box::new(confirmer)),
+                    advisory: Some(Box::new(helper_advisory_evaluator(
+                        &composition,
+                        &broker_path,
+                    ))),
+                    scope: CeremonyScope {
+                        instance_id: "default".to_owned(),
+                        target_id: "postgres:central".to_owned(),
+                    },
+                    roots: super::audit::Roots {
+                        protected_dir: broker_root.to_string_lossy().into_owned(),
+                        audit_dir: broker_root.join("audit").to_string_lossy().into_owned(),
+                        instance_id: composition.instance_id.clone(),
+                        audit_uid: 0,
+                        audit_gid: 0,
+                    },
+                }) as Box<dyn super::audit::AuditHandler>),
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            }
+        },
+        // `newProductionRescueHandler` — D06: the B01 evaluator
+        // (installed verdicts are branches, never gates), the
+        // candidate evaluator over the same facts/witness/trust minus
+        // the recorder, and the bounded compose-down cleanup the
+        // lifecycle handler would otherwise carry. The deny-safe
+        // record sits in the broker protected root — the same dir the
+        // transport gate arms on below.
+        rescue: {
+            let broker_root = match crate::broker::daemon::production_broker_root_at(
+                &composition,
+                crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+                0,
+                0,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            };
+            let confirmer = match helper_confirmer(&composition) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            };
+            let witness = match crate::infra::advisory_fetch::TimeWitnessStore::new(
+                &composition.authoritative_state_root,
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {}", e.message());
+                    return 6;
+                }
+            };
+            Some(Box::new(super::rescue::RescueHandlerImpl {
+                pam: Some(Box::new(confirmer)),
+                installed: Some(Box::new(helper_advisory_evaluator(
+                    &composition,
+                    &broker_path,
+                ))),
+                candidate: Some(Box::new(ProductionCandidateEvaluator {
+                    facts: crate::infra::advisory_fetch::HostFactsCollector::new(),
+                    witness,
+                    verifier: central_infra::advisory::Verifier::production(),
+                })),
+                cleanup: Some(Box::new(ComposeDownRescueCleanup {
+                    instance_id: composition.instance_id.clone(),
+                })),
+                store: Some(crate::infra::advisory_fetch::FileDenySafeStore::new(
+                    &broker_root,
+                    0,
+                    0,
+                )),
+                scope: CeremonyScope {
+                    instance_id: "default".to_owned(),
+                    target_id: "postgres:central".to_owned(),
+                },
+                roots: super::rescue::RescueRoots {
+                    deny_safe_dir: broker_root.to_string_lossy().into_owned(),
+                    deny_safe_uid: 0,
+                    deny_safe_gid: 0,
+                },
+            }) as Box<dyn super::rescue::RescueHandler>)
+        },
+        // `newProductionMaintenanceHandler` — E01: the protected
+        // matrix store and the host-facts probes. A missing probe
+        // leaves the dependency "unprobed" — reported, never
+        // fabricated.
+        maintenance: {
+            let broker_root = match crate::broker::daemon::production_broker_root_at(
+                &composition,
+                crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+                0,
+                0,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            };
+            Some(Box::new(super::maintenance::MaintenanceHandlerImpl {
+                store: Some(central_infra::maintenance::new_store(&broker_root)),
+                probes: maintenance_probes(true),
+            })
+                as Box<dyn super::maintenance::MaintenanceHandler>)
+        },
+        // `newProductionMaintenanceApplyHandler` — E02/E03: the same
+        // store and probes, the ceremony confirmer, and the image
+        // probe that asks the local docker daemon whether a digest
+        // resolves. The gate observes; it never pulls.
+        maintenance_apply: {
+            let broker_root = match crate::broker::daemon::production_broker_root_at(
+                &composition,
+                crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+                0,
+                0,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            };
+            match helper_confirmer(&composition) {
+                Ok(confirmer) => Some(Box::new(super::maintenance::MaintenanceApplyHandlerImpl {
+                    store: Some(central_infra::maintenance::new_store(&broker_root)),
+                    probes: maintenance_probes(false),
+                    images: Some(Box::new(maintenance_image_probe)),
+                    pam: Some(Box::new(confirmer)),
+                    scope: CeremonyScope {
+                        instance_id: "default".to_owned(),
+                        target_id: "postgres:central".to_owned(),
+                    },
+                })
+                    as Box<dyn super::maintenance::MaintenanceApplyHandler>),
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            }
+        },
+        // `denySafeDirForComposition` — the same broker protected dir
+        // the rescue handler records to. Resolution failure disables
+        // the gate (empty dir) rather than guessing a path — but the
+        // rescue handler itself refused to compose in that case, so a
+        // running helper never serves rescue without its gate armed on
+        // the same dir.
+        deny_safe_dir: crate::broker::daemon::production_broker_root_at(
+            &composition,
+            crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+            0,
+            0,
+        )
+        .ok()
+        .map(|root| root.to_string_lossy().into_owned()),
         // `lifecycle` stays unset for the same dependency-chain reason,
         // one link deeper: `infra::lifecycle::new_production_service`
         // needs (1) the B01 advisory evaluator — the same deferred seam
@@ -758,6 +958,342 @@ fn run_restore_capacity_startup_sweep(
     if let Err((_, e)) = authority.sweep_and_publish(time::OffsetDateTime::now_utc()) {
         report_sweep_failure(SITE, e.message(), stderr);
     }
+}
+
+// ---------------------------------------------------------------------------
+// R6-13 composition helpers — `cmd/central`'s *_helper_composition.go
+// adapters.
+// ---------------------------------------------------------------------------
+
+/// `helperCeremonyInstanceID`/`helperCeremonyTargetID` are already
+/// bound into the `CeremonyScope` literals above — this is the shared
+/// confirmer constructor upstream calls `newHelperConfirmer`.
+///
+/// `newHelperConfirmer` — whichever ceremony mode the instance has
+/// installed. `physical_tty` (the default, and what an instance
+/// without a mode file gets) is exactly the ADR 0023 confirmer. Grant
+/// mode opens the instance's grant store and refuses to compose at
+/// all if it is missing or mis-owned: a helper that silently fell
+/// back to the console when its grant store was absent would hang
+/// every unattended run at a prompt nobody is watching.
+fn helper_confirmer(
+    composition: &crate::broker::daemon::ProductionInstanceComposition,
+) -> Result<PamConfirmer, String> {
+    if composition.authoritative_state_root.is_empty() {
+        return Err("ceremony: instance composition names no state root".to_owned());
+    }
+    let (uid, gid) = (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    );
+    match super::grant::read_ceremony_mode(&composition.authoritative_state_root, uid, gid)
+        .map_err(|e| format!("ceremony: {}", e.message()))?
+    {
+        super::grant::CeremonyMode::PhysicalTty => Ok(PamConfirmer::new()),
+        super::grant::CeremonyMode::Grant => {
+            let store_dir =
+                std::path::Path::new(&composition.authoritative_state_root).join("grants");
+            let store = super::grant::GrantStore::open(&store_dir.to_string_lossy(), uid, gid)
+                .map_err(|e| format!("ceremony: {}", e.message()))?;
+            Ok(PamConfirmer::with_grants(
+                store,
+                "default",
+                "postgres:central",
+            ))
+        }
+    }
+}
+
+/// The concrete `app.Service` shape `newProductionAdvisoryEvaluator`
+/// composes — `deny_safe` stays `None` exactly as upstream's helper
+/// evaluator carries no `DenySafeDir` (the serve path's evaluator owns
+/// deny-safe entry; the helper only reads installed verdicts).
+type HelperEvaluationService = central_infra::advisory::EvaluationService<
+    crate::infra::advisory_fetch::ActiveBundleSource,
+    crate::infra::advisory_fetch::HostFactsCollector,
+    crate::infra::advisory_fetch::SystemAdvisoryClock,
+    crate::infra::advisory_fetch::TimeWitnessStore,
+    crate::infra::advisory_fetch::AdvisoryTransitionRecorder<
+        crate::infra::advisory_fetch::AdvisoryEvaluationJournalClient,
+    >,
+    crate::infra::advisory_fetch::FileDenySafeStore,
+>;
+
+/// `HelperAdvisoryEvaluator` — `newHelperAdvisoryEvaluator` over the
+/// helper's narrow seams: `None` is upstream's
+/// `unavailableLifecycleEvaluator` fallback (a production evaluator
+/// that fails to compose — most often a fresh instance whose state
+/// root does not exist yet — falls back deny-only rather than taking
+/// the whole helper down).
+struct HelperAdvisoryEvaluator {
+    service: Option<HelperEvaluationService>,
+}
+
+impl HelperAdvisoryEvaluator {
+    /// The installed advisory's verdict, or the evaluator's own
+    /// failure — both surfaces upstream's `(Result, error)` return.
+    fn outcome(
+        &self,
+    ) -> Result<central_infra::advisory::Outcome, central_foundation::failure::Failure> {
+        let Some(service) = &self.service else {
+            return Err(central_foundation::failure::Failure::unavailable(
+                "advisory_evaluator_unavailable",
+                "B01 lifecycle admission evaluator is unavailable",
+            ));
+        };
+        crate::infra::lifecycle::block_on(service.evaluate())
+            .map(|(outcome, _)| outcome)
+            .map_err(|e| e.source)
+    }
+}
+
+impl super::rescue::RescueAdvisoryEvaluator for HelperAdvisoryEvaluator {
+    fn evaluate(
+        &self,
+    ) -> Result<central_infra::advisory::Outcome, central_foundation::failure::Failure> {
+        self.outcome()
+    }
+}
+
+impl super::audit::AuditAdvisoryEvaluator for HelperAdvisoryEvaluator {
+    fn evaluate(
+        &self,
+    ) -> Result<super::audit::AdvisoryVerdict, central_foundation::failure::Failure> {
+        Ok(match self.outcome()?.state {
+            central_infra::advisory::State::Current => super::audit::AdvisoryVerdict::Current,
+            _ => super::audit::AdvisoryVerdict::NotCurrent,
+        })
+    }
+}
+
+/// `newHelperAdvisoryEvaluator` — the one B01 evaluator this helper
+/// process admits work with; both audit and rescue take it from here
+/// rather than each resolving their own, upstream's single-resolution
+/// rule.
+fn helper_advisory_evaluator(
+    composition: &crate::broker::daemon::ProductionInstanceComposition,
+    broker_path: &std::path::Path,
+) -> HelperAdvisoryEvaluator {
+    if composition.authoritative_state_root.is_empty() || composition.instance_id.is_empty() {
+        return HelperAdvisoryEvaluator { service: None };
+    }
+    let service = (|| {
+        let source = crate::infra::advisory_fetch::ActiveBundleSource::new(
+            &composition.authoritative_state_root,
+            &composition.instance_id,
+        )
+        .ok()?;
+        let witness = crate::infra::advisory_fetch::TimeWitnessStore::new(
+            &composition.authoritative_state_root,
+        )
+        .ok()?;
+        let journal = crate::infra::advisory_fetch::AdvisoryEvaluationJournalClient::new(
+            broker_path.to_path_buf(),
+        );
+        Some(HelperEvaluationService {
+            source,
+            facts: crate::infra::advisory_fetch::HostFactsCollector::new(),
+            clock: crate::infra::advisory_fetch::SystemAdvisoryClock,
+            witness,
+            recorder: crate::infra::advisory_fetch::AdvisoryTransitionRecorder::new(journal),
+            verifier: central_infra::advisory::Verifier::production(),
+            deny_safe: None,
+        })
+    })();
+    if service.is_none() {
+        // Upstream logs to stderr and falls back deny-only; the call
+        // site reports through the daemon's own composition path.
+        return HelperAdvisoryEvaluator { service: None };
+    }
+    HelperAdvisoryEvaluator { service }
+}
+
+/// `productionCandidateEvaluator` — runs B01 over operator-carried
+/// candidate bytes with the installed evaluator's own facts, witness,
+/// and release trust — minus the recorder: candidate evaluation
+/// records nothing and advances nothing. The deny-safe attempt record
+/// is where the outcome lands.
+struct ProductionCandidateEvaluator {
+    facts: crate::infra::advisory_fetch::HostFactsCollector,
+    witness: crate::infra::advisory_fetch::TimeWitnessStore,
+    verifier: central_infra::advisory::Verifier,
+}
+
+impl super::rescue::RescueCandidateEvaluator for ProductionCandidateEvaluator {
+    fn evaluate_candidate(
+        &self,
+        candidate: &[u8],
+    ) -> Result<central_infra::advisory::Outcome, central_foundation::failure::Failure> {
+        Ok(central_infra::advisory::evaluate_candidate(
+            &self.verifier,
+            &self.facts,
+            &self.witness,
+            time::OffsetDateTime::now_utc(),
+            candidate,
+        )
+        .1)
+    }
+}
+
+/// `lifecycleDownCleanup` — the deny-safe cleanup, bounded to a direct
+/// `docker compose down --remove-orphans` over the instance's
+/// protected runtime path: the same mechanical effect the composed
+/// lifecycle handler's down path produces upstream, minus its second
+/// ceremony (the lifecycle service is not composed in this port — see
+/// the `lifecycle` field's own note — so the rescue ceremony alone
+/// carries the authorization here). Sandboxes and database
+/// connections die with the stopped service containers; state is
+/// preserved: down stops, it never deletes.
+struct ComposeDownRescueCleanup {
+    instance_id: String,
+}
+
+impl super::rescue::RescueCleanup for ComposeDownRescueCleanup {
+    /// `Cleanup` — the two-minute machine share of the rescue budget,
+    /// the closed docker environment, and idempotent-by-construction
+    /// semantics (`down` on a stopped project is a no-op).
+    fn cleanup(&self) -> Result<(), central_foundation::failure::Failure> {
+        let file = crate::infra::compose::RenderedFile {
+            path: format!(
+                "/run/central-infra/{}/docker-compose.yaml",
+                self.instance_id
+            ),
+            content: Vec::new(),
+        };
+        use crate::infra::compose::ComposeRunner;
+        let runner =
+            crate::infra::compose::CommandComposeRunner::new("/usr/bin/docker", None, None);
+        runner
+            .down(
+                &file,
+                crate::infra::prepare::OpDeadline::after(std::time::Duration::from_secs(120)),
+            )
+            .map_err(|e| {
+                central_foundation::failure::Failure::unavailable(
+                    "rescue_cleanup",
+                    format!("rescue: lifecycle down failed: {e}"),
+                )
+            })
+    }
+}
+
+/// `maintenanceProbes` — the four host-facts probes upstream installs:
+/// the toolchain is the running binary's own language toolchain (the
+/// rustc version observed on the host, the Rust port's equivalent of
+/// `runtime.Version()`); the docker/compose/psql probes share the
+/// advisory host-facts collector. `shared` is upstream's `factsOnce`
+/// distinction: the plan handler caches one collect across the three
+/// probes; apply collects per probe call.
+fn maintenance_probes(shared: bool) -> super::maintenance::MaintenanceProbes {
+    let collector = std::sync::Arc::new(crate::infra::advisory_fetch::HostFactsCollector::new());
+    let cache: std::sync::Arc<std::sync::Mutex<Option<central_infra::advisory::HostFacts>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let facts = move || -> central_infra::advisory::HostFacts {
+        if shared {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(f) = &*guard {
+                return f.clone();
+            }
+            let f = collector.collect_facts();
+            *guard = Some(f.clone());
+            f
+        } else {
+            collector.collect_facts()
+        }
+    };
+    let facts = std::sync::Arc::new(facts);
+    let mut probes: super::maintenance::MaintenanceProbes = std::collections::BTreeMap::new();
+    probes.insert(
+        "go-toolchain".to_owned(),
+        Box::new(|| {
+            // The Rust port's `runtime.Version()` equivalent: the
+            // installed rustc, reported as `x.y.z`.
+            let out = std::process::Command::new("rustc")
+                .arg("--version")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .map_err(|e| {
+                    central_foundation::failure::Failure::unavailable(
+                        "maintenance_probe",
+                        format!("rustc probe: {e}"),
+                    )
+                })?;
+            if !out.status.success() {
+                return Err(central_foundation::failure::Failure::unavailable(
+                    "maintenance_probe",
+                    "rustc probe failed",
+                ));
+            }
+            let text = String::from_utf8_lossy(&out.stdout);
+            let version = text
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            if version.is_empty() {
+                return Err(central_foundation::failure::Failure::unavailable(
+                    "maintenance_probe",
+                    "rustc probe reported nothing",
+                ));
+            }
+            Ok(version)
+        }),
+    );
+    for (name, pick) in [
+        ("postgresql", "psql"),
+        ("docker-engine", "docker"),
+        ("docker-compose", "compose"),
+    ] {
+        let facts = facts.clone();
+        probes.insert(
+            name.to_owned(),
+            Box::new(move || {
+                let f = facts();
+                let v = match pick {
+                    "psql" => f.psql,
+                    "docker" => f.docker,
+                    _ => f.compose,
+                };
+                if v.is_empty() {
+                    return Err(central_foundation::failure::Failure::unavailable(
+                        "maintenance_probe",
+                        format!("{name} probe reported nothing"),
+                    ));
+                }
+                Ok(v)
+            }),
+        );
+    }
+    probes
+}
+
+/// `maintenanceImageProbe` — `docker image inspect <digest>` bounded
+/// to fifteen seconds. It resolves a digest already present on the
+/// host; it never pulls. A non-zero exit means not present.
+fn maintenance_image_probe(digest: &str) -> Result<bool, central_foundation::failure::Failure> {
+    let mut cmd = std::process::Command::new("/usr/bin/docker");
+    cmd.arg("image")
+        .arg("inspect")
+        .arg(digest)
+        .env_clear()
+        .envs(
+            crate::infra::compose::closed_docker_environment()
+                .iter()
+                .filter_map(|kv| kv.split_once('=')),
+        );
+    let out = crate::infra::compose::run_compose_bounded(
+        crate::infra::prepare::OpDeadline::after(std::time::Duration::from_secs(15)),
+        &mut cmd,
+        None,
+    )
+    .map_err(|e| {
+        central_foundation::failure::Failure::unavailable(
+            "maintenance_image_probe",
+            format!("image probe: {e}"),
+        )
+    })?;
+    Ok(out.status.success())
 }
 
 /// `reportRestoreCapacityReserveSweepFailure` — the one place a sweep

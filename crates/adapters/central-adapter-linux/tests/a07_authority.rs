@@ -108,26 +108,20 @@ fn helper_matrix_denies_unregistered_verbs_exact() {
 }
 
 /// Every registered-but-unimplemented verb on the operator arm defers
-/// with the same reason. The seven maintenance verbs Task 7 ported
-/// (`backup-create` … `restore-abandon`) are implemented now — they
-/// answer with their own refusal codes and are asserted elsewhere.
+/// with the same reason. The maintenance verbs Task 7 ported
+/// (`backup-create` … `restore-abandon`), Task 11's destructive set
+/// (`wipe`, `backup-delete`, `backup-prune`), Task 12's
+/// export/import pair, and the Task-13 set (`security-update`,
+/// `state-audit`, `security-rescue`, `maintenance-plan`,
+/// `maintenance-apply`) are implemented now — they answer with their
+/// own refusal codes and are asserted elsewhere.
 #[test]
 fn helper_matrix_defers_unimplemented_operator_verbs_exact() {
     let server = operator_server();
-    for v in [
-        verb::WIPE,
-        verb::PREPARE,
-        verb::SECURITY_UPDATE,
-        verb::TRUST_INSTALL,
-        verb::BACKUP_EXPORT,
-        verb::BACKUP_IMPORT,
-        verb::BACKUP_DELETE,
-        verb::BACKUP_PRUNE,
-        verb::STATE_AUDIT,
-        verb::SECURITY_RESCUE,
-        verb::MAINTENANCE_PLAN,
-        verb::MAINTENANCE_APPLY,
-    ] {
+    // `prepare` is conditionally implemented through `Server::prepare`
+    // upstream, so its matrix row stays closed; `trust-install` is the
+    // one plain unimplemented verb left on this arm.
+    for v in [verb::PREPARE, verb::TRUST_INSTALL] {
         let resp = helper_request(&server, &req("op-d", v));
         assert_eq!(resp.outcome, "deferred", "verb {v}");
         assert_eq!(resp.exit_code, 5, "verb {v}");
@@ -200,10 +194,23 @@ fn helper_dispatch_implemented_but_handlerless_verbs() {
     }
     // The R6 task-2 verbs are implemented arms: with no handler
     // injected each defers with its own upstream reason — never the
-    // closed-slice `UNSUPPORTED_IN_THIS_SLICE`.
+    // closed-slice `UNSUPPORTED_IN_THIS_SLICE`. The Slice D and
+    // Task-13 verbs defer the same way (`s.Wipe == nil`,
+    // `s.Audit == nil`, `s.Rescue == nil`, `s.Maintenance* == nil`,
+    // `s.SecurityUpdate == nil`).
     for (v, reason) in [
         (verb::MIGRATE_LAUNCH, "MIGRATION_LAUNCH_UNAVAILABLE"),
         (verb::MIGRATE_READ_OUTCOME, "MIGRATION_OUTCOME_UNAVAILABLE"),
+        (verb::WIPE, "WIPE_UNAVAILABLE"),
+        (verb::BACKUP_EXPORT, "EXPORT_UNAVAILABLE"),
+        (verb::BACKUP_IMPORT, "IMPORT_UNAVAILABLE"),
+        (verb::BACKUP_DELETE, "DELETE_UNAVAILABLE"),
+        (verb::BACKUP_PRUNE, "PRUNE_UNAVAILABLE"),
+        (verb::SECURITY_UPDATE, "SECURITY_UPDATE_UNAVAILABLE"),
+        (verb::STATE_AUDIT, "AUDIT_UNAVAILABLE"),
+        (verb::SECURITY_RESCUE, "RESCUE_UNAVAILABLE"),
+        (verb::MAINTENANCE_PLAN, "MAINTENANCE_UNAVAILABLE"),
+        (verb::MAINTENANCE_APPLY, "MAINTENANCE_UNAVAILABLE"),
     ] {
         let resp = helper_request(&server, &req("op-m", v));
         assert_eq!(resp.outcome, "deferred", "verb {v}");

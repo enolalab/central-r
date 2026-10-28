@@ -1284,6 +1284,181 @@ impl AuditHandler for AuditHandlerImpl {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AuditClient — client_linux.go's linuxAuditClient.
+// ---------------------------------------------------------------------------
+
+/// `AuditClientResult` mirrors the helper's `AuditResult` across the
+/// socket — strict-decoded and canonical-checked.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditClientResult {
+    pub operation_id: String,
+    pub report_id: String,
+    pub manifest_id: String,
+    pub manifest_valid: bool,
+    pub checked: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tampered: Vec<TamperedFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub late: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub baseline_created: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repaired: bool,
+    pub completed_at: String,
+}
+
+/// `AuditClientError` exposes only the stable exit class plus a
+/// whitelisted reason token.
+#[derive(Debug)]
+pub struct AuditClientError {
+    exit_code: i64,
+    reason: String,
+}
+
+impl AuditClientError {
+    pub fn exit_code(&self) -> i64 {
+        self.exit_code
+    }
+    /// The whitelisted helper reason token, or the empty string when
+    /// the helper reported nothing on the closed set.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for AuditClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "helper: audit failed")
+    }
+}
+impl std::error::Error for AuditClientError {}
+
+/// `retainedAuditReason` — the complete whitelist of audit reason
+/// tokens this client retains.
+fn retained_audit_reason(reason: &str) -> String {
+    match reason {
+        REASON_DENY_SAFE_ACTIVE
+        | REASON_AUDIT_REPAIR_REFUSED
+        | REASON_AUDIT_REPAIR_FAILED
+        | REASON_AUDIT_CEREMONY_REQUIRED
+        | "AUTHORITY_DENIED"
+        | REASON_AUDIT_DENIED_SIGNED => reason.to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn new_audit_client_error(exit_code: i64, reason: &str) -> AuditClientError {
+    let exit_code = if !(2..=7).contains(&exit_code) {
+        6
+    } else {
+        exit_code
+    };
+    AuditClientError {
+        exit_code,
+        reason: retained_audit_reason(reason),
+    }
+}
+
+/// `decodeExactAuditResult` — strict decode plus canonical re-encode
+/// equality.
+fn decode_exact_audit_result(payload: &[u8]) -> Result<AuditClientResult, String> {
+    if payload.is_empty() {
+        return Err("helper: audit result is invalid".to_owned());
+    }
+    let result: AuditClientResult =
+        super::protocol::strict_decode(payload).map_err(|e| e.to_string())?;
+    let canonical = serde_json::to_vec(&result)
+        .map_err(|_| "helper: audit result is not canonical".to_owned())?;
+    if canonical != payload {
+        return Err("helper: audit result is not canonical".to_owned());
+    }
+    Ok(result)
+}
+
+/// `AuditClient` — `linuxAuditClient`: dials the state-audit verb.
+pub struct AuditClient {
+    socket_path: String,
+}
+
+impl AuditClient {
+    pub fn new(socket_path: impl Into<String>) -> Self {
+        AuditClient {
+            socket_path: socket_path.into(),
+        }
+    }
+
+    /// `Audit` — sends repair/scheduled/last_run_at and validates the
+    /// bounded result: operation id echoes and identity fields are
+    /// complete.
+    ///
+    /// # Errors
+    /// [`AuditClientError`] — transport failures fold to exit 3, a
+    /// non-canonical or mismatched result to exit 6, and helper
+    /// denials carry the envelope code plus the whitelisted reason.
+    pub fn audit(
+        &self,
+        operation_id: &str,
+        repair: bool,
+        scheduled: bool,
+        last_run_at: &str,
+    ) -> Result<AuditClientResult, AuditClientError> {
+        if self.socket_path.is_empty() || operation_id.is_empty() {
+            return Err(new_audit_client_error(3, ""));
+        }
+        let mut conn = super::browser::dial_unix_bounded(
+            Path::new(&self.socket_path),
+            super::client::DIAL_TIMEOUT,
+        )
+        .map_err(|_| new_audit_client_error(3, ""))?;
+        let _ = conn.set_read_timeout(Some(
+            super::client::DIAL_TIMEOUT + super::server::STATE_AUDIT_BUDGET,
+        ));
+        let _ = conn.set_write_timeout(Some(super::client::DIAL_TIMEOUT));
+        let mut payload = serde_json::Map::new();
+        if repair {
+            payload.insert("repair".to_owned(), true.into());
+        }
+        if scheduled {
+            payload.insert("scheduled".to_owned(), true.into());
+        }
+        if !last_run_at.is_empty() {
+            payload.insert("last_run_at".to_owned(), last_run_at.into());
+        }
+        let msg = super::Request {
+            operation_id: operation_id.to_owned(),
+            verb: super::verb::STATE_AUDIT.to_owned(),
+            payload: serde_json::value::RawValue::from_string(
+                serde_json::Value::Object(payload).to_string(),
+            )
+            .ok(),
+        };
+        super::protocol::write_request(&mut conn, &msg)
+            .map_err(|_| new_audit_client_error(3, ""))?;
+        let response =
+            super::protocol::read_response(&mut conn).map_err(|_| new_audit_client_error(3, ""))?;
+        if response.outcome != "success" || response.exit_code != 0 {
+            return Err(new_audit_client_error(response.exit_code, &response.reason));
+        }
+        let raw = response
+            .result
+            .as_ref()
+            .map_or(&b""[..], |r| r.get().as_bytes());
+        let result = decode_exact_audit_result(raw).map_err(|_| new_audit_client_error(6, ""))?;
+        if result.operation_id != operation_id
+            || result.report_id.is_empty()
+            || result.manifest_id.is_empty()
+            || result.completed_at.is_empty()
+        {
+            return Err(new_audit_client_error(response.exit_code, &response.reason));
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

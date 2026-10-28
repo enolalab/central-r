@@ -560,7 +560,10 @@ impl<R: AdvisoryCommandRunner> HostFactsCollector<R> {
             .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
     }
 
-    fn collect_facts(&self) -> HostFacts {
+    /// `Collect`'s synchronous body — total by construction (every
+    /// probe degrades to an absent fact upstream-fashion); the async
+    /// port and the candidate seam both delegate here.
+    pub(crate) fn collect_facts(&self) -> HostFacts {
         // `ctx, cancel := context.WithTimeout(ctx, 5s)` upstream: ONE
         // deadline for the whole collection — the file reads are not
         // ctx-bound but do consume wall-clock budget, and each command
@@ -1379,21 +1382,31 @@ impl FileDenySafeStore {
 }
 
 impl FileDenySafeStore {
-    /// The synchronous body of `EnterDenySafe`.
-    fn enter_sync(&self, trigger_code: &str, now: OffsetDateTime) -> Result<(), Failure> {
+    /// `load` — `LoadDenySafe` through the store's own dir.
+    pub fn load(&self) -> Result<(crate::helper::audit::DenySafeState, bool), Failure> {
+        crate::helper::audit::load_deny_safe(
+            self.dir
+                .to_str()
+                .ok_or_else(|| internal("advisory_denysafe_dir", "deny-safe dir not UTF-8"))?,
+        )
+    }
+
+    /// The synchronous body of `EnterDenySafe`, returning the state
+    /// the rescue sequence reads `cleanup_done` from.
+    fn enter_sync(
+        &self,
+        trigger_code: &str,
+        now: OffsetDateTime,
+    ) -> Result<crate::helper::audit::DenySafeState, Failure> {
         if trigger_code.is_empty() {
             return Err(internal(
                 "advisory_denysafe_trigger",
                 "advisory: deny-safe trigger is empty",
             ));
         }
-        let (state, found) = crate::helper::audit::load_deny_safe(
-            self.dir
-                .to_str()
-                .ok_or_else(|| internal("advisory_denysafe_dir", "deny-safe dir not UTF-8"))?,
-        )?;
+        let (state, found) = self.load()?;
         if found && state.active && state.exited_at.is_empty() {
-            return Ok(());
+            return Ok(state);
         }
         // `time.Format(RFC3339Nano)` — see `advance_witness` for why
         // audit.rs's wrapper is not reused.
@@ -1411,7 +1424,83 @@ impl FileDenySafeStore {
             },
             ..crate::helper::audit::DenySafeState::default()
         };
-        self.store(&entered)
+        self.store(&entered)?;
+        Ok(entered)
+    }
+
+    /// `EnterDenySafe` — the rescue handler's entry call: returns the
+    /// recorded (or already-active) state.
+    pub fn enter_deny_safe(
+        &self,
+        trigger_code: &str,
+        now: OffsetDateTime,
+    ) -> Result<crate::helper::audit::DenySafeState, Failure> {
+        self.enter_sync(trigger_code, now)
+    }
+
+    /// `MarkDenySafeCleanupDone` — refuses a state that is not
+    /// actively awaiting cleanup.
+    pub fn mark_deny_safe_cleanup_done(&self) -> Result<(), Failure> {
+        let (mut state, found) = self.load()?;
+        if !found || !state.active || !state.exited_at.is_empty() {
+            return Err(internal(
+                "advisory_denysafe_inactive",
+                "advisory: deny-safe is not active",
+            ));
+        }
+        state.cleanup_done = true;
+        self.store(&state)
+    }
+
+    /// `RecordDenySafeAttempt` — appends one rescue attempt to the
+    /// active record.
+    pub fn record_deny_safe_attempt(
+        &self,
+        attempt: &crate::helper::audit::RescueAttempt,
+    ) -> Result<(), Failure> {
+        if attempt.attempt_id.is_empty()
+            || attempt.at.is_empty()
+            || attempt.candidate_digest_sha256.is_empty()
+            || attempt.result.is_empty()
+        {
+            return Err(internal(
+                "advisory_denysafe_attempt",
+                "advisory: rescue attempt is incomplete",
+            ));
+        }
+        let (mut state, found) = self.load()?;
+        if !found || !state.active || !state.exited_at.is_empty() {
+            return Err(internal(
+                "advisory_denysafe_inactive",
+                "advisory: deny-safe is not active",
+            ));
+        }
+        state.rescue_attempts.push(attempt.clone());
+        self.store(&state)
+    }
+
+    /// `ExitDenySafe` — records mode exit; cleanup must have
+    /// completed first.
+    pub fn exit_deny_safe(&self, now: OffsetDateTime) -> Result<(), Failure> {
+        let (mut state, found) = self.load()?;
+        if !found || !state.active || !state.exited_at.is_empty() {
+            return Err(internal(
+                "advisory_denysafe_inactive",
+                "advisory: deny-safe is not active",
+            ));
+        }
+        if !state.cleanup_done {
+            return Err(internal(
+                "advisory_denysafe_cleanup",
+                "advisory: deny-safe cleanup has not completed",
+            ));
+        }
+        state.active = false;
+        state.exited_at = now
+            .to_offset(time::UtcOffset::UTC)
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        self.store(&state)
     }
 }
 
@@ -1422,7 +1511,37 @@ impl port::DenySafeStore for FileDenySafeStore {
     /// the first. Attempts from an earlier completed episode carry
     /// over.
     async fn enter(&self, trigger_code: &str, now: OffsetDateTime) -> Result<(), Failure> {
-        self.enter_sync(trigger_code, now)
+        self.enter_sync(trigger_code, now).map(|_| ())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Candidate seams — denysafe.go's `CandidateFacts`/`CandidateWitness` over
+// the installed evaluator's own adapters: read-only, recording nothing.
+// ---------------------------------------------------------------------------
+
+impl central_infra::advisory::CandidateFacts for HostFactsCollector<RealCommandRunner> {
+    /// `Collect` — `collect_facts` is total by construction (every
+    /// probe degrades to an absent fact upstream-fashion), so the seam
+    /// never fails.
+    fn collect(&self) -> Result<HostFacts, Failure> {
+        Ok(self.collect_facts())
+    }
+}
+
+impl central_infra::advisory::CandidateWitness for TimeWitnessStore<Openat2Fs> {
+    /// `Load` — the read side of the witness; never advances.
+    fn load(&self) -> Result<TimeWitness, Failure> {
+        self.load_witness()
+    }
+}
+
+/// `advisoryClock{}` — the wall clock `Service.Clock` binds.
+pub struct SystemAdvisoryClock;
+
+impl port::AdvisoryClock for SystemAdvisoryClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::now_utc()
     }
 }
 

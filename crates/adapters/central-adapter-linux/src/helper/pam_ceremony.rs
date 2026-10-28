@@ -476,6 +476,74 @@ impl PamConfirmer {
     }
 }
 
+/// `auditPAMConfirmer` — repair runs under the D01 ceremony, so the
+/// seam maps onto `ConfirmWipe` exactly as upstream's
+/// `wipePAMConfirmer` type assertion did.
+impl super::audit::AuditPamConfirmer for PamConfirmer {
+    fn confirm_wipe(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        op_id: &str,
+    ) -> Result<String, Failure> {
+        PamConfirmer::confirm_wipe(self, peer, deadline, scope, op_id)
+    }
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+}
+
+/// `rescuePAMConfirmer` — the D06 ceremony; a confirmer that cannot
+/// run it stays `None` on the handler.
+impl super::rescue::RescuePamConfirmer for PamConfirmer {
+    fn confirm_security_rescue(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        op_id: &str,
+    ) -> Result<String, Failure> {
+        PamConfirmer::confirm_security_rescue(self, peer, deadline, scope, op_id)
+    }
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+}
+
+/// `securityUpdatePAMConfirmer` — the generic lifecycle ceremony
+/// (`h.pam.Confirm(ctx, operationID)` upstream).
+impl super::security_update::SecurityUpdatePamConfirmer for PamConfirmer {
+    fn confirm(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        operation_id: &str,
+    ) -> Result<String, Failure> {
+        PamConfirmer::confirm(self, peer, deadline, operation_id)
+    }
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+}
+
+/// `maintenanceApplyPAMConfirmer` — the E02 ceremony; a confirmer that
+/// cannot run it stays `None` on the handler.
+impl super::maintenance::MaintenanceApplyPamConfirmer for PamConfirmer {
+    fn confirm_maintenance_apply(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        op_id: &str,
+    ) -> Result<String, Failure> {
+        PamConfirmer::confirm_maintenance_apply(self, peer, deadline, scope, op_id)
+    }
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -48,6 +48,20 @@ pub const BACKUP_STATUS_BUDGET: Duration = Duration::from_secs(5);
 pub const BACKUP_CREATE_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 /// `backupVerifyDeadline`.
 pub const BACKUP_VERIFY_BUDGET: Duration = Duration::from_secs(2 * 60);
+/// `securityUpdateDeadline` — thirty seconds: the ceremony plus an
+/// envelope write.
+pub const SECURITY_UPDATE_BUDGET: Duration = Duration::from_secs(30);
+/// `stateAuditDeadline` — the ceremony share plus eight minutes of
+/// protected-state walk.
+pub const STATE_AUDIT_BUDGET: Duration = Duration::from_secs(120 + 8 * 60);
+/// `rescueDeadline` — the ceremony share plus thirteen minutes of
+/// cleanup and evaluation.
+pub const RESCUE_BUDGET: Duration = Duration::from_secs(120 + 13 * 60);
+/// `maintenancePlanDeadline` — sixty seconds of read-only planning.
+pub const MAINTENANCE_PLAN_BUDGET: Duration = Duration::from_secs(60);
+/// `maintenanceApplyDeadline` — the ceremony share plus two minutes
+/// of gate and journal work.
+pub const MAINTENANCE_APPLY_BUDGET: Duration = Duration::from_secs(120 + 2 * 60);
 
 /// `restoreVerifyDeadline` — derived from the default recovery
 /// profile's media-verification bound over the helper's two walks
@@ -100,6 +114,11 @@ pub fn helper_verb_deadline(verb: &str) -> Duration {
         v if v == verb::BACKUP_IMPORT => restore_apply_deadline() + Duration::from_secs(28 * 60),
         v if v == verb::BACKUP_DELETE => CEREMONY_BUDGET + Duration::from_secs(8 * 60),
         v if v == verb::BACKUP_PRUNE => CEREMONY_BUDGET + Duration::from_secs(58 * 60),
+        v if v == verb::SECURITY_UPDATE => SECURITY_UPDATE_BUDGET,
+        v if v == verb::STATE_AUDIT => STATE_AUDIT_BUDGET,
+        v if v == verb::SECURITY_RESCUE => RESCUE_BUDGET,
+        v if v == verb::MAINTENANCE_PLAN => MAINTENANCE_PLAN_BUDGET,
+        v if v == verb::MAINTENANCE_APPLY => MAINTENANCE_APPLY_BUDGET,
         v if v == verb::BROWSER_OPEN => Duration::from_secs(30),
         v if v == verb::TRUST_INSTALL => Duration::from_secs(120),
         v if v == verb::BOOTSTRAP_SHOW => Duration::from_secs(5),
@@ -259,6 +278,16 @@ pub struct Server {
     /// `Prune` — D04 prune plan and apply, a separate seam so a
     /// composition can substitute a stub.
     pub prune: Option<Box<dyn super::prune::PruneHandler>>,
+    /// `SecurityUpdate` — B01's write path.
+    pub security_update: Option<super::security_update::SecurityUpdateHandler>,
+    /// `Audit` — D05 protected-state audit.
+    pub audit: Option<Box<dyn super::audit::AuditHandler>>,
+    /// `Rescue` — D06 deny-safe rescue.
+    pub rescue: Option<Box<dyn super::rescue::RescueHandler>>,
+    /// `Maintenance` — E01 read-only compatibility planning.
+    pub maintenance: Option<Box<dyn super::maintenance::MaintenanceHandler>>,
+    /// `MaintenanceApply` — E02/E03 authorized transitions.
+    pub maintenance_apply: Option<Box<dyn super::maintenance::MaintenanceApplyHandler>>,
     pub browser: Option<super::browser::BrowserHandler>,
     pub bootstrap_show: Option<super::browser::BootstrapShowHandler>,
     /// Arms the deny-safe gate while non-empty.
@@ -289,6 +318,11 @@ impl Server {
             import: None,
             delete: None,
             prune: None,
+            security_update: None,
+            audit: None,
+            rescue: None,
+            maintenance: None,
+            maintenance_apply: None,
             browser: None,
             bootstrap_show: None,
             deny_safe_dir: None,
@@ -584,6 +618,86 @@ impl Server {
                         &req.operation_id,
                         2,
                         central_infra::portable::REASON_IMPORT_INVALID_REQUEST,
+                    ),
+                }
+            }
+            v if v == verb::SECURITY_UPDATE => {
+                let Some(handler) = &self.security_update else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        super::security_update::REASON_SECURITY_UPDATE_UNAVAILABLE,
+                    );
+                };
+                match super::security_update::parse_security_update_request(req) {
+                    Ok(parsed) => handler.install_security_update(peer, deadline, parsed),
+                    Err(_) => Response::denied(
+                        &req.operation_id,
+                        2,
+                        super::security_update::REASON_INVALID_SECURITY_UPDATE_REQUEST,
+                    ),
+                }
+            }
+            v if v == verb::STATE_AUDIT => {
+                let Some(handler) = &self.audit else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        super::audit::REASON_AUDIT_UNAVAILABLE,
+                    );
+                };
+                match parse_audit_request(req) {
+                    Ok(parsed) => handler.audit(peer, deadline, parsed),
+                    Err(_) => Response::denied(
+                        &req.operation_id,
+                        2,
+                        super::audit::REASON_AUDIT_INVALID_REQUEST,
+                    ),
+                }
+            }
+            v if v == verb::SECURITY_RESCUE => {
+                let Some(handler) = &self.rescue else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        central_infra::advisory::REASON_RESCUE_UNAVAILABLE,
+                    );
+                };
+                match super::rescue::parse_rescue_request(req) {
+                    Ok(parsed) => handler.rescue(peer, deadline, parsed),
+                    Err(_) => Response::denied(
+                        &req.operation_id,
+                        2,
+                        central_infra::advisory::REASON_RESCUE_INVALID_REQUEST,
+                    ),
+                }
+            }
+            v if v == verb::MAINTENANCE_PLAN => {
+                let Some(handler) = &self.maintenance else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        super::maintenance::REASON_MAINTENANCE_UNAVAILABLE,
+                    );
+                };
+                match super::maintenance::parse_maintenance_request(req) {
+                    Ok(parsed) => handler.maintenance_plan(peer, deadline, parsed),
+                    Err(_) => Response::denied(
+                        &req.operation_id,
+                        2,
+                        super::maintenance::REASON_INVALID_MAINTENANCE_REQUEST,
+                    ),
+                }
+            }
+            v if v == verb::MAINTENANCE_APPLY => {
+                let Some(handler) = &self.maintenance_apply else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        super::maintenance::REASON_MAINTENANCE_UNAVAILABLE,
+                    );
+                };
+                match super::maintenance::parse_maintenance_apply_request(req) {
+                    Ok(parsed) => handler.maintenance_apply(peer, deadline, parsed),
+                    Err(_) => Response::denied(
+                        &req.operation_id,
+                        2,
+                        super::maintenance::REASON_INVALID_MAINTENANCE_REQUEST,
                     ),
                 }
             }
@@ -1228,7 +1342,21 @@ mod tests {
                 "RESTORE_VERIFY_UNAVAILABLE",
             ),
             (verb::BACKUP_CREATE, "deferred", "BACKUP_CREATE_UNAVAILABLE"),
-            (verb::STATE_AUDIT, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
+            // Implemented but unconfigured: the verb's own upstream
+            // unavailable answers (`s.Audit == nil`, `s.Rescue == nil`,
+            // `s.MaintenanceApply == nil`, `s.SecurityUpdate == nil`),
+            // not the matrix refusal.
+            (verb::STATE_AUDIT, "deferred", "AUDIT_UNAVAILABLE"),
+            (
+                verb::SECURITY_UPDATE,
+                "deferred",
+                "SECURITY_UPDATE_UNAVAILABLE",
+            ),
+            (
+                verb::MAINTENANCE_PLAN,
+                "deferred",
+                "MAINTENANCE_UNAVAILABLE",
+            ),
             // Implemented but unconfigured: the verb's own upstream
             // unavailable answer, not the matrix's closed refusal —
             // `exportUnavailable`/`importUnavailable`.
@@ -1237,13 +1365,9 @@ mod tests {
             (
                 verb::MAINTENANCE_APPLY,
                 "deferred",
-                "UNSUPPORTED_IN_THIS_SLICE",
+                "MAINTENANCE_UNAVAILABLE",
             ),
-            (
-                verb::SECURITY_RESCUE,
-                "deferred",
-                "UNSUPPORTED_IN_THIS_SLICE",
-            ),
+            (verb::SECURITY_RESCUE, "deferred", "RESCUE_UNAVAILABLE"),
             (verb::UP, "deferred", "LIFECYCLE_SERVICE_UNAVAILABLE"),
             (verb::STATUS, "deferred", "LIFECYCLE_SERVICE_UNAVAILABLE"),
         ];

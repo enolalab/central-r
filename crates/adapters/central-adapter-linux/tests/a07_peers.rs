@@ -94,13 +94,14 @@ fn helper_conn_daemon_arm_refuses_operator_only_peer() {
         operator_uid: euid(),
         operator_gid: egid(),
     });
-    // `wipe` is registered-but-unimplemented on the operator arm:
-    // admitted, then deferred — proving the arm gate ran first.
+    // `trust-install` is registered-but-unimplemented on the
+    // operator arm: admitted, then deferred — proving the arm gate
+    // ran first.
     let resp = helper_request(
         &server,
         &Request {
             operation_id: "op-peer-2".to_owned(),
-            verb: "wipe".to_owned(),
+            verb: "trust-install".to_owned(),
             payload: None,
         },
     );
