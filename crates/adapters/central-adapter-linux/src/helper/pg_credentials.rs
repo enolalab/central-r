@@ -159,7 +159,7 @@ pub(crate) fn write_owned_passfile_atomic(
 fn sync_directory_path(dir: &Path) -> Result<(), Failure> {
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
-        .map_err(|_| unavailable("postgres superuser credential: sync directory"))
+        .map_err(|_| unavailable("postgres credential: sync directory"))
 }
 
 // ---------------------------------------------------------------------------
