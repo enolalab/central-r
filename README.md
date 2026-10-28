@@ -10,10 +10,11 @@ the upstream Go `central` codebase. It is delivered as the `R0`–`R6`
 vertical-slice sequence defined by
 [ADR 0043](docs/adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md).
 
-> **Status:** pre-release. Phases R0–R5 are complete. **Phase R6 (backup,
-> restore, wipe, maintenance) is in progress.** Commands that belong to a slice
-> not yet accepted exit with code `5` / `UNSUPPORTED_IN_THIS_SLICE` and change
-> nothing.
+> **Status:** pre-release. **The `R0`–`R6` sequence is complete**, followed by
+> the post-R6 `lifecycle-composition` slice (broker-backed `local up|down|status`
+> and the `bind_postgres_service_role` writer). Commands whose slice is not yet
+> accepted (e.g. `local browser open`) exit with code `5` /
+> `UNSUPPORTED_IN_THIS_SLICE` and change nothing.
 
 ---
 
@@ -141,35 +142,36 @@ and the live scope is in [current-phase.md](docs/implementation/current-phase.md
 | **R3** | Harness control plane (4 adapters), `central serve`, API v1 + SSR Web UI, harness launcher | ✅ Complete |
 | **R4** | Multi-agent workflow orchestration (Phase 2 slices 2A–2F) and the 23-scenario recovery matrix | ✅ Complete |
 | **R5** | Host authority, protected broker, audited Linux boundary, six-service Compose topology | ✅ Complete |
-| **R6** | Backup, restore, wipe, maintenance, and launcher daemons | 🚧 In progress |
+| **R6** | Backup, restore, wipe, maintenance, and launcher daemons | ✅ Complete |
+| **LC** | Post-R6 lifecycle composition: broker `bind_postgres_service_role`, service-role credential store, compose/bootstrap decorations, helper-daemon `local up\|down\|status` | ✅ Complete |
 
 ```
 R0 ██████████ R1 ██████████ R2 ██████████ R3 ██████████
-R4 ██████████ R5 ██████████ R6 ███▊░░░░░░   (~6.5 / 16 tasks)
+R4 ██████████ R5 ██████████ R6 ██████████ LC ██████████   (16 / 16 + 5 / 5 tasks)
 ```
 
 ### Phase R6 progress
 
+All 16 tasks are done: migrate CLI and launcher daemons, backup/restore domain
+and evidence stores, broker recovery authority, C01–C06 recovery flows and
+acceptance, wipe/reseed and delete/prune (D01/D04), `bx1` export/import
+(D02/D03), audit/rescue/security update (D05/D06), D07 acceptance, maintenance
+and `central-advisory-sign` (E01–E04), and the E05/E06 closeout.
+
+### Post-R6: lifecycle composition
+
 | # | Task | Status |
 | --- | --- | --- |
-| 1 | `central-migrate` CLI + `central migrate *` dispatch | ✅ Done |
-| 2 | `central-migration-launcherd` + broker migration authority | ✅ Done |
-| 3 | `central-backup` backup and recovery domain | ✅ Done |
-| 4 | PostgreSQL recovery evidence stores (`b25`–`b29`) | ✅ Done |
-| 5 | Backup execution adapter (`pg_dump`/`pg_restore`, object store, operator state) | ✅ Done |
-| 6 | `central-backup-launcherd` daemon | ✅ Done |
-| 7 | Broker backup/restore/recovery authority + helper ops | 🚧 In progress (7a, 7b landed) |
-| 8 | C02 throughput and restore-capacity admission | ⏳ Pending |
-| 9 | `central-backup` / `central-restore` binaries + C01/C03/C04/C05 flows | ⏳ Pending |
-| 10 | C06 recovery acceptance | ⏳ Pending |
-| 11 | Wipe + reseed (D01), delete/prune (D04) | ⏳ Pending |
-| 12 | Export / `bx1` fresh-host import (D02/D03) | ⏳ Pending |
-| 13 | Protected-state audit (D05), advisory rescue (D06), security update | ⏳ Pending |
-| 14 | D07 acceptance (Docker evidence profile) | ⏳ Pending |
-| 15 | Maintenance (E01–E04) + `central-advisory-sign` | ⏳ Pending |
-| 16 | E05/E06 Phase 1 full exit + R-sequence closeout | ⏳ Pending |
+| LC-T1 | Broker `bind_postgres_service_role` writer arm | ✅ Done |
+| LC-T2 | Service-role credential store + `pg_wire` rotate-then-sync | ✅ Done |
+| LC-T3 | Compose/bootstrap decorations, rendezvous, client authority impls | ✅ Done |
+| LC-T4 | Helper-daemon lifecycle composition (`local up\|down\|status` live) | ✅ Done |
+| LC-T5 | Closeout: R6 deferral resolved, `current-phase.md` updated | ✅ Done |
 
-**After R6:** the Rust port reaches full parity with upstream. The product
+Still deferred: `local browser open`, prepare promotion/attestation, and the
+root/Tier-3 physical evidence tiers.
+
+**After R6:** the Rust port has reached full parity with upstream. The product
 roadmap then continues toward hybrid execution and Central Server / Online Mode
 (see [docs/product/roadmap.md](docs/product/roadmap.md) and
 [docs/architecture/online-mode.md](docs/architecture/online-mode.md)).
