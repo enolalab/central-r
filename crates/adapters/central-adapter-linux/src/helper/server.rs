@@ -91,6 +91,13 @@ pub fn helper_verb_deadline(verb: &str) -> Duration {
         v if v == verb::BACKUP_VERIFY => BACKUP_VERIFY_BUDGET,
         v if v == verb::BACKUP_STATUS => BACKUP_STATUS_BUDGET,
         v if v == verb::WIPE => CEREMONY_BUDGET + Duration::from_secs(13 * 60),
+        // `exportDeadline` — the ceremony share plus just under an
+        // hour of machine work; the sealed backup's own profile bound
+        // substitutes for a per-request size derivation.
+        v if v == verb::BACKUP_EXPORT => CEREMONY_BUDGET + Duration::from_secs(58 * 60),
+        // `importDeadline` — `restoreApplyDeadline() + importStagingShare`:
+        // ceremony, 28-minute staging share, and the full engine share.
+        v if v == verb::BACKUP_IMPORT => restore_apply_deadline() + Duration::from_secs(28 * 60),
         v if v == verb::BACKUP_DELETE => CEREMONY_BUDGET + Duration::from_secs(8 * 60),
         v if v == verb::BACKUP_PRUNE => CEREMONY_BUDGET + Duration::from_secs(58 * 60),
         v if v == verb::BROWSER_OPEN => Duration::from_secs(30),
@@ -240,6 +247,12 @@ pub struct Server {
     /// `Wipe` — D01, a separate seam so a composition can install wipe
     /// without installing any other destructive verb.
     pub wipe: Option<Box<dyn super::wipe::WipeHandler>>,
+    /// `Export` — D02, a separate seam so a composition can install
+    /// export without installing any other destructive verb.
+    pub export: Option<Box<dyn super::export::ExportHandler>>,
+    /// `Import` — D03, a separate seam so a composition can install
+    /// import without installing any other destructive verb.
+    pub import: Option<Box<dyn super::import::ImportHandler>>,
     /// `Delete` — D04 delete, a separate seam so a composition can
     /// substitute a stub.
     pub delete: Option<Box<dyn super::delete::DeleteHandler>>,
@@ -272,6 +285,8 @@ impl Server {
             restore_resume: None,
             restore_abandon: None,
             wipe: None,
+            export: None,
+            import: None,
             delete: None,
             prune: None,
             browser: None,
@@ -538,6 +553,38 @@ impl Server {
                 match super::prune::parse_prune_request(req) {
                     Ok(prune) => handler.prune(deadline, prune, &peer),
                     Err(_) => Response::denied(&req.operation_id, 2, "INVALID_PRUNE_REQUEST"),
+                }
+            }
+            v if v == verb::BACKUP_EXPORT => {
+                let Some(handler) = &self.export else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        central_infra::portable::REASON_EXPORT_UNAVAILABLE,
+                    );
+                };
+                match super::export::parse_export_request(req) {
+                    Ok(parsed) => handler.export(deadline, parsed, &peer),
+                    Err(_) => Response::denied(
+                        &req.operation_id,
+                        2,
+                        central_infra::portable::REASON_EXPORT_INVALID_REQUEST,
+                    ),
+                }
+            }
+            v if v == verb::BACKUP_IMPORT => {
+                let Some(handler) = &self.import else {
+                    return Response::deferred(
+                        &req.operation_id,
+                        central_infra::portable::REASON_IMPORT_UNAVAILABLE,
+                    );
+                };
+                match super::import::parse_import_request(req) {
+                    Ok(parsed) => handler.import(deadline, parsed, &peer),
+                    Err(_) => Response::denied(
+                        &req.operation_id,
+                        2,
+                        central_infra::portable::REASON_IMPORT_INVALID_REQUEST,
+                    ),
                 }
             }
             v if v == verb::TRUST_INSTALL => {
@@ -1182,7 +1229,11 @@ mod tests {
             ),
             (verb::BACKUP_CREATE, "deferred", "BACKUP_CREATE_UNAVAILABLE"),
             (verb::STATE_AUDIT, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
-            (verb::BACKUP_EXPORT, "deferred", "UNSUPPORTED_IN_THIS_SLICE"),
+            // Implemented but unconfigured: the verb's own upstream
+            // unavailable answer, not the matrix's closed refusal —
+            // `exportUnavailable`/`importUnavailable`.
+            (verb::BACKUP_EXPORT, "deferred", "EXPORT_UNAVAILABLE"),
+            (verb::BACKUP_IMPORT, "deferred", "IMPORT_UNAVAILABLE"),
             (
                 verb::MAINTENANCE_APPLY,
                 "deferred",

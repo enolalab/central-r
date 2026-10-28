@@ -238,6 +238,7 @@ pub enum TokenError {
 /// `IssueBx1Token` — signs a token over the bundle digest. `ttl` bounds
 /// the token's life; the signature covers the JCS-canonical unsigned
 /// bytes. `seed` is the 32-byte Ed25519 seed.
+#[allow(clippy::too_many_arguments)]
 pub fn issue_bx1_token(
     seed: &[u8; 32],
     token_id: &str,
@@ -451,7 +452,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 #[must_use]
 pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let nibble = |c: u8| -> Option<u8> {
@@ -463,7 +464,7 @@ pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
         }
     };
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     Some(out)
@@ -589,7 +590,7 @@ mod tests {
             &bundle_sha,
             datetime!(2025-01-03 00:00:00 UTC),
         )
-        .unwrap_or_else(|e| panic!("verify: {e:?}"));
+        .expect("verify");
     }
 
     #[test]

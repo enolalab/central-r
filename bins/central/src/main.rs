@@ -337,8 +337,6 @@ mod tests {
                 &["local", "dependency", "upgrade", "apply"],
                 "local.dependency-upgrade-plan",
             ),
-            (&["backup", "export"], "backup.export"),
-            (&["backup", "import"], "backup.import"),
             (&["maintenance", "plan"], "maintenance.plan"),
             (&["maintenance", "apply"], "maintenance.apply"),
             (&["bootstrap", "show"], "bootstrap.show"),
@@ -417,6 +415,16 @@ mod tests {
                 "PRUNE_FAILED",
                 "INSPECT_PRUNE_STATE",
             ),
+            // R6 task 12 (D02/D03): the portable verbs are activated —
+            // export fails closed at the absent socket with its stable
+            // terminal refusal; import's own grammar gate is covered
+            // below.
+            (
+                &["backup", "export"][..],
+                "backup.export",
+                "EXPORT_FAILED",
+                "INSPECT_EXPORT_STATE",
+            ),
         ] {
             let (code, stdout, _) = invoke(argv);
             let parsed = parse_envelope(&stdout);
@@ -444,6 +452,9 @@ mod tests {
             &["backup", "delete", "--retention-days=29"][..],
             &["backup", "prune"][..],
             &["backup", "prune", "apply"][..],
+            // `backup import` without its three required flags is a
+            // grammar refusal before any socket work.
+            &["backup", "import"][..],
         ] {
             let (code, stdout, _) = invoke(argv);
             let parsed = parse_envelope(&stdout);

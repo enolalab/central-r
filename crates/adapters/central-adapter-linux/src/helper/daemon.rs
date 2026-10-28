@@ -554,6 +554,90 @@ pub fn run_helper_daemon(
             },
             super::wipe::production_app_armor_deps(),
         ))),
+        // `newProductionExportHandler` — D02. The broker protected dir
+        // resolves through the same `resolveProductionBrokerRoot` check
+        // upstream runs; a refusal fails the whole composition rather
+        // than exporting without the TLS-authority pin.
+        export: {
+            let broker_root = match crate::broker::daemon::production_broker_root_at(
+                &composition,
+                crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+                0,
+                0,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            };
+            Some(Box::new(super::export::ExportHandlerImpl::new(
+                Some(Box::new(PamConfirmer::new())),
+                CeremonyScope {
+                    instance_id: "default".to_owned(),
+                    target_id: "postgres:central".to_owned(),
+                },
+                super::export::ExportRoots {
+                    instance_id: composition.instance_id.clone(),
+                    state_root: composition.authoritative_state_root.clone(),
+                    broker_protected_dir: broker_root.to_string_lossy().into_owned(),
+                    instances_parent_uid: 0,
+                    instances_parent_gid: 0,
+                    instance_uid: central_infra::authority::CENTRAL_RUNTIME_UID,
+                    instance_gid: central_infra::authority::CENTRAL_RUNTIME_GID,
+                    staging_parent: std::path::PathBuf::from(&composition.authoritative_state_root)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                },
+                Some(Box::new(super::export::RepositoryExportSource {
+                    root: backup_repository_root.clone(),
+                    instance_id: composition.instance_id.clone(),
+                    profile: central_backup::backup::capacity::default_recovery_profile(),
+                })),
+            )) as Box<dyn super::export::ExportHandler>)
+        },
+        // `newProductionImportHandler` — D03 composed `WithEngine`
+        // only: the restore launcher is mandatory upstream
+        // (`import: production composition has no restore engine`), and
+        // the same `Arc` handle serves apply/resume and import alike.
+        import: {
+            let broker_root = match crate::broker::daemon::production_broker_root_at(
+                &composition,
+                crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES,
+                0,
+                0,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    let _ = writeln!(stderr, "helper: composition: {e}");
+                    return 6;
+                }
+            };
+            Some(Box::new(super::import::ImportHandlerImpl::with_engine(
+                Some(Box::new(PamConfirmer::new())),
+                CeremonyScope {
+                    instance_id: "default".to_owned(),
+                    target_id: "postgres:central".to_owned(),
+                },
+                super::import::ImportRoots {
+                    instance_id: composition.instance_id.clone(),
+                    state_root: composition.authoritative_state_root.clone(),
+                    broker_protected_dir: broker_root.to_string_lossy().into_owned(),
+                    staging_parent: std::path::PathBuf::from(&composition.authoritative_state_root)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    instance_uid: central_infra::authority::CENTRAL_RUNTIME_UID,
+                    instance_gid: central_infra::authority::CENTRAL_RUNTIME_GID,
+                    parent_uid: 0,
+                    parent_gid: 0,
+                },
+                Some(Box::new(
+                    super::restore_launcher::SharedRestoreEngineLauncher(restore_launcher.clone()),
+                )),
+            )) as Box<dyn super::import::ImportHandler>)
+        },
         // `newProductionDeleteHandler` — D04 delete. The backup source
         // and reference checker are unavailable until the
         // repository-delete and PG plumbing land — upstream's own

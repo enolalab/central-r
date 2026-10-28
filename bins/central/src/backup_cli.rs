@@ -101,6 +101,14 @@ pub(crate) fn backup(
         // `apply` entry is shadowed by the shared `(backup, prune)`
         // registry key upstream-fashion, so the sub-action resolves
         // inside the handler.
+        // `runBackupExport`/`runBackupImport` — the D02/D03 portable
+        // verbs live beside the other destructive flows.
+        "backup.export" => {
+            return crate::destructive_cli::backup_export(command_id, tokens, stdout, stderr);
+        }
+        "backup.import" => {
+            return crate::destructive_cli::backup_import(command_id, tokens, stdout, stderr);
+        }
         "backup.delete" => {
             return crate::destructive_cli::backup_delete(command_id, tokens, stdout, stderr);
         }

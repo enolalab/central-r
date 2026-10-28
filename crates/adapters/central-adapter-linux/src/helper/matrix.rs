@@ -79,8 +79,8 @@ impl Matrix {
         register(verb::RESTORE_APPLY, true, true, true);
         register(verb::RESTORE_RESUME, true, true, true);
         register(verb::RESTORE_ABANDON, true, true, true);
-        register(verb::BACKUP_EXPORT, false, true, false);
-        register(verb::BACKUP_IMPORT, false, true, true);
+        register(verb::BACKUP_EXPORT, true, true, false);
+        register(verb::BACKUP_IMPORT, true, true, true);
         register(verb::BACKUP_DELETE, true, true, true);
         register(verb::BACKUP_PRUNE, true, true, true);
         register(verb::STATE_AUDIT, false, false, false);
@@ -163,6 +163,8 @@ mod tests {
             verb::RESTORE_RESUME,
             verb::RESTORE_ABANDON,
             verb::WIPE,
+            verb::BACKUP_EXPORT,
+            verb::BACKUP_IMPORT,
             verb::BACKUP_DELETE,
             verb::BACKUP_PRUNE,
         ];
@@ -172,8 +174,6 @@ mod tests {
             verb::SECURITY_UPDATE,
             verb::SECURITY_RESCUE,
             verb::STATE_AUDIT,
-            verb::BACKUP_EXPORT,
-            verb::BACKUP_IMPORT,
             verb::MAINTENANCE_PLAN,
             verb::MAINTENANCE_APPLY,
         ] {

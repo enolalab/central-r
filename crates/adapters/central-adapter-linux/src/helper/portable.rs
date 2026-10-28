@@ -785,7 +785,7 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("tmp: {e}"));
+        fs::create_dir_all(&dir).expect("tmp");
         dir
     }
 
@@ -796,9 +796,9 @@ mod tests {
             .map(|i| (i % 251) as u8)
             .collect();
         let mut sealed = Vec::new();
-        encrypt_stream(&plain[..], &mut sealed, &key).unwrap_or_else(|e| panic!("enc: {e}"));
+        encrypt_stream(&plain[..], &mut sealed, &key).expect("enc");
         let mut opened = Vec::new();
-        decrypt_stream(&sealed[..], &mut opened, &key).unwrap_or_else(|e| panic!("dec: {e}"));
+        decrypt_stream(&sealed[..], &mut opened, &key).expect("dec");
         assert_eq!(opened, plain);
     }
 
@@ -808,7 +808,7 @@ mod tests {
         let wrong = domain::derive_bundle_key(&[0x43; 32]).unwrap_or_default();
         let plain = vec![0xabu8; 700_000];
         let mut sealed = Vec::new();
-        encrypt_stream(&plain[..], &mut sealed, &key).unwrap_or_else(|e| panic!("enc: {e}"));
+        encrypt_stream(&plain[..], &mut sealed, &key).expect("enc");
         // Tampered ciphertext byte.
         let mut bad = sealed.clone();
         let n = bad.len();
@@ -830,7 +830,7 @@ mod tests {
         // Bad magic.
         let mut bad = {
             let mut s = Vec::new();
-            encrypt_stream(&plain[..], &mut s, &key).unwrap_or_else(|e| panic!("enc: {e}"));
+            encrypt_stream(&plain[..], &mut s, &key).expect("enc");
             s
         };
         bad[0] = b'X';
@@ -840,27 +840,27 @@ mod tests {
     #[test]
     fn build_extract_tar_gz_deterministic_round_trip() {
         let src = tmp("tarsrc");
-        fs::create_dir_all(src.join("backup/bodies")).unwrap_or_else(|e| panic!("mkdir: {e}"));
-        fs::write(src.join("manifest.json"), b"{}\n").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::create_dir_all(src.join("backup/bodies")).expect("mkdir");
+        fs::write(src.join("manifest.json"), b"{}\n").expect("w");
         fs::write(src.join("backup/binding.json"), b"{\"a\":1}\n")
-            .unwrap_or_else(|e| panic!("w: {e}"));
+            .expect("w");
         fs::write(src.join("backup/bodies/b1.bin"), vec![7u8; 1000])
-            .unwrap_or_else(|e| panic!("w: {e}"));
+            .expect("w");
         let at = datetime!(2025-03-04 05:06:07.123456789 UTC);
         let mut a = Vec::new();
-        build_tar_gz(&src, &mut a, at).unwrap_or_else(|e| panic!("tar: {e}"));
+        build_tar_gz(&src, &mut a, at).expect("tar");
         let mut b = Vec::new();
-        build_tar_gz(&src, &mut b, at).unwrap_or_else(|e| panic!("tar: {e}"));
+        build_tar_gz(&src, &mut b, at).expect("tar");
         assert_eq!(a, b, "archive must be deterministic");
         let dst = tmp("tardst");
-        extract_tar_gz(&a[..], &dst).unwrap_or_else(|e| panic!("untar: {e}"));
+        extract_tar_gz(&a[..], &dst).expect("untar");
         assert_eq!(
             fs::read(dst.join("backup/binding.json")).unwrap_or_default(),
             b"{\"a\":1}\n"
         );
         let mode = std::os::unix::fs::PermissionsExt::mode(
             &fs::metadata(dst.join("backup/bodies/b1.bin"))
-                .unwrap_or_else(|e| panic!("m: {e}"))
+                .expect("m")
                 .permissions(),
         );
         assert_eq!(mode & 0o777, 0o600);
@@ -879,18 +879,18 @@ mod tests {
         let at = std::env::var("DUMP_AT")
             .ok()
             .and_then(|s| domain::parse_rfc3339(&s))
-            .unwrap_or_else(|| datetime!(2025-03-04 05:06:07.123456789 UTC));
+            .unwrap_or(datetime!(2025-03-04 05:06:07.123456789 UTC));
         let mut buf = Vec::new();
-        build_tar_gz(Path::new(&src), &mut buf, at).unwrap_or_else(|e| panic!("tar: {e}"));
-        fs::write(&out, &buf).unwrap_or_else(|e| panic!("dump: {e}"));
+        build_tar_gz(Path::new(&src), &mut buf, at).expect("tar");
+        fs::write(&out, &buf).expect("dump");
     }
 
     #[test]
     fn build_tar_gz_refuses_symlink() {
         let src = tmp("tarsym");
-        fs::write(src.join("real.txt"), b"x").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::write(src.join("real.txt"), b"x").expect("w");
         std::os::unix::fs::symlink(src.join("real.txt"), src.join("link.txt"))
-            .unwrap_or_else(|e| panic!("ln: {e}"));
+            .expect("ln");
         let mut out = Vec::new();
         assert!(build_tar_gz(&src, &mut out, datetime!(2025-01-01 00:00:00 UTC)).is_err());
         let _ = fs::remove_dir_all(&src);
@@ -901,8 +901,8 @@ mod tests {
         let dir = tmp("tree");
         let body = b"payload-bytes";
         let sum = sha256_hex(body);
-        fs::create_dir_all(dir.join("backup")).unwrap_or_else(|e| panic!("m: {e}"));
-        fs::write(dir.join("backup/dump"), body).unwrap_or_else(|e| panic!("w: {e}"));
+        fs::create_dir_all(dir.join("backup")).expect("m");
+        fs::write(dir.join("backup/dump"), body).expect("w");
         let manifest = ExportManifest {
             bundle_id: "b".into(),
             instance_id: "i".into(),
@@ -916,18 +916,18 @@ mod tests {
             body_count: 0,
         };
         let raw = serde_json::to_vec(&manifest).unwrap_or_default();
-        fs::write(dir.join("manifest.json"), &raw).unwrap_or_else(|e| panic!("w: {e}"));
-        let got = verify_extracted_tree(&dir).unwrap_or_else(|e| panic!("verify: {e}"));
+        fs::write(dir.join("manifest.json"), &raw).expect("w");
+        let got = verify_extracted_tree(&dir).expect("verify");
         assert_eq!(got, manifest);
         // Unlisted file refuses.
-        fs::write(dir.join("extra"), b"x").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::write(dir.join("extra"), b"x").expect("w");
         assert!(verify_extracted_tree(&dir).is_err());
-        fs::remove_file(dir.join("extra")).unwrap_or_else(|e| panic!("rm: {e}"));
+        fs::remove_file(dir.join("extra")).expect("rm");
         // Digest drift refuses.
-        fs::write(dir.join("backup/dump"), b"different!!").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::write(dir.join("backup/dump"), b"different!!").expect("w");
         assert!(verify_extracted_tree(&dir).is_err());
         // Missing listed file refuses.
-        fs::remove_file(dir.join("backup/dump")).unwrap_or_else(|e| panic!("rm: {e}"));
+        fs::remove_file(dir.join("backup/dump")).expect("rm");
         assert!(verify_extracted_tree(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -942,19 +942,19 @@ mod tests {
         let uid = rustix::process::geteuid().as_raw();
         let gid = rustix::process::getegid().as_raw();
         let (minted, created) = load_or_mint_export_identity(&path, uid, gid, now)
-            .unwrap_or_else(|e| panic!("mint: {e}"));
+            .expect("mint");
         assert!(created);
         let (loaded, created2) = load_or_mint_export_identity(&path, uid, gid, now)
-            .unwrap_or_else(|e| panic!("load: {e}"));
+            .expect("load");
         assert!(!created2);
         assert_eq!(loaded.private_seed_hex, minted.private_seed_hex);
-        fs::write(&path, b"not json").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::write(&path, b"not json").expect("w");
         assert!(load_or_mint_export_identity(&path, uid, gid, now).is_err());
         // Wrong public key for a valid seed refuses too.
         let mut bad = minted.clone();
         bad.public_key_hex = domain::hex_encode(&[0xee; 32]);
         fs::write(&path, serde_json::to_vec(&bad).unwrap_or_default())
-            .unwrap_or_else(|e| panic!("w: {e}"));
+            .expect("w");
         assert!(load_or_mint_export_identity(&path, uid, gid, now).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -962,12 +962,12 @@ mod tests {
     #[test]
     fn scan_protected_subset_flags_trust_material() {
         let dir = tmp("scan");
-        fs::write(dir.join("config.json"), b"{}").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::write(dir.join("config.json"), b"{}").expect("w");
         assert!(scan_protected_subset(&dir).is_ok());
-        fs::write(dir.join("tls-authority.json"), b"{}").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::write(dir.join("tls-authority.json"), b"{}").expect("w");
         assert!(scan_protected_subset(&dir).is_err());
-        fs::remove_file(dir.join("tls-authority.json")).unwrap_or_else(|e| panic!("rm: {e}"));
-        fs::write(dir.join("notes.txt"), b"has ca_key inside").unwrap_or_else(|e| panic!("w: {e}"));
+        fs::remove_file(dir.join("tls-authority.json")).expect("rm");
+        fs::write(dir.join("notes.txt"), b"has ca_key inside").expect("w");
         assert!(scan_protected_subset(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }

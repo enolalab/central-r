@@ -12,11 +12,14 @@ use std::time::Instant;
 use central_adapter_linux::helper::audit::REASON_DENY_SAFE_ACTIVE;
 use central_adapter_linux::helper::backup::BackupCreateClient;
 use central_adapter_linux::helper::delete::{DeleteClient, DeleteClientError};
+use central_adapter_linux::helper::export as export_client;
+use central_adapter_linux::helper::import as import_client;
 use central_adapter_linux::helper::prune::{PruneBody, PruneClient, PruneClientError};
 use central_adapter_linux::helper::wipe::{WipeClient, WipeClientError};
 use central_foundation::failure::ExitClass;
 use central_foundation::local_result::LocalResult;
 use central_infra::destructive::{self as domain, AppArmorState, DeleteEvidence, WipeEvidence};
+use central_infra::portable;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -1001,6 +1004,542 @@ fn write_evidence<T: Serialize>(name: &str, evidence: &T) -> Result<(), ()> {
     std::fs::write(name, body).map_err(|_| ())
 }
 
+// -- `central backup export` ----------------------------------------------
+
+/// `ExportEvidenceFileName` — the D02 evidence artifact.
+const EXPORT_EVIDENCE_FILE_NAME: &str = "slice-d-export.json";
+
+/// `command.ExportDetails` — the only export payload emitted to
+/// stdout. File names are basenames by construction.
+#[derive(Debug, Default, Serialize)]
+struct ExportDetails {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    operation_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    bundle_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    backup_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    bundle_sha256: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    bundle_file: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    token_file: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    public_key_hex: String,
+    identity_created: bool,
+    safe_next_action: String,
+    elapsed_ms: u64,
+}
+
+/// `runBackupExport` — `backup export [--backup=<uuid>] [--out=<dir>]`:
+/// parse, mint the operation id, one helper call, validate, write
+/// `slice-d-export.json`.
+pub(crate) fn backup_export(
+    command_id: &str,
+    tokens: &[String],
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    let started = Instant::now();
+    let (backup_id, out_dir) = match parse_export_args(tokens) {
+        Ok(parsed) => parsed,
+        Err(()) => {
+            return emit(
+                envelope(
+                    command_id,
+                    ExitClass::Usage,
+                    "INVALID_EXPORT_GRAMMAR",
+                    &ExportDetails {
+                        safe_next_action: "RUN_CENTRAL_BACKUP_EXPORT_WITH_FLAGS".to_owned(),
+                        elapsed_ms: elapsed_ms(started),
+                        ..ExportDetails::default()
+                    },
+                ),
+                stdout,
+                stderr,
+            );
+        }
+    };
+    let operation_id = Uuid::now_v7().to_string();
+    let result = match export_client::ExportClient::new(crate::backup_cli::helper_socket_path())
+        .export(&operation_id, &backup_id, &out_dir)
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let (class, reason, next) = export_error_result(&err);
+            return emit(
+                envelope(
+                    command_id,
+                    class,
+                    reason,
+                    &ExportDetails {
+                        operation_id,
+                        safe_next_action: next.to_owned(),
+                        elapsed_ms: elapsed_ms(started),
+                        ..ExportDetails::default()
+                    },
+                ),
+                stdout,
+                stderr,
+            );
+        }
+    };
+    if !valid_export_result(&operation_id, &backup_id, &result) {
+        return emit(
+            envelope(
+                command_id,
+                ExitClass::Terminal,
+                "EXPORT_RESULT_INVALID",
+                &ExportDetails {
+                    operation_id,
+                    safe_next_action: "INSPECT_EXPORT_STATE".to_owned(),
+                    elapsed_ms: elapsed_ms(started),
+                    ..ExportDetails::default()
+                },
+            ),
+            stdout,
+            stderr,
+        );
+    }
+    let evidence = portable::ExportEvidence {
+        operation_id: result.operation_id.clone(),
+        bundle_id: result.bundle_id.clone(),
+        backup_id: result.backup_id.clone(),
+        instance_id: result.instance_id.clone(),
+        bundle_sha256: result.bundle_sha256.clone(),
+        token_id: result.token_id.clone(),
+        identity_created: result.identity_created,
+        public_key_hex: result.public_key_hex.clone(),
+        body_count: result.body_count,
+        bundle_bytes: result.bundle_bytes,
+        completed_at: result.completed_at.clone(),
+    };
+    if write_evidence(EXPORT_EVIDENCE_FILE_NAME, &evidence).is_err() {
+        return emit(
+            envelope(
+                command_id,
+                ExitClass::Terminal,
+                "EXPORT_EVIDENCE_FAILED",
+                &ExportDetails {
+                    operation_id,
+                    safe_next_action: "INSPECT_EXPORT_STATE".to_owned(),
+                    elapsed_ms: elapsed_ms(started),
+                    ..ExportDetails::default()
+                },
+            ),
+            stdout,
+            stderr,
+        );
+    }
+    emit(
+        envelope(
+            command_id,
+            ExitClass::Success,
+            "ok",
+            &ExportDetails {
+                operation_id: result.operation_id,
+                bundle_id: result.bundle_id,
+                backup_id: result.backup_id,
+                bundle_sha256: result.bundle_sha256,
+                bundle_file: result.bundle_file,
+                token_file: result.token_file,
+                public_key_hex: result.public_key_hex,
+                identity_created: result.identity_created,
+                safe_next_action: "EXPORT_COMPLETE".to_owned(),
+                elapsed_ms: elapsed_ms(started),
+            },
+        ),
+        stdout,
+        stderr,
+    )
+}
+
+/// `parseExportArgs` — each flag at most once; `--backup` is a non-nil
+/// UUID; `--out` defaults to the working directory, resolved absolute
+/// and cleaned.
+fn parse_export_args(tokens: &[String]) -> Result<(String, String), ()> {
+    let mut backup_id = String::new();
+    let mut out_dir = String::new();
+    for token in tokens {
+        if let Some(value) = token.strip_prefix("--backup=") {
+            if !backup_id.is_empty() {
+                return Err(());
+            }
+            match Uuid::parse_str(value) {
+                Ok(id) if !id.is_nil() => backup_id = value.to_owned(),
+                _ => return Err(()),
+            }
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--out=") {
+            if !out_dir.is_empty() || value.is_empty() {
+                return Err(());
+            }
+            out_dir = value.to_owned();
+            continue;
+        }
+        return Err(());
+    }
+    // `filepath.Abs` + `filepath.Clean` — relative resolves against the
+    // working directory.
+    let raw = if out_dir.is_empty() {
+        std::env::current_dir().map_err(|_| ())?
+    } else {
+        let p = std::path::Path::new(&out_dir);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(|_| ())?.join(p)
+        }
+    };
+    let abs = std::path::absolute(&raw).map_err(|_| ())?;
+    Ok((backup_id, abs.to_string_lossy().into_owned()))
+}
+
+/// `validExportResult` — the helper's echo is proven, not trusted.
+fn valid_export_result(
+    operation_id: &str,
+    backup_id: &str,
+    result: &export_client::ExportClientResult,
+) -> bool {
+    if result.operation_id != operation_id
+        || result.bundle_id.is_empty()
+        || result.backup_id.is_empty()
+        || result.instance_id.is_empty()
+        || result.bundle_sha256.is_empty()
+        || result.token_id.is_empty()
+        || result.public_key_hex.is_empty()
+        || (!backup_id.is_empty() && result.backup_id != backup_id)
+    {
+        return false;
+    }
+    // File names are basenames by contract: any separator is a
+    // protocol violation, not a path to follow.
+    [&result.bundle_file, &result.token_file]
+        .iter()
+        .all(|name| {
+            !name.is_empty()
+                && std::path::Path::new(name.as_str())
+                    .file_name()
+                    .is_some_and(|base| base == name.as_str())
+        })
+}
+
+/// `mapHelperExportError` + `exportErrorResult` — the closed
+/// reason→(exit class, reason, safe next action) table.
+fn export_error_result(
+    err: &export_client::ExportClientError,
+) -> (ExitClass, &'static str, &'static str) {
+    if err.reason().is_empty() {
+        return (ExitClass::Terminal, "EXPORT_FAILED", "INSPECT_EXPORT_STATE");
+    }
+    let class = exit_class_of(err.exit_code());
+    match err.reason() {
+        r if r == REASON_DENY_SAFE_ACTIVE => (
+            class,
+            REASON_DENY_SAFE_ACTIVE,
+            "RUN_CENTRAL_LOCAL_SECURITY_RESCUE",
+        ),
+        r if r == portable::REASON_EXPORT_SELF_VERIFY_FAILED => (
+            class,
+            portable::REASON_EXPORT_SELF_VERIFY_FAILED,
+            "RETRY_EXPORT",
+        ),
+        r if r == portable::REASON_EXPORT_NO_BACKUP => (
+            class,
+            portable::REASON_EXPORT_NO_BACKUP,
+            "CREATE_BACKUP_FIRST",
+        ),
+        r if r == portable::REASON_EXPORT_BACKUP_AMBIGUOUS => (
+            class,
+            portable::REASON_EXPORT_BACKUP_AMBIGUOUS,
+            "NAME_BACKUP_EXPLICITLY",
+        ),
+        r if r == portable::REASON_EXPORT_BACKUP_UNSEALED => (
+            class,
+            portable::REASON_EXPORT_BACKUP_UNSEALED,
+            "VERIFY_BACKUP_SEALED",
+        ),
+        r if r == portable::REASON_EXPORT_OUT_INVALID => (
+            class,
+            portable::REASON_EXPORT_OUT_INVALID,
+            "CHOOSE_WRITABLE_OUT_DIR",
+        ),
+        r if r == portable::REASON_EXPORT_IDENTITY_FAILED => (
+            class,
+            portable::REASON_EXPORT_IDENTITY_FAILED,
+            "INSPECT_EXPORT_IDENTITY",
+        ),
+        r if r == portable::REASON_EXPORT_CEREMONY_REQUIRED => (
+            class,
+            portable::REASON_EXPORT_CEREMONY_REQUIRED,
+            "COMPLETE_EXPORT_CEREMONY",
+        ),
+        r if r == portable::REASON_EXPORT_AUTHORITY_DENIED => (
+            class,
+            portable::REASON_EXPORT_AUTHORITY_DENIED,
+            "COMPLETE_EXPORT_CEREMONY",
+        ),
+        _ => (class, "EXPORT_FAILED", "INSPECT_EXPORT_STATE"),
+    }
+}
+
+// -- `central backup import` ----------------------------------------------
+
+/// `ImportEvidenceFileName` — the D03 evidence artifact.
+const IMPORT_EVIDENCE_FILE_NAME: &str = "slice-d-import.json";
+
+/// `command.ImportDetails` — the only import payload emitted to
+/// stdout.
+#[derive(Debug, Default, Serialize)]
+struct ImportDetails {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    operation_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    bundle_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    source_instance_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    target_instance_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    bundle_sha256: String,
+    data_plane_restored: bool,
+    safe_next_action: String,
+    elapsed_ms: u64,
+}
+
+/// `runBackupImport` — `backup import --bundle=<path> --token=<path>
+/// --trust-key=<64hex>`: all three required, the trust key decodes to
+/// 32 bytes, the paths resolve absolute.
+pub(crate) fn backup_import(
+    command_id: &str,
+    tokens: &[String],
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> u8 {
+    let started = Instant::now();
+    let (bundle_path, token_path, trust_key) = match parse_import_args(tokens) {
+        Ok(parsed) => parsed,
+        Err(()) => {
+            return emit(
+                envelope(
+                    command_id,
+                    ExitClass::Usage,
+                    "INVALID_IMPORT_GRAMMAR",
+                    &ImportDetails {
+                        safe_next_action: "RUN_CENTRAL_BACKUP_IMPORT_WITH_FLAGS".to_owned(),
+                        elapsed_ms: elapsed_ms(started),
+                        ..ImportDetails::default()
+                    },
+                ),
+                stdout,
+                stderr,
+            );
+        }
+    };
+    let operation_id = Uuid::now_v7().to_string();
+    let result = match import_client::ImportClient::new(crate::backup_cli::helper_socket_path())
+        .import(&operation_id, &bundle_path, &token_path, &trust_key)
+    {
+        Ok(result) => result,
+        Err(err) => {
+            let (class, reason, next) = import_error_result(&err);
+            return emit(
+                envelope(
+                    command_id,
+                    class,
+                    reason,
+                    &ImportDetails {
+                        operation_id,
+                        safe_next_action: next.to_owned(),
+                        elapsed_ms: elapsed_ms(started),
+                        ..ImportDetails::default()
+                    },
+                ),
+                stdout,
+                stderr,
+            );
+        }
+    };
+    if !valid_import_result(&operation_id, &result) {
+        return emit(
+            envelope(
+                command_id,
+                ExitClass::Terminal,
+                "IMPORT_RESULT_INVALID",
+                &ImportDetails {
+                    operation_id,
+                    safe_next_action: "INSPECT_IMPORT_STATE".to_owned(),
+                    elapsed_ms: elapsed_ms(started),
+                    ..ImportDetails::default()
+                },
+            ),
+            stdout,
+            stderr,
+        );
+    }
+    let evidence = portable::ImportEvidence {
+        operation_id: result.operation_id.clone(),
+        bundle_id: result.bundle_id.clone(),
+        backup_id: String::new(),
+        source_instance_id: result.source_instance_id.clone(),
+        target_instance_id: result.target_instance_id.clone(),
+        token_id: result.token_id.clone(),
+        bundle_sha256: result.bundle_sha256.clone(),
+        body_count: result.body_count,
+        staged_dump_sha256: result.staged_dump_sha256.clone(),
+        restore_plan_sha256: result.restore_plan_sha256.clone(),
+        data_plane_restored: result.data_plane_restored,
+        completed_at: result.completed_at.clone(),
+    };
+    if write_evidence(IMPORT_EVIDENCE_FILE_NAME, &evidence).is_err() {
+        return emit(
+            envelope(
+                command_id,
+                ExitClass::Terminal,
+                "IMPORT_EVIDENCE_FAILED",
+                &ImportDetails {
+                    operation_id,
+                    safe_next_action: "INSPECT_IMPORT_STATE".to_owned(),
+                    elapsed_ms: elapsed_ms(started),
+                    ..ImportDetails::default()
+                },
+            ),
+            stdout,
+            stderr,
+        );
+    }
+    let safe_next = if result.data_plane_restored {
+        "IMPORT_COMPLETE"
+    } else {
+        "IMPORT_STAGED_RUN_DATA_PLANE_RESTORE"
+    };
+    emit(
+        envelope(
+            command_id,
+            ExitClass::Success,
+            "ok",
+            &ImportDetails {
+                operation_id: result.operation_id,
+                bundle_id: result.bundle_id,
+                source_instance_id: result.source_instance_id,
+                target_instance_id: result.target_instance_id,
+                bundle_sha256: result.bundle_sha256,
+                data_plane_restored: result.data_plane_restored,
+                safe_next_action: safe_next.to_owned(),
+                elapsed_ms: elapsed_ms(started),
+            },
+        ),
+        stdout,
+        stderr,
+    )
+}
+
+/// `parseImportArgs` — exactly the three flags, each once, non-empty;
+/// `--trust-key` is 64 hex decoding to 32 bytes; paths resolve
+/// absolute and clean.
+fn parse_import_args(tokens: &[String]) -> Result<(String, String, String), ()> {
+    let mut bundle = String::new();
+    let mut token = String::new();
+    let mut trust = String::new();
+    for arg in tokens {
+        let (slot, value) = if let Some(v) = arg.strip_prefix("--bundle=") {
+            (&mut bundle, v)
+        } else if let Some(v) = arg.strip_prefix("--token=") {
+            (&mut token, v)
+        } else if let Some(v) = arg.strip_prefix("--trust-key=") {
+            (&mut trust, v)
+        } else {
+            return Err(());
+        };
+        if !slot.is_empty() || value.is_empty() {
+            return Err(());
+        }
+        *slot = value.to_owned();
+    }
+    if bundle.is_empty() || token.is_empty() || trust.is_empty() {
+        return Err(());
+    }
+    let key = portable::hex_decode(&trust).ok_or(())?;
+    if key.len() != 32 {
+        return Err(());
+    }
+    let resolve = |p: &str| -> Result<String, ()> {
+        let path = std::path::Path::new(p);
+        let raw = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(|_| ())?.join(path)
+        };
+        std::path::absolute(&raw)
+            .map(|abs| abs.to_string_lossy().into_owned())
+            .map_err(|_| ())
+    };
+    Ok((resolve(&bundle)?, resolve(&token)?, trust))
+}
+
+/// `validImportResult` — the helper's echo is proven, not trusted.
+fn valid_import_result(operation_id: &str, result: &import_client::ImportClientResult) -> bool {
+    result.operation_id == operation_id
+        && !result.bundle_id.is_empty()
+        && !result.source_instance_id.is_empty()
+        && !result.target_instance_id.is_empty()
+        && !result.token_id.is_empty()
+        && !result.bundle_sha256.is_empty()
+        && !result.staged_dump_sha256.is_empty()
+        && !result.restore_plan_sha256.is_empty()
+}
+
+/// `mapHelperImportError` + `importErrorResult` — the closed
+/// reason→(exit class, reason, safe next action) table.
+fn import_error_result(
+    err: &import_client::ImportClientError,
+) -> (ExitClass, &'static str, &'static str) {
+    if err.reason().is_empty() {
+        return (ExitClass::Terminal, "IMPORT_FAILED", "INSPECT_IMPORT_STATE");
+    }
+    let class = exit_class_of(err.exit_code());
+    match err.reason() {
+        r if r == REASON_DENY_SAFE_ACTIVE => (
+            class,
+            REASON_DENY_SAFE_ACTIVE,
+            "RUN_CENTRAL_LOCAL_SECURITY_RESCUE",
+        ),
+        r if r == portable::REASON_IMPORT_TOKEN_INVALID => (
+            class,
+            portable::REASON_IMPORT_TOKEN_INVALID,
+            "CHECK_TOKEN_AND_TRUST_KEY",
+        ),
+        r if r == portable::REASON_IMPORT_BUNDLE_MISMATCH => (
+            class,
+            portable::REASON_IMPORT_BUNDLE_MISMATCH,
+            "RETRANSFER_BUNDLE_AND_TOKEN",
+        ),
+        r if r == portable::REASON_IMPORT_TARGET_INIT => (
+            class,
+            portable::REASON_IMPORT_TARGET_INIT,
+            "WIPE_TARGET_FIRST",
+        ),
+        r if r == portable::REASON_IMPORT_CONFIRM_FAILED => (
+            class,
+            portable::REASON_IMPORT_CONFIRM_FAILED,
+            "INSPECT_IMPORT_STATE",
+        ),
+        r if r == portable::REASON_IMPORT_CEREMONY_REQUIRED => (
+            class,
+            portable::REASON_IMPORT_CEREMONY_REQUIRED,
+            "COMPLETE_IMPORT_CEREMONY",
+        ),
+        r if r == portable::REASON_IMPORT_AUTHORITY_DENIED => (
+            class,
+            portable::REASON_IMPORT_AUTHORITY_DENIED,
+            "COMPLETE_IMPORT_CEREMONY",
+        ),
+        _ => (class, "IMPORT_FAILED", "INSPECT_IMPORT_STATE"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,5 +1833,176 @@ mod tests {
         assert!(read_prune_plan_file(&plan_id).is_err());
         std::env::set_current_dir(cwd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod portable_cli_tests {
+    use super::*;
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn export_args_accept_defaults_and_explicit_flags() {
+        let id = Uuid::now_v7().to_string();
+        let (backup, out) = parse_export_args(&argv(&[])).unwrap();
+        assert!(backup.is_empty() && std::path::Path::new(&out).is_absolute());
+        let (backup, out) =
+            parse_export_args(&argv(&[&format!("--backup={id}"), "--out=/tmp"])).unwrap();
+        assert_eq!(backup, id);
+        assert_eq!(out, "/tmp");
+    }
+
+    #[test]
+    fn export_args_reject_duplicates_unknown_and_bad_uuid() {
+        let id = Uuid::now_v7().to_string();
+        for tokens in [
+            argv(&["--backup=not-a-uuid"]),
+            argv(&["--backup="]),
+            argv(&["--out="]),
+            argv(&["--out=/a", "--out=/b"]),
+            argv(&[&format!("--backup={id}"), &format!("--backup={id}")]),
+            argv(&["--bogus=1"]),
+            argv(&["positional"]),
+        ] {
+            assert!(parse_export_args(&tokens).is_err(), "{tokens:?}");
+        }
+    }
+
+    #[test]
+    fn import_args_require_all_three_and_a_32_byte_key() {
+        let key = "ab".repeat(32);
+        let parsed = parse_import_args(&argv(&[
+            "--bundle=/b",
+            "--token=/t",
+            &format!("--trust-key={key}"),
+        ]))
+        .unwrap();
+        assert_eq!(parsed.2, key);
+        for tokens in [
+            argv(&["--bundle=/b", "--token=/t"]),
+            argv(&["--bundle=/b", "--token=/t", "--trust-key=zz"]),
+            argv(&["--bundle=/b", "--token=/t", "--trust-key=abcd"]),
+            argv(&["--bundle=", "--token=/t", &format!("--trust-key={key}")]),
+            argv(&[
+                "--bundle=/b",
+                "--bundle=/c",
+                "--token=/t",
+                &format!("--trust-key={key}"),
+            ]),
+            argv(&[
+                "--bundle=/b",
+                "--token=/t",
+                &format!("--trust-key={key}"),
+                "--bogus",
+            ]),
+        ] {
+            assert!(parse_import_args(&tokens).is_err(), "{tokens:?}");
+        }
+    }
+
+    #[test]
+    fn export_error_table_is_closed() {
+        for (wire, reason, next) in [
+            (
+                7,
+                REASON_DENY_SAFE_ACTIVE,
+                "RUN_CENTRAL_LOCAL_SECURITY_RESCUE",
+            ),
+            (
+                7,
+                portable::REASON_EXPORT_SELF_VERIFY_FAILED,
+                "RETRY_EXPORT",
+            ),
+            (2, portable::REASON_EXPORT_NO_BACKUP, "CREATE_BACKUP_FIRST"),
+            (
+                2,
+                portable::REASON_EXPORT_BACKUP_AMBIGUOUS,
+                "NAME_BACKUP_EXPLICITLY",
+            ),
+            (
+                2,
+                portable::REASON_EXPORT_BACKUP_UNSEALED,
+                "VERIFY_BACKUP_SEALED",
+            ),
+            (
+                2,
+                portable::REASON_EXPORT_OUT_INVALID,
+                "CHOOSE_WRITABLE_OUT_DIR",
+            ),
+            (
+                7,
+                portable::REASON_EXPORT_IDENTITY_FAILED,
+                "INSPECT_EXPORT_IDENTITY",
+            ),
+            (
+                7,
+                portable::REASON_EXPORT_CEREMONY_REQUIRED,
+                "COMPLETE_EXPORT_CEREMONY",
+            ),
+            (
+                7,
+                portable::REASON_EXPORT_AUTHORITY_DENIED,
+                "COMPLETE_EXPORT_CEREMONY",
+            ),
+        ] {
+            let err = export_client::ExportClientError::new_for_test(wire, reason);
+            let (_, r, n) = export_error_result(&err);
+            assert_eq!((r, n), (reason, next), "{reason}");
+        }
+        let err = export_client::ExportClientError::new_for_test(6, "UNEXPECTED");
+        let (_, r, n) = export_error_result(&err);
+        assert_eq!((r, n), ("EXPORT_FAILED", "INSPECT_EXPORT_STATE"));
+        let err = export_client::ExportClientError::new_for_test(3, "");
+        assert_eq!(
+            export_error_result(&err),
+            (ExitClass::Terminal, "EXPORT_FAILED", "INSPECT_EXPORT_STATE")
+        );
+    }
+
+    #[test]
+    fn import_error_table_is_closed() {
+        for (wire, reason, next) in [
+            (
+                7,
+                REASON_DENY_SAFE_ACTIVE,
+                "RUN_CENTRAL_LOCAL_SECURITY_RESCUE",
+            ),
+            (
+                2,
+                portable::REASON_IMPORT_TOKEN_INVALID,
+                "CHECK_TOKEN_AND_TRUST_KEY",
+            ),
+            (
+                2,
+                portable::REASON_IMPORT_BUNDLE_MISMATCH,
+                "RETRANSFER_BUNDLE_AND_TOKEN",
+            ),
+            (2, portable::REASON_IMPORT_TARGET_INIT, "WIPE_TARGET_FIRST"),
+            (
+                7,
+                portable::REASON_IMPORT_CONFIRM_FAILED,
+                "INSPECT_IMPORT_STATE",
+            ),
+            (
+                7,
+                portable::REASON_IMPORT_CEREMONY_REQUIRED,
+                "COMPLETE_IMPORT_CEREMONY",
+            ),
+            (
+                7,
+                portable::REASON_IMPORT_AUTHORITY_DENIED,
+                "COMPLETE_IMPORT_CEREMONY",
+            ),
+        ] {
+            let err = import_client::ImportClientError::new_for_test(wire, reason);
+            let (_, r, n) = import_error_result(&err);
+            assert_eq!((r, n), (reason, next), "{reason}");
+        }
+        let err = import_client::ImportClientError::new_for_test(6, "UNEXPECTED");
+        let (_, r, n) = import_error_result(&err);
+        assert_eq!((r, n), ("IMPORT_FAILED", "INSPECT_IMPORT_STATE"));
     }
 }

@@ -363,6 +363,40 @@ impl super::wipe::WipePamConfirmer for PamConfirmer {
     }
 }
 
+impl super::export::ExportPamConfirmer for PamConfirmer {
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+    fn confirm_backup_export(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        op_id: &str,
+    ) -> Option<Result<String, Failure>> {
+        Some(PamConfirmer::confirm_backup_export(
+            self, peer, deadline, scope, op_id,
+        ))
+    }
+}
+
+impl super::import::ImportPamConfirmer for PamConfirmer {
+    fn verify_and_consume(&self, token: &str) -> bool {
+        PamConfirmer::verify_and_consume(self, token)
+    }
+    fn confirm_backup_import(
+        &self,
+        peer: PeerIdentity,
+        deadline: Option<Instant>,
+        scope: &super::grant::CeremonyScope,
+        op_id: &str,
+    ) -> Option<Result<String, Failure>> {
+        Some(PamConfirmer::confirm_backup_import(
+            self, peer, deadline, scope, op_id,
+        ))
+    }
+}
+
 impl super::delete::DeletePamConfirmer for PamConfirmer {
     fn verify_and_consume(&self, token: &str) -> bool {
         PamConfirmer::verify_and_consume(self, token)
