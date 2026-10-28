@@ -1108,6 +1108,7 @@ mod tests {
             config_binding: String::new(),
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
+            lifecycle_root: String::new(),
             role_roots: central_backup::backup::capacity::RoleRoots::default(),
             backup_repository_root: String::new(),
             compose_path: String::new(),

@@ -25,11 +25,18 @@ use central_adapter_linux::helper::grant::{self, GrantKind, GrantScope, GrantSto
 use central_adapter_linux::helper::init::{
     self, GenesisInitHandler, InitConfirmer, InitConsole, InitHandler, InitRequest,
 };
-use central_adapter_linux::helper::protocol::{PrepareRequest, Request};
-use central_adapter_linux::helper::{self, PeerIdentity, PeerPolicy, Server, verb};
+use central_adapter_linux::helper::lifecycle::{
+    LifecycleApplication, LifecycleAuthorizer, LifecycleConfirmer, LifecycleHandler,
+    LifecycleOperation, LifecycleServiceResult, ProductionLifecycleHandler,
+};
+use central_adapter_linux::helper::protocol::{LifecycleRequest, PrepareRequest, Request};
+use central_adapter_linux::helper::{
+    self, LifecycleAuthorization, LifecycleAuthorizationRequest, PeerIdentity, PeerPolicy, Server,
+    verb,
+};
 use central_adapter_linux::infra::lifecycle::{
     self, ActiveReceiptReader, AdvisoryEvaluator, FileBarrier, FilesystemCapacity,
-    ReceiptAdmission, ReceiptInspector,
+    ProductionRequestResolver, ReceiptAdmission, ReceiptInspector,
 };
 use central_adapter_linux::sandbox::envelope;
 use central_foundation::failure::{Failure, FailureKind};
@@ -43,7 +50,8 @@ use central_infra::port::{
     AdmissionRequest, LifecycleAdmission, LifecycleBarrier, LifecycleCapacity,
 };
 use serde_json::value::RawValue;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// An operator-admitting `Server` — the test peer is the exact
@@ -277,6 +285,407 @@ fn helper_prepare_invalid_request_denied() {
     assert_eq!(resp.outcome, "denied");
     assert_eq!(resp.exit_code, 7);
     assert_eq!(resp.reason, "INVALID_PREPARE_REQUEST");
+}
+
+// ---------------------------------------------------------------------------
+// The composed lifecycle arm — LC-T4's chain under test fakes: the
+// real `Server::handle_lifecycle` dispatch drives the resolver, the
+// PAM confirmer, the broker authorizer seam, and the service in
+// upstream's order.
+// ---------------------------------------------------------------------------
+
+/// A counting `ActiveReceiptReader` — the production resolver's
+/// fresh-read-per-request contract.
+#[derive(Clone)]
+struct LifecycleReceipts {
+    receipt: DependencyReceipt,
+    calls: Arc<AtomicU32>,
+}
+impl ActiveReceiptReader for LifecycleReceipts {
+    fn active(&self) -> Result<DependencyReceipt, Failure> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(self.receipt.clone())
+    }
+}
+
+/// A `LifecycleApplication` that records the resolved operation it was
+/// handed — proving the resolver's receipt fields reach the service —
+/// and answers a canned wire result.
+#[derive(Clone, Default)]
+struct CapturingLifecycle {
+    operations: Arc<Mutex<Vec<LifecycleOperation>>>,
+}
+impl LifecycleApplication for CapturingLifecycle {
+    fn up(&self, _deadline: Instant, operation: LifecycleOperation) -> LifecycleServiceResult {
+        self.operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(operation);
+        LifecycleServiceResult {
+            state: "running".to_owned(),
+            receipt_id: "receipt-1".to_owned(),
+            ..LifecycleServiceResult::default()
+        }
+    }
+    fn down(&self, _deadline: Instant, operation: LifecycleOperation) -> LifecycleServiceResult {
+        self.operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(operation);
+        LifecycleServiceResult {
+            state: "stopped".to_owned(),
+            receipt_id: "receipt-1".to_owned(),
+            ..LifecycleServiceResult::default()
+        }
+    }
+    fn status(&self, _deadline: Instant, operation: LifecycleOperation) -> LifecycleServiceResult {
+        self.operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(operation);
+        LifecycleServiceResult {
+            state: "running".to_owned(),
+            receipt_id: "receipt-1".to_owned(),
+            ..LifecycleServiceResult::default()
+        }
+    }
+}
+
+/// A `LifecycleAuthorizer` recording the exact scope the handler binds
+/// — the claim it returns echoes the request, the same minted scope
+/// the consume call then sees.
+#[derive(Clone, Default)]
+struct RecordingLifecycleAuthorizer {
+    requests: Arc<Mutex<Vec<LifecycleAuthorizationRequest>>>,
+    fail_authorize: bool,
+    fail_consume: bool,
+}
+impl LifecycleAuthorizer for RecordingLifecycleAuthorizer {
+    fn authorize_bound_lifecycle(
+        &self,
+        request: &LifecycleAuthorizationRequest,
+    ) -> Result<LifecycleAuthorization, Failure> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request.clone());
+        if self.fail_authorize {
+            return Err(Failure::denied("test", "refused"));
+        }
+        Ok(LifecycleAuthorization {
+            nonce: "nonce-1".to_owned(),
+            instance_id: request.instance_id.clone(),
+            operation: request.operation.clone(),
+            request_digest: request.request_digest.clone(),
+            peer_uid: request.peer_uid,
+            peer_pid: request.peer_pid,
+            caller_fingerprint: "fingerprint".to_owned(),
+            expires_at: "9999-01-01T00:00:00Z".to_owned(),
+        })
+    }
+    fn consume_bound_lifecycle_authorization(
+        &self,
+        _claim: &LifecycleAuthorization,
+        _request: &LifecycleAuthorizationRequest,
+    ) -> Result<(), Failure> {
+        if self.fail_consume {
+            return Err(Failure::denied("test", "consumed"));
+        }
+        Ok(())
+    }
+}
+
+/// A `LifecycleConfirmer` — the token is `confirm`'s return and
+/// `verify_and_consume` accepts exactly it; the failure arm refuses
+/// the confirmation outright.
+#[derive(Clone, Default)]
+struct TokenConfirmer {
+    confirm_calls: Arc<AtomicU32>,
+    fail: bool,
+}
+impl LifecycleConfirmer for TokenConfirmer {
+    fn confirm(
+        &self,
+        _peer: PeerIdentity,
+        _deadline: Option<Instant>,
+        _op_id: &str,
+    ) -> Result<String, Failure> {
+        self.confirm_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail {
+            return Err(Failure::denied("test", "refused"));
+        }
+        Ok("token-1".to_owned())
+    }
+    fn verify_and_consume(&self, token: &str) -> bool {
+        !self.fail && token == "token-1"
+    }
+}
+
+/// The LC-T4-shaped server: the authorized production handler over the
+/// production resolver, fakes standing in for the B04 broker client,
+/// the confirmer, and the domain service.
+struct LifecycleArm {
+    server: Server,
+    service: CapturingLifecycle,
+    receipts: LifecycleReceipts,
+    authorizer: RecordingLifecycleAuthorizer,
+    confirmer: TokenConfirmer,
+}
+fn lifecycle_arm() -> LifecycleArm {
+    let service = CapturingLifecycle::default();
+    let receipts = LifecycleReceipts {
+        receipt: DependencyReceipt {
+            id: "receipt-1".to_owned(),
+            manifest_digest: "sha256:manifest".to_owned(),
+            ..DependencyReceipt::default()
+        },
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let authorizer = RecordingLifecycleAuthorizer::default();
+    let confirmer = TokenConfirmer::default();
+    let handler = ProductionLifecycleHandler::new_authorized(
+        Box::new(service.clone()),
+        Box::new(ProductionRequestResolver::new(
+            Arc::new(receipts.clone()),
+            "inst-1",
+            "cfg-binding",
+        )),
+        Box::new(authorizer.clone()),
+        Box::new(confirmer.clone()),
+    );
+    let mut server = operator_server();
+    server.lifecycle = Some(Box::new(handler));
+    LifecycleArm {
+        server,
+        service,
+        receipts,
+        authorizer,
+        confirmer,
+    }
+}
+
+/// `status` — the read-only verb runs no ceremony: the resolver's
+/// active receipt feeds the operation the service sees, and the wire
+/// result carries the service's own fields.
+#[test]
+fn helper_lifecycle_composed_status_reaches_service() {
+    let arm = lifecycle_arm();
+    let resp = helper_request(&arm.server, &req("op-s", verb::STATUS));
+    assert_eq!(resp.outcome, "success");
+    assert_eq!(resp.exit_code, 0);
+    assert_eq!(resp.reason, "running");
+    assert!(resp.result.is_some(), "the service result is serialized");
+    let ops = arm
+        .service
+        .operations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].instance_id, "inst-1");
+    assert_eq!(ops[0].config_binding, "cfg-binding");
+    assert_eq!(ops[0].receipt_id, "receipt-1");
+    assert_eq!(ops[0].model_digest, "sha256:manifest");
+    assert_eq!(ops[0].payload_epoch, "sha256:manifest");
+    drop(ops);
+    assert_eq!(arm.receipts.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(arm.confirmer.confirm_calls.load(Ordering::Relaxed), 0);
+    assert!(
+        arm.authorizer
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty(),
+        "status runs no authorization ceremony"
+    );
+}
+
+/// `up` — the full authorization chain in upstream's order: resolver
+/// (fresh receipt read) → PAM confirm → verify-and-consume → broker
+/// authorize bound to the request scope → consume → service. The
+/// recorded authorization request proves the digest binds the
+/// operation id, the verb, and the binding.
+#[test]
+fn helper_lifecycle_composed_up_authorized_reaches_service() {
+    let arm = lifecycle_arm();
+    let resp = helper_request(&arm.server, &req("op-u", verb::UP));
+    assert_eq!(resp.outcome, "success");
+    assert_eq!(resp.exit_code, 0);
+    assert_eq!(resp.reason, "running");
+    assert_eq!(arm.confirmer.confirm_calls.load(Ordering::Relaxed), 1);
+    let requests = arm
+        .authorizer
+        .requests
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].operation, "up");
+    assert_eq!(requests[0].instance_id, "inst-1");
+    assert!(requests[0].request_digest.starts_with("sha256:"));
+    assert_eq!(requests[0].peer_uid, euid());
+    assert!(requests[0].peer_pid > 0);
+    drop(requests);
+    assert_eq!(
+        arm.service
+            .operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len(),
+        1
+    );
+}
+
+/// The resolver runs before any ceremony: a request binding that does
+/// not name the composition's binding verbatim is denied
+/// `LIFECYCLE_BINDING_INVALID` at exit 5 — the receipt was still read
+/// (upstream's `resolve` ordering), while no PAM call and no service
+/// call happened. A request binding naming the composed binding
+/// resolves and runs.
+#[test]
+fn helper_lifecycle_composed_binding_mismatch_denied() {
+    let arm = lifecycle_arm();
+    let resp = helper_request(
+        &arm.server,
+        &req_payload("op-f", verb::UP, "{\"config_binding\":\"foreign\"}"),
+    );
+    assert_eq!(resp.outcome, "denied");
+    assert_eq!(resp.exit_code, 5);
+    assert_eq!(resp.reason, "LIFECYCLE_BINDING_INVALID");
+    assert_eq!(arm.receipts.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(arm.confirmer.confirm_calls.load(Ordering::Relaxed), 0);
+    assert!(
+        arm.service
+            .operations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    );
+    // The same binding named verbatim resolves.
+    let resp = helper_request(
+        &arm.server,
+        &req_payload("op-m", verb::UP, "{\"config_binding\":\"cfg-binding\"}"),
+    );
+    assert_eq!(resp.outcome, "success");
+}
+
+/// The fail-closed arms of the authorized handler: no
+/// authorizer/confirmer pair answers `LIFECYCLE_AUTHORIZATION_REQUIRED`
+/// on a mutating verb while `status` still runs; a refusing confirmer,
+/// a rejected authorization, and a failed consume each take their own
+/// exact denial — never the service.
+#[test]
+fn helper_lifecycle_authorization_failure_paths() {
+    let receipts = LifecycleReceipts {
+        receipt: DependencyReceipt {
+            id: "receipt-1".to_owned(),
+            manifest_digest: "sha256:manifest".to_owned(),
+            ..DependencyReceipt::default()
+        },
+        calls: Arc::new(AtomicU32::new(0)),
+    };
+    let resolver = || {
+        Box::new(ProductionRequestResolver::new(
+            Arc::new(receipts.clone()),
+            "inst-1",
+            "cfg-binding",
+        )) as Box<dyn helper::lifecycle::LifecycleRequestResolver>
+    };
+    // `NewProductionLifecycleHandler` — no authorizer, no confirmer:
+    // `up`/`down` refuse the required ceremony; `status` still runs.
+    let mut server = operator_server();
+    server.lifecycle = Some(Box::new(ProductionLifecycleHandler::new(
+        Box::new(CapturingLifecycle::default()),
+        resolver(),
+    )));
+    for v in [verb::UP, verb::DOWN] {
+        let resp = helper_request(&server, &req("op-n", v));
+        assert_eq!(resp.outcome, "denied", "verb {v}");
+        assert_eq!(resp.exit_code, 7, "verb {v}");
+        assert_eq!(resp.reason, "LIFECYCLE_AUTHORIZATION_REQUIRED", "verb {v}");
+    }
+    let resp = helper_request(&server, &req("op-n", verb::STATUS));
+    assert_eq!(resp.outcome, "success");
+
+    // Each failure arm, one at a time, over a fresh server.
+    for (label, confirmer, authorizer, want) in [
+        (
+            "confirmer refused",
+            TokenConfirmer {
+                confirm_calls: Arc::new(AtomicU32::new(0)),
+                fail: true,
+            },
+            RecordingLifecycleAuthorizer {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                fail_authorize: true,
+                fail_consume: false,
+            },
+            "AUTHORITY_DENIED",
+        ),
+        (
+            "authorize refused",
+            TokenConfirmer::default(),
+            RecordingLifecycleAuthorizer {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                fail_authorize: true,
+                fail_consume: false,
+            },
+            "LIFECYCLE_AUTHORIZATION_DENIED",
+        ),
+        (
+            "consume refused",
+            TokenConfirmer::default(),
+            RecordingLifecycleAuthorizer {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                fail_authorize: false,
+                fail_consume: true,
+            },
+            "LIFECYCLE_AUTHORIZATION_REJECTED",
+        ),
+    ] {
+        let service = CapturingLifecycle::default();
+        let mut server = operator_server();
+        server.lifecycle = Some(Box::new(ProductionLifecycleHandler::new_authorized(
+            Box::new(service.clone()),
+            resolver(),
+            Box::new(authorizer),
+            Box::new(confirmer),
+        )));
+        let resp = helper_request(&server, &req("op-x", verb::UP));
+        assert_eq!(resp.outcome, "denied", "{label}");
+        assert_eq!(resp.exit_code, 7, "{label}");
+        assert_eq!(resp.reason, want, "{label}");
+        assert!(
+            service
+                .operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "{label}: the service never ran"
+        );
+    }
+
+    // `lifecyclePeerFromContext`'s gate: a peer whose kernel
+    // credentials are unavailable is refused before PAM — driven
+    // through the handler directly since a socket pair always carries
+    // a live pid.
+    let handler = ProductionLifecycleHandler::new_authorized(
+        Box::new(CapturingLifecycle::default()),
+        resolver(),
+        Box::new(RecordingLifecycleAuthorizer::default()),
+        Box::new(TokenConfirmer::default()),
+    );
+    let resp = handler.handle_lifecycle(
+        PeerIdentity {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        },
+        Instant::now(),
+        &req("op-p", verb::UP),
+        LifecycleRequest::default(),
+    );
+    assert_eq!(resp.outcome, "denied");
+    assert_eq!(resp.exit_code, 7);
+    assert_eq!(resp.reason, "LIFECYCLE_PEER_UNAVAILABLE");
 }
 
 // ---------------------------------------------------------------------------

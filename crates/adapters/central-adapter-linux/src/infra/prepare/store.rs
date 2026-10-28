@@ -791,6 +791,18 @@ impl CandidateStore {
     }
 }
 
+/// `ActiveReceiptReader` — the lifecycle service's B02 selector
+/// boundary: `NewCandidateStore(nil, dependencyRoot)` is upstream's
+/// read-only receipts seam in `newHelperLifecycleHandler`. The narrowed
+/// port carries no request context, so `OpDeadline::NONE` is the
+/// always-live `ctx` upstream's one `ctx.Err()` check observes — the
+/// store's own filesystem reads are the whole operation.
+impl crate::infra::lifecycle::ActiveReceiptReader for CandidateStore {
+    fn active(&self) -> Result<DependencyReceipt, Failure> {
+        self.active(OpDeadline::NONE)
+    }
+}
+
 fn receipt_from_record(
     record: &PreparedReceiptRecord,
     manifest: &PreparedManifest,

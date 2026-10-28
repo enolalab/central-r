@@ -4,15 +4,16 @@
 //! cancellation, and `Serve`/`ServeGenesis` on the systemd-supplied
 //! descriptor 3.
 //!
-//! What this slice composes is deliberately the protocol shell: the
-//! peer and socket policies, the closed matrix, the genesis transport
-//! (init admitted, everything else denied), and `prepare`'s explicit
-//! unavailable answer. `init` is real on both branches — the genesis
-//! handler on an absent host, the present-instance answer on the
-//! ordinary server (R5 T13). The handlers that need the
-//! infralifecycle service, the advisory evaluator, or the broker are
-//! the later tasks' composition; their verbs keep upstream's
-//! unconfigured-handler answers, never a made-up success.
+//! What this slice composes is the production handler set: the peer
+//! and socket policies, the closed matrix, the genesis transport
+//! (init admitted, everything else denied), and — on the instance
+//! branch — the full handler graph including the broker-backed
+//! lifecycle arm (`newHelperLifecycleHandler`: the B01 evaluator, B02
+//! candidate store, B04 broker authority, ADR 0019 postgres
+//! credential stores, and the authorized production handler).
+//! `init` is real on both branches — the genesis handler on an
+//! absent host, the present-instance answer on the ordinary server
+//! (R5 T13).
 
 use super::browser::{
     BootstrapShowHandler, BrowserHandler, Presentation, PresentationGuard,
@@ -932,24 +933,27 @@ pub fn run_helper_daemon(
         )
         .ok()
         .map(|root| root.to_string_lossy().into_owned()),
-        // `lifecycle` stays unset for the remaining dependency-chain
-        // reason: `infra::lifecycle::new_production_service` needs
-        // (1) the B01 advisory evaluator — now landed as
-        // `HelperAdvisoryEvaluator`'s `infra::lifecycle::AdvisoryEvaluator`
-        // impl, upstream's `newHelperAdvisoryEvaluator` resolution —
-        // (2) the B02 active-receipt reader, (3) the OCI receipt
-        // inspector, (4) a `ComposeRunner`, (5) the typed B04 broker
-        // authority (SCM_RIGHTS custody path), (6) the broker
-        // rendezvous for the minio-provision socket, and (7) the
-        // dead-owner verifier the lock takeover consults. The port of
-        // upstream's handler exists — `infra::lifecycle`'s
-        // `LifecycleApplicationBridge` + `production_lifecycle_handler`
-        // — but installing it without the full chain would be a
-        // made-up success, so the matrix's `LIFECYCLE_SERVICE_UNAVAILABLE`
-        // answer stands until the remaining links land. This is
-        // upstream's production status verbatim, not dead code: the
-        // bridge drives the domain service synchronously and maps its
-        // result onto the wire shape once composed.
+        // `newHelperLifecycleHandler` — the complete broker-backed
+        // lifecycle chain: ADR 0020's version-zero dependency receipt,
+        // the read-only B02 candidate store, the shared B01 evaluator,
+        // the typed B04 broker client (authorization, dead-owner
+        // verification, the SCM_RIGHTS custody path), the ADR 0019
+        // postgres credential stores, the production service over the
+        // service-role-decorated runner, the first-boot-decorated
+        // bootstrap, and the broker rendezvous — sealed by the
+        // per-request active-receipt resolver and the authorized
+        // handler bound to the shared confirmer. A composition refusal
+        // exits 6, upstream's own `return nil, err`: the daemon never
+        // serves a half seam.
+        lifecycle: match helper_confirmer(&composition)
+            .and_then(|confirmer| helper_lifecycle_handler(&composition, &broker_path, confirmer))
+        {
+            Ok(handler) => Some(Box::new(handler) as Box<dyn super::lifecycle::LifecycleHandler>),
+            Err(e) => {
+                let _ = writeln!(stderr, "helper: composition: {e}");
+                return 6;
+            }
+        },
         ..Server::new()
     });
     // `runHelperRestoreCapacityReserveStartupSweep` — the sweep's
@@ -1145,8 +1149,8 @@ impl HelperAdvisoryEvaluator {
 
 impl crate::infra::lifecycle::AdvisoryEvaluator for HelperAdvisoryEvaluator {
     /// The lifecycle handler's B01 boundary — the same one resolution
-    /// upstream hands `NewProductionService`. Composed when the rest of
-    /// the lifecycle chain lands; the seam is in place now.
+    /// upstream hands `NewProductionService`, composed into
+    /// `helper_lifecycle_handler` above.
     fn evaluate(
         &self,
     ) -> Result<
@@ -1294,6 +1298,131 @@ fn helper_advisory_evaluator(
     HelperAdvisoryEvaluator { service }
 }
 
+/// `newHelperLifecycleHandler` — the complete B03 chain in upstream's
+/// order: ADR 0020's version-zero dependency receipt before any
+/// receipt read can resolve one, the read-only candidate store
+/// (`NewCandidateStore(nil, dependencyRoot)`), the shared B01
+/// evaluator, the typed broker lifecycle client, the ADR 0019
+/// postgres credential stores, the production service over the
+/// service-role-decorated runner and the first-boot-decorated
+/// bootstrap with the broker rendezvous, the per-request
+/// active-receipt resolver, and the authorized handler bound to the
+/// shared confirmer. A composition refusal is the daemon's exit 6,
+/// exactly like upstream's `return nil, err` at the call site.
+fn helper_lifecycle_handler(
+    composition: &crate::broker::daemon::ProductionInstanceComposition,
+    broker_path: &std::path::Path,
+    confirmer: PamConfirmer,
+) -> Result<super::lifecycle::ProductionLifecycleHandler, String> {
+    // `cmd`'s pinned literals: the host's docker binary, and
+    // `ProductionServiceConfig.RuntimeRoot` = `/run/central-infra` —
+    // the generic runtime root `Topology` joins the instance id onto
+    // itself (SC-DEF-32); the composition's already-scoped runtime
+    // root would double-append it.
+    const DOCKER_BINARY_PATH: &str = "/usr/bin/docker";
+    const CENTRAL_INFRA_ROOT: &str = "/run/central-infra";
+    let dependency_root = std::path::PathBuf::from(&composition.dependency_root);
+    let lifecycle_root = std::path::PathBuf::from(&composition.lifecycle_root);
+    // ADR 0020: first-write-only, and it refuses to repair a corrupt
+    // existing selector — a broken dependency store fails the daemon,
+    // it never gets repaired behind the operator's back.
+    crate::infra::prepare::ensure_version_zero_receipt(
+        crate::infra::prepare::OpDeadline::NONE,
+        &dependency_root,
+    )
+    .map_err(|e| format!("version-zero dependency receipt: {}", e.message()))?;
+    let receipts: Arc<dyn crate::infra::lifecycle::ActiveReceiptReader> = Arc::new(
+        crate::infra::prepare::CandidateStore::new(None, &dependency_root),
+    );
+    let evaluator = helper_advisory_evaluator(composition, broker_path);
+    let broker_client = Arc::new(crate::broker::lifecycle_client::LifecycleClient::new(
+        broker_path.to_path_buf(),
+    ));
+    // ADR 0019: the superuser store first — the service-role store's
+    // `ALTER ROLE` calls authenticate with whatever password it
+    // currently has live.
+    let superuser = Arc::new(
+        super::pg_credentials::ProductionPostgresSuperuserCredentialStore::new_production(
+            composition,
+        )
+        .map_err(|e| format!("postgres superuser credential store: {}", e.message()))?,
+    );
+    let roles: Option<Arc<dyn super::lifecycle_compose::PostgresServiceRoleSync>> = Some(Arc::new(
+        super::pg_credentials::ProductionPostgresServiceRoleCredentialStore::new_production(
+            composition,
+            superuser.clone(),
+            broker_client.clone(),
+        )
+        .map_err(|e| format!("postgres service role credential store: {}", e.message()))?,
+    ));
+    let clock: Arc<dyn central_infra::port::LifecycleClock> =
+        Arc::new(crate::infra::lifecycle::SystemClock);
+    let runner: Arc<dyn crate::infra::compose::ComposeRunner> = Arc::new(
+        super::lifecycle_compose::PostgresServiceRoleComposeRunner::new(
+            Arc::new(crate::infra::compose::CommandComposeRunner::new(
+                DOCKER_BINARY_PATH,
+                None,
+                None,
+            )),
+            roles,
+        ),
+    );
+    let bootstrap = Arc::new(super::lifecycle_compose::PostgresFirstBootBootstrap::new(
+        Arc::new(crate::infra::lifecycle::FileBootstrap::new(
+            lifecycle_root.join("bootstrap"),
+            clock.clone(),
+            broker_client.clone(),
+        )),
+        superuser.clone(),
+    ));
+    let service = crate::infra::lifecycle::new_production_service(
+        crate::infra::lifecycle::ProductionServiceConfig {
+            evaluator: Arc::new(evaluator),
+            receipts: receipts.clone(),
+            inspector: Arc::new(crate::infra::lifecycle::DockerReceiptInspector::new(
+                DOCKER_BINARY_PATH,
+                None,
+            )),
+            runner,
+            journal_root: lifecycle_root,
+            runtime_root: std::path::PathBuf::from(CENTRAL_INFRA_ROOT),
+            capacity_root: std::path::PathBuf::from(&composition.authoritative_state_root),
+            lock_lifetime: None,
+            clock,
+            owner_verifier: broker_client.clone(),
+            bootstrap: Some(bootstrap),
+            b04_bootstrap: broker_client.clone(),
+            rendezvous: Arc::new(super::lifecycle_compose::LifecycleBrokerRendezvous::new(
+                &broker_path.to_string_lossy(),
+            )),
+        },
+    )
+    .map_err(|e| format!("helper lifecycle service: {}", e.message()))?;
+    // Upstream's `resolve` closure: the binding the bridge stamps is
+    // upstream's helper-level `infralifecycle.Binding` — the resolver
+    // fills every request field the request itself may name, so the
+    // composed binding carries only what the helper never exposes.
+    let bridge = crate::infra::lifecycle::LifecycleApplicationBridge::new(
+        service,
+        central_infra::domain::LifecycleBinding::default(),
+    );
+    let resolver = crate::infra::lifecycle::ProductionRequestResolver::new(
+        receipts,
+        &composition.instance_id,
+        &composition.config_binding,
+    );
+    Ok(
+        super::lifecycle::ProductionLifecycleHandler::new_authorized(
+            Box::new(bridge),
+            Box::new(resolver),
+            Box::new(crate::broker::lifecycle_client::LifecycleClient::new(
+                broker_path.to_path_buf(),
+            )),
+            Box::new(confirmer),
+        ),
+    )
+}
+
 /// `productionCandidateEvaluator` — runs B01 over operator-carried
 /// candidate bytes with the installed evaluator's own facts, witness,
 /// and release trust — minus the recorder: candidate evaluation
@@ -1324,12 +1453,12 @@ impl super::rescue::RescueCandidateEvaluator for ProductionCandidateEvaluator {
 /// `lifecycleDownCleanup` — the deny-safe cleanup, bounded to a direct
 /// `docker compose down --remove-orphans` over the instance's
 /// protected runtime path: the same mechanical effect the composed
-/// lifecycle handler's down path produces upstream, minus its second
-/// ceremony (the lifecycle service is not composed in this port — see
-/// the `lifecycle` field's own note — so the rescue ceremony alone
-/// carries the authorization here). Sandboxes and database
-/// connections die with the stopped service containers; state is
-/// preserved: down stops, it never deletes.
+/// lifecycle handler's down path produces, minus the lifecycle verb's
+/// own ceremony (the rescue ceremony alone carries the authorization
+/// here — upstream's rescue cleanup is likewise a direct compose
+/// down, not a second trip through `local down`). Sandboxes and
+/// database connections die with the stopped service containers;
+/// state is preserved: down stops, it never deletes.
 struct ComposeDownRescueCleanup {
     instance_id: String,
 }
@@ -1650,6 +1779,7 @@ mod tests {
             config_binding: String::new(),
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
+            lifecycle_root: String::new(),
             role_roots: Default::default(),
             backup_repository_root: String::new(),
             compose_path: String::new(),

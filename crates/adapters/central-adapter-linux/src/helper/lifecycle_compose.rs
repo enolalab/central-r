@@ -18,8 +18,7 @@
 //!   bind-mounts.
 //!
 //! LC-T4 wires all three into `helper::daemon`'s lifecycle
-//! composition; until then they carry `dead_code` allows on their
-//! constructors.
+//! composition (`helper_lifecycle_handler`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -43,7 +42,6 @@ use crate::infra::prepare::OpDeadline;
 
 /// The shared `errors.New` refusal for a decorator composed without
 /// both halves — a composition bug, never a partial drive.
-#[allow(dead_code)] // used by the decorators' port impls once wired in LC-T4
 fn bootstrap_composition_unavailable() -> Failure {
     Failure::internal(
         "postgres_first_boot",
@@ -61,7 +59,6 @@ fn bootstrap_composition_unavailable() -> Failure {
 /// `*productionPostgresServiceRoleCredentialStore` field, narrowed to
 /// a port so composition tests record the call without a live
 /// server).
-#[allow(dead_code)] // consumed by `PostgresServiceRoleComposeRunner`, wired in LC-T4
 pub(crate) trait PostgresServiceRoleSync: Send + Sync {
     /// `Sync`.
     fn sync(&self) -> Result<(), Failure>;
@@ -86,7 +83,6 @@ impl PostgresServiceRoleSync for ProductionPostgresServiceRoleCredentialStore {
 ///
 /// Every other `ComposeRunner` method is the embedded, undecorated
 /// implementation.
-#[allow(dead_code)] // the daemon lifecycle composition wires this in LC-T4
 pub(crate) struct PostgresServiceRoleComposeRunner {
     inner: Arc<dyn ComposeRunner>,
     roles: Option<Arc<dyn PostgresServiceRoleSync>>,
@@ -96,7 +92,6 @@ impl PostgresServiceRoleComposeRunner {
     /// `postgresServiceRoleComposeRunner{ComposeRunner: inner, roles: roles}`
     /// — a `None` roles store is upstream's nil field: `up` still
     /// decorates, the sync step is simply absent.
-    #[allow(dead_code)] // the daemon lifecycle composition wires this in LC-T4
     pub(crate) fn new(
         inner: Arc<dyn ComposeRunner>,
         roles: Option<Arc<dyn PostgresServiceRoleSync>>,
@@ -107,7 +102,6 @@ impl PostgresServiceRoleComposeRunner {
 
 /// `composeServicesInclude` — reports whether `services` names `name`
 /// explicitly, or is empty: `up`'s own contract for "every service".
-#[allow(dead_code)] // used by `PostgresServiceRoleComposeRunner::up`, wired in LC-T4
 fn compose_services_include(services: &[String], name: &str) -> bool {
     services.is_empty() || services.iter().any(|s| s == name)
 }
@@ -206,7 +200,6 @@ impl ComposeRunner for PostgresServiceRoleComposeRunner {
 /// decorator makes on the superuser credential store (upstream's
 /// concrete `*productionPostgresSuperuserCredentialStore` field,
 /// narrowed to a port so composition tests record the ordering).
-#[allow(dead_code)] // consumed by `PostgresFirstBootBootstrap`, wired in LC-T4
 pub(crate) trait PostgresSuperuserFirstBoot: Send + Sync {
     /// `EnsureFirstBootMaterialized`.
     fn ensure_first_boot_materialized(&self) -> Result<(), Failure>;
@@ -226,7 +219,6 @@ impl PostgresSuperuserFirstBoot for ProductionPostgresSuperuserCredentialStore {
 /// B04 MinIO ceremony still leaves the postgres passfile in place.
 /// Every other bootstrap method is the embedded broker-backed
 /// implementation.
-#[allow(dead_code)] // the daemon lifecycle composition wires this in LC-T4
 pub(crate) struct PostgresFirstBootBootstrap<B: B04Bootstrap> {
     /// `*infraadapter.FileBootstrap` — `Option` so the decorator can
     /// express upstream's nilable embedded field; the production
@@ -238,7 +230,6 @@ pub(crate) struct PostgresFirstBootBootstrap<B: B04Bootstrap> {
 
 impl<B: B04Bootstrap> PostgresFirstBootBootstrap<B> {
     /// `postgresFirstBootBootstrap{FileBootstrap: inner, superuser: superuser}`.
-    #[allow(dead_code)] // the daemon lifecycle composition wires this in LC-T4
     pub(crate) fn new(
         inner: Arc<FileBootstrap<B>>,
         superuser: Arc<dyn PostgresSuperuserFirstBoot>,
@@ -252,7 +243,6 @@ impl<B: B04Bootstrap> PostgresFirstBootBootstrap<B> {
     /// The embedded broker-backed implementation — where upstream's
     /// nil embed would panic, the port refuses with the same
     /// composition-unavailable message `materialize` checks for.
-    #[allow(dead_code)] // used by the port impls once wired in LC-T4
     fn delegate(&self) -> Result<&Arc<FileBootstrap<B>>, Failure> {
         self.inner
             .as_ref()
@@ -355,14 +345,12 @@ impl<B: B04Bootstrap> B04Bootstrap for PostgresFirstBootBootstrap<B> {
 /// and a stale entry pointing at a different inode is unlinked
 /// rather than trusted — so this delegates to it instead of
 /// restating any of it.
-#[allow(dead_code)] // the daemon lifecycle composition wires this in LC-T4
 pub(crate) struct LifecycleBrokerRendezvous {
     source_socket: String,
 }
 
 impl LifecycleBrokerRendezvous {
     /// `newLifecycleBrokerRendezvous`.
-    #[allow(dead_code)] // the daemon lifecycle composition wires this in LC-T4
     pub(crate) fn new(source_socket: &str) -> Self {
         Self {
             source_socket: source_socket.to_owned(),

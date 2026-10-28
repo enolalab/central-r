@@ -69,6 +69,10 @@ pub struct ProductionInstanceComposition {
     /// `<authoritative_state_root>/dependencies` — upstream's
     /// `DependencyRoot`, where the active dependency receipt lives.
     pub dependency_root: String,
+    /// `<authoritative_state_root>/lifecycle` — upstream's
+    /// `LifecycleRoot`: the lifecycle service's durable journal,
+    /// barrier, and lock root.
+    pub lifecycle_root: String,
     /// The host directories backing the four capacity-reserve roles —
     /// upstream `productionInstanceComposition.RoleRoots`. Derived,
     /// never accepted: `infra::capacity_roles::role_roots` is the same
@@ -238,6 +242,7 @@ pub fn load_production_instance_composition_for_owner(
         config_binding,
         authoritative_state_root: state_root.clone(),
         dependency_root: format!("{state_root}/dependencies"),
+        lifecycle_root: format!("{state_root}/lifecycle"),
         role_roots,
         backup_repository_root: cfg.paths.backup_repository_root.clone(),
         compose_path: format!("/run/central-infra/{instance_id}/docker-compose.yaml"),
@@ -859,6 +864,7 @@ mod tests {
             config_binding: String::new(),
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
+            lifecycle_root: String::new(),
             role_roots: Default::default(),
             backup_repository_root: String::new(),
             compose_path: String::new(),

@@ -179,7 +179,6 @@ pub(crate) trait PostgresSuperuserRotator: Send + Sync {
 pub(crate) struct ProductionPostgresSuperuserCredentialStore {
     protected_dir: PathBuf,
     secrets_dir: PathBuf,
-    #[allow(dead_code)]
     init_script_path: PathBuf,
     syncer: PostgresSuperuserSyncer,
     passfile_uid: u32,
@@ -220,12 +219,8 @@ impl ProductionPostgresSuperuserCredentialStore {
     /// from it. It never contacts the server: at first boot the
     /// server does not run yet.
     /// Upstream's call site is `postgresFirstBootBootstrap.
-    /// Materialize` inside the helper lifecycle composition — which
-    /// this codebase still serves as `LIFECYCLE_SERVICE_UNAVAILABLE`
-    /// (the B01 evaluator seam is deferred with it). The store API is
-    /// complete so the decorator wiring is a one-line call when the
-    /// lifecycle composition lands.
-    #[allow(dead_code)]
+    /// Materialize` inside the helper lifecycle composition — the
+    /// `PostgresSuperuserFirstBoot` port impl below is that call.
     pub(crate) fn ensure_first_boot_materialized(&self) -> Result<(), Failure> {
         self.ensure_protected_dir()?;
         let active = match self.read_secret(POSTGRES_SUPERUSER_ACTIVE_FILE_NAME) {
@@ -261,7 +256,6 @@ impl ProductionPostgresSuperuserCredentialStore {
     /// script at the exact bind-mount source the rendered compose
     /// names. It carries no password material and is rewritten
     /// idempotently.
-    #[allow(dead_code)]
     fn write_init_script(&self) -> Result<(), Failure> {
         if self.init_script_path.as_os_str().is_empty() {
             return Err(unavailable(
@@ -285,7 +279,6 @@ impl ProductionPostgresSuperuserCredentialStore {
     /// the server; `postgresServiceRoleCredentialStore`'s
     /// rotate-then-sync reuses it as the admin credential for its own
     /// `ALTER ROLE` calls.
-    #[allow(dead_code)] // consumed by the service-role store's port, not this slice's
     pub(crate) fn active_password(&self) -> Result<String, Failure> {
         self.read_secret(POSTGRES_SUPERUSER_ACTIVE_FILE_NAME)
             .map_err(|_| unavailable("postgres superuser credential store unavailable"))
@@ -489,7 +482,6 @@ const POSTGRES_SERVICE_ROLE_SECRET_DIR_NAME: &str = "postgres-service-roles";
 /// `postgresServiceRoleBroker` — the seam `sync` uses to register a
 /// rotated password as the new active protected binding —
 /// `LifecycleClient` in production (upstream's `brokerClient`).
-#[allow(dead_code)]
 pub(crate) trait PostgresServiceRoleBroker: Send + Sync {
     /// `BindPostgresServiceRole`.
     fn bind_postgres_service_role(
@@ -504,7 +496,6 @@ pub(crate) trait PostgresServiceRoleBroker: Send + Sync {
 /// drives: `verify_as` proves a password currently authenticates the
 /// named role; `alter_login` authenticates as `central` and grants
 /// the role LOGIN with `new_password`.
-#[allow(dead_code)]
 pub(crate) trait ServiceRoleSyncer: Send + Sync {
     /// `Verify`.
     fn verify_as(&self, role_name: &str, password: &str) -> Result<(), Failure>;
@@ -538,7 +529,6 @@ impl ServiceRoleSyncer for PostgresServiceRoleSyncer {
 /// `ProductionPostgresSuperuserCredentialStore` currently has live,
 /// since that store is the sole owner of rotating and verifying the
 /// `central` role itself.
-#[allow(dead_code)]
 pub(crate) struct ProductionPostgresServiceRoleCredentialStore {
     instance_id: String,
     protected_dir: PathBuf,
@@ -547,7 +537,6 @@ pub(crate) struct ProductionPostgresServiceRoleCredentialStore {
     syncer: Arc<dyn ServiceRoleSyncer>,
 }
 
-#[allow(dead_code)] // the postgres-provision compose `up` decorator lands in LC-T3/T4
 impl ProductionPostgresServiceRoleCredentialStore {
     /// `newProductionPostgresServiceRoleCredentialStore`. Upstream's
     /// nil-superuser/nil-broker refusals are the type system's job —
@@ -1148,6 +1137,7 @@ mod tests {
             config_binding: String::new(),
             authoritative_state_root: String::new(),
             dependency_root: String::new(),
+            lifecycle_root: String::new(),
             role_roots: central_backup::backup::capacity::RoleRoots::default(),
             backup_repository_root: String::new(),
             compose_path: String::new(),

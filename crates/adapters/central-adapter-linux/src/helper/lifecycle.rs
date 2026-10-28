@@ -20,11 +20,18 @@ pub fn lifecycle_operation_deadline(verb: &str) -> Duration {
 }
 
 /// The resolved lifecycle operation the service runs —
-/// `infralifecycle.Request`'s helper-visible fields.
+/// `infralifecycle.Request`'s helper-visible fields: the instance and
+/// config bindings plus the active receipt's identity and digests the
+/// resolver reads fresh per request (upstream's `resolve` fills
+/// `ReceiptID`, `ModelDigest`, and `PayloadEpoch` from
+/// `receipts.Active`).
 #[derive(Debug, Clone, Default)]
 pub struct LifecycleOperation {
     pub instance_id: String,
     pub config_binding: String,
+    pub receipt_id: String,
+    pub model_digest: String,
+    pub payload_epoch: String,
 }
 
 /// The service's result — `infralifecycle.Result` as the wire consumes

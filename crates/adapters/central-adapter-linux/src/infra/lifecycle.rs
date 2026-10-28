@@ -3152,11 +3152,12 @@ impl<S> LifecycleApplicationBridge<S> {
     }
 
     /// The upstream `infralifecycle.Request` for one resolved
-    /// operation: the resolver's instance/config values lead (upstream
-    /// passes `operation` straight into `service.Up`), and the
-    /// composed binding supplies the fields the narrowed helper seam
-    /// does not carry (admission, receipt, model digest, payload
-    /// epoch, bootstrap fingerprints).
+    /// operation: the resolver's values lead — upstream's `resolve`
+    /// returns the instance/config bindings and the receipt fields it
+    /// read from `receipts.Active` for exactly this request, and
+    /// `service.Up` consumes `operation` verbatim. The composed
+    /// binding supplies only the fields upstream's helper `resolve`
+    /// leaves unset (`AdmissionID`, `BootstrapFingerprints`).
     fn request(
         &self,
         operation: &crate::helper::lifecycle::LifecycleOperation,
@@ -3165,9 +3166,9 @@ impl<S> LifecycleApplicationBridge<S> {
             instance_id: operation.instance_id.clone(),
             config_binding: operation.config_binding.clone(),
             admission_id: self.binding.admission_id.clone(),
-            receipt_id: self.binding.receipt_id.clone(),
-            model_digest: self.binding.model_digest.clone(),
-            payload_epoch: self.binding.payload_epoch.clone(),
+            receipt_id: operation.receipt_id.clone(),
+            model_digest: operation.model_digest.clone(),
+            payload_epoch: operation.payload_epoch.clone(),
             bootstrap_fingerprints: self.binding.bootstrap_fingerprints.clone(),
         }
     }
@@ -3313,6 +3314,9 @@ pub fn production_lifecycle_handler(
 
 /// `StaticRequestResolver` — resolves the helper's fixed binding; the
 /// request may not carry topology (upstream `LifecycleRequestResolver`).
+/// It resolves no receipt: the operation's receipt fields stay empty,
+/// the receipt-less binding upstream's domain `Binding.Validate` would
+/// refuse — [`ProductionRequestResolver`] is the production resolver.
 pub struct StaticRequestResolver {
     operation: crate::helper::lifecycle::LifecycleOperation,
 }
@@ -3324,6 +3328,7 @@ impl StaticRequestResolver {
             operation: crate::helper::lifecycle::LifecycleOperation {
                 instance_id: instance_id.to_owned(),
                 config_binding: config_binding.to_owned(),
+                ..Default::default()
             },
         }
     }
@@ -3341,6 +3346,71 @@ impl crate::helper::lifecycle::LifecycleRequestResolver for StaticRequestResolve
             ));
         }
         Ok(self.operation.clone())
+    }
+}
+
+/// `ProductionRequestResolver` — upstream's `resolve` closure inside
+/// `newHelperLifecycleHandler`: the active B02 receipt is read fresh
+/// for every request, the request's config binding may override the
+/// composition's only by naming it verbatim, and the resolved
+/// operation carries `ReceiptID`/`ModelDigest`/`PayloadEpoch` exactly
+/// as `infralifecycle.Request` did (`PayloadEpoch` is the manifest
+/// digest — upstream's own field copy).
+pub struct ProductionRequestResolver {
+    receipts: Arc<dyn ActiveReceiptReader>,
+    instance_id: String,
+    config_binding: String,
+}
+
+impl ProductionRequestResolver {
+    /// `resolve`'s captured `receipts`/`composition` — the store the
+    /// service's own admission reads, never a second source.
+    pub fn new(
+        receipts: Arc<dyn ActiveReceiptReader>,
+        instance_id: &str,
+        config_binding: &str,
+    ) -> Self {
+        Self {
+            receipts,
+            instance_id: instance_id.to_owned(),
+            config_binding: config_binding.to_owned(),
+        }
+    }
+}
+
+impl crate::helper::lifecycle::LifecycleRequestResolver for ProductionRequestResolver {
+    /// `receipts.Active(ctx)` → binding default/match → the resolved
+    /// request, upstream's ordering verbatim: the receipt read happens
+    /// even when the request's binding will be refused.
+    fn resolve(
+        &self,
+        request: &crate::helper::protocol::LifecycleRequest,
+    ) -> Result<crate::helper::lifecycle::LifecycleOperation, Failure> {
+        let receipt = self.receipts.active().map_err(|e| {
+            Failure::new(
+                e.kind(),
+                e.code(),
+                format!("active B02 receipt: {}", e.message()),
+            )
+        })?;
+        let binding = if request.config_binding.is_empty() {
+            self.config_binding.clone()
+        } else {
+            request.config_binding.clone()
+        };
+        if binding != self.config_binding {
+            return Err(Failure::invalid(
+                "LIFECYCLE_BINDING",
+                "unexpected lifecycle config binding",
+            ));
+        }
+        Ok(crate::helper::lifecycle::LifecycleOperation {
+            instance_id: self.instance_id.clone(),
+            config_binding: binding,
+            receipt_id: receipt.id,
+            model_digest: receipt.manifest_digest.clone(),
+            payload_epoch: receipt.manifest_digest,
+        })
     }
 }
 
@@ -4531,5 +4601,115 @@ mod tests {
         .unwrap();
         assert_eq!(generation.generation, 1);
         assert!(generation.digest.starts_with("sha256:"));
+    }
+
+    // -- ProductionRequestResolver -------------------------------------------
+
+    /// A counting receipt reader — upstream's `resolve` reads
+    /// `receipts.Active` inside every call, never a startup snapshot;
+    /// the counter proves it.
+    struct CountingReceipts {
+        receipt: DependencyReceipt,
+        calls: AtomicU32,
+    }
+    impl ActiveReceiptReader for CountingReceipts {
+        fn active(&self) -> Result<DependencyReceipt, Failure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.receipt.clone())
+        }
+    }
+
+    /// An `active()` that always refuses — the resolver wraps the
+    /// store's failure in its `active B02 receipt:` context while
+    /// preserving the store's own kind and code.
+    struct FailingReceipts {
+        calls: AtomicU32,
+    }
+    impl ActiveReceiptReader for FailingReceipts {
+        fn active(&self) -> Result<DependencyReceipt, Failure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(Failure::unavailable(
+                "receipts_unavailable",
+                "store unavailable",
+            ))
+        }
+    }
+
+    fn production_resolver_receipts() -> Arc<CountingReceipts> {
+        Arc::new(CountingReceipts {
+            receipt: DependencyReceipt {
+                id: "receipt-1".to_owned(),
+                manifest_digest: "sha256:manifest".to_owned(),
+                ..DependencyReceipt::default()
+            },
+            calls: AtomicU32::new(0),
+        })
+    }
+
+    /// `resolve` — an empty request binding defaults to the composed
+    /// binding; the resolved operation carries the active receipt's
+    /// id and the manifest digest stamped onto both `ModelDigest` and
+    /// `PayloadEpoch` (upstream's own field copy), and the store is
+    /// consulted on every call.
+    #[test]
+    fn production_request_resolver_resolves_active_receipt_per_request() {
+        use crate::helper::lifecycle::LifecycleRequestResolver;
+        let receipts = production_resolver_receipts();
+        let resolver = ProductionRequestResolver::new(receipts.clone(), "inst-1", "cfg-binding");
+        let request = crate::helper::protocol::LifecycleRequest::default();
+        for expected_calls in [1, 2] {
+            let op = resolver.resolve(&request).unwrap();
+            assert_eq!(op.instance_id, "inst-1");
+            assert_eq!(op.config_binding, "cfg-binding");
+            assert_eq!(op.receipt_id, "receipt-1");
+            assert_eq!(op.model_digest, "sha256:manifest");
+            assert_eq!(op.payload_epoch, "sha256:manifest");
+            assert_eq!(
+                receipts.calls.load(Ordering::Relaxed),
+                expected_calls,
+                "the active receipt is read fresh per request"
+            );
+        }
+        // An explicit request binding that names the composed binding
+        // verbatim resolves identically.
+        let matching = crate::helper::protocol::LifecycleRequest {
+            config_binding: "cfg-binding".to_owned(),
+        };
+        let op = resolver.resolve(&matching).unwrap();
+        assert_eq!(op.config_binding, "cfg-binding");
+    }
+
+    /// `resolve` — a non-matching request binding refuses
+    /// `LIFECYCLE_BINDING`, and it refuses *after* the receipt read:
+    /// upstream's ordering puts `receipts.Active` first, so the count
+    /// still advances.
+    #[test]
+    fn production_request_resolver_rejects_foreign_binding() {
+        use crate::helper::lifecycle::LifecycleRequestResolver;
+        let receipts = production_resolver_receipts();
+        let resolver = ProductionRequestResolver::new(receipts.clone(), "inst-1", "cfg-binding");
+        let foreign = crate::helper::protocol::LifecycleRequest {
+            config_binding: "somebody-elses-binding".to_owned(),
+        };
+        let err = resolver.resolve(&foreign).unwrap_err();
+        assert_eq!(err.code(), "LIFECYCLE_BINDING");
+        assert_eq!(err.message(), "unexpected lifecycle config binding");
+        assert_eq!(receipts.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// `resolve` — a receipt-read failure propagates with the
+    /// resolver's own context prefix, preserving the store's kind.
+    #[test]
+    fn production_request_resolver_wraps_receipt_failure() {
+        use crate::helper::lifecycle::LifecycleRequestResolver;
+        let receipts = Arc::new(FailingReceipts {
+            calls: AtomicU32::new(0),
+        });
+        let resolver = ProductionRequestResolver::new(receipts.clone(), "inst-1", "cfg-binding");
+        let err = resolver
+            .resolve(&crate::helper::protocol::LifecycleRequest::default())
+            .unwrap_err();
+        assert_eq!(err.message(), "active B02 receipt: store unavailable");
+        assert_eq!(receipts.calls.load(Ordering::Relaxed), 1);
     }
 }

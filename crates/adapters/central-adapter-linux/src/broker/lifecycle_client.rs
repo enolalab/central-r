@@ -532,6 +532,77 @@ impl B04Bootstrap for LifecycleClient {
     }
 }
 
+/// `helper::lifecycle::LifecycleAuthorizer` — the production lifecycle
+/// handler's broker authorization seam (upstream passes
+/// `broker.NewLifecycleClient(brokerSocketPath())` straight into
+/// `NewAuthorizedProductionLifecycleHandler`). The helper's
+/// `LifecycleAuthorization*` vocabulary is the same scope with the
+/// expiry carried as text; the client's wire types carry it as a
+/// timestamp, so the impl translates both directions — the claim the
+/// broker minted is the exact claim handed back at consume.
+impl crate::helper::lifecycle::LifecycleAuthorizer for LifecycleClient {
+    fn authorize_bound_lifecycle(
+        &self,
+        request: &crate::helper::LifecycleAuthorizationRequest,
+    ) -> Result<crate::helper::LifecycleAuthorization, Failure> {
+        let claim = LifecycleClient::authorize_bound_lifecycle(
+            self,
+            &LifecycleAuthorizationRequest {
+                instance_id: request.instance_id.clone(),
+                operation: request.operation.clone(),
+                request_digest: request.request_digest.clone(),
+                peer_uid: request.peer_uid,
+                peer_pid: request.peer_pid,
+            },
+        )?;
+        Ok(crate::helper::LifecycleAuthorization {
+            nonce: claim.nonce,
+            instance_id: claim.instance_id,
+            operation: claim.operation,
+            request_digest: claim.request_digest,
+            peer_uid: claim.peer_uid,
+            peer_pid: claim.peer_pid,
+            caller_fingerprint: claim.caller_fingerprint,
+            expires_at: claim
+                .expires_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| internal(format!("broker lifecycle: claim expiry: {e}")))?,
+        })
+    }
+
+    fn consume_bound_lifecycle_authorization(
+        &self,
+        claim: &crate::helper::LifecycleAuthorization,
+        request: &crate::helper::LifecycleAuthorizationRequest,
+    ) -> Result<(), Failure> {
+        let expires_at = time::OffsetDateTime::parse(
+            &claim.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|e| invalid(format!("broker lifecycle: claim expiry: {e}")))?;
+        LifecycleClient::consume_bound_lifecycle_authorization(
+            self,
+            &LifecycleAuthorization {
+                nonce: claim.nonce.clone(),
+                instance_id: claim.instance_id.clone(),
+                operation: claim.operation.clone(),
+                request_digest: claim.request_digest.clone(),
+                peer_uid: claim.peer_uid,
+                peer_pid: claim.peer_pid,
+                caller_fingerprint: claim.caller_fingerprint.clone(),
+                expires_at,
+            },
+            &LifecycleAuthorizationRequest {
+                instance_id: request.instance_id.clone(),
+                operation: request.operation.clone(),
+                request_digest: request.request_digest.clone(),
+                peer_uid: request.peer_uid,
+                peer_pid: request.peer_pid,
+            },
+        )
+    }
+}
+
 /// `json.NewDecoder(conn).Decode(&response)` — one JSON line off the
 /// wire.
 fn read_response_line(conn: &mut UnixStream) -> Result<BrokerResponse, Failure> {
