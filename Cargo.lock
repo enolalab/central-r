@@ -764,6 +764,7 @@ dependencies = [
  "central-task",
  "central-transport-http",
  "central-workflow",
+ "ed25519-dalek",
  "rustix",
  "serde",
  "serde_json",

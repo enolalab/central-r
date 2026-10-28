@@ -96,7 +96,11 @@ central-backup = { path = "../../crates/capabilities/central-backup", version = 
 # probe shares the vocabulary the audited adapter boundary already
 # enables (pty/termios land via feature unification; declared for the
 # surface the test itself uses).
-rustix = { workspace = true, features = ["pty", "termios"] }
+rustix = { workspace = true, features = ["pty", "rand", "termios"] }
+# E04 (`tests/e04_advisory/`): the suite mints its own ephemeral
+# fixture keypairs — `crypto/ed25519` in upstream's test file —
+# over the same pinned signing crate the domain verifies with.
+ed25519-dalek.workspace = true
 
 [[test]]
 name = "phase2_acceptance"
@@ -117,6 +121,15 @@ path = "tests/c06_acceptance/mod.rs"
 [[test]]
 name = "d07_acceptance"
 path = "tests/d07_acceptance/mod.rs"
+
+# R6 task 15 slice A — E04 advisory lifecycle conformance (upstream
+# cmd/central's e04_advisory_lifecycle_test.go). Fully portable: an
+# ephemeral suite keypair signs the fixtures; a real broker Journal
+# commits the transition evidence in-process. CENTRAL_E04_EVIDENCE_DIR
+# additionally emits slice-e-advisory-lifecycle.json + fixture copies.
+[[test]]
+name = "e04_advisory"
+path = "tests/e04_advisory/mod.rs"
 
 [lints]
 workspace = true
