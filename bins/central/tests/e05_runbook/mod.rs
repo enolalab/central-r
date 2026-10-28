@@ -95,7 +95,8 @@ fn e05_reason_tokens(text: &str) -> std::collections::BTreeSet<String> {
         if matches!(
             w.as_str(),
             "INVALID_MAINTENANCE_GRAMMAR" | "AUTHORITY_DENIED" | "DENY_SAFE_ACTIVE"
-        ) || (w.starts_with("MAINTENANCE_")
+        ) || (w.len() > "MAINTENANCE_".len()
+            && w.starts_with("MAINTENANCE_")
             && w.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
         {
             tokens.insert(w);
@@ -150,7 +151,7 @@ fn e05_runbook_commands_parse() {
     // with no envelope at all, so root runs cannot exercise the
     // equivalent surface and skip (the `non_root` precedent in
     // `main.rs`'s dispatch tests).
-    if rustix::process::geteuid().as_raw() == 0 {
+    if rustix::process::getuid().as_raw() == 0 {
         eprintln!(
             "e05: skipping as root — upstream exercises `command.Dispatch` \
              in-process, which never ran `main()`'s privilege gate; the \
