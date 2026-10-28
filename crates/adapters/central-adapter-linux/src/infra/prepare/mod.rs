@@ -17,6 +17,7 @@
 //! `Build` refuses an unbound or non-isolated request before `docker`
 //! is ever consulted.
 
+pub mod attestation;
 pub mod buildkit;
 pub mod capacity;
 pub mod fetch;
@@ -38,6 +39,10 @@ use std::time::Instant;
 use central_foundation::failure::Failure;
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 
+pub use attestation::{
+    ATTESTATION_KEY_ENV, AttestationService, AttestationSigner, AttestationVerifier, Attestor,
+    attestation_key_path, load_attestation_signer,
+};
 pub use buildkit::{
     BUILD_KIT_DAEMON_IMAGE, BuildKit, DETERMINISTIC_SOURCE_DATE_EPOCH, build_recipe_is_go,
     inventory_from_oci_layout, parse_build_recipe,

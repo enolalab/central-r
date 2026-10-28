@@ -36,11 +36,12 @@ Already ported (consumed, not redone): `central_infra::prepare` domain
 - Tests: round trip, deadline/phase fidelity, path-traversal ids refused,
   forged-id mismatch refused, unsettled skips terminal, mode bits.
 
-### PP-T2 — comparator wiring, independent-build + attestation-materials checks
+### PP-T2 (FOLDED INTO PP-T5) — comparator wiring, independent-build + attestation-materials checks
 - `validate_independent_builds` and `oci::Comparator` already exist; port only
   `attestation_materials` and `SubjectFromInventory` and wire them.
 
-### PP-T3 — attestor: key custody, DSSE signer, verify (SBOM / license / SLSA)
+### PP-T3 (DONE) — attestor: key custody, DSSE signer, verify (SBOM / license / SLSA)
+- `infra/prepare/attestation.rs`: `AttestationVerifier`, `AttestationSigner`, `AttestationService` (`Attestor`), `load_attestation_signer` (openat2 NO_MAGICLINKS+NOFOLLOW, regular file, owner-only). Key *generation* (upstream operator tool) is not ported.
 ### PP-T4 — image loader (`Supported`, `Load`, post-load digest validation)
 ### PP-T5 — state machine `PrepareState` (run/settle/resume, progress tracker)
 ### PP-T6 — release path: verify, import (`PrepareOneFromRelease`), export
