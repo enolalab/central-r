@@ -342,6 +342,15 @@ fn deny_safe_gate_denies_mutating_and_admits_readonly() {
         assert_eq!(resp.reason, reason, "verb {}", req.verb);
     }
 
+    // `doctor` sits on the daemon arm, so it needs a daemon-admitting
+    // server to reach the gate at all — admitted, it lands on the
+    // matrix's own answer, not DENY_SAFE_ACTIVE.
+    let mut daemon = daemon_server();
+    daemon.deny_safe_dir = Some(scratch.path().to_string_lossy().into_owned());
+    let resp = helper_request(&daemon, &req("op-safe", verb::DOCTOR));
+    assert_ne!(resp.reason, "DENY_SAFE_ACTIVE", "doctor must pass the gate");
+    assert_eq!(resp.reason, "UNSUPPORTED_IN_THIS_SLICE");
+
     // The deny side: every mutating verb — including the Task-13
     // security-update/maintenance-apply pair and a repair audit —
     // collapses to DENY_SAFE_ACTIVE before reaching a handler.
