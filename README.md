@@ -168,7 +168,7 @@ and `central-advisory-sign` (E01–E04), and the E05/E06 closeout.
 | LC-T4 | Helper-daemon lifecycle composition (`local up\|down\|status` live) | ✅ Done |
 | LC-T5 | Closeout: R6 deferral resolved, `current-phase.md` updated | ✅ Done |
 
-Still deferred: `local browser open`, prepare promotion/attestation, and the
+Prepare promotion/attestation (journal, attestation, image load, release import/export) landed on `prepare-promotion`. Still deferred: `local browser open` and the
 root/Tier-3 physical evidence tiers.
 
 **After R6:** the Rust port has reached full parity with upstream. The product
