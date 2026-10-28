@@ -28,6 +28,7 @@ pub mod module_cache;
 pub mod oci;
 pub mod release_stage;
 pub mod service;
+pub mod state_machine;
 pub mod store;
 pub mod version_zero;
 

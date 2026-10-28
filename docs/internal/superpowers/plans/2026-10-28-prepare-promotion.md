@@ -43,7 +43,8 @@ Already ported (consumed, not redone): `central_infra::prepare` domain
 ### PP-T3 (DONE) — attestor: key custody, DSSE signer, verify (SBOM / license / SLSA)
 - `infra/prepare/attestation.rs`: `AttestationVerifier`, `AttestationSigner`, `AttestationService` (`Attestor`), `load_attestation_signer` (openat2 NO_MAGICLINKS+NOFOLLOW, regular file, owner-only). Key *generation* (upstream operator tool) is not ported.
 ### PP-T4 (DONE) — image loader (`Supported`, `Load`, post-load digest validation)
-### PP-T5 — state machine `PrepareState` (run/settle/resume, progress tracker)
+### PP-T5 (DONE) — state machine `PrepareState` (run/settle/resume, progress tracker)
+- `infra/prepare/state_machine.rs` (+ `CandidateStore::recover`, deferred since R5). Ports as traits with fakes in tests; `attestation_materials`, `prepared_dependency_set`, `persist_op_artifacts` live here. `prepare_one_from_release` is PP-T6.
 ### PP-T6 — release path: verify, import (`PrepareOneFromRelease`), export
 ### PP-T7 — factory wiring: replace `PREPARE_PROMOTION_UNAVAILABLE`, real
 `resume` and `prepare_export_release` in `infra/prepare/service.rs`
