@@ -38,11 +38,13 @@ mod destructive_cli;
 mod grant_cli;
 mod harness_cli;
 mod local_cli;
+mod maintenance_cli;
 mod migrate_cli;
 mod modes;
 mod node_cli;
 mod restore_cli;
 mod run_cli;
+mod security_cli;
 mod serve;
 
 fn main() -> ExitCode {
@@ -197,6 +199,9 @@ fn dispatch(args: &[String], stdout: &mut impl Write, stderr: &mut impl Write) -
     if command_id.starts_with("local.") {
         return local_cli::local(command_id, tokens, stdout, stderr);
     }
+    if command_id.starts_with("maintenance.") {
+        return maintenance_cli::maintenance(command_id, tokens, stdout, stderr);
+    }
     if command_id.starts_with("migrate-") {
         return migrate_cli::migrate(command_id, tokens, stdout, stderr);
     }
@@ -318,17 +323,8 @@ mod tests {
             (&["local", "init", "--status"], "local.init.status"),
             (&["local", "init", "--resume=abc"], "local.init.resume"),
             (&["local", "init", "--abandon=abc"], "local.init.abandon"),
-            (&["local", "audit"], "local.audit"),
             (&["local", "browser", "open"], "local.browser.open"),
             (&["local", "trust", "install"], "local.trust.install"),
-            (&["local", "security", "update"], "local.security-update"),
-            // First-match collapse: every `local security *` form
-            // resolves to the first `local security` registry id.
-            (&["local", "security", "rescue"], "local.security-update"),
-            (
-                &["local", "security", "rescue", "cleanup"],
-                "local.security-update",
-            ),
             (
                 &["local", "dependency", "upgrade", "plan"],
                 "local.dependency-upgrade-plan",
@@ -337,8 +333,6 @@ mod tests {
                 &["local", "dependency", "upgrade", "apply"],
                 "local.dependency-upgrade-plan",
             ),
-            (&["maintenance", "plan"], "maintenance.plan"),
-            (&["maintenance", "apply"], "maintenance.apply"),
             (&["bootstrap", "show"], "bootstrap.show"),
         ];
         for (argv, want_id) in deferred {
@@ -352,6 +346,104 @@ mod tests {
             assert!(parsed["timestamp"].is_string());
             assert!(parsed.get("details").is_none());
         }
+
+        // R6 task 13 — the D05/D06 + Slice E verbs resolve and run
+        // their own grammar gates and helper dials instead of the
+        // deferred envelope.
+        let r6_13: &[(&[&str], &str, u8, &str)] = &[
+            // Grammar gates (exit 2) run before the helper dial.
+            (
+                &["local", "audit", "--bogus"][..],
+                "local.audit",
+                2,
+                "INVALID_AUDIT_GRAMMAR",
+            ),
+            (
+                &["local", "audit", "--repair", "--repair"][..],
+                "local.audit",
+                2,
+                "INVALID_AUDIT_GRAMMAR",
+            ),
+            (
+                &["local", "security"][..],
+                "local.security-update",
+                2,
+                "INVALID_SECURITY_GRAMMAR",
+            ),
+            (
+                &["local", "security", "bogus"][..],
+                "local.security-update",
+                2,
+                "INVALID_SECURITY_GRAMMAR",
+            ),
+            (
+                &["local", "security", "update"][..],
+                "local.security-update",
+                2,
+                "INVALID_SECURITY_UPDATE_GRAMMAR",
+            ),
+            (
+                &["local", "security", "update", "/nonexistent-env"][..],
+                "local.security-update",
+                2,
+                "SECURITY_UPDATE_ENVELOPE_UNREADABLE",
+            ),
+            (
+                &["local", "security", "rescue"][..],
+                "local.security-update",
+                2,
+                "INVALID_RESCUE_GRAMMAR",
+            ),
+            (
+                &["local", "security", "rescue", "--advisory=/nonexistent-env"][..],
+                "local.security-update",
+                2,
+                "RESCUE_ADVISORY_UNREADABLE",
+            ),
+            (
+                &["maintenance", "plan", "--check=nope"][..],
+                "maintenance.plan",
+                2,
+                "INVALID_MAINTENANCE_GRAMMAR",
+            ),
+            (
+                &["maintenance", "apply"][..],
+                "maintenance.apply",
+                2,
+                "INVALID_MAINTENANCE_GRAMMAR",
+            ),
+            (
+                &["maintenance", "apply", "--set=x=", "--resume=a"][..],
+                "maintenance.apply",
+                2,
+                "INVALID_MAINTENANCE_GRAMMAR",
+            ),
+            // Helper-dial failures (exit 3) on a helper-less host.
+            (&["local", "audit"][..], "local.audit", 3, "AUDIT_FAILED"),
+            (
+                &["maintenance", "plan"][..],
+                "maintenance.plan",
+                3,
+                "MAINTENANCE_PLAN_FAILED",
+            ),
+        ];
+        for (argv, want_id, want_code, want_reason) in r6_13 {
+            let (code, stdout, _) = invoke(argv);
+            assert_eq!(code, *want_code, "argv {argv:?}");
+            let parsed = parse_envelope(&stdout);
+            assert_eq!(parsed["command_id"], *want_id, "argv {argv:?}");
+            assert_eq!(parsed["reason"], *want_reason, "argv {argv:?}");
+        }
+
+        // `local security rescue cleanup` resolves to the shared
+        // `local security` id and stays deferred to Slice E — with
+        // the rescue details payload upstream emits here.
+        let (code, stdout, _) = invoke(&["local", "security", "rescue", "cleanup"]);
+        assert_eq!(code, 5);
+        let parsed = parse_envelope(&stdout);
+        assert_eq!(parsed["command_id"], "local.security-update");
+        assert_eq!(parsed["reason"], "UNSUPPORTED_IN_THIS_SLICE");
+        assert_eq!(parsed["details"]["safe_next_action"], "WAIT_FOR_SLICE_E");
 
         // R6 `migrate *` (task 1): every verb is activated — it
         // delegates to the helper socket, which is absent in this

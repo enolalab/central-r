@@ -8,11 +8,14 @@
 //! installs a lifecycle client, so a helper-less host is upstream's
 //! `helper: dial:` failure branch.
 //!
+//! `local.wipe` is the D01 verb (destructive_cli), `local.security-*`
+//! the D06 update/rescue pair and `local.audit` the D05 protected-state
+//! audit (security_cli).
+//!
 //! Every other registered `local` id — `local.browser.open`,
-//! `local.trust.install`, `local.security-update`, `local.wipe`,
-//! `local.audit`, `local.dependency-upgrade-plan` — stays deferred to
-//! its owning slice through the exact `UNSUPPORTED_IN_THIS_SLICE`
-//! envelope.
+//! `local.trust.install`, `local.dependency-upgrade-plan` — stays
+//! deferred to its owning slice through the exact
+//! `UNSUPPORTED_IN_THIS_SLICE` envelope.
 
 use std::io::Write;
 use std::time::Instant;
@@ -59,6 +62,14 @@ pub(crate) fn local(
         "local.prepare" => run_prepare(command_id, tokens, stdout, stderr),
         // `runLocalWipe` — the D01 verb: checkpoint, wipe, evidence.
         "local.wipe" => crate::destructive_cli::local_wipe(command_id, tokens, stdout, stderr),
+        // `runLocalSecurity` — the shared `("local","security")` key
+        // routes update/rescue on tokens[0]; `rescue cleanup` stays
+        // deferred to Slice E inside the handler.
+        "local.security-update" => {
+            crate::security_cli::local_security(command_id, tokens, stdout, stderr)
+        }
+        // `runLocalAudit` — the D05 protected-state audit.
+        "local.audit" => crate::security_cli::local_audit(command_id, tokens, stdout, stderr),
         _ => emit(
             command_id,
             stdout,
@@ -1234,10 +1245,8 @@ mod tests {
     #[test]
     fn other_registered_local_ids_stay_unsupported() {
         for id in [
-            "local.security-update",
             "local.browser.open",
             "local.trust.install",
-            "local.audit",
             "local.dependency-upgrade-plan",
         ] {
             let (code, stdout, _) = invoke(id, &["x"]);
