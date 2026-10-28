@@ -45,7 +45,8 @@ Already ported (consumed, not redone): `central_infra::prepare` domain
 ### PP-T4 (DONE) — image loader (`Supported`, `Load`, post-load digest validation)
 ### PP-T5 (DONE) — state machine `PrepareState` (run/settle/resume, progress tracker)
 - `infra/prepare/state_machine.rs` (+ `CandidateStore::recover`, deferred since R5). Ports as traits with fakes in tests; `attestation_materials`, `prepared_dependency_set`, `persist_op_artifacts` live here. `prepare_one_from_release` is PP-T6.
-### PP-T6 — release path: verify, import (`PrepareOneFromRelease`), export
+### PP-T6 (verify+import DONE; export pending) — release path: verify, import (`PrepareOneFromRelease`), export
+- `infra/prepare/release.rs`: `verify_release`, `reverify_manifest_envelopes`, `ReleaseImportService`, `infra_pin_manifests`; `PrepareState::prepare_one_from_release`. Export (`release_export_linux.go`) is PP-T6b.
 ### PP-T7 — factory wiring: replace `PREPARE_PROMOTION_UNAVAILABLE`, real
 `resume` and `prepare_export_release` in `infra/prepare/service.rs`
 ### PP-T8 — closeout: task record, `current-phase.md`, README, dashboard

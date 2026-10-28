@@ -26,6 +26,7 @@ pub mod journal;
 pub mod lock;
 pub mod module_cache;
 pub mod oci;
+pub mod release;
 pub mod release_stage;
 pub mod service;
 pub mod state_machine;
@@ -66,6 +67,10 @@ pub use module_cache::{
     STAGED_MODULE_CACHE_DIR, module_proxy_url, tree_bytes,
 };
 pub use oci::{COMPARATOR_VERSION, Comparator, compare_oci};
+pub use release::{
+    ReleaseImportService, ReleaseImporter, infra_pin_manifests, reverify_manifest_envelopes,
+    verify_release,
+};
 pub use release_stage::{
     read_infra_save_config, read_infra_save_manifest, read_release_minio_inventory,
     stage_release_dir,

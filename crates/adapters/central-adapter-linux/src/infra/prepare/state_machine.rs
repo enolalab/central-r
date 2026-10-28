@@ -33,10 +33,10 @@ use central_foundation::failure::Failure;
 use central_infra::authority::{PrepareOperation, PrepareOperationPhase};
 use central_infra::domain::{
     AcquisitionKind, AdmissionBinding, AttestationFact, Candidate, ComparisonFact,
-    DependencyReceipt, OciInventory, PreparePhase, PreparedDependencySet, PreparedMode,
-    acquisition_kind_for, codes, inventory_digest, new_admission_binding, selector_token,
-    service_mode_for_selector, valid_operation_id, validate_attestation_facts,
-    validate_independent_builds,
+    DependencyReceipt, ManifestSource, OciInventory, PreparePhase, PreparedDependencySet,
+    PreparedMode, REQUIRED_ATTESTATION_PREDICATES, StoredEnvelope, acquisition_kind_for, codes,
+    inventory_digest, new_admission_binding, selector_token, service_mode_for_selector,
+    valid_operation_id, validate_attestation_facts, validate_independent_builds,
 };
 use central_infra::prepare::{
     AttestationMaterials, BuildRequest, ImageLoadRequest, Lock, MAX_PROGRESS_EVENTS,
@@ -49,6 +49,7 @@ use time::OffsetDateTime;
 use super::attestation::Attestor;
 use super::image_load::ImageLoader;
 use super::journal::FileJournal;
+use super::release::ReleaseImporter;
 use super::{BuildKit, CandidateStore, CapacityChecker, Comparator, Fetcher, OpDeadline};
 use crate::helper::prepare::AdvisoryAdmission;
 
@@ -228,6 +229,22 @@ const fn is_settlement_checkpoint(phase: PrepareOperationPhase) -> bool {
             | PrepareOperationPhase::SelectorSwitched
             | PrepareOperationPhase::Completed
     )
+}
+
+/// `mapReleaseError` — names the release failure by its sentinel; anything
+/// else is a load failure.
+fn map_release_error(e: &Failure) -> String {
+    let code = e.code();
+    let label = [
+        prepare_codes::RELEASE_UNREADABLE,
+        prepare_codes::RELEASE_INVALID,
+        prepare_codes::RELEASE_LOCK_MISMATCH,
+        prepare_codes::RELEASE_UNTRUSTED,
+    ]
+    .into_iter()
+    .find(|c| *c == code)
+    .unwrap_or("LOAD_FAILED");
+    format!("{label}: {}", e.message())
 }
 
 fn failure_text(e: &Failure) -> String {
@@ -461,6 +478,7 @@ pub struct PrepareState {
     comparator: Option<Arc<dyn OciComparator>>,
     attestor: Option<Arc<dyn Attestor>>,
     image_loader: Option<Arc<dyn ImageLoader>>,
+    release_importer: Option<Arc<dyn ReleaseImporter>>,
     reporter: Option<Arc<dyn ProgressReporter>>,
     selectors: Vec<String>,
     build_dir: PathBuf,
@@ -494,6 +512,7 @@ impl PrepareState {
             comparator: None,
             attestor: None,
             image_loader: None,
+            release_importer: None,
             reporter: None,
             selectors,
             build_dir: build_dir.into(),
@@ -523,6 +542,14 @@ impl PrepareState {
     #[must_use]
     pub fn with_image_loader(mut self, loader: Arc<dyn ImageLoader>) -> Self {
         self.image_loader = Some(loader);
+        self
+    }
+
+    /// `WithReleaseImporter` — verifies a release directory and loads its
+    /// images for [`Self::prepare_one_from_release`].
+    #[must_use]
+    pub fn with_release_importer(mut self, importer: Arc<dyn ReleaseImporter>) -> Self {
+        self.release_importer = Some(importer);
         self
     }
 
@@ -598,6 +625,135 @@ impl PrepareState {
             return self.terminal(&op, format!("RECORD_FAILED: {}", failure_text(&e)));
         }
         self.run(op)
+    }
+
+    /// `PrepareOneFromRelease` — imports one selector from a verified
+    /// release directory: capacity, admission, import (stage + verify +
+    /// load), stage, promotion, switch. It journals terminal records only:
+    /// nothing before the commit persists, so a crash retries by re-running,
+    /// never resuming.
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_one_from_release(
+        &self,
+        admission: &AdvisoryAdmission,
+        selector: &str,
+        dir: &std::path::Path,
+    ) -> PrepareResult {
+        let start = self.now();
+        let mut op = self.new_op("", selector, admission);
+        op.operation_id = format!("import-{}-{selector}", start.unix_timestamp_nanos());
+        let deadline = OpDeadline::after(OPERATION_BUDGET);
+        if selector != "minio" {
+            return self.terminal(&op, format!(
+                "SELECTOR_RELEASE_UNIMPLEMENTED: {selector:?} has no release path; only minio imports from a release"
+            ));
+        }
+        match self.capacity.has_capacity(deadline, selector) {
+            Err(e) => {
+                return self.terminal(&op, format!("CAPACITY_CHECK_FAILED: {}", failure_text(&e)));
+            }
+            Ok(false) => return self.terminal(&op, "CAPACITY_UNAVAILABLE".to_owned()),
+            Ok(true) => {}
+        }
+        let Some(loader) = &self.image_loader else {
+            return self.terminal(&op, "LOAD_UNCONFIGURED".to_owned());
+        };
+        if let Err(e) = loader.supported(deadline) {
+            return self.terminal(
+                &op,
+                format!("IMAGE_STORE_UNSUPPORTED: {}", failure_text(&e)),
+            );
+        }
+        if let Err(e) = self.verifier.verify_current(deadline, admission) {
+            return self.terminal(&op, format!("VERIFY_FAILED: {}", failure_text(&e)));
+        }
+        let Some(importer) = &self.release_importer else {
+            return self.terminal(&op, "RELEASE_IMPORT_UNCONFIGURED".to_owned());
+        };
+        let evidence =
+            match importer.import_release(deadline, dir, &self.build_dir.join(&op.operation_id)) {
+                Ok(ev) => ev,
+                Err(e) => return self.terminal(&op, map_release_error(&e)),
+            };
+        // The adapter verified; the staging seam re-validates anyway,
+        // exactly as the build path's candidate-staged checkpoint does.
+        if let Err(e) = evidence.comparison.validate() {
+            return self.terminal(&op, format!("STAGE_FAILED: {}", failure_text(&e)));
+        }
+        if let Err(e) =
+            validate_attestation_facts(&evidence.facts, &evidence.comparison.index_digest)
+        {
+            return self.terminal(&op, format!("STAGE_FAILED: {}", failure_text(&e)));
+        }
+        op.acquired = 1;
+        let prepared = match prepared_dependency_set(
+            &self.lock,
+            selector,
+            &evidence.inventory,
+            &evidence.comparison,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return self.terminal(&op, format!("PROMOTION_REJECTED: {}", failure_text(&e)));
+            }
+        };
+        let envelopes = REQUIRED_ATTESTATION_PREDICATES
+            .iter()
+            .map(|predicate| StoredEnvelope {
+                predicate: *predicate,
+                envelope: evidence
+                    .envelopes
+                    .get(predicate)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let staged = match self.candidates.stage(
+            deadline,
+            &Candidate {
+                operation_id: op.operation_id.clone(),
+                selector: selector.to_owned(),
+                phase: Some(PreparePhase::Staging),
+                dependency_set: prepared,
+                comparison: evidence.comparison.clone(),
+                attestations: evidence.facts.clone(),
+                source: ManifestSource::Release,
+                envelopes,
+                ..Candidate::default()
+            },
+        ) {
+            Ok(c) => c,
+            Err(e) => return self.terminal(&op, format!("STAGE_FAILED: {}", failure_text(&e))),
+        };
+        op.receipt_id = staged.id;
+        let binding = match self.promotion_binding(deadline, &op) {
+            Ok(b) => b,
+            Err(e) => {
+                return self.terminal(&op, format!("PROMOTION_REJECTED: {}", failure_text(&e)));
+            }
+        };
+        let receipt = match self.candidates.recover(deadline, &op.receipt_id, &binding) {
+            Ok(r) => r,
+            Err(e) => return self.terminal(&op, format!("SWITCH_FAILED: {}", failure_text(&e))),
+        };
+        if let Err(e) = receipt.validate_b03() {
+            return self.terminal(
+                &op,
+                format!("SWITCH_REINSPECTION_FAILED: {}", failure_text(&e)),
+            );
+        }
+        op.receipt_id = receipt.id;
+        op.phase = PrepareOperationPhase::Completed;
+        "completed".clone_into(&mut op.reason);
+        if let Err(e) = self.journal.record(&op) {
+            return self.terminal(&op, format!("RECORD_FAILED: {}", failure_text(&e)));
+        }
+        let mut r = result_from_op(&op);
+        r.exit_code = 0;
+        r.phase = PreparePhase::Ready;
+        r.elapsed_ms = i64::try_from((self.now() - start).whole_milliseconds()).unwrap_or(i64::MAX);
+        r.counters.bytes_read = evidence.staged_bytes;
+        with_safe_next_action(r)
     }
 
     /// `Resume` — settles an exact journalled operation. The ID is a trust
@@ -1864,5 +2020,168 @@ mod tests {
         let events = sink.0.lock().expect("sink");
         assert!(!events.is_empty() && events.len() <= MAX_PROGRESS_EVENTS);
         assert_eq!(events.last().expect("last").phase, PreparePhase::Ready);
+    }
+
+    struct FakeImporter {
+        outcome: Result<(), &'static str>,
+    }
+
+    impl ReleaseImporter for FakeImporter {
+        fn import_release(
+            &self,
+            _: OpDeadline,
+            _: &std::path::Path,
+            _: &std::path::Path,
+        ) -> Result<central_infra::prepare::ReleaseEvidence, Failure> {
+            if let Err(code) = self.outcome {
+                return Err(Failure::invalid(code, "bad release"));
+            }
+            let inventory = built();
+            let comparison = Comparator.compare(&inventory, &inventory).expect("cmp");
+            let facts: Vec<_> = REQUIRED_ATTESTATION_PREDICATES
+                .iter()
+                .map(|p| AttestationFact {
+                    predicate: *p,
+                    schema: central_infra::domain::ATTESTATION_SCHEMA.to_owned(),
+                    key_id: "k1".to_owned(),
+                    envelope_digest: digest('e'),
+                    subject_digest: inventory.index_digest.clone(),
+                })
+                .collect();
+            Ok(central_infra::prepare::ReleaseEvidence {
+                subject: subject_from_inventory("minio", &inventory),
+                facts,
+                inventory,
+                comparison,
+                minio_tar: "/x/minio.tar".to_owned(),
+                infra_tar: "/x/infra.tar".to_owned(),
+                envelopes: REQUIRED_ATTESTATION_PREDICATES
+                    .iter()
+                    .map(|p| (*p, b"{}".to_vec()))
+                    .collect(),
+                staged_bytes: 4096,
+            })
+        }
+    }
+
+    fn with_importer(f: &mut Fixture, outcome: Result<(), &'static str>) {
+        f.state.release_importer = Some(Arc::new(FakeImporter { outcome }));
+    }
+
+    #[test]
+    fn release_import_stages_a_release_candidate_and_switches_without_building() {
+        let mut f = fixture(&Opts::default());
+        with_importer(&mut f, Ok(()));
+        let r =
+            f.state
+                .prepare_one_from_release(&admission(), "minio", std::path::Path::new("/rel"));
+        assert_eq!(r.exit_code, 0, "{}", r.reason);
+        assert_eq!(r.phase, PreparePhase::Ready);
+        assert_eq!((r.acquired, r.reused), (1, 0));
+        assert_eq!(r.counters.bytes_read, 4096);
+        assert_eq!(
+            f.builds.calls.load(Ordering::SeqCst),
+            0,
+            "import never builds"
+        );
+        assert_eq!(events(&f), ["docker:info", "stage", "recover:cand-1"]);
+        let op = f.journal.exact(&r.operation_id).expect("record");
+        assert!(r.operation_id.starts_with("import-"));
+        assert_eq!(op.phase, PrepareOperationPhase::Completed);
+    }
+
+    #[test]
+    fn release_import_refuses_before_any_side_effect() {
+        let mut f = fixture(&Opts::default());
+        with_importer(&mut f, Ok(()));
+        let r = f.state.prepare_one_from_release(
+            &admission(),
+            "postgresql",
+            std::path::Path::new("/rel"),
+        );
+        assert!(
+            r.reason.starts_with("SELECTOR_RELEASE_UNIMPLEMENTED"),
+            "{}",
+            r.reason
+        );
+
+        let f = fixture(&Opts::default());
+        let r =
+            f.state
+                .prepare_one_from_release(&admission(), "minio", std::path::Path::new("/rel"));
+        assert!(
+            r.reason.starts_with("RELEASE_IMPORT_UNCONFIGURED"),
+            "{}",
+            r.reason
+        );
+
+        for (opts, want) in [
+            (
+                Opts {
+                    capacity_denied: true,
+                    ..Opts::default()
+                },
+                "CAPACITY_UNAVAILABLE",
+            ),
+            (
+                Opts {
+                    no_loader: true,
+                    ..Opts::default()
+                },
+                "LOAD_UNCONFIGURED",
+            ),
+            (
+                Opts {
+                    classic_store: true,
+                    ..Opts::default()
+                },
+                "IMAGE_STORE_UNSUPPORTED",
+            ),
+            (
+                Opts {
+                    verifier_fail_from: Some(1),
+                    ..Opts::default()
+                },
+                "VERIFY_FAILED",
+            ),
+        ] {
+            let mut f = fixture(&opts);
+            with_importer(&mut f, Ok(()));
+            let r = f.state.prepare_one_from_release(
+                &admission(),
+                "minio",
+                std::path::Path::new("/rel"),
+            );
+            assert!(r.reason.starts_with(want), "{want}: {}", r.reason);
+            assert!(!events(&f).iter().any(|e| e == "stage"));
+        }
+    }
+
+    #[test]
+    fn release_import_failures_are_named_by_their_release_sentinel() {
+        for (code, label) in [
+            (prepare_codes::RELEASE_UNREADABLE, "RELEASE_UNREADABLE"),
+            (prepare_codes::RELEASE_INVALID, "RELEASE_INVALID"),
+            (
+                prepare_codes::RELEASE_LOCK_MISMATCH,
+                "RELEASE_LOCK_MISMATCH",
+            ),
+            (prepare_codes::RELEASE_UNTRUSTED, "RELEASE_UNTRUSTED"),
+            ("IMAGE_LOAD", "LOAD_FAILED"),
+        ] {
+            let mut f = fixture(&Opts::default());
+            with_importer(&mut f, Err(code));
+            let r = f.state.prepare_one_from_release(
+                &admission(),
+                "minio",
+                std::path::Path::new("/rel"),
+            );
+            assert!(
+                r.reason.starts_with(&format!("{label}: ")),
+                "{label}: {}",
+                r.reason
+            );
+            assert!(!events(&f).iter().any(|e| e == "stage"));
+        }
     }
 }

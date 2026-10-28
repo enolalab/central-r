@@ -103,6 +103,39 @@ struct Envelope {
     signatures: Vec<SigBlock>,
 }
 
+/// `parseUnverifiedStatement` — parses an envelope's statement WITHOUT
+/// checking its signature. Release verification needs the unverified
+/// envelope prefix to overlay the producer-local materials into the
+/// expectation [`AttestationVerifier::verify`] then checks. The returned
+/// statement is untrusted input until `verify` admits it.
+///
+/// # Errors
+/// `ATTESTATION_INVALID` for an empty, misshapen or wrong-typed envelope.
+pub fn parse_unverified_statement(raw: &[u8]) -> Result<AttestationStatement, Failure> {
+    if raw.is_empty() {
+        return Err(invalid("dependencyprepare: attestation payload is empty"));
+    }
+    let envelope = parse_envelope(raw).map_err(|e| {
+        invalid(format!(
+            "dependencyprepare: invalid attestation: attestation envelope: {e}"
+        ))
+    })?;
+    if envelope.payload_type != ATTESTATION_PAYLOAD_TYPE {
+        return Err(invalid(format!(
+            "dependencyprepare: invalid attestation: payload type {:?} != {:?}",
+            envelope.payload_type, ATTESTATION_PAYLOAD_TYPE
+        )));
+    }
+    let payload = b64_decode(&envelope.payload).ok_or_else(|| {
+        invalid("dependencyprepare: invalid attestation: decode payload: illegal base64 data")
+    })?;
+    serde_json::from_slice(&payload).map_err(|e| {
+        invalid(format!(
+            "dependencyprepare: invalid attestation: invalid payload JSON: {e}"
+        ))
+    })
+}
+
 fn parse_envelope(raw: &[u8]) -> Result<Envelope, String> {
     let envelope: Envelope =
         serde_json::from_slice(raw).map_err(|e| format!("invalid JSON: {e}"))?;
