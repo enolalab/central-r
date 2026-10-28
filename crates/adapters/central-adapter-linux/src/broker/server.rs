@@ -167,6 +167,16 @@ struct AdvisoryEvaluationAppendResult {
 /// `time.Time.UnmarshalJSON` does, and a mistyped scalar denies too.
 /// The decoded value is discarded; the check only proves the blob is
 /// a JSON object in the evidence vocabulary, never its semantics.
+///
+/// Residual serde-vs-Go divergences accepted as edge gaps: duplicate
+/// keys deny (Go last-wins), field names match case-sensitively (Go
+/// also accepts case variants for known fields), and the RFC 3339
+/// dialect is `time`-crate strict (Go tolerates a few more spellings
+/// and one fewer — single-digit fields, comma fraction, `+24:00`,
+/// space separator, lowercase `z`, leap `:60`). None lets a
+/// hand-crafted record past the allowlisted vocabulary in a way
+/// upstream would deny: every divergence is one of strictness or a
+/// spelling Go's own marshal never emits.
 #[derive(serde::Deserialize)]
 #[allow(dead_code)]
 struct AdvisoryEvaluationEvidenceShape {
@@ -191,7 +201,25 @@ struct AdvisoryEvaluationEvidenceShape {
     #[serde(default)]
     time_witness_state: Option<String>,
     #[serde(default)]
-    host_facts: Option<central_infra::authority::AdvisoryHostFacts>,
+    host_facts: Option<AdvisoryEvaluationHostFactsShape>,
+}
+
+/// `authority.AdvisoryHostFacts` under the same Go `json.Unmarshal`
+/// rules — every field optional so `{"os_release":null}` is a no-op
+/// exactly as upstream, while a mistyped scalar still denies.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct AdvisoryEvaluationHostFactsShape {
+    #[serde(default)]
+    os_release: Option<String>,
+    #[serde(default)]
+    kernel: Option<String>,
+    #[serde(default)]
+    docker: Option<String>,
+    #[serde(default)]
+    compose: Option<String>,
+    #[serde(default)]
+    psql: Option<String>,
 }
 
 /// `time.Time.UnmarshalJSON` semantics: `null` is a no-op, a present
@@ -764,6 +792,14 @@ impl Service {
         let Some(raw) = payload.get("request") else {
             return denied("missing request field");
         };
+        // `json.Unmarshal` refuses a non-object request — serde's
+        // derived `visit_seq` would happily take `[{…}]` or `[]`, so
+        // the shape is pinned first; `null` still reaches the
+        // no-op arm below exactly as upstream.
+        let trimmed_req = raw.get().trim();
+        if !trimmed_req.starts_with('{') && trimmed_req != "null" {
+            return denied("invalid request");
+        }
         let wire_req =
             match serde_json::from_str::<Option<AdvisoryEvaluationAppendRequest>>(raw.get()) {
                 Ok(Some(w)) => w,
@@ -3157,6 +3193,10 @@ mod tests {
             (Some(BTreeMap::new()), "missing request field"),
             (request_raw("null"), "invalid evidence size"),
             (request_raw("42"), "invalid request"),
+            // serde's derived `visit_seq` would take these — upstream
+            // refuses a non-object request outright.
+            (request_raw("[{\"evidence\":{}}]"), "invalid request"),
+            (request_raw("[]"), "invalid request"),
             (request_raw("{}"), "invalid evidence size"),
             (request_raw("{\"evidence\": null}"), "invalid evidence size"),
             // `" "` keeps its quotes on the raw bytes — `trim` sees a
@@ -3219,11 +3259,14 @@ mod tests {
         )));
         let purpose = "append_advisory_evaluation";
         // Every object upstream accepts — `{}` and partial records —
-        // commits; the journal stores them verbatim.
+        // commits; the journal stores them verbatim. `null` fields are
+        // Go `json.Unmarshal` no-ops, nested included.
         for evidence in [
             "{}",
             "{\"state\":\"current\"}",
             "{\"generation_id\":null,\"extra\":1}",
+            "{\"evaluation_time\":null}",
+            "{\"host_facts\":{\"os_release\":null}}",
         ] {
             let resp = svc.dispatch_append_advisory_evaluation(&request(
                 purpose,
