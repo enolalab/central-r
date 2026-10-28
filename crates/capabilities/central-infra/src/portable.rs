@@ -10,8 +10,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier as _, VerifyingKey};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 // ---------------------------------------------------------------------------
 // Reason vocabulary — upstream `internal/portable/bundle.go` constants.
@@ -293,8 +293,7 @@ pub fn verify_bx1_token(
     if public.len() != 32 {
         return Err(TokenError::Invalid("public key"));
     }
-    let signature =
-        hex_decode(&token.signature_hex).ok_or(TokenError::Invalid("signature"))?;
+    let signature = hex_decode(&token.signature_hex).ok_or(TokenError::Invalid("signature"))?;
     if signature.len() != 64 {
         return Err(TokenError::Invalid("signature"));
     }
@@ -309,8 +308,7 @@ pub fn verify_bx1_token(
     pk.copy_from_slice(&public);
     let mut sig = [0u8; 64];
     sig.copy_from_slice(&signature);
-    let verifying =
-        VerifyingKey::from_bytes(&pk).map_err(|_| TokenError::Invalid("public key"))?;
+    let verifying = VerifyingKey::from_bytes(&pk).map_err(|_| TokenError::Invalid("public key"))?;
     let signature = Signature::from_bytes(&sig);
     verifying
         .verify(&canonical, &signature)
@@ -585,8 +583,13 @@ mod tests {
         let token = issued();
         let bundle_sha = hex_encode(&[0xaa; 32]);
         let trust = token.public_key_hex.clone();
-        verify_bx1_token(&token, &trust, &bundle_sha, datetime!(2025-01-03 00:00:00 UTC))
-            .unwrap_or_else(|e| panic!("verify: {e:?}"));
+        verify_bx1_token(
+            &token,
+            &trust,
+            &bundle_sha,
+            datetime!(2025-01-03 00:00:00 UTC),
+        )
+        .unwrap_or_else(|e| panic!("verify: {e:?}"));
     }
 
     #[test]
@@ -603,7 +606,12 @@ mod tests {
         );
         // Expired → Expired (after pin/signature structural checks).
         assert_eq!(
-            verify_bx1_token(&token, &trust, &bundle_sha, datetime!(2025-02-02 03:04:05 UTC)),
+            verify_bx1_token(
+                &token,
+                &trust,
+                &bundle_sha,
+                datetime!(2025-02-02 03:04:05 UTC)
+            ),
             Err(TokenError::Expired)
         );
         // Tampered unsigned field → signature mismatch.
@@ -617,8 +625,11 @@ mod tests {
         // still a signature mismatch under the pinned key.
         bad = token.clone();
         let other = SigningKey::from_bytes(&[8u8; 32]);
-        bad.signature_hex =
-            hex_encode(&other.sign(&bad.unsigned_canonical().unwrap_or_default()).to_bytes());
+        bad.signature_hex = hex_encode(
+            &other
+                .sign(&bad.unsigned_canonical().unwrap_or_default())
+                .to_bytes(),
+        );
         assert_eq!(
             verify_bx1_token(&bad, &trust, &bundle_sha, now),
             Err(TokenError::Invalid("signature mismatch"))
@@ -656,7 +667,10 @@ mod tests {
         assert_eq!(hex_decode("abc"), None);
         assert_eq!(hex_decode("zz"), None);
         let raw = b"hello, bx1";
-        assert_eq!(b64_url_raw_decode(&b64_url_raw_encode(raw)).as_deref(), Some(&raw[..]));
+        assert_eq!(
+            b64_url_raw_decode(&b64_url_raw_encode(raw)).as_deref(),
+            Some(&raw[..])
+        );
         // RawURLEncoding: no padding; `-`/`_` alphabet only.
         let enc = b64_url_raw_encode(&[0xfb, 0xff, 0xfe]);
         assert_eq!(enc, "-__-");
@@ -667,8 +681,12 @@ mod tests {
 
     #[test]
     fn rfc3339_nano_trims_zero_fraction() {
-        assert_eq!(format_rfc3339_nano(datetime!(2025-01-02 03:04:05 UTC)), "2025-01-02T03:04:05Z");
-        let t = parse_rfc3339("2025-01-02T03:04:05.123456789Z").unwrap_or_else(OffsetDateTime::now_utc);
+        assert_eq!(
+            format_rfc3339_nano(datetime!(2025-01-02 03:04:05 UTC)),
+            "2025-01-02T03:04:05Z"
+        );
+        let t =
+            parse_rfc3339("2025-01-02T03:04:05.123456789Z").unwrap_or_else(OffsetDateTime::now_utc);
         assert_eq!(format_rfc3339_nano(t), "2025-01-02T03:04:05.123456789Z");
         assert!(parse_rfc3339("not a time").is_none());
     }

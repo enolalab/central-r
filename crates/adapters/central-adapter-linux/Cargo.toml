@@ -49,6 +49,11 @@ rand.workspace = true
 rcgen.workspace = true
 x509-parser.workspace = true
 rustls-pki-types.workspace = true
+# Portable-export additions (R6 task 12): `aes-gcm` is the bx1 bundle's
+# authenticated cipher (upstream internal/portable/bundle.go —
+# AES-256-GCM segment framing). Pinned exact in
+# `[workspace.dependencies]` and consumed only here.
+aes-gcm.workspace = true
 # Dependency-prepare additions (R5 task 11): verified source-archive
 # extraction and release-tar staging. `flate2` keeps its default
 # `miniz_oxide` backend; both are pinned exact in

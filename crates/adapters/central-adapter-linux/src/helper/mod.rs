@@ -23,6 +23,7 @@ pub(crate) mod minio_provision;
 pub mod pam_ceremony;
 pub(crate) mod pg_credentials;
 pub(crate) mod pg_wire;
+pub mod portable;
 pub mod prepare;
 pub mod protocol;
 pub mod prune;
