@@ -27,7 +27,9 @@ use central_infra::authority::{
     LifecycleAuthorizationRequest,
 };
 use central_infra::domain::B04LifecycleEvidence;
-use central_infra::port::{BootstrapHandoff, DeadOwnerProof, MountProof};
+use central_infra::port::{
+    B04Bootstrap, BootstrapHandoff, DeadOwnerProof, DeadOwnerVerifier, MountProof,
+};
 
 use super::protocol;
 
@@ -494,6 +496,42 @@ impl crate::helper::pg_credentials::PostgresServiceRoleBroker for LifecycleClien
     }
 }
 
+/// `port.DeadOwnerVerifier` — the lifecycle lock takeover's
+/// broker-proof seam (upstream `NewProductionService`'s
+/// `cfg.OwnerVerifier`): the synchronous RPC completes inline inside
+/// the port's async shape, the same bridge `FileBootstrap`'s own
+/// port impls use.
+impl DeadOwnerVerifier for LifecycleClient {
+    async fn verify_dead_owner(
+        &self,
+        lock_id: &str,
+        owner_pid: i32,
+    ) -> Result<DeadOwnerProof, Failure> {
+        LifecycleClient::verify_dead_owner(self, lock_id, owner_pid)
+    }
+}
+
+/// `port.B04Bootstrap` — the typed B04 authority
+/// (`cfg.B04Bootstrap`): adoption, the descriptor-only materialize
+/// transport, and the SC-DEF-12 proof issuance. Same async-bridge
+/// pattern as [`Self::verify_dead_owner`].
+impl B04Bootstrap for LifecycleClient {
+    async fn adopt_b03_minio(&self, evidence: B04LifecycleEvidence) -> Result<(), Failure> {
+        LifecycleClient::adopt_b03_minio(self, &evidence)
+    }
+
+    async fn materialize_minio_root(
+        &self,
+        handoff: BootstrapHandoff,
+    ) -> Result<MountProof, Failure> {
+        LifecycleClient::materialize_minio_root(self, &handoff)
+    }
+
+    async fn issue_lifecycle_proof(&self, evidence: B04LifecycleEvidence) -> Result<(), Failure> {
+        LifecycleClient::issue_lifecycle_proof(self, &evidence)
+    }
+}
+
 /// `json.NewDecoder(conn).Decode(&response)` — one JSON line off the
 /// wire.
 fn read_response_line(conn: &mut UnixStream) -> Result<BrokerResponse, Failure> {
@@ -535,5 +573,18 @@ mod tests {
                 "value": "cGFzc2ZpbGU",
             })
         );
+    }
+
+    /// `LifecycleClient` satisfies the lifecycle authority ports the
+    /// production composition injects — upstream `cfg.OwnerVerifier`
+    /// and `cfg.B04Bootstrap` — including through the shared `Arc`
+    /// the service/topology composition shares. (The methods
+    /// themselves dial the protected socket; the delegation is the
+    /// typed seam these bounds pin.)
+    #[test]
+    fn lifecycle_client_satisfies_lifecycle_authority_ports() {
+        fn assert_ports<T: DeadOwnerVerifier + B04Bootstrap>() {}
+        assert_ports::<LifecycleClient>();
+        assert_ports::<std::sync::Arc<LifecycleClient>>();
     }
 }

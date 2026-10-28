@@ -2843,62 +2843,110 @@ impl<B: B04Bootstrap> B04Bootstrap for FileBootstrap<B> {
     }
 }
 
-/// `SharedBootstrap` — the one composed bootstrap shared between the
-/// lifecycle service and the topology (a local newtype over the shared
-/// `Arc`, so the foreign port traits can be implemented for it).
-pub struct SharedBootstrap<B>(pub Arc<FileBootstrap<B>>);
+/// `ProductionBootstrap` — the one composed bootstrap the lifecycle
+/// service and its topology share (upstream `NewProductionService`'s
+/// `bootstrap` local): either the injected composition-root
+/// decorator `D` (upstream's `cfg.Bootstrap`) or the broker-backed
+/// `FileBootstrap` default built over `cfg.B04Bootstrap` (upstream's
+/// nil branch). `D`'s bounds are upstream's
+/// `bootstrap.(port.B04Bootstrap)` interface assertion, discharged
+/// by the type system.
+///
+/// `D` is an `Arc<…>` handle in practice: the clone must stay cheap
+/// because the service and the topology share the one object exactly
+/// as upstream shares the pointer. (`LifecycleBootstrap`/`B04Bootstrap`
+/// are `trait_variant` async traits — not dyn-compatible — so the
+/// upstream interface-typed field is an enum here.)
+pub enum ProductionBootstrap<B, D> {
+    /// `NewFileBootstrap` — the default over the typed B04 authority.
+    Default(Arc<FileBootstrap<B>>),
+    /// `cfg.Bootstrap` — the injected composition-root decorator.
+    Injected(D),
+}
 
-impl<B: B04Bootstrap> SharedBootstrap<B> {
-    /// Wraps the shared bootstrap.
-    pub fn new(inner: Arc<FileBootstrap<B>>) -> Self {
-        Self(inner)
+impl<B, D: Clone> Clone for ProductionBootstrap<B, D> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Default(b) => Self::Default(b.clone()),
+            Self::Injected(d) => Self::Injected(d.clone()),
+        }
     }
 }
 
-impl<B: B04Bootstrap> LifecycleBootstrap for SharedBootstrap<B> {
+impl<B: B04Bootstrap, D: LifecycleBootstrap + B04Bootstrap> LifecycleBootstrap
+    for ProductionBootstrap<B, D>
+{
     async fn ensure(
         &self,
         binding: &LifecycleBinding,
         purpose: BootstrapPurpose,
     ) -> Result<BootstrapGeneration, Failure> {
-        self.0.ensure(binding, purpose).await
+        match self {
+            Self::Default(b) => b.ensure(binding, purpose).await,
+            Self::Injected(d) => d.ensure(binding, purpose).await,
+        }
     }
     async fn materialize(&self, handoff: BootstrapHandoff) -> Result<MountProof, Failure> {
-        self.0.materialize(handoff).await
+        match self {
+            Self::Default(b) => b.materialize(handoff).await,
+            Self::Injected(d) => d.materialize(handoff).await,
+        }
     }
     async fn cleanup(&self, proof: MountProof) -> Result<(), Failure> {
-        self.0.cleanup(proof).await
+        match self {
+            Self::Default(b) => b.cleanup(proof).await,
+            Self::Injected(d) => d.cleanup(proof).await,
+        }
     }
     async fn record_handoff(
         &self,
         binding: &LifecycleBinding,
         proof: &MountProof,
     ) -> Result<(), Failure> {
-        self.0.record_handoff(binding, proof).await
+        match self {
+            Self::Default(b) => b.record_handoff(binding, proof).await,
+            Self::Injected(d) => d.record_handoff(binding, proof).await,
+        }
     }
     async fn cleanup_binding(&self, binding: &LifecycleBinding) -> Result<(), Failure> {
-        self.0.cleanup_binding(binding).await
+        match self {
+            Self::Default(b) => b.cleanup_binding(binding).await,
+            Self::Injected(d) => d.cleanup_binding(binding).await,
+        }
     }
 }
 
-impl<B: B04Bootstrap> B04Bootstrap for SharedBootstrap<B> {
+/// The typed B04 authority delegates to whichever half is installed,
+/// matching upstream's interface assertion on the bootstrap.
+impl<B: B04Bootstrap, D: LifecycleBootstrap + B04Bootstrap> B04Bootstrap
+    for ProductionBootstrap<B, D>
+{
     async fn adopt_b03_minio(
         &self,
         evidence: central_infra::domain::B04LifecycleEvidence,
     ) -> Result<(), Failure> {
-        self.0.adopt_b03_minio(evidence).await
+        match self {
+            Self::Default(b) => b.adopt_b03_minio(evidence).await,
+            Self::Injected(d) => d.adopt_b03_minio(evidence).await,
+        }
     }
     async fn materialize_minio_root(
         &self,
         handoff: BootstrapHandoff,
     ) -> Result<MountProof, Failure> {
-        self.0.materialize_minio_root(handoff).await
+        match self {
+            Self::Default(b) => b.materialize_minio_root(handoff).await,
+            Self::Injected(d) => d.materialize_minio_root(handoff).await,
+        }
     }
     async fn issue_lifecycle_proof(
         &self,
         evidence: central_infra::domain::B04LifecycleEvidence,
     ) -> Result<(), Failure> {
-        self.0.issue_lifecycle_proof(evidence).await
+        match self {
+            Self::Default(b) => b.issue_lifecycle_proof(evidence).await,
+            Self::Injected(d) => d.issue_lifecycle_proof(evidence).await,
+        }
     }
 }
 
@@ -2917,7 +2965,10 @@ impl LifecycleClock for SystemClock {
 
 /// `ProductionServiceConfig` — already-authorized B01/B02 authorities
 /// from the composition root (upstream `ProductionServiceConfig`).
-pub struct ProductionServiceConfig<B, V> {
+/// `D` is the optional bootstrap decorator (upstream `cfg.Bootstrap`);
+/// it defaults to [`NoInjectedBootstrap`] for a composition with no
+/// decorator.
+pub struct ProductionServiceConfig<B, V, D = NoInjectedBootstrap> {
     /// B01 evaluator.
     pub evaluator: Arc<dyn AdvisoryEvaluator>,
     /// B02 active-receipt reader.
@@ -2938,19 +2989,84 @@ pub struct ProductionServiceConfig<B, V> {
     pub clock: Arc<dyn LifecycleClock>,
     /// Broker dead-owner verification for lock takeover.
     pub owner_verifier: V,
+    /// `Bootstrap` — the composition root's optional bootstrap
+    /// injection (upstream `cfg.Bootstrap port.Bootstrap`), e.g. the
+    /// postgres first-boot decorator as `Arc<PostgresFirstBootBootstrap>`.
+    /// `None` installs the broker-backed `FileBootstrap` default built
+    /// over `b04_bootstrap`; `D`'s `LifecycleBootstrap + B04Bootstrap`
+    /// bound is upstream's `bootstrap.(port.B04Bootstrap)` assertion
+    /// discharged at compile time.
+    pub bootstrap: Option<D>,
     /// The typed B04 broker authority (carries the credential ceremony:
-    /// sealed `memfd` over `SCM_RIGHTS` through the broker custody path).
+    /// sealed `memfd` over `SCM_RIGHTS` through the broker custody
+    /// path). Required even when `bootstrap` is injected — matching
+    /// upstream's composition refusal — though it only backs the
+    /// `FileBootstrap` default built when `bootstrap` is `None`.
     pub b04_bootstrap: B,
     /// Broker rendezvous for the minio-provision socket.
     pub rendezvous: Arc<dyn BrokerRendezvous>,
 }
 
+/// `NoInjectedBootstrap` — the default `D` for a composition with no
+/// injected bootstrap decorator: uninhabited, so `bootstrap` can only
+/// be `None` — which is exactly what selects the `FileBootstrap`
+/// default.
+#[derive(Debug, Clone)]
+pub enum NoInjectedBootstrap {}
+
+impl LifecycleBootstrap for NoInjectedBootstrap {
+    async fn ensure(
+        &self,
+        _binding: &LifecycleBinding,
+        _purpose: BootstrapPurpose,
+    ) -> Result<BootstrapGeneration, Failure> {
+        match *self {}
+    }
+    async fn materialize(&self, _handoff: BootstrapHandoff) -> Result<MountProof, Failure> {
+        match *self {}
+    }
+    async fn cleanup(&self, _proof: MountProof) -> Result<(), Failure> {
+        match *self {}
+    }
+    async fn record_handoff(
+        &self,
+        _binding: &LifecycleBinding,
+        _proof: &MountProof,
+    ) -> Result<(), Failure> {
+        match *self {}
+    }
+    async fn cleanup_binding(&self, _binding: &LifecycleBinding) -> Result<(), Failure> {
+        match *self {}
+    }
+}
+
+impl B04Bootstrap for NoInjectedBootstrap {
+    async fn adopt_b03_minio(
+        &self,
+        _evidence: central_infra::domain::B04LifecycleEvidence,
+    ) -> Result<(), Failure> {
+        match *self {}
+    }
+    async fn materialize_minio_root(
+        &self,
+        _handoff: BootstrapHandoff,
+    ) -> Result<MountProof, Failure> {
+        match *self {}
+    }
+    async fn issue_lifecycle_proof(
+        &self,
+        _evidence: central_infra::domain::B04LifecycleEvidence,
+    ) -> Result<(), Failure> {
+        match *self {}
+    }
+}
+
 /// The composed production service type.
-pub type ProductionService<B, V> = LifecycleService<
+pub type ProductionService<B, V, D> = LifecycleService<
     Arc<ReceiptAdmission>,
-    Arc<FileBootstrap<B>>,
+    ProductionBootstrap<B, D>,
     Arc<FileJournal>,
-    Arc<Topology<SharedBootstrap<B>>>,
+    Arc<Topology<ProductionBootstrap<B, D>>>,
     Arc<FilesystemCapacity>,
     Arc<FileBarrier>,
     Arc<FileLocker<V>>,
@@ -2959,9 +3075,14 @@ pub type ProductionService<B, V> = LifecycleService<
 
 /// `NewProductionService` — composes the concrete B03 adapters the
 /// domain `LifecycleService` requires; refuses absent authorities.
-pub fn new_production_service<B: B04Bootstrap, V: DeadOwnerVerifier>(
-    cfg: ProductionServiceConfig<B, V>,
-) -> Result<ProductionService<B, V>, Failure> {
+pub fn new_production_service<B, V, D>(
+    cfg: ProductionServiceConfig<B, V, D>,
+) -> Result<ProductionService<B, V, D>, Failure>
+where
+    B: B04Bootstrap,
+    V: DeadOwnerVerifier,
+    D: LifecycleBootstrap + B04Bootstrap + Clone,
+{
     if cfg.journal_root.as_os_str().is_empty()
         || cfg.runtime_root.as_os_str().is_empty()
         || cfg.capacity_root.as_os_str().is_empty()
@@ -2977,18 +3098,25 @@ pub fn new_production_service<B: B04Bootstrap, V: DeadOwnerVerifier>(
         cfg.journal_root.clone(),
         cfg.clock.clone(),
     )?);
-    let bootstrap = Arc::new(FileBootstrap::new(
-        cfg.journal_root.join("bootstrap"),
-        cfg.clock.clone(),
-        cfg.b04_bootstrap,
-    ));
+    // `bootstrap := cfg.Bootstrap; if bootstrap == nil { NewFileBootstrap(...) }`
+    // — upstream's injected-bootstrap defaulting; the `Injected` half's
+    // `D` bounds are upstream's `bootstrap.(port.B04Bootstrap)`
+    // assertion discharged by the type system.
+    let bootstrap = match cfg.bootstrap {
+        Some(d) => ProductionBootstrap::Injected(d),
+        None => ProductionBootstrap::Default(Arc::new(FileBootstrap::new(
+            cfg.journal_root.join("bootstrap"),
+            cfg.clock.clone(),
+            cfg.b04_bootstrap,
+        ))),
+    };
     let topology = Arc::new(
         Topology::new(
             cfg.runner,
             cfg.receipts.clone(),
             policy,
             cfg.runtime_root,
-            SharedBootstrap::new(bootstrap.clone()),
+            bootstrap.clone(),
         )
         .with_broker_rendezvous(cfg.rendezvous),
     );
@@ -4319,5 +4447,99 @@ mod tests {
         let dir = runtime.join("inst-1");
         assert_eq!(mode_of(&dir), 0o700);
         assert_eq!(mode_of(&dir.join("docker-compose.yaml")), 0o600);
+    }
+
+    // -- ProductionServiceConfig bootstrap injection -------------------------
+
+    /// B01 evaluator stand-in — construction never calls `evaluate`.
+    struct FakeEvaluator;
+    impl AdvisoryEvaluator for FakeEvaluator {
+        fn evaluate(&self) -> Result<(advisory::Outcome, advisory::Admission), Failure> {
+            Err(Failure::internal("test", "evaluator unwired"))
+        }
+    }
+
+    /// OCI re-inspector stand-in.
+    struct FakeInspector;
+    impl ReceiptInspector for FakeInspector {
+        fn inspect_set(&self, _set: &PreparedDependencySet) -> Result<(), Failure> {
+            Ok(())
+        }
+    }
+
+    /// Broker rendezvous stand-in.
+    struct FakeRendezvous;
+    impl BrokerRendezvous for FakeRendezvous {
+        fn ensure_minio_provision_rendezvous(&self, _instance_id: &str) -> Result<(), Failure> {
+            Ok(())
+        }
+    }
+
+    fn production_config(
+        root: &Path,
+        bootstrap: Option<Arc<RecordingBootstrap>>,
+    ) -> ProductionServiceConfig<ScriptedB04, NoDeadOwner, Arc<RecordingBootstrap>> {
+        ProductionServiceConfig {
+            evaluator: Arc::new(FakeEvaluator),
+            receipts: Arc::new(StaticReceipts {
+                receipt: DependencyReceipt::default(),
+            }),
+            inspector: Arc::new(FakeInspector),
+            runner: Arc::new(CapturingRunner {
+                run_calls: Mutex::new(Vec::new()),
+                exit_code: 0,
+            }),
+            journal_root: root.join("journal"),
+            runtime_root: root.join("runtime"),
+            capacity_root: root.join("capacity"),
+            lock_lifetime: None,
+            clock: Arc::new(TestClock),
+            owner_verifier: NoDeadOwner,
+            bootstrap,
+            b04_bootstrap: ScriptedB04 {
+                proof: MountProof::default(),
+            },
+            rendezvous: Arc::new(FakeRendezvous),
+        }
+    }
+
+    /// `cfg.Bootstrap != nil` — the injected object is the service's
+    /// bootstrap (upstream's non-nil branch), shared with the
+    /// topology, never wrapped in a `FileBootstrap` default.
+    #[test]
+    fn production_service_uses_injected_bootstrap() {
+        let root = tmpdir("prod-injected");
+        let injected = Arc::new(RecordingBootstrap {
+            cleaned: AtomicU32::new(0),
+        });
+        let service =
+            new_production_service(production_config(&root, Some(injected.clone()))).unwrap();
+        let ProductionBootstrap::Injected(d) = &service.bootstrap else {
+            unreachable!("expected the injected bootstrap, got the FileBootstrap default")
+        };
+        assert!(Arc::ptr_eq(d, &injected));
+    }
+
+    /// `cfg.Bootstrap == nil` — the broker-backed `FileBootstrap`
+    /// default is built over `cfg.B04Bootstrap` (upstream's nil
+    /// branch), proven by a live `ensure` writing the durable
+    /// generation file under the journal root.
+    #[test]
+    fn production_service_defaults_to_file_bootstrap() {
+        let root = tmpdir("prod-default");
+        let cfg = ProductionServiceConfig {
+            bootstrap: None,
+            ..production_config(&root, None)
+        };
+        let service = new_production_service(cfg).unwrap();
+        assert!(matches!(service.bootstrap, ProductionBootstrap::Default(_)));
+        let generation = block_on(
+            service
+                .bootstrap
+                .ensure(&binding(), BootstrapPurpose::FirstSetup),
+        )
+        .unwrap();
+        assert_eq!(generation.generation, 1);
+        assert!(generation.digest.starts_with("sha256:"));
     }
 }

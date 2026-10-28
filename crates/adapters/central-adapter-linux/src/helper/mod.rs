@@ -18,6 +18,7 @@ pub mod grant;
 pub mod import;
 pub mod init;
 pub mod lifecycle;
+pub(crate) mod lifecycle_compose;
 pub mod maintenance;
 pub mod matrix;
 pub mod migration;
