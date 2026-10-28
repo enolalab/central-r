@@ -349,6 +349,18 @@ pub(crate) fn validate_central_migration_passfile(value: &[u8]) -> Result<(), Fa
     validate_central_passfile_role(value, "central_migration")
 }
 
+/// `validateCentralOutboxPassfile` — mirrors
+/// [`validate_central_runtime_passfile`] but pins the `central_outbox`
+/// role, for the same reason [`validate_central_migration_passfile`]
+/// pins the migration role: shape equality alone must never let one
+/// service role's credential satisfy a check meant for another.
+///
+/// # Errors
+/// `recovery_journal_unavailable` on any malformed shape.
+pub(crate) fn validate_central_outbox_passfile(value: &[u8]) -> Result<(), Failure> {
+    validate_central_passfile_role(value, "central_outbox")
+}
+
 /// The shared five-field `hostname:port:database:username:password`
 /// passfile check both role pins delegate to.
 fn validate_central_passfile_role(value: &[u8], role: &str) -> Result<(), Failure> {
@@ -752,6 +764,24 @@ mod tests {
         );
         assert!(
             validate_central_migration_passfile(b"127.0.0.1:55432:central:central_runtime:pw\n")
+                .is_err()
+        );
+    }
+
+    /// `validateCentralOutboxPassfile` pins the outbox role — neither
+    /// sibling role's passfile may satisfy it.
+    #[test]
+    fn outbox_passfile_shape() {
+        assert!(
+            validate_central_outbox_passfile(b"127.0.0.1:55432:central:central_outbox:pw\n")
+                .is_ok()
+        );
+        assert!(
+            validate_central_outbox_passfile(b"127.0.0.1:55432:central:central_runtime:pw\n")
+                .is_err()
+        );
+        assert!(
+            validate_central_outbox_passfile(b"127.0.0.1:55432:central:central_migration:pw\n")
                 .is_err()
         );
     }

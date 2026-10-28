@@ -264,17 +264,17 @@ pub fn is_advisory_evaluation_authority_purpose(purpose: &str) -> bool {
 /// [`UNSUPPORTED_IN_THIS_SLICE`] rather than `"unknown purpose"`.
 /// Connection-only purposes with real `HandleConn` handlers (the
 /// backup/throughput/payload-epoch worker and helper sets,
-/// `restore_issue_launch`) are NOT here — upstream's `Dispatch`
+/// `restore_issue_launch`, `bind_postgres_service_role`,
+/// `append_advisory_evaluation`) are NOT here — upstream's `Dispatch`
 /// `default` answers `"unknown purpose"` for them, and the match arm
 /// owns every live dispatch.
 #[must_use]
-pub fn is_r6_purpose(purpose: &str) -> bool {
-    // `append_advisory_evaluation` is live now: `HandleConn` serves it
-    // behind the root-backup-helper peer gate, and upstream's
-    // `Dispatch` answers `"unknown purpose"` for it like every other
-    // connection-only purpose — so it no longer belongs to the closed
-    // R6 set.
-    is_postgres_service_role_authority_purpose(purpose)
+pub fn is_r6_purpose(_purpose: &str) -> bool {
+    // The set is empty: `bind_postgres_service_role`, the last member,
+    // is live now — `HandleConn` serves it behind the root-backup-
+    // helper peer gate exactly as upstream, and `Dispatch` answers
+    // `"unknown purpose"` like every other connection-only purpose.
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -921,11 +921,12 @@ mod tests {
         // in the closed table — everything else is either a live
         // `Dispatch` arm or a connection-only purpose upstream's
         // `default` answers `"unknown purpose"` for.
-        assert!(is_r6_purpose("bind_postgres_service_role"));
-        // `append_advisory_evaluation` is live — `HandleConn` serves it
-        // behind the root-backup-helper peer gate, and `Dispatch`'s
-        // `default` answers `"unknown purpose"`, like every other
-        // connection-only purpose.
+        // `bind_postgres_service_role` and `append_advisory_evaluation`
+        // are live — `HandleConn` serves them behind the root-backup-
+        // helper peer gate, and `Dispatch`'s `default` answers
+        // `"unknown purpose"`, like every other connection-only
+        // purpose. The closed set is empty.
+        assert!(!is_r6_purpose("bind_postgres_service_role"));
         assert!(!is_r6_purpose("append_advisory_evaluation"));
         for handled in [
             // Live RPCs and the purposes with a real Dispatch arm are

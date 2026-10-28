@@ -43,6 +43,10 @@ use crate::sys::peercred::{PeerCred, peercred};
 
 use super::backup_launch::BackupLaunchStore;
 use super::backup_throughput_launch::BackupThroughputLaunchStore;
+use super::backup_worker_credential::{
+    validate_central_migration_passfile, validate_central_outbox_passfile,
+    validate_central_runtime_passfile,
+};
 use super::bootstrap_session::{self, BootstrapSession};
 use super::handoff::{self, HandoffService};
 use super::journal::Journal;
@@ -136,6 +140,35 @@ fn marshal_result<T: serde::Serialize + ?Sized>(value: &T) -> Box<serde_json::va
 /// `advisory_evaluation_journal.go`), the same defense-in-depth every
 /// root-helper RPC applies.
 const MAX_ADVISORY_EVALUATION_EVIDENCE_BYTES: usize = 16 * 1024;
+
+/// `postgresServiceRoleBindTTL` — how long a rotated service-role
+/// binding's lease stays valid before the next rotate-then-sync cycle
+/// must renew it (upstream `24 * time.Hour`). The readers reject an
+/// expired lease outright — these are bound as genuine leases the
+/// syncer is expected to keep renewing, unlike `minio_root_v1`'s
+/// equality-forever binding.
+const POSTGRES_SERVICE_ROLE_BIND_TTL: time::Duration = time::Duration::hours(24);
+
+/// `postgresServiceRoleBindRequest` — the root helper's wire request.
+/// `value` carries the exact passfile bytes already ALTERed live on
+/// the server (`"127.0.0.1:55432:central:<role>:<password>\n"`),
+/// raw-std-base64-encoded so the JSON envelope never needs to escape
+/// colon/newline bytes. `Option` fields mirror Go `json.Unmarshal` on
+/// a `string` field: absent and `null` are both no-ops leaving the
+/// zero string, while a present mistyped field still denies.
+#[derive(Deserialize, Default)]
+struct PostgresServiceRoleBindRequest {
+    #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
+    purpose: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// The per-role passfile shape gate the bind arm selects —
+/// `validateCentral{Runtime,Migration,Outbox}Passfile`.
+type PassfileValidator = fn(&[u8]) -> Result<(), Failure>;
 
 /// `advisoryEvaluationAppendRequest` — `{"evidence": <raw json>}`.
 /// `default` maps an absent field to JSON `null`, matching the
@@ -843,6 +876,96 @@ impl Service {
                 }),
             ),
             Err(e) => denied(e.message()),
+        }
+    }
+
+    /// `dispatchBindPostgresServiceRole` — ADR 0019 §4's
+    /// rotate-then-sync write side: the root helper, having already
+    /// minted a value and ALTERed the live PostgreSQL role to accept
+    /// it, registers that exact value as the new active binding for
+    /// one of the three service-role purposes. It reuses the generic
+    /// protected bindings/leases store every `Materializable` purpose
+    /// reads through [`SecretBootstrap::active_binding_for_purpose`] —
+    /// unlike `minio_root_v1`, these roles need no bespoke
+    /// scope-matching store: the passfile bytes are the whole
+    /// credential. Every failure denies with a
+    /// `POSTGRES_SERVICE_ROLE_BIND_DENIED`-prefixed message.
+    fn dispatch_bind_postgres_service_role(&self, req: &BrokerRequest) -> BrokerResponse {
+        let denied = |message: &str| {
+            migration_denied(
+                &req.operation_id,
+                format!("POSTGRES_SERVICE_ROLE_BIND_DENIED: {message}"),
+            )
+        };
+        let Some(payload) = &req.payload else {
+            return denied("empty payload");
+        };
+        let Some(raw) = payload.get("request") else {
+            return denied("missing request field");
+        };
+        // `json.Unmarshal` refuses a non-object request — serde's
+        // derived `visit_seq` would happily take `[{…}]` or `[]`, so
+        // the shape is pinned first; `null` still reaches the no-op
+        // arm below exactly as upstream.
+        let trimmed_req = raw.get().trim();
+        if !trimmed_req.starts_with('{') && trimmed_req != "null" {
+            return denied("invalid request");
+        }
+        let wire_req =
+            match serde_json::from_str::<Option<PostgresServiceRoleBindRequest>>(raw.get()) {
+                Ok(Some(w)) => w,
+                // `json.Unmarshal` on a JSON `null` request is a no-op —
+                // the struct stays at its zero value, so the purpose
+                // check below reports the denial, exactly upstream.
+                Ok(None) => PostgresServiceRoleBindRequest::default(),
+                Err(_) => return denied("invalid request"),
+            };
+        let (purpose, validate): (Purpose, PassfileValidator) =
+            match wire_req.purpose.unwrap_or_default().as_str() {
+                "postgres_runtime_v1" => {
+                    (Purpose::PostgresRuntime, validate_central_runtime_passfile)
+                }
+                "postgres_migration_v1" => (
+                    Purpose::PostgresMigration,
+                    validate_central_migration_passfile,
+                ),
+                "postgres_outbox_v1" => (Purpose::PostgresOutbox, validate_central_outbox_passfile),
+                _ => return denied("unsupported purpose"),
+            };
+        // `decodeBase64Passfile` — `base64.RawStdEncoding`, strict and
+        // padding-free, exactly upstream.
+        let value = match super::wire::b64_raw_decode(&wire_req.value.unwrap_or_default()) {
+            // `defer zeroBytes(value)` — `Zeroizing` scrubs the decoded
+            // passfile on every return path below.
+            Some(v) => zeroize::Zeroizing::new(v),
+            None => return denied("invalid value encoding"),
+        };
+        if validate(&value).is_err() {
+            return denied("malformed value");
+        }
+        let instance_id = wire_req.instance_id.unwrap_or_default();
+        if instance_id.is_empty() {
+            return denied("unavailable");
+        }
+        let Some(bootstrap) = &self.bootstrap else {
+            return denied("unavailable");
+        };
+        match bootstrap.bind_materialized_secret(
+            purpose,
+            &instance_id,
+            &value,
+            POSTGRES_SERVICE_ROLE_BIND_TTL,
+        ) {
+            // `POSTGRES_SERVICE_ROLE_BIND_DENIED: {err}` — upstream
+            // forwards the store error; the passfile bytes never reach
+            // the message.
+            Err(e) => denied(e.message()),
+            Ok(_) => BrokerResponse {
+                operation_id: req.operation_id.clone(),
+                outcome: BrokerOutcome::Success,
+                result: None,
+                evidence: BrokerEvidence::default(),
+            },
         }
     }
 
@@ -2542,11 +2665,8 @@ fn dispatch_json(
                 "broker: denied postgres service role bind peer",
             ));
         }
-        protocol::write_deny(
-            conn,
-            &req.operation_id,
-            &format!("POSTGRES_SERVICE_ROLE_BIND_DENIED: {UNSUPPORTED_IN_THIS_SLICE}"),
-        );
+        let resp = svc.dispatch_bind_postgres_service_role(req);
+        let _ = protocol::write_response(conn, &resp);
         return Ok(());
     }
     if is_advisory_evaluation_authority_purpose(&req.purpose) {
@@ -2913,8 +3033,6 @@ mod tests {
             // Permanent denials.
             CREATE_PROTECTED_GENERATION_RPC,
             MATERIALIZE_DEPENDENCY_HANDOFF_RPC,
-            // The closed set — upstream RPCs this slice does not port.
-            "bind_postgres_service_role",
         ] {
             // Live purposes may succeed on an empty request (e.g.
             // `hmac_fingerprint` fingerprints empty domain+data) or
@@ -2949,10 +3067,12 @@ mod tests {
             BACKUP_THROUGHPUT_WORKER_TARGET_RPC,
             BACKUP_THROUGHPUT_WORKER_STAGE_RPC,
             MIGRATION_REPORT_OUTCOME_RPC,
-            // `append_advisory_evaluation` is connection-only upstream
-            // too — `HandleConn` serves it behind the peer gate, so
+            // `append_advisory_evaluation` and
+            // `bind_postgres_service_role` are connection-only upstream
+            // too — `HandleConn` serves them behind the peer gate, so
             // `Dispatch` answers its `default` text.
             "append_advisory_evaluation",
+            POSTGRES_SERVICE_ROLE_BIND_RPC,
         ] {
             let resp = svc.dispatch(&request(purpose, None));
             assert_eq!(resp.outcome, BrokerOutcome::Denied, "{purpose}");
@@ -3344,19 +3464,179 @@ mod tests {
         );
     }
 
+    /// Upstream `postgres_service_role_bind.go` — the denial ladder
+    /// ahead of the binding store, in rung order.
     #[test]
-    fn dispatch_denies_every_r6_purpose_closed() {
+    fn dispatch_bind_postgres_service_role_denial_ladder() {
         let dir = TempDir::new("server");
         let svc = service(&dir);
-        // `bind_postgres_service_role` is the one upstream RPC this
-        // slice still does not port — everything else is live or
-        // connection-only.
-        let resp = svc.dispatch(&request("bind_postgres_service_role", None));
-        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        let purpose = POSTGRES_SERVICE_ROLE_BIND_RPC;
+        let passfile = b"127.0.0.1:55432:central:central_runtime:pw\n";
+        let encoded = super::super::wire::b64_raw_encode(passfile);
+        type Payload = Option<BTreeMap<String, Box<serde_json::value::RawValue>>>;
+        let cases: Vec<(Payload, &str)> = vec![
+            (None, "empty payload"),
+            (Some(BTreeMap::new()), "missing request field"),
+            (request_raw("42"), "invalid request"),
+            (request_raw("\"x\""), "invalid request"),
+            // serde's derived `visit_seq` would take these — upstream
+            // refuses a non-object request outright.
+            (
+                request_raw("[{\"purpose\":\"postgres_runtime_v1\"}]"),
+                "invalid request",
+            ),
+            (request_raw("[]"), "invalid request"),
+            // `json.Unmarshal` on `null` is a no-op — the zero-value
+            // request falls through to the purpose check.
+            (request_raw("null"), "unsupported purpose"),
+            (request_raw("{}"), "unsupported purpose"),
+            // A registered-but-not-service-role purpose denies the
+            // same — upstream's switch defaults on the cast Purpose.
+            (
+                request_raw("{\"purpose\":\"minio_root_v1\"}"),
+                "unsupported purpose",
+            ),
+            // RawStdEncoding refuses padding, non-alphabet bytes, and
+            // residual length 1 mod 4.
+            (
+                request_raw("{\"purpose\":\"postgres_runtime_v1\",\"value\":\"aGVsbG8=\"}"),
+                "invalid value encoding",
+            ),
+            (
+                request_raw("{\"purpose\":\"postgres_runtime_v1\",\"value\":\"a\"}"),
+                "invalid value encoding",
+            ),
+            (
+                request_raw("{\"purpose\":\"postgres_runtime_v1\",\"value\":\"a-b_\"}"),
+                "invalid value encoding",
+            ),
+            // Empty and malformed passfiles decode fine, then fail the
+            // pinned role shape.
+            (
+                request_raw("{\"purpose\":\"postgres_runtime_v1\",\"value\":\"\"}"),
+                "malformed value",
+            ),
+            (
+                request_raw("{\"purpose\":\"postgres_runtime_v1\",\"value\":\"d3JvbmcK\"}"),
+                "malformed value",
+            ),
+            // A sibling role's passfile bytes fail the purpose's own
+            // role pin.
+            (
+                request_raw(&format!(
+                    "{{\"purpose\":\"postgres_migration_v1\",\"value\":\"{encoded}\"}}"
+                )),
+                "malformed value",
+            ),
+            // Empty instance_id — same rung as an absent one.
+            (
+                request_raw(&format!(
+                    "{{\"purpose\":\"postgres_runtime_v1\",\"value\":\"{encoded}\",\"instance_id\":\"\"}}"
+                )),
+                "unavailable",
+            ),
+            (
+                request_raw(&format!(
+                    "{{\"purpose\":\"postgres_runtime_v1\",\"value\":\"{encoded}\"}}"
+                )),
+                "unavailable",
+            ),
+        ];
+        for (payload, message) in cases {
+            let resp = svc.dispatch_bind_postgres_service_role(&request(purpose, payload));
+            assert_eq!(resp.outcome, BrokerOutcome::Denied, "{message}");
+            assert_eq!(
+                resp.evidence.message,
+                format!("POSTGRES_SERVICE_ROLE_BIND_DENIED: {message}")
+            );
+        }
+        // `s.bootstrap == nil` upstream — the store-less service denies
+        // the same way as an empty instance_id.
+        let mut svc = service(&dir);
+        svc.bootstrap = None;
+        let resp = svc.dispatch_bind_postgres_service_role(&request(
+            purpose,
+            request_raw(&format!(
+                "{{\"purpose\":\"postgres_runtime_v1\",\"value\":\"{encoded}\",\"instance_id\":\"inst\"}}"
+            )),
+        ));
         assert_eq!(
             resp.evidence.message,
-            format!("BROKER_AUTHORITY_DENIED: {}", UNSUPPORTED_IN_THIS_SLICE)
+            "POSTGRES_SERVICE_ROLE_BIND_DENIED: unavailable"
         );
+    }
+
+    /// The happy path — each service-role purpose binds its passfile
+    /// verbatim under a 24-hour lease readable through the generic
+    /// active-binding store.
+    #[test]
+    fn dispatch_bind_postgres_service_role_binds_each_purpose() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        for (purpose, enum_purpose, passfile) in [
+            (
+                "postgres_runtime_v1",
+                Purpose::PostgresRuntime,
+                &b"127.0.0.1:55432:central:central_runtime:pw-a\n"[..],
+            ),
+            (
+                "postgres_migration_v1",
+                Purpose::PostgresMigration,
+                &b"127.0.0.1:55432:central:central_migration:pw-b\n"[..],
+            ),
+            (
+                "postgres_outbox_v1",
+                Purpose::PostgresOutbox,
+                &b"127.0.0.1:55432:central:central_outbox:pw-c\n"[..],
+            ),
+        ] {
+            let resp = svc.dispatch_bind_postgres_service_role(&request(
+                POSTGRES_SERVICE_ROLE_BIND_RPC,
+                request_raw(&format!(
+                    "{{\"instance_id\":\"inst-1\",\"purpose\":\"{purpose}\",\"value\":\"{}\"}}",
+                    super::super::wire::b64_raw_encode(passfile)
+                )),
+            ));
+            assert_eq!(resp.outcome, BrokerOutcome::Success, "{purpose}");
+            assert!(resp.result.is_none());
+            // The binding is durably readable through the same
+            // `ActiveBindingForPurpose` every materializable-purpose
+            // reader uses, with the lease TTL upstream pins.
+            let (binding, lease) = svc
+                .bootstrap
+                .as_ref()
+                .unwrap()
+                .active_binding_for_purpose(enum_purpose)
+                .unwrap();
+            assert_eq!(binding.instance_id, "inst-1");
+            assert_ne!(lease.fencing_token, 0);
+            let remaining = lease.expires_at - OffsetDateTime::now_utc();
+            assert!(
+                remaining > time::Duration::hours(23)
+                    && remaining <= POSTGRES_SERVICE_ROLE_BIND_TTL,
+                "lease ttl {remaining} off the 24h pin"
+            );
+            // The passfile bytes land verbatim in the generation store.
+            let generation = svc
+                .backend
+                .get_by_id(uuid::Uuid::from_bytes(*binding.generation_id.as_bytes()))
+                .unwrap();
+            assert_eq!(generation.purpose, purpose);
+            assert_eq!(svc.backend.read(&generation).unwrap(), passfile);
+        }
+    }
+
+    #[test]
+    fn dispatch_bind_purpose_is_connection_only() {
+        let dir = TempDir::new("server");
+        let svc = service(&dir);
+        // The closed R6 set is now empty — `bind_postgres_service_role`
+        // is live at `HandleConn` behind the root-helper peer gate, so
+        // in-process `Dispatch` answers upstream's `default` text for
+        // it exactly like every other connection-only purpose.
+        let resp = svc.dispatch(&request(POSTGRES_SERVICE_ROLE_BIND_RPC, None));
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
+        assert_eq!(resp.evidence.message, "unknown purpose");
         // The live recovery arms answer through their own denial
         // ladders on an empty request — never the closed text.
         for purpose in [
@@ -4098,8 +4378,8 @@ mod tests {
     fn dispatch_json_closed_and_live_purposes() {
         let dir = TempDir::new("server");
         let svc = service(&dir);
-        // `bind_postgres_service_role` — root-only gate, then the
-        // slice's closed denial (the RPC is deliberately unported).
+        // `bind_postgres_service_role` — root-only gate, then the live
+        // arm's own denial ladder (absent payload → its first rung).
         let (result, resp) = json_call(
             &svc,
             peer(4242, 4242),
@@ -4112,9 +4392,10 @@ mod tests {
             peer(0, 0),
             &request(POSTGRES_SERVICE_ROLE_BIND_RPC, None),
         );
+        assert_eq!(resp.outcome, BrokerOutcome::Denied);
         assert_eq!(
             resp.evidence.message,
-            format!("POSTGRES_SERVICE_ROLE_BIND_DENIED: {UNSUPPORTED_IN_THIS_SLICE}")
+            "POSTGRES_SERVICE_ROLE_BIND_DENIED: empty payload"
         );
         // `inspect_restore_barrier` — a root peer reaches the live
         // handler; an exactly-empty payload answers with the barrier.
