@@ -691,7 +691,9 @@ impl ImportHandlerImpl {
             let _ = fs::remove_dir_all(&work);
             return Err(());
         }
-        let rel = dump.path.trim_start_matches("backup/");
+        // Go strings.TrimPrefix strips exactly one leading "backup/" —
+        // trim_start_matches would also eat a "backup/backup/..." prefix.
+        let rel = dump.path.strip_prefix("backup/").unwrap_or(&dump.path);
         let plan = domain::RestorePlan {
             bundle_id: manifest.bundle_id.clone(),
             instance_id: manifest.instance_id.clone(),
