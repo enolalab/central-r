@@ -538,55 +538,175 @@ fn e04_exclusion_scan() {
 }
 
 /// `production_region` — the source with every `#[cfg(test)]`-gated
-/// item removed, wherever it appears. An item's extent is the first
-/// `{`-opened balanced brace body (fn/impl/mod) or a `;`-terminated
-/// statement; line and block comments are skipped while locating the
-/// item's head so a `;` inside a doc comment cannot truncate it.
+/// item removed, wherever it appears. One lexical pass honors line
+/// and block comments, `"…"`/`b"…"`/`r#"…"#` strings, char literals,
+/// and lifetimes in both the scanned region and the dropped item, so
+/// a `{`/`;`/`"` inside a literal can never desync the walk — and a
+/// `#[cfg(test)]` inside a comment or string is never a marker.
 fn production_region(raw: &str) -> String {
     const MARK: &str = "#[cfg(test)]";
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
     let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(idx) = rest.find(MARK) {
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + MARK.len()..];
-        let bytes = after.as_bytes();
-        let mut i = 0;
-        let end = loop {
-            match bytes.get(i) {
-                None => break after.len(),
-                Some(b'/') if bytes.get(i + 1) == Some(&b'/') => {
-                    i += bytes[i..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map_or(bytes.len(), |p| i + p);
-                }
-                Some(b'/') if bytes.get(i + 1) == Some(&b'*') => {
-                    let close = after[i + 2..]
-                        .find("*/")
-                        .map_or(bytes.len(), |p| i + 2 + p + 2);
-                    i = close;
-                }
-                Some(b';') => break i + 1,
-                Some(b'{') => {
-                    let mut depth = 1usize;
-                    let mut j = i + 1;
-                    while j < bytes.len() && depth > 0 {
-                        match bytes[j] {
-                            b'{' => depth += 1,
-                            b'}' => depth -= 1,
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    break j;
-                }
-                Some(_) => i += 1,
-            }
-        };
-        rest = &after[end..];
+    let mut i = 0;
+    while i < len {
+        if let Some(end) = skip_lexeme(bytes, len, i) {
+            out.push_str(&raw[i..end]);
+            i = end;
+            continue;
+        }
+        if bytes[i..].starts_with(MARK.as_bytes()) {
+            i = skip_item(bytes, len, i + MARK.len());
+            continue;
+        }
+        let c = raw[i..].chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
     }
-    out.push_str(rest);
     out
+}
+
+/// The lexical atoms the scanner never looks inside: comments,
+/// string/byte-string/raw-string literals, and char literals
+/// (lifetimes return `None`). Returns the index just past the token.
+fn skip_lexeme(bytes: &[u8], len: usize, i: usize) -> Option<usize> {
+    match bytes[i] {
+        b'/' if bytes.get(i + 1) == Some(&b'/') => Some(
+            bytes[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(len, |p| i + p),
+        ),
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            // Rust block comments nest.
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while depth > 0 && j + 1 < len {
+                match (bytes[j], bytes[j + 1]) {
+                    (b'/', b'*') => {
+                        depth += 1;
+                        j += 2;
+                    }
+                    (b'*', b'/') => {
+                        depth -= 1;
+                        j += 2;
+                    }
+                    _ => j += 1,
+                }
+            }
+            Some(if depth == 0 { j } else { len })
+        }
+        b'"' => Some(skip_quoted(bytes, len, i + 1, b'"')),
+        b'b' if bytes.get(i + 1) == Some(&b'"') => Some(skip_quoted(bytes, len, i + 2, b'"')),
+        b'r' | b'b' => {
+            // Raw strings `r"…"`, `r#"…"#`, `br#"…"#`: `r`/`br` +
+            // `#`* + `"`, closed by `"` + the same `#` count.
+            let mut k = i;
+            if bytes[k] == b'b' && bytes.get(k + 1) == Some(&b'r') {
+                k += 1;
+            }
+            if bytes.get(k) != Some(&b'r') {
+                return None;
+            }
+            let mut h = k + 1;
+            while bytes.get(h) == Some(&b'#') {
+                h += 1;
+            }
+            if bytes.get(h) != Some(&b'"') {
+                return None;
+            }
+            let hashes = h - (k + 1);
+            let mut j = h + 1;
+            while j < len {
+                if bytes[j] == b'"'
+                    && j + 1 + hashes <= len
+                    && bytes[j + 1..j + 1 + hashes].iter().all(|&c| c == b'#')
+                {
+                    return Some(j + 1 + hashes);
+                }
+                j += 1;
+            }
+            Some(len)
+        }
+        b'\'' => {
+            // Char literal `'x'`/`'\n'` vs lifetime `'a`: only a
+            // closing quote one char (or escape) ahead counts.
+            let mut j = i + 1;
+            if bytes.get(j) == Some(&b'\\') {
+                j += 1;
+            }
+            if bytes.get(j + 1) == Some(&b'\'') {
+                Some(j + 2)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `"`/`'` body with `\` escaping; `start` sits just past the opener.
+fn skip_quoted(bytes: &[u8], len: usize, start: usize, quote: u8) -> usize {
+    let mut j = start;
+    while j < len {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b if b == quote => return j + 1,
+            _ => j += 1,
+        }
+    }
+    len
+}
+
+/// The item following a `#[cfg(test)]` marker: trivia + signature
+/// tokens until the first `{` (balanced body) or `;` (statement) at
+/// bracket depth zero — a `;` inside `[u8; N]` or a generic bound
+/// can never cut the head short.
+fn skip_item(bytes: &[u8], len: usize, mut i: usize) -> usize {
+    let mut depth = 0i64;
+    loop {
+        if let Some(end) = skip_lexeme(bytes, len, i) {
+            i = end;
+            continue;
+        }
+        match bytes.get(i) {
+            None => return len,
+            Some(b'(' | b'[' | b'<') => {
+                depth += 1;
+                i += 1;
+            }
+            Some(b')' | b']' | b'>') => {
+                depth -= 1;
+                i += 1;
+            }
+            Some(b';') if depth <= 0 => return i + 1,
+            Some(b'{') if depth <= 0 => {
+                i += 1;
+                break;
+            }
+            Some(_) => i += 1,
+        }
+    }
+    // Balanced body, literals and comments transparent.
+    let mut braces = 1usize;
+    while i < len && braces > 0 {
+        if let Some(end) = skip_lexeme(bytes, len, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => {
+                braces += 1;
+                i += 1;
+            }
+            b'}' => {
+                braces -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    i
 }
 
 #[test]
@@ -597,4 +717,19 @@ fn production_region_drops_test_items_but_keeps_the_tail() {
     assert!(production.contains("fn live_b()"));
     assert!(!production.contains("helper"));
     assert!(!production.contains("mod tests"));
+}
+
+#[test]
+fn production_region_survives_comment_before_head_and_literals() {
+    // A doc comment between the marker and the head — the `;` inside
+    // it must not end the item, and the item tail must still drop.
+    let raw = "fn live() {}\n#[cfg(test)]\n    /// uses x;\n    fn t(a: [u8; 4]) {\n        let s = \"};\"\n    }\nfn tail() {}\n";
+    let production = production_region(raw);
+    assert!(production.contains("fn live()"));
+    assert!(production.contains("fn tail()"));
+    assert!(!production.contains("fn t("));
+    // A `#[cfg(test)]` string inside production code is not a marker.
+    let raw2 = "fn live() { let _ = \"#[cfg(test)]\"; }\nfn tail2() {}\n";
+    let production2 = production_region(raw2);
+    assert!(production2.contains("fn tail2()"));
 }

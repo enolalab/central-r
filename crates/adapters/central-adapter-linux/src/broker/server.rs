@@ -25,11 +25,11 @@ use std::time::Duration;
 use central_foundation::failure::Failure;
 use central_foundation::identity::{HandoffReceiptId, OperationId, SecretBindingId};
 use central_infra::authority::{
-    AdvisoryAdmissionEvidence, AuthorityTransitionPayload, B04AdoptRequest, B04AdoptResult,
-    B04IssueProofRequest, B04MaterializeRequest, B04MaterializeResult,
-    B05MaterializePostgresMigrationRequest, B05MaterializePostgresMigrationResult,
-    B05MigrationLaunchResult, BrokerEvidence, BrokerOutcome, BrokerRequest, BrokerResponse,
-    LifecycleAuthorization, LifecycleAuthorizationRequest, ProtectedGeneration,
+    AuthorityTransitionPayload, B04AdoptRequest, B04AdoptResult, B04IssueProofRequest,
+    B04MaterializeRequest, B04MaterializeResult, B05MaterializePostgresMigrationRequest,
+    B05MaterializePostgresMigrationResult, B05MigrationLaunchResult, BrokerEvidence, BrokerOutcome,
+    BrokerRequest, BrokerResponse, LifecycleAuthorization, LifecycleAuthorizationRequest,
+    ProtectedGeneration,
 };
 use central_infra::domain::{
     AdoptRequest, HandoffReceipt, HandoffRequest, MigrationLaunchBinding, Purpose,
@@ -157,6 +157,52 @@ fn null_raw_value() -> Box<serde_json::value::RawValue> {
 struct AdvisoryEvaluationAppendResult {
     receipt_id: String,
     receipt_sequence: u64,
+}
+
+/// `authority.AdvisoryAdmissionEvidence` decoded the way Go's
+/// `json.Unmarshal` treats a struct target: every field optional
+/// (absent or `null` → ignored), unknown keys ignored, but each
+/// *present* field still validated for its own type — a non-RFC3339
+/// `evaluation_time` denies exactly as upstream's
+/// `time.Time.UnmarshalJSON` does, and a mistyped scalar denies too.
+/// The decoded value is discarded; the check only proves the blob is
+/// a JSON object in the evidence vocabulary, never its semantics.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct AdvisoryEvaluationEvidenceShape {
+    #[serde(default)]
+    generation_id: Option<String>,
+    #[serde(default)]
+    selector_digest: Option<String>,
+    #[serde(default)]
+    canonical_bundle_digest: Option<String>,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    check: Option<String>,
+    #[serde(default, deserialize_with = "opt_rfc3339")]
+    evaluation_time: Option<OffsetDateTime>,
+    #[serde(default)]
+    policy_version: Option<String>,
+    #[serde(default)]
+    time_witness_state: Option<String>,
+    #[serde(default)]
+    host_facts: Option<central_infra::authority::AdvisoryHostFacts>,
+}
+
+/// `time.Time.UnmarshalJSON` semantics: `null` is a no-op, a present
+/// value must be a valid RFC 3339 timestamp.
+fn opt_rfc3339<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<OffsetDateTime>, D::Error> {
+    let Some(text) = Option::<String>::deserialize(d)? else {
+        return Ok(None);
+    };
+    OffsetDateTime::parse(&text, &time::format_description::well_known::Rfc3339)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
 }
 
 /// `BrokerError` outcome — upstream's non-denial failure class
@@ -739,7 +785,8 @@ impl Service {
         {
             return denied("invalid evidence size");
         }
-        if serde_json::from_str::<AdvisoryAdmissionEvidence>(wire_req.evidence.get()).is_err() {
+        if serde_json::from_str::<AdvisoryEvaluationEvidenceShape>(wire_req.evidence.get()).is_err()
+        {
             return denied("invalid evidence shape");
         }
         let Some(journal) = &self.journal else {
@@ -3154,6 +3201,56 @@ mod tests {
             resp.evidence.message,
             "ADVISORY_EVALUATION_APPEND_DENIED: unavailable"
         );
+    }
+
+    /// Go's `json.Unmarshal` struct semantics: any JSON object in the
+    /// evidence vocabulary passes the shape gate — absent fields zero
+    /// out, `null` is a no-op, unknown keys are ignored — while a
+    /// mistyped or malformed present field denies. This is what keeps
+    /// the stream from smuggling arbitrary bytes, no more.
+    #[test]
+    fn dispatch_append_advisory_evaluation_shape_is_go_unmarshal() {
+        let dir = TempDir::new("server");
+        let mut svc = service(&dir);
+        svc.journal = Some(Arc::new(Journal::new(
+            dir.join("journal"),
+            svc.signing.clone(),
+            svc.signer.clone(),
+        )));
+        let purpose = "append_advisory_evaluation";
+        // Every object upstream accepts — `{}` and partial records —
+        // commits; the journal stores them verbatim.
+        for evidence in [
+            "{}",
+            "{\"state\":\"current\"}",
+            "{\"generation_id\":null,\"extra\":1}",
+        ] {
+            let resp = svc.dispatch_append_advisory_evaluation(&request(
+                purpose,
+                request_raw(&format!("{{\"evidence\": {evidence}}}")),
+            ));
+            assert_eq!(
+                resp.outcome,
+                BrokerOutcome::Success,
+                "{evidence} should commit"
+            );
+        }
+        // Mistyped or malformed present fields deny — a bad timestamp
+        // fails `time.Time.UnmarshalJSON` upstream too.
+        for evidence in [
+            "{\"state\":4}",
+            "{\"evaluation_time\":\"not-a-time\"}",
+            "{\"host_facts\":{\"os_release\":4}}",
+        ] {
+            let resp = svc.dispatch_append_advisory_evaluation(&request(
+                purpose,
+                request_raw(&format!("{{\"evidence\": {evidence}}}")),
+            ));
+            assert_eq!(
+                resp.evidence.message, "ADVISORY_EVALUATION_APPEND_DENIED: invalid evidence shape",
+                "{evidence}"
+            );
+        }
     }
 
     /// Upstream's happy path — verbatim evidence bytes land in the
