@@ -1,8 +1,10 @@
 # Current Phase
 
-## Active slice: none — the `R0`–`R6` sequence is complete
+## Active slice: lifecycle composition — post-R6 slice on `lifecycle-composition`
 
 `central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **All seven slices are complete** (see below) — R6 closed out the backup/restore/wipe/maintenance operator surface: the migrate CLI and launcher daemons, the Slice C recovery plane, Slice D destructive portable operations, and the Slice E dependency-maintenance and release-advisory lifecycle.
+
+The `lifecycle-composition` slice closes R6's largest recorded deferral — the `bind_postgres_service_role` writer half and the broker-backed `local up|down|status` lifecycle in the helper daemon — per the [lifecycle-composition plan](../internal/superpowers/plans/2026-10-28-lifecycle-composition.md): the broker writer arm, the production service-role credential store with rotate-then-sync, the compose/bootstrap decorations and broker rendezvous, and the full B03 chain wired into `Server::lifecycle` (rescue cleanup delegating `down` as upstream's second ceremony, one shared confirmer across handler slots).
 
 Verification for changes continues to follow the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
 
@@ -24,7 +26,7 @@ Phase R6 delivered, per roadmap §9 and the [R6 plan](../internal/superpowers/pl
 - Slice E verification and acceptance: `tests/e05_runbook` (runbook grammar/token parity) and `tests/e06_acceptance` (the E-slice authority cycle end-to-end on the real store, apply handler, and Journal; physical-tier criteria recorded `deferred-physical`).
 - Committed `.sqlx/` offline query metadata for the `b25`–`b29` stores and every new checked statement; the §7 fail-fast pipeline is green — the `CENTRAL_TEST_DSN`/`CENTRAL_TEST_HELPER_SOCKET`-gated e2e suites and the root/Tier-3 platform legs skip cleanly as designed.
 
-Documented boundaries deferred past the `R0`–`R6` sequence: `bind_postgres_service_role` (writer half lives inside `local up` lifecycle composition — every Postgres credential draw stays fail-closed until it lands; recorded in `docs/internal/tasks/r6-t16-postgres-service-role-bind-deferral.md`), broker-backed lifecycle composition in the helper daemon, `local browser open`, prepare promotion/attestation (`PREPARE_PROMOTION_UNAVAILABLE`), `security-rescue-cleanup` (also unimplemented upstream), and the physical/Tier-3 evidence tiers requiring a root-capable reference host.
+Documented boundaries deferred past the `R0`–`R6` sequence: `local browser open`, prepare promotion/attestation (`PREPARE_PROMOTION_UNAVAILABLE`), `security-rescue-cleanup` (also unimplemented upstream), and the physical/Tier-3 evidence tiers requiring a root-capable reference host. The `bind_postgres_service_role` writer half and broker-backed lifecycle composition landed on `lifecycle-composition` — the R6 deferral record at `docs/internal/tasks/r6-t16-postgres-service-role-bind-deferral.md` is now resolved.
 
 ## Completed: Phase R5 — Host Authority, Broker & Compose Topology
 
@@ -47,7 +49,7 @@ Phase R5 delivered, per roadmap §8 and the [R5 plan](../internal/superpowers/pl
 - `tests/a07_*`: the host-authority denial suite — same-UID peer denial, descriptor smuggling, TTY spoofing, `openat2` path races, broker crash mid-transition, and the full denial ladder; portable tier green locally, Tier 3 legs gated (`CENTRAL_TIER3=1` + root + pinned reference host).
 - Committed `.sqlx/` offline query metadata for every new checked statement; the §7 fail-fast pipeline is green (`phase2_recovery_matrix` remains `CENTRAL_TEST_DSN`-gated by design).
 
-Documented slice boundaries deferred to R6: broker-backed restore-barrier RPC for `central serve` production preflight (fail-closed `RESTORE_BARRIER_UNAVAILABLE` until composed), broker-backed lifecycle composition in the helper daemon, `local browser open` client verb, promotion/attestation for `local prepare`, and backup/restore/wipe/maintenance operations.
+Documented slice boundaries deferred to R6: broker-backed restore-barrier RPC for `central serve` production preflight (fail-closed `RESTORE_BARRIER_UNAVAILABLE` until composed), `local browser open` client verb, promotion/attestation for `local prepare`, and backup/restore/wipe/maintenance operations. (Broker-backed lifecycle composition in the helper daemon — listed here at R5 close — landed on `lifecycle-composition`.)
 
 ## Completed: Phase R4 — Multi-Agent Workflow Orchestration
 

@@ -2,7 +2,7 @@
 
 - **Type:** Recorded slice-boundary deferral — a writer half upstream ports inside `local up` lifecycle composition, deliberately not landed in R0–R6. This file satisfies ADR 0028 §D3's "carried by a record" half for a defect that cannot be fixed under the four criteria (the port spans a new compose-runner decoration and a production credential store — an architecture-sized change, not a routine fix).
 - **Found:** 2026-10-28, by the R6 final whole-branch review (C-1) — the same topology gap upstream recorded as SC-DEF-39 in `central/docs/internal/tasks/sc-def-39-*.md`.
-- **Status:** Recorded deferred — NOT fixed. Everything downstream of it is fail-closed, which is the correct shape, but the deferral needed an explicit record.
+- **Status:** **RESOLVED** on branch `lifecycle-composition` (commits `45f3740`…`d07fd5b`). The writer half and the full broker-backed lifecycle composition landed per direction 1 below — see "Resolution" at the bottom.
 
 ## The gap
 
@@ -34,3 +34,14 @@ Until either lands, the closed denial text `POSTGRES_SERVICE_ROLE_BIND_DENIED: u
 - Rust: `crates/adapters/central-adapter-linux/src/broker/server.rs` (`is_postgres_service_role_authority_purpose` arm, closed denial), `broker/lifecycle_client.rs` (`bind_postgres_service_role`, no callers), `broker/secret_bootstrap.rs` (`bind_materialized_secret`, read side only), `helper/pg_credentials.rs` (`active_password`/`write_init_script`, `#[allow(dead_code)]` awaiting the store port).
 - Upstream: `internal/adapter/authority/broker/postgres_service_role_bind.go`, `cmd/central/postgres_service_role_credential.go`, `cmd/central/main.go:340-349` (compose decoration), `docs/internal/tasks/sc-def-39-*.md` (the upstream record this mirrors).
 - `docs/adr/0028-adopt-a-pre-authorized-grant-ceremony-and-context-independent-verdicts.md` §D3 — the delegation rule this record satisfies.
+
+## Resolution (lifecycle-composition slice, `45f3740`…`d07fd5b`)
+
+Direction 1 — the full parity port — landed across five tasks, each through the implementer→reviewer→fix cycle:
+
+- **LC-T1 `45f3740`/`0d3f09f`/`f54ece9`** — `dispatch_bind_postgres_service_role` in the broker: snake_case wire decode with Go `Unmarshal` absent/null semantics, raw-base64 value decode with zeroization, all three role-specific passfile validators (migration/runtime/outbox), root backup-helper peer gating, 24-hour binding TTL, upstream's exact denial ladder, and the `lifecycle_client` PascalCase→snake_case serializer fix.
+- **LC-T2 `49b1240`/`0719b7b`** — the production Postgres service-role credential store over the existing superuser store: rotate-then-sync for all three roles (verify-then-`ALTER ROLE ... WITH LOGIN PASSWORD` via `pg_wire` `verify_as`/`alter_login`, closed role literals + constrained alphabet), atomic secret persistence with protected-dir fsync, and unconditional broker binding to renew the lease.
+- **LC-T3 `aef73c3`/`26e4b87`** — `PostgresServiceRoleComposeRunner` decorator (Sync only when `postgres` is in the service set, after `up --wait` health), first-boot bootstrap decorator owning the init-script materialization, `LifecycleClient` trait impls (dead-owner verify, authorization+consume, service-role bind, B04 bootstrap), MinIO broker rendezvous over the trusted hardlink path.
+- **LC-T4 `15c70fe`/`e31c887`/`d07fd5b`** — `helper_lifecycle_handler` composes the complete B03 chain (version-zero receipt, `CandidateStore` active-receipt reader, shared B01 evaluator, broker lifecycle client, both credential stores, decorated runner/bootstrap/rendezvous, per-request resolver, authorized handler) into `Server::lifecycle`, exiting 6 on refusal; rescue cleanup delegates `down` through the same handler as upstream's second ceremony; one shared confirmer across all handler slots.
+
+`Purpose::PostgresMigration`/`PostgresRuntime`/`PostgresOutbox` bindings now establish during `local up` exactly as upstream; the closed denial remains only for a genuinely absent binding. Remaining boundaries are tracked in `current-phase.md`.
