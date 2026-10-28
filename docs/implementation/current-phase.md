@@ -1,10 +1,28 @@
 # Current Phase
 
-## Active slice: Phase R6 — Backup, Restore, Maintenance & Launcher Daemons
+## Active slice: none — the `R0`–`R6` sequence is complete
 
-`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **Phase R6 is the active implementation slice**; Phases R1–R5 are complete (see below) — R5 delivered the host-authority stack: protected broker custody, the audited `central-adapter-linux` OS boundary, the six-service Compose lifecycle, `central local init|prepare` ceremonies, TLS-hardened `central serve`, and the A07 denial suite.
+`central-rust` is delivered as the `R0`–`R6` vertical-slice sequence defined in [rust-vertical-slice-roadmap.md](rust-vertical-slice-roadmap.md) under Accepted [ADR 0043](../adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md). **All seven slices are complete** (see below) — R6 closed out the backup/restore/wipe/maintenance operator surface: the migrate CLI and launcher daemons, the Slice C recovery plane, Slice D destructive portable operations, and the Slice E dependency-maintenance and release-advisory lifecycle.
 
-Verification for every R6 change follows the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+Verification for changes continues to follow the fail-fast pipeline in [rust-engineering-workflow.md](rust-engineering-workflow.md) §7 (`cargo sqlx prepare --check` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo deny check` → `cargo test --workspace`).
+
+## Completed: Phase R6 — Backup, Restore, Wipe & Maintenance
+
+Phase R6 delivered, per roadmap §9 and the [R6 plan](../internal/superpowers/plans/2026-10-23-phase-r6-backup-restore-wipe-maintenance.md):
+
+- `bins/central-migrate` + `bins/central-migration-launcherd`: the CLI migration-ops surface — `migrate verify|up|status|resume` over the helper transport plus the exact version-zero `migrate reset` semantics — and the launcher daemon driving them.
+- `central-backup` capability + `bins/central-backup`/`bins/central-restore`/`bins/central-backup-launcherd`: exclusive target capture, the `pg_dump`/`pg_restore` fd-3 tool adapters, chunked canonical-key inventory, the verified manifest seal, one-use restore tickets, the restore capacity reserve gate (ADR 0018), quarantine resolution, authority reset on restore, incremental runtime-grant reapplication after `pg_restore`, and the rescue-backup lifecycle.
+- Broker R6 stores and RPCs: the `b25`–`b29` recovery evidence stores (`central-adapter-postgres`), the recovery and throughput journals + launch store, `0xc1`/`0xc2` credential transports, the authority RPC dispatch with Go digest wire parity, restore-capacity admission, `RestoreTicketIssuer`/`BrokerAuthorityReset`, and the `advisory_evaluation` append RPC behind the peer gate.
+- `central-adapter-linux`: the `pg_dump`/`pg_restore` process boundary, the restore engine, the production backup/restore MinIO credential provisioner, and the C02 throughput gate.
+- Slice C recovery acceptance (`tests/c06_acceptance/`): the ceremony driver plus the slice-C acceptance core — corruption injection and detection, the verify-resolver battery, the ticket one-use lifecycle, and the continuous run.
+- Slice D destructive portable operations: the `central-infra::destructive` vocabulary, helper wipe/delete/prune handlers behind the grant ceremony, and the `local wipe`/`backup delete`/`backup prune` CLI verbs with evidence.
+- Portable backup exchange: the `central-infra::portable` `bx1` vocabulary and chunked AES-256-GCM token crypto, the Go-byte-parity tar/gzip codec (committed goldens), and `backup export`/`backup import` with the production import-MinIO preparer.
+- Slice D acceptance (`tests/d07_acceptance/`): the fixture-tier grant-ceremony suite — wipe/reseed, signed denial, export→import staging, fail-closed delete/prune, tamper-detecting audit repair, and the rescue cycle; the production tier stays an explicit opt-in honest skip.
+- Audit/rescue/security-update: the deny-safe rescue vocabulary plus the `local audit`, `local security update`, and `local security rescue` helper handlers, clients, and dispatch.
+- Slice E dependency maintenance: the `central-infra::maintenance` compatibility-matrix domain (HMAC-chained transition journal, sealed matrix file), the helper plan/apply handlers, and `central maintenance plan|apply` with their evidence artifacts.
+- Release-advisory lifecycle: `bins/central-advisory-sign` (`genkey`/`bundle`/`verify`), the shared B01 evaluator wired into every destructive helper path, and the `tests/e04_advisory` conformance suite over a real broker Journal.
+- Slice E verification and acceptance: `tests/e05_runbook` (runbook grammar/token parity) and `tests/e06_acceptance` (the E-slice authority cycle end-to-end on the real store, apply handler, and Journal; physical-tier criteria recorded `deferred-physical`).
+- Committed `.sqlx/` offline query metadata for the `b25`–`b29` stores and every new checked statement; the §7 fail-fast pipeline is green — the `CENTRAL_TEST_DSN`/`CENTRAL_TEST_HELPER_SOCKET`-gated e2e suites and the root/Tier-3 platform legs skip cleanly as designed.
 
 ## Completed: Phase R5 — Host Authority, Broker & Compose Topology
 
@@ -106,4 +124,4 @@ Two upstream decisions shape everything below: [ADR 0035](../adr/0035-freeze-b09
 | R3 | Harness control plane, `central-session`, `central-transport-http`, `central-harness-launcherd` | **Complete** |
 | R4 | Phase 2 orchestration (`workflow`, `eventjournal`, `scheduler`, `retry`, `runview`, `runsubmit`), recovery matrix | **Complete** |
 | R5 | Host authority, protected broker, `central-adapter-linux`, Compose topology | **Complete** |
-| R6 | Backup, restore, wipe, maintenance, launcher daemons | **Active** |
+| R6 | Backup, restore, wipe, maintenance, launcher daemons | **Complete** |
