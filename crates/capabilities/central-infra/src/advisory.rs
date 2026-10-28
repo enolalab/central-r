@@ -1349,6 +1349,43 @@ pub fn discard_candidate(raw: &mut [u8]) {
     raw.fill(0);
 }
 
+// ---------------------------------------------------------------------------
+// Deny-safe rescue vocabulary + evidence (denysafe.go)
+// ---------------------------------------------------------------------------
+
+/// `ReasonDenySafeActive` — the transport gate's refusal.
+pub const REASON_DENY_SAFE_ACTIVE: &str = "DENY_SAFE_ACTIVE";
+/// `ReasonRescueCeremonyRequired`.
+pub const REASON_RESCUE_CEREMONY_REQUIRED: &str = "RESCUE_CEREMONY_REQUIRED";
+/// `ReasonRescueAuthorityDenied`.
+pub const REASON_RESCUE_AUTHORITY_DENIED: &str = "AUTHORITY_DENIED";
+/// `ReasonRescueUnavailable`.
+pub const REASON_RESCUE_UNAVAILABLE: &str = "RESCUE_UNAVAILABLE";
+/// `ReasonRescueInvalidRequest`.
+pub const REASON_RESCUE_INVALID_REQUEST: &str = "INVALID_RESCUE_REQUEST";
+/// `ReasonRescueAdvisoryInvalid`.
+pub const REASON_RESCUE_ADVISORY_INVALID: &str = "RESCUE_ADVISORY_INVALID";
+/// `ReasonRescueStaysDenied`.
+pub const REASON_RESCUE_STAYS_DENIED: &str = "RESCUE_STAYS_DENIED";
+/// `ReasonRescueNotApplicable`.
+pub const REASON_RESCUE_NOT_APPLICABLE: &str = "RESCUE_NOT_APPLICABLE";
+/// `ReasonRescueCleanupFailed`.
+pub const REASON_RESCUE_CLEANUP_FAILED: &str = "RESCUE_CLEANUP_FAILED";
+
+/// `RescueEvidence` — the D06 evidence artifact
+/// (`slice-d-rescue.json`): identities and counts only.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RescueEvidence {
+    pub operation_id: String,
+    pub exited: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub already_current: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub resumed_after_crash: bool,
+    pub attempts: i64,
+    pub completed_at: String,
+}
+
 /// `CandidateFacts` — the read-only host-facts seam
 /// [`evaluate_candidate`] needs.
 pub trait CandidateFacts: Send + Sync {
