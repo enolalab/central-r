@@ -842,10 +842,8 @@ mod tests {
         let src = tmp("tarsrc");
         fs::create_dir_all(src.join("backup/bodies")).expect("mkdir");
         fs::write(src.join("manifest.json"), b"{}\n").expect("w");
-        fs::write(src.join("backup/binding.json"), b"{\"a\":1}\n")
-            .expect("w");
-        fs::write(src.join("backup/bodies/b1.bin"), vec![7u8; 1000])
-            .expect("w");
+        fs::write(src.join("backup/binding.json"), b"{\"a\":1}\n").expect("w");
+        fs::write(src.join("backup/bodies/b1.bin"), vec![7u8; 1000]).expect("w");
         let at = datetime!(2025-03-04 05:06:07.123456789 UTC);
         let mut a = Vec::new();
         build_tar_gz(&src, &mut a, at).expect("tar");
@@ -889,8 +887,7 @@ mod tests {
     fn build_tar_gz_refuses_symlink() {
         let src = tmp("tarsym");
         fs::write(src.join("real.txt"), b"x").expect("w");
-        std::os::unix::fs::symlink(src.join("real.txt"), src.join("link.txt"))
-            .expect("ln");
+        std::os::unix::fs::symlink(src.join("real.txt"), src.join("link.txt")).expect("ln");
         let mut out = Vec::new();
         assert!(build_tar_gz(&src, &mut out, datetime!(2025-01-01 00:00:00 UTC)).is_err());
         let _ = fs::remove_dir_all(&src);
@@ -941,11 +938,9 @@ mod tests {
         // instance uid/gid (helper runs privileged).
         let uid = rustix::process::geteuid().as_raw();
         let gid = rustix::process::getegid().as_raw();
-        let (minted, created) = load_or_mint_export_identity(&path, uid, gid, now)
-            .expect("mint");
+        let (minted, created) = load_or_mint_export_identity(&path, uid, gid, now).expect("mint");
         assert!(created);
-        let (loaded, created2) = load_or_mint_export_identity(&path, uid, gid, now)
-            .expect("load");
+        let (loaded, created2) = load_or_mint_export_identity(&path, uid, gid, now).expect("load");
         assert!(!created2);
         assert_eq!(loaded.private_seed_hex, minted.private_seed_hex);
         fs::write(&path, b"not json").expect("w");
@@ -953,8 +948,7 @@ mod tests {
         // Wrong public key for a valid seed refuses too.
         let mut bad = minted.clone();
         bad.public_key_hex = domain::hex_encode(&[0xee; 32]);
-        fs::write(&path, serde_json::to_vec(&bad).unwrap_or_default())
-            .expect("w");
+        fs::write(&path, serde_json::to_vec(&bad).unwrap_or_default()).expect("w");
         assert!(load_or_mint_export_identity(&path, uid, gid, now).is_err());
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1097,8 +1097,7 @@ mod tests {
         let base = tmp(tag);
         let state = base.join("state");
         fs::create_dir_all(&state).expect("state");
-        fs::write(state.join("reseed.json"), b"{\"reseeded\":true}")
-            .expect("reseed");
+        fs::write(state.join("reseed.json"), b"{\"reseeded\":true}").expect("reseed");
         for d in ["lifecycle", "data", "dependencies", "backups"] {
             fs::create_dir_all(state.join(d)).expect("{d}");
         }
@@ -1133,11 +1132,9 @@ mod tests {
     fn make_bundle(tag: &str) -> (PathBuf, PathBuf, domain::Bx1Token) {
         let dir = tmp(&format!("{tag}-bundle"));
         let payload = dir.join("payload");
-        fs::create_dir_all(payload.join("backup").join("objects"))
-            .expect("mk");
+        fs::create_dir_all(payload.join("backup").join("objects")).expect("mk");
         fs::create_dir_all(payload.join("protected")).expect("mk");
-        fs::write(payload.join("backup").join("central.dump"), b"pgdump-body")
-            .expect("w");
+        fs::write(payload.join("backup").join("central.dump"), b"pgdump-body").expect("w");
         fs::write(
             payload.join("backup").join("objects").join("body-1"),
             b"body",
@@ -1220,13 +1217,7 @@ mod tests {
     }
 
     fn decode_result(resp: &Response) -> ImportResult {
-        serde_json::from_str(
-            resp.result
-                .as_ref()
-                .expect("no result")
-                .get(),
-        )
-        .expect("decode")
+        serde_json::from_str(resp.result.as_ref().expect("no result").get()).expect("decode")
     }
 
     /// `TestImportRejectsMalformedPathsBeforeCeremony` — relative,

@@ -132,8 +132,10 @@ fn report_sweep_failure(site: &str, err: &str) {
 // preparer lives in `helper/minio_provision.rs`
 // (`ProductionRestoreMinioPreparer`, the real chain the ported
 // `ProductionInstanceComposition` now feeds). The import writer is
-// still uncomposed — `import_minio` stays `None` and the import
-// launch refuses at the exact rung upstream's nil check sits.
+// composed the same way: `ProductionImportMinioPreparer` mints the
+// `minio_import_v1` writer; its construction failure is tolerated
+// into `None`, which `launch_restore_import` refuses at the exact
+// rung upstream's nil check sits.
 // ---------------------------------------------------------------------------
 
 /// `restoreMinioCredentialPreparer` — mints the operation-bound,
@@ -749,12 +751,22 @@ fn restore_verify_engine_deadline() -> Duration {
 }
 
 /// `restoreImportEngineDeadline` — the import run's share of the
-/// import transport budget: transport minus ceremony minus staging.
-/// The import verb's budgets are unported in this slice, so the
-/// derivation yields zero and `launch_restore_import` refuses —
-/// upstream's fail-closed arm, not a made-up figure.
+/// import transport budget: transport minus ceremony minus staging,
+/// mirroring `restore_apply_engine_deadline`'s subtraction. A
+/// nonsense derivation fails closed to zero, which
+/// `launch_restore_import` refuses rather than launching under.
 fn restore_import_engine_deadline() -> Duration {
-    Duration::ZERO
+    /// `importStagingShare` — `server.go`'s 28-minute staging share.
+    const IMPORT_STAGING_SHARE: Duration = Duration::from_secs(28 * 60);
+    // `importDeadline()` — `restoreApplyDeadline() +
+    // importStagingShare`; `server.rs`'s `BACKUP_IMPORT` arm derives
+    // the same figure.
+    let transport = super::server::restore_apply_deadline() + IMPORT_STAGING_SHARE;
+    let shares = RESTORE_CEREMONY_DEADLINE + IMPORT_STAGING_SHARE;
+    if transport.is_zero() || transport <= shares {
+        return Duration::ZERO;
+    }
+    transport - shares
 }
 
 /// `productionRestoreEngineLauncher` runs the root recovery engine
@@ -878,7 +890,18 @@ impl ProductionRestoreEngineLauncher {
                     None => root.to_path_buf(),
                 }
             },
-            import_minio: None,
+            // `newProductionImportMinioCredentialPreparer` tolerates
+            // its own construction failing exactly like the restore
+            // wrapper: a composition problem narrows only the import
+            // launch (which checks `None` and denies), never the
+            // whole helper.
+            import_minio:
+                crate::helper::minio_provision::ProductionImportMinioPreparer::new_production(
+                    composition,
+                    broker_socket,
+                )
+                .ok()
+                .map(|p| Box::new(p) as Box<dyn ImportMinioCredentialPreparer>),
         })
     }
 

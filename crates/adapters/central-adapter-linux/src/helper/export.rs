@@ -1187,8 +1187,7 @@ mod tests {
         let base = tmp(tag);
         let state = base.join("state");
         fs::create_dir_all(&state).expect("state");
-        fs::write(state.join("config.json"), b"{\"instance_id\":\"x\"}")
-            .expect("config");
+        fs::write(state.join("config.json"), b"{\"instance_id\":\"x\"}").expect("config");
         let broker = base.join("broker").join("protected");
         fs::create_dir_all(&broker).expect("broker");
         let tls = format!(
@@ -1223,13 +1222,7 @@ mod tests {
     }
 
     fn decode_result(resp: &Response) -> ExportResult {
-        serde_json::from_str(
-            resp.result
-                .as_ref()
-                .expect("no result")
-                .get(),
-        )
-        .expect("decode")
+        serde_json::from_str(resp.result.as_ref().expect("no result").get()).expect("decode")
     }
 
     /// `TestExportRejectsInvalidOutDirBeforeCeremony` — a relative or
@@ -1410,8 +1403,7 @@ mod tests {
             result.bundle_bytes
         );
         let token: domain::Bx1Token =
-            serde_json::from_slice(&fs::read(&token_path).expect("token"))
-                .expect("token json");
+            serde_json::from_slice(&fs::read(&token_path).expect("token")).expect("token json");
         domain::verify_bx1_token(
             &token,
             &result.public_key_hex,

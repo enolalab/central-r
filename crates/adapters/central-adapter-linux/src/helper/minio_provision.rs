@@ -222,7 +222,7 @@ pub(crate) fn exact_backup_minio_compose_model(
 
 /// `localInfraBackupMinioTarget` — the opaque fence descriptor the
 /// provisioner binds its handoff receipt to.
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct LocalInfraMinioTarget {
     fd_number: i64,
     device: u64,
@@ -615,6 +615,221 @@ impl super::restore_launcher::RestoreMinioCredentialPreparer for ProductionResto
 }
 
 // ---------------------------------------------------------------------------
+// The import preparer — `productionImportMinioPreparer`.
+// ---------------------------------------------------------------------------
+
+/// `central.import-minio-fence/v1` — the import operation's fence
+/// domain separator; can never collide with or replay against the
+/// backup or restore values even though all three derive from the
+/// same identity shape.
+fn import_minio_fence(operation_id: Uuid) -> u64 {
+    minio_fence("central.import-minio-fence/v1", operation_id)
+}
+
+/// `importMinioTargetDescriptor` — see [`import_minio_fence`].
+fn import_minio_target_descriptor(operation_id: Uuid) -> LocalInfraMinioTarget {
+    minio_target_descriptor("central.import-minio-target/v1", operation_id)
+}
+
+/// `productionImportMinioPreparer` mints the operation-bound
+/// `minio_import_v1` writer the import engine uploads staged bodies
+/// through (ADR 0034). It mirrors [`ProductionRestoreMinioPreparer`]
+/// — same provisioner container, same broker-mediated handoff
+/// protocol, same compose model and receipt validation — with two
+/// differences: the purpose is `minio_import_v1` (whose policy grants
+/// `PutObject` on the ready prefix alongside `GetObject`), and
+/// `expires_at` is the operation-absolute `importMinioHandoffExpiry`
+/// value identical across retried launches.
+pub(crate) struct ProductionImportMinioPreparer {
+    instance_id: String,
+    bucket: String,
+    policy_hash: String,
+    policy: Policy,
+    receipts: Box<dyn BackupDependencyReceiptSource>,
+    issuer: Box<dyn BackupMinioHandoffIssuer>,
+    runner: Box<dyn BackupMinioComposeRunner>,
+    rendered: RenderedFile,
+    broker_socket: PathBuf,
+    now: fn() -> OffsetDateTime,
+}
+
+impl ProductionImportMinioPreparer {
+    /// `newProductionImportMinioPreparer`.
+    pub(crate) fn new_production(
+        composition: &crate::broker::daemon::ProductionInstanceComposition,
+        broker_socket: &Path,
+    ) -> Result<Self, Failure> {
+        let parsed = InstanceId::parse(&composition.instance_id);
+        if parsed.is_err()
+            || parsed.map(|p| p.to_string()).as_deref() != Ok(composition.instance_id.as_str())
+            || composition.dependency_root.is_empty()
+            || composition.compose_path != expected_compose_path(&composition.instance_id)
+            || composition.object_store_bucket != BACKUP_MINIO_BUCKET
+            || composition.import_policy_digest.is_empty()
+        {
+            return Err(unavailable("import MinIO composition unavailable"));
+        }
+        let policy =
+            load_default_policy().map_err(|_| unavailable("import MinIO policy unavailable"))?;
+        Ok(Self {
+            instance_id: composition.instance_id.clone(),
+            bucket: composition.object_store_bucket.clone(),
+            policy_hash: composition.import_policy_digest.clone(),
+            policy,
+            receipts: Box::new(CandidateStore::new(
+                None,
+                composition.dependency_root.clone(),
+            )),
+            issuer: Box::new(
+                crate::broker::backup_authority::BackupMinioHandoffIssuer::new(
+                    broker_socket.to_path_buf(),
+                ),
+            ),
+            runner: Box::new(CommandComposeRunner::new(
+                BACKUP_MINIO_DOCKER_PATH,
+                None,
+                None,
+            )),
+            rendered: RenderedFile {
+                path: composition.compose_path.clone(),
+                content: Vec::new(),
+            },
+            broker_socket: broker_socket.to_path_buf(),
+            now: OffsetDateTime::now_utc,
+        })
+    }
+}
+
+impl super::restore_launcher::ImportMinioCredentialPreparer for ProductionImportMinioPreparer {
+    /// `PrepareImportMinio`.
+    fn prepare_import_minio(
+        &self,
+        deadline: Instant,
+        operation_id: Uuid,
+        expires_at: OffsetDateTime,
+    ) -> Result<(), Failure> {
+        let op_deadline = OpDeadline(Some(deadline));
+        let now = (self.now)();
+        if operation_id.is_nil()
+            || operation_id.get_version_num() != 7
+            || self.bucket != BACKUP_MINIO_BUCKET
+            || self.rendered.path != expected_compose_path(&self.instance_id)
+            || expires_at == crate::broker::wire::go_zero_time()
+            || now >= expires_at
+        {
+            return Err(unavailable("import MinIO preparation unavailable"));
+        }
+        let parsed = InstanceId::parse(&self.instance_id);
+        if parsed.is_err()
+            || parsed.map(|p| p.to_string()).as_deref() != Ok(self.instance_id.as_str())
+        {
+            return Err(unavailable("import MinIO preparation unavailable"));
+        }
+        let receipt = self
+            .receipts
+            .active(op_deadline)
+            .map_err(|_| unavailable("import MinIO dependency identity unavailable"))?;
+        if receipt.validate_b03().is_err() {
+            return Err(unavailable("import MinIO dependency identity unavailable"));
+        }
+        let image_digest = backup_minio_image_digest(&receipt.dependency_set)
+            .map_err(|_| unavailable("import MinIO dependency identity unavailable"))?;
+        let model = self
+            .runner
+            .config(&self.rendered, op_deadline)
+            .map_err(|_| unavailable("import MinIO topology unavailable"))?;
+        if !exact_backup_minio_compose_model(&model, &self.instance_id, &image_digest) {
+            return Err(unavailable("import MinIO topology unavailable"));
+        }
+        ensure_backup_minio_broker_rendezvous(
+            &self.broker_socket.to_string_lossy(),
+            &self.instance_id,
+        )
+        .map_err(|_| unavailable("import MinIO broker rendezvous unavailable"))?;
+        let scope = minio_recovery_key_scope(Purpose::MinioImport)
+            .map_err(|_| unavailable("import MinIO scope unavailable"))?;
+        let policy_digest_value = minio_recovery_policy_digest(Purpose::MinioImport, &self.bucket)
+            .map_err(|_| unavailable("import MinIO policy unavailable"))?;
+        if policy_digest_value.trim_start_matches("sha256:") != self.policy_hash {
+            return Err(unavailable("import MinIO policy unavailable"));
+        }
+        let fence = import_minio_fence(operation_id);
+        let expires_at = expires_at.to_offset(time::UtcOffset::UTC);
+        let request = RecoveryMinioHandoffRequest {
+            operation_id: operation_id.to_string(),
+            instance_id: self.instance_id.clone(),
+            purpose: Purpose::MinioImport.as_str().to_owned(),
+            bucket: self.bucket.clone(),
+            key_prefix: scope.to_owned(),
+            policy_digest: policy_digest_value.clone(),
+            expires_at,
+            fence_token: fence,
+        };
+        let handoff = self
+            .issuer
+            .issue_recovery_minio_handoff(&request)
+            .map_err(|_| unavailable("import MinIO broker handoff unavailable"))?;
+        if handoff.operation_id != request.operation_id
+            || handoff.instance_id != request.instance_id
+            || handoff.purpose != request.purpose
+            || handoff.bucket != request.bucket
+            || handoff.key_prefix != request.key_prefix
+            || handoff.policy_digest != request.policy_digest
+            || handoff.receipt_id.is_empty()
+            || handoff.fence_token != fence
+            || handoff.expires_at != expires_at
+        {
+            return Err(unavailable("import MinIO broker handoff unavailable"));
+        }
+        if handoff.bound {
+            return Ok(());
+        }
+        let payload = serde_json::to_vec(&LocalInfraMinioRequest {
+            schema_version: "central.local.infra.request/v1".to_owned(),
+            mode: "minio-provision".to_owned(),
+            operation_id: operation_id.to_string(),
+            instance_id: self.instance_id.clone(),
+            target: import_minio_target_descriptor(operation_id),
+            policy_digest: policy_digest(&self.policy),
+            image_digest,
+            deadline: expires_at,
+            minio_provision: LocalInfraMinioParams {
+                root_credential_path: BACKUP_MINIO_ROOT_CREDENTIAL_PATH.to_owned(),
+                broker_socket_path: BACKUP_MINIO_BROKER_SOCKET_PATH.to_owned(),
+                bucket: self.bucket.clone(),
+                key_prefix: scope.to_owned(),
+                policy_digest: policy_digest_value,
+                credential_purpose: Purpose::MinioImport.as_str().to_owned(),
+                handoff_receipt_id: handoff.receipt_id,
+                fence_token: fence,
+            },
+        })
+        .map_err(|_| unavailable("import MinIO request unavailable"))?;
+        let (output, exit_code) = self
+            .runner
+            .run_with_input_output(
+                &self.rendered,
+                "minio-provision",
+                &["minio-provision".to_owned()],
+                &payload,
+                op_deadline,
+            )
+            .map_err(|_| unavailable("import MinIO provisioner failed"))?;
+        if exit_code != 0
+            || !valid_backup_minio_provision_receipt(
+                &output,
+                &operation_id.to_string(),
+                &self.instance_id,
+                now,
+            )
+        {
+            return Err(unavailable("import MinIO provisioner failed"));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The backup preparer — `productionBackupMinioPreparer`.
 // ---------------------------------------------------------------------------
 
@@ -858,5 +1073,51 @@ impl super::backup::BackupMinioCredentialPreparer for ProductionBackupMinioPrepa
         }
         self.prepare_backup_minio_operation(deadline, authority.operation_id, expires_at)
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TestImportMinioFenceAndTargetAreDomainSeparated` — the import
+    /// fence and target descriptor can never collide with, or be
+    /// replayed against, the backup or restore values for the same
+    /// operation id.
+    #[test]
+    fn import_fence_and_target_are_domain_separated() {
+        for _ in 0..8 {
+            let op = Uuid::now_v7();
+            let import_fence = import_minio_fence(op);
+            assert_ne!(import_fence, backup_minio_fence(op));
+            assert_ne!(import_fence, restore_minio_fence(op));
+            assert_ne!(import_fence, 0);
+            let target = import_minio_target_descriptor(op);
+            assert_ne!(target, backup_minio_target_descriptor(op));
+            assert_ne!(target, restore_minio_target_descriptor(op));
+        }
+    }
+
+    /// `TestNewProductionImportMinioPreparerRejectsIncomplete` — an
+    /// empty composition produces no preparer, so the wrapper's `None`
+    /// narrows only the import launch.
+    #[test]
+    fn import_preparer_rejects_incomplete_composition() {
+        let empty = crate::broker::daemon::ProductionInstanceComposition {
+            instance_id: String::new(),
+            authoritative_state_root: String::new(),
+            dependency_root: String::new(),
+            role_roots: central_backup::backup::capacity::RoleRoots::default(),
+            backup_repository_root: String::new(),
+            compose_path: String::new(),
+            object_store_bucket: String::new(),
+            backup_policy_digest: String::new(),
+            restore_policy_digest: String::new(),
+            import_policy_digest: String::new(),
+        };
+        assert!(
+            ProductionImportMinioPreparer::new_production(&empty, Path::new("/nonexistent.sock"))
+                .is_err()
+        );
     }
 }
