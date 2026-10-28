@@ -766,6 +766,12 @@ impl ExportHandlerImpl {
 /// directory aborts the copy. Shared by export staging and import
 /// bootstrap/plan writes.
 pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<(), ()> {
+    // Upstream's `filepath.WalkDir(src, ...)` visits `src` itself
+    // first — rel "." is a directory, so the destination root is
+    // created before any child copies. Iterating children only left
+    // that invariant to readdir order, and `fs::copy` does not create
+    // parents.
+    fs::create_dir_all(dst).map_err(|_| ())?;
     let mut stack = vec![src.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).map_err(|_| ())? {

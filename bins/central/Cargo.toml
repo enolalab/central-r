@@ -110,5 +110,13 @@ path = "tests/phase2_acceptance/mod.rs"
 name = "c06_acceptance"
 path = "tests/c06_acceptance/mod.rs"
 
+# R6 task 14 — D07 Slice-D acceptance (upstream cmd/central's
+# d07_*_test.go). The fixture tier runs in ordinary `cargo test`; the
+# production tier stays an explicit CENTRAL_D07_RUN + root opt-in and
+# reports the same honest skip upstream's unrehearsed install does.
+[[test]]
+name = "d07_acceptance"
+path = "tests/d07_acceptance/mod.rs"
+
 [lints]
 workspace = true
