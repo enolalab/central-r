@@ -6,5 +6,22 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+# The JCS canonicalization the signed digest is computed over — the same
+# implementation `Verifier::verify_snapshot` runs, so the tool and the
+# verifier can never drift on canonical form.
+central-foundation = { path = "../../crates/central-foundation", version = "0.1.0" }
+# The bundle/envelope vocabulary (CompatibilityMatrix, DenyPolicy), the
+# production key id, and `Verifier::production()` for `verify` — the same
+# domain the runtime evaluator pins, so wire shape and trust root agree.
+central-infra = { path = "../../crates/capabilities/central-infra", version = "0.1.0" }
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+# `crypto/rand.Reader` — the OS CSPRNG via the pinned rustix wrapper.
+rustix = { workspace = true, features = ["rand"] }
+
 [lints]
 workspace = true
