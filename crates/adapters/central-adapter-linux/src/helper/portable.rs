@@ -5,10 +5,13 @@
 //! chunked AES-256-GCM framing is byte-compatible with upstream:
 //! `BX1GCM01` + 12-byte base nonce, then per segment u32be length +
 //! GCM-sealed chunk under nonce `base[..4] || BE64(index)`, no AAD.
-//! The tar writer reproduces Go `archive/tar`'s PAX-format byte layout:
-//! sorted `mtime=`/`path=` x-header records, USTAR-shaped header bodies
-//! (truncated name, no 155-prefix split when PAX was emitted), octal
-//! fields, Go checksum format.
+//! The tar writer reproduces Go `archive/tar`'s byte layout end to end:
+//! the `allowedFormats`/`FormatPAX` decision tree (USTAR only when it
+//! encodes everything), sorted `mtime=`/`path=`/`size=` x-header
+//! records (size riding decimal when it overflows the octal field),
+//! `toASCII`/`formatString`/`formatOctal` semantics on the USTAR-shaped
+//! header bodies (rune-dropping ASCII fallback, trailing-slash
+//! workaround, zero-fallback numerics), and Go's checksum format.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -207,32 +210,33 @@ pub fn valid_path(rel: &str) -> bool {
         .any(|seg| seg.is_empty() || seg == "." || seg == "..")
 }
 
+/// Go `isASCII` — every byte < 0x80 and none NUL (the tar name field
+/// is a C string: a NUL terminates it early).
 fn is_ascii(s: &str) -> bool {
-    s.is_ascii()
+    s.bytes().all(|b| b != 0 && b < 0x80)
 }
 
-/// `toASCII` — Go replaces each non-ASCII rune with '?' when falling
-/// back to a truncated USTAR/PAX-body name.
+/// `toASCII` — Go drops non-ASCII runes outright (never substitutes)
+/// when falling back to a truncated USTAR/PAX-body name.
 fn to_ascii(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii() { c } else { '?' })
-        .collect()
+    s.chars().filter(|&c| c.is_ascii() && c != '\0').collect()
 }
 
-/// `splitUSTARPath` — prefix ≤155 bytes, suffix ≤100 bytes, split at the
-/// last '/' that fits the prefix budget; both halves must fit.
+/// `splitUSTARPath` — prefix ≤155 bytes, suffix ≤100 bytes, split at
+/// the last '/' inside Go's 156-byte window. Go consults only that
+/// last candidate (`strings.LastIndex`), refuses a leading '/' split
+/// (`i <= 0`), and returns not-ok for ≤100-byte or non-ASCII names —
+/// the caller writes those whole.
 fn split_ustar_path(name: &str) -> Option<(String, String)> {
     let bytes = name.as_bytes();
-    if !is_ascii(name) {
+    if bytes.len() <= 100 || !is_ascii(name) {
         return None;
     }
-    if bytes.len() <= 100 {
-        return Some((String::new(), name.to_owned()));
-    }
-    // Go iterates every '/' position, keeping the last valid split.
+    // An earlier '/' can only lengthen the suffix, so the last index
+    // satisfying the budget is exactly Go's `LastIndex` candidate.
     let mut best: Option<usize> = None;
     for (i, &b) in bytes.iter().enumerate() {
-        if b == b'/' && i <= 155 && bytes.len() - i - 1 <= 100 && bytes.len() - i - 1 > 0 {
+        if b == b'/' && i > 0 && i <= 155 && bytes.len() - i - 1 <= 100 && bytes.len() - i - 1 > 0 {
             best = Some(i);
         }
     }
@@ -254,22 +258,75 @@ fn format_pax_record(key: &str, value: &str) -> String {
 }
 
 /// `formatPAXTime` — `sec.frac` with the fraction trimmed of trailing
-/// zeros; whole seconds emit no fraction.
+/// zeros; whole seconds emit no fraction. Negative seconds take Go's
+/// borrow correction (`secs = -(secs+1)`, nanoseconds mirrored) so a
+/// pre-epoch `mtime` record is byte-identical too.
 fn format_pax_time(t: OffsetDateTime) -> String {
-    let sec = t.unix_timestamp();
-    let nsec = t.nanosecond();
-    if nsec == 0 {
-        return format!("{sec}");
+    let mut secs = t.unix_timestamp();
+    let mut nsecs = i64::from(t.nanosecond());
+    if nsecs == 0 {
+        return format!("{secs}");
     }
-    let frac = format!("{nsec:09}");
-    let frac = frac.trim_end_matches('0');
-    format!("{sec}.{frac}")
+    let sign = if secs < 0 {
+        secs = -(secs + 1);
+        nsecs = 1_000_000_000 - nsecs;
+        "-"
+    } else {
+        ""
+    };
+    let record = format!("{sign}{secs}.{nsecs:09}");
+    record.trim_end_matches('0').to_owned()
 }
 
+/// Go `fitsInOctal` — `x` encodes into an `n`-byte field as zero-padded
+/// octal digits plus a NUL terminator (fields ≥22 bytes always fit).
+fn fits_in_octal(field_bytes: usize, value: u64) -> bool {
+    field_bytes >= 22 || value < (1u64 << ((field_bytes - 1) * 3))
+}
+
+/// Go `formatOctal` — zero-padded octal digits plus a NUL. A value
+/// that cannot fit writes the zero field instead, exactly Go's
+/// last-resort zero on the (error-ignored) PAX body path — never a
+/// truncated field and never a panic.
 fn octal_field(value: u64, digits: usize) -> Vec<u8> {
+    let value = if fits_in_octal(digits + 1, value) {
+        value
+    } else {
+        0
+    };
     let mut field = format!("{value:0>width$o}", width = digits).into_bytes();
     field.push(0);
     field
+}
+
+/// Go `formatString` — copies `s` into the field, and when `s`
+/// overruns the field and the copied tail is '/', NULs the first byte
+/// of that trailing-slash run (Go's buggy-reader workaround writes a
+/// single NUL and leaves the rest of the copied bytes in place).
+fn format_string(field: &mut [u8], s: &[u8]) {
+    let n = s.len().min(field.len());
+    field[..n].copy_from_slice(&s[..n]);
+    if s.len() > field.len() && field[field.len() - 1] == b'/' {
+        let slashes = s[..field.len() - 1]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'/')
+            .count();
+        field[field.len() - 1 - slashes] = 0;
+    }
+}
+
+/// `writeRawFile`'s name handling for 'x' extended headers —
+/// `toASCII`, truncate to the 100-byte field, then `TrimRight` every
+/// trailing '/' (the x-header name ends clean, unlike the body
+/// field's single-NUL workaround in [`format_string`]).
+fn raw_file_name(name: &str) -> String {
+    let mut ascii = to_ascii(name);
+    ascii.truncate(100);
+    while ascii.ends_with('/') {
+        ascii.pop();
+    }
+    ascii
 }
 
 /// One 512-byte USTAR-shaped header block (Go's `v7Plus` template —
@@ -288,9 +345,10 @@ fn write_header_block(
     // entries but formats "0000000\0" on the v7-plus file/dir template.
     let fill_dev = typeflag != b'x';
     let mut block = [0u8; 512];
-    // name[0:100]
-    let name_bytes = to_ascii(name).into_bytes();
-    block[..name_bytes.len().min(100)].copy_from_slice(&name_bytes[..name_bytes.len().min(100)]);
+    // name[0:100] — Go `formatString`; callers pre-process the name
+    // (`toASCII` for PAX bodies, `writeRawFile`'s trim for 'x', the
+    // USTAR split suffix for plain entries).
+    format_string(&mut block[..100], name.as_bytes());
     // mode[100:108] — "%07o\0"
     block[100..108].copy_from_slice(&octal_field(u64::from(mode), 7));
     // uid[108:116], gid[116:124] — zeroed identities.
@@ -317,9 +375,7 @@ fn write_header_block(
         block[337..345].copy_from_slice(&octal_field(0, 7));
     }
     // prefix[345:500]
-    let prefix_bytes = prefix.as_bytes();
-    block[345..345 + prefix_bytes.len().min(155)]
-        .copy_from_slice(&prefix_bytes[..prefix_bytes.len().min(155)]);
+    format_string(&mut block[345..500], prefix.as_bytes());
     // pad[500:512] stays zero.
     let sum: u64 = block.iter().map(|&b| u64::from(b)).sum();
     // Go's chksum format: "%06o\0 " (six digits, NUL, trailing space).
@@ -336,11 +392,101 @@ fn pad512(w: &mut impl Write, written: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `tw.WriteHeader` for one entry — Go's `allowedFormats` decision
+/// tree for the `FormatPAX`-requested headers `BuildTarGz` emits:
+/// USTAR wins when it encodes the whole header (ASCII name ≤100 bytes
+/// or USTAR-splittable, octal-fitting size and mtime); PAX wins when
+/// a nanosecond or octal-overflowing `ModTime` prefers it or a field
+/// cannot be USTAR-encoded at all. The 'x' extended header carries
+/// the sorted `mtime`/`path`/`size` records — `size` riding decimal
+/// whenever it overflows the 11-octal-digit field — and the USTAR-
+/// shaped body header writes `formatOctal`'s zero fallback for any
+/// field that overflowed. `size` is the DECLARED size: the caller
+/// streams that many body bytes next (Go's `tw.curr` contract), so a
+/// test can exercise the overflow path without a real 8-GiB file.
+fn write_entry_header(
+    w: &mut impl Write,
+    name: &str,
+    typeflag: u8,
+    mode: u32,
+    size: u64,
+    created_at: OffsetDateTime,
+) -> std::io::Result<()> {
+    let mtime_secs = created_at.unix_timestamp();
+    // verifyNumeric/verifyTime: the 12-byte octal fields refuse
+    // negatives and anything ≥ 2^33.
+    let mtime_fits = mtime_secs >= 0 && fits_in_octal(12, mtime_secs as u64);
+    let size_fits = fits_in_octal(12, size);
+    let mut records: Vec<(String, String)> = Vec::new();
+    // `verifyTime` — sub-second or overflowing ModTime prefers PAX
+    // and rides as the `mtime` record (Go sets `preferPAX` on either).
+    let prefer_pax = created_at.nanosecond() != 0 || !mtime_fits;
+    if prefer_pax {
+        records.push(("mtime".to_owned(), format_pax_time(created_at)));
+    }
+    // `verifyString` — `path` records a non-ASCII or >100-byte name
+    // whenever PAX is chosen, independent of USTAR splittability.
+    if !is_ascii(name) || name.len() > 100 {
+        records.push(("path".to_owned(), name.to_owned()));
+    }
+    // `verifyNumeric` — an overflowing size rides decimal as `size`.
+    if !size_fits {
+        records.push(("size".to_owned(), size.to_string()));
+    }
+    let ustar_split = split_ustar_path(name);
+    // `allowedFormats` ∩ wanted (`{PAX,USTAR}` unless `preferPAX`
+    // pinned PAX alone): PAX is emitted whenever USTAR was voted out
+    // or the preference excludes it.
+    let name_ustar = is_ascii(name) && (name.len() <= 100 || ustar_split.is_some());
+    let emit_pax = prefer_pax || !name_ustar || !size_fits || !mtime_fits;
+    if emit_pax {
+        records.sort();
+        let record_bytes: String = records
+            .iter()
+            .map(|(k, v)| format_pax_record(k, v))
+            .collect();
+        // `writeRawFile`'s 'x' entry — `dir/PaxHeaders.0/base` beside
+        // the real entry (root-level names drop the dir).
+        let dir = name.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let base = name.rsplit('/').next().unwrap_or(name);
+        let x_name = if dir.is_empty() {
+            format!("PaxHeaders.0/{base}")
+        } else {
+            format!("{dir}/PaxHeaders.0/{base}")
+        };
+        write_header_block(
+            w,
+            &raw_file_name(&x_name),
+            "",
+            0,
+            record_bytes.len() as u64,
+            0,
+            b'x',
+        )?;
+        w.write_all(record_bytes.as_bytes())
+            .and_then(|()| pad512(w, record_bytes.len() as u64))?;
+        // PAX body: `formatString(toASCII(name))` — the 100-byte field
+        // truncates with Go's trailing-slash workaround inside; the
+        // numeric fields write `formatOctal`'s zero fallback when a
+        // value rode in the records instead.
+        write_header_block(w, &to_ascii(name), "", mode, size, mtime_secs, typeflag)
+    } else {
+        // `writeUSTARHeader` — split when `splitUSTARPath` returned a
+        // pair, else the whole name with an empty prefix.
+        let (short, prefix) = match ustar_split {
+            Some((p, s)) => (s, p),
+            None => (name.to_owned(), String::new()),
+        };
+        write_header_block(w, &short, &prefix, mode, size, mtime_secs, typeflag)
+    }
+}
+
 /// `BuildTarGz` — sorted names, uid/gid 0, file 0600 / dir 0700, mtime
 /// pinned to `created_at`. Symlinks and special files are refused.
-/// Emits Go's PAX layout: an `mtime` x-header record (plus `path` when
-/// the name can't be USTAR-encoded) whenever the pinned time carries
-/// nanoseconds, else a split-capable USTAR entry.
+/// Emits Go's layout: a PAX 'x' extended header carrying the sorted
+/// `mtime`/`path`/`size` records whenever a nanosecond timestamp, a
+/// non-USTAR name, or an octal-overflowing size/mtime demands it —
+/// else a split-capable USTAR entry.
 pub fn build_tar_gz(
     src_dir: &Path,
     w: impl Write,
@@ -389,64 +535,8 @@ pub fn build_tar_gz(
         } else {
             (b'0', 0o600u32, meta.len())
         };
-        let mut records: Vec<(String, String)> = Vec::new();
-        let prefer_pax = created_at.nanosecond() != 0;
-        if prefer_pax {
-            records.push(("mtime".to_owned(), format_pax_time(created_at)));
-        }
-        let ustar_split = split_ustar_path(name);
-        // Go's verifyString: `path` records whenever the name is
-        // non-ASCII or >100 bytes — independent of splittability.
-        if !is_ascii(name) || name.len() > 100 {
-            records.push(("path".to_owned(), name.clone()));
-        }
-        records.sort();
-        let emit_pax = prefer_pax || ustar_split.is_none();
-        if emit_pax {
-            let record_bytes: String = records
-                .iter()
-                .map(|(k, v)| format_pax_record(k, v))
-                .collect();
-            let dir = name.rsplit_once('/').map(|(d, _)| d).unwrap_or(".");
-            let base = name.rsplit('/').next().unwrap_or(name);
-            let x_name = if dir == "." {
-                format!("PaxHeaders.0/{base}")
-            } else {
-                format!("{dir}/PaxHeaders.0/{base}")
-            };
-            write_header_block(&mut gz, &x_name, "", 0, record_bytes.len() as u64, 0, b'x')
-                .map_err(|e| PortableError::msg(format!("xheader: {e}")))?;
-            gz.write_all(record_bytes.as_bytes())
-                .and_then(|()| pad512(&mut gz, record_bytes.len() as u64))
-                .map_err(|e| PortableError::msg(format!("xheader body: {e}")))?;
-            // PAX body: name is the ASCII-truncated form — no split.
-            let body_name = to_ascii(name);
-            let truncated: String = {
-                let b = body_name.as_bytes();
-                String::from_utf8_lossy(&b[..b.len().min(100)]).into_owned()
-            };
-            write_header_block(
-                &mut gz,
-                &truncated,
-                "",
-                mode,
-                size,
-                created_at.unix_timestamp(),
-                typeflag,
-            )
+        write_entry_header(&mut gz, name, typeflag, mode, size, created_at)
             .map_err(|e| PortableError::msg(format!("header {name}: {e}")))?;
-        } else if let Some((prefix, short)) = ustar_split {
-            write_header_block(
-                &mut gz,
-                &short,
-                &prefix,
-                mode,
-                size,
-                created_at.unix_timestamp(),
-                typeflag,
-            )
-            .map_err(|e| PortableError::msg(format!("header {name}: {e}")))?;
-        }
         if !meta.is_dir() {
             let mut file = fs::File::open(&full)
                 .map_err(|e| PortableError::msg(format!("open {name}: {e}")))?;
@@ -866,6 +956,69 @@ mod tests {
         let _ = fs::remove_dir_all(&dst);
     }
 
+    /// A declared size ≥ 8GiB overflows the 11-octal-digit field: Go's
+    /// `verifyNumeric` drops USTAR and rides `size` decimal in the 'x'
+    /// records; the body header's size field writes `formatOctal`'s
+    /// zero fallback. No real 8GiB file — `write_entry_header` takes
+    /// the declared size.
+    #[test]
+    fn oversized_declared_size_emits_pax_size_record() {
+        let at = datetime!(2025-03-04 05:06:07 UTC);
+        let mut out = Vec::new();
+        write_entry_header(&mut out, "big.bin", b'0', 0o600, 8 << 30, at).expect("hdr");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("size=8589934592\n"),
+            "x-header carries the decimal size record"
+        );
+        // Layout: 'x' header 0..512, record body 512..1024, body header
+        // 1024..1536. The body's size field (124..136) is the zero
+        // fallback, never a truncated field.
+        assert_eq!(out[156], b'x');
+        assert_eq!(&out[1024 + 124..1024 + 136], b"00000000000\0");
+        assert_eq!(out[1024 + 156], b'0');
+        // Fitting mtime and short ASCII name carry no records.
+        assert!(!text.contains("mtime="));
+        assert!(!text.contains("path="));
+    }
+
+    /// A `ModTime` beyond the octal field (year ~2242+) prefers PAX
+    /// and rides as the `mtime` record; the body's mtime field writes
+    /// zeros — the same decision tree the `size` overflow takes.
+    #[test]
+    fn far_future_mtime_emits_pax_mtime_record() {
+        let at = datetime!(2300-01-01 00:00:00 UTC);
+        let mut out = Vec::new();
+        write_entry_header(&mut out, "future.bin", b'0', 0o600, 3, at).expect("hdr");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("mtime=10413792000\n"));
+        assert_eq!(&out[1024 + 136..1024 + 148], b"00000000000\0");
+        // A fitting size stays octal in the body header.
+        assert_eq!(&out[1024 + 124..1024 + 136], b"00000000003\0");
+    }
+
+    /// Go `toASCII` drops non-ASCII runes (never substitutes '?') and
+    /// `formatString` NULs the head of a trailing-slash run when the
+    /// name overruns the 100-byte field.
+    #[test]
+    fn ascii_and_slash_edge_semantics() {
+        assert_eq!(to_ascii("dïr/nâmé-€.txt"), "dr/nm-.txt");
+        // '/' at byte 99 of an overrun name → Go writes a single NUL.
+        let name = format!("{}/q.txt", "z".repeat(99));
+        let mut field = [0u8; 100];
+        format_string(&mut field, to_ascii(&name).as_bytes());
+        assert_eq!(&field[99..100], b"\0");
+        assert_eq!(&field[..99], "z".repeat(99).as_bytes());
+        // Trailing slash run ending at byte 99: NUL lands at the head
+        // of the run, the remaining slashes stay copied (Go writes
+        // exactly one NUL).
+        let name = format!("{}/////{}", "a".repeat(95), "b".repeat(20));
+        let mut field = [0u8; 100];
+        format_string(&mut field, name.as_bytes());
+        assert_eq!(field[95], 0);
+        assert_eq!(&field[96..100], b"////");
+    }
+
     /// Env-gated fixture dump for the Go byte-parity check:
     /// `DUMP_SRC` + `DUMP_OUT` set → emit the same archive upstream's
     /// `BuildTarGz` produced and compare decompressed bytes.
@@ -882,6 +1035,7 @@ mod tests {
         build_tar_gz(Path::new(&src), &mut buf, at).expect("tar");
         fs::write(&out, &buf).expect("dump");
     }
+
 
     #[test]
     fn build_tar_gz_refuses_symlink() {
