@@ -21,6 +21,7 @@ pub mod attestation;
 pub mod buildkit;
 pub mod capacity;
 pub mod fetch;
+pub mod image_load;
 pub mod journal;
 pub mod lock;
 pub mod module_cache;
@@ -52,6 +53,10 @@ pub use fetch::{
     ArtifactInfo, FetchTransport, Fetcher, HttpTransport, TransportFailure, archive_entry_path,
     fetch_url, is_public_unicast, is_transient_fetch_error, lock_artifact, url_port,
     verify_stored_digest,
+};
+pub use image_load::{
+    CONTAINERD_SNAPSHOTTER_DRIVER_TYPE, DockerImageLoader, ImageLoader, UnavailableImageLoader,
+    image_loader_for,
 };
 pub use journal::FileJournal;
 pub use lock::LockAdapter;
