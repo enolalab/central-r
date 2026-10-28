@@ -131,5 +131,23 @@ path = "tests/d07_acceptance/mod.rs"
 name = "e04_advisory"
 path = "tests/e04_advisory/mod.rs"
 
+# R6 task 16 — E05 runbook verification (upstream cmd/central's
+# e05_runbook_test.go): every documented `central maintenance …`
+# command parses through the real binary's grammar, and every reason
+# token the runbook documents exists in `crates/` + `bins/` sources.
+# CENTRAL_E05_EVIDENCE_DIR emits slice-e-runbooks-verification.json.
+[[test]]
+name = "e05_runbook"
+path = "tests/e05_runbook/mod.rs"
+
+# R6 task 16 — E06 Slice-E Phase-1 acceptance (upstream cmd/central's
+# e06_acceptance_test.go): the authority cycle end-to-end on the real
+# maintenance store + apply handler + broker Journal, confirmer seam
+# stubbed; physical-tier criteria record deferred-physical.
+# CENTRAL_E06_EVIDENCE_DIR emits slice-e-full-phase1-acceptance.json.
+[[test]]
+name = "e06_acceptance"
+path = "tests/e06_acceptance/mod.rs"
+
 [lints]
 workspace = true

@@ -154,6 +154,11 @@ fn run_maintenance_plan(
     };
     let operation_id = Uuid::now_v7().to_string();
     let socket = helper_socket();
+    // Upstream's nil-client arm emits "MAINTENANCE_SERVICE_UNAVAILABLE"
+    // here; this port always constructs the client — the arm is
+    // unreachable and an absent helper surfaces as the dial failure
+    // `maintenance_error_result` maps below (the lifecycle port's
+    // identical LIFECYCLE_SERVICE_UNAVAILABLE fold).
     let result = match MaintenanceClient::new(socket).plan(&operation_id, &checks) {
         Ok(result) => result,
         Err(err) => {
@@ -465,6 +470,9 @@ fn run_maintenance_apply(
         abandon: parsed.abandon,
     };
     let socket = helper_socket();
+    // Same unreachable nil-client arm as plan's — upstream emits
+    // "MAINTENANCE_SERVICE_UNAVAILABLE" when no apply client is wired;
+    // the always-constructed client makes the dial the only failure.
     let result = match MaintenanceApplyClient::new(socket).apply(&operation_id, &request) {
         Ok(result) => result,
         Err(err) => {
