@@ -20,6 +20,7 @@
 pub mod buildkit;
 pub mod capacity;
 pub mod fetch;
+pub mod journal;
 pub mod lock;
 pub mod module_cache;
 pub mod oci;
@@ -47,6 +48,7 @@ pub use fetch::{
     fetch_url, is_public_unicast, is_transient_fetch_error, lock_artifact, url_port,
     verify_stored_digest,
 };
+pub use journal::FileJournal;
 pub use lock::LockAdapter;
 pub use module_cache::{
     DockerModuleAcquirer, MODULE_CACHE_CAPABILITY_KEY, MODULE_DOWNLOAD_DIR, ModuleAcquirer,
