@@ -27,10 +27,12 @@ use sha2::{Digest, Sha256};
 use crate::broker::wire::{b64_decode, b64_encode, b64_raw_encode};
 
 /// `productionPostgresLoopbackHostPort`.
-const POSTGRES_LOOPBACK_HOST_PORT: &str = "127.0.0.1:55432";
-/// The startup packet's user/database pair (fixed, not caller-chosen).
+pub(crate) const POSTGRES_LOOPBACK_HOST_PORT: &str = "127.0.0.1:55432";
+/// The startup packet's admin user (the `central` superuser); the
+/// database is fixed, the service-role syncer chooses its own user.
 const POSTGRES_USER: &str = "central";
-const POSTGRES_DATABASE: &str = "central";
+/// The startup packet's database (fixed, not caller-chosen).
+pub(crate) const POSTGRES_DATABASE: &str = "central";
 /// pgx's `connect_timeout=5` dial bound.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// pgx's `context.WithTimeout(ctx, 10*time.Second)` whole-exchange bound.
@@ -154,11 +156,11 @@ impl PgConn {
         }
     }
 
-    fn send_startup(&mut self) -> Result<(), Failure> {
+    fn send_startup(&mut self, user: &str) -> Result<(), Failure> {
         let mut body = Vec::with_capacity(64);
         body.extend_from_slice(&196608u32.to_be_bytes()); // protocol 3.0
         body.extend_from_slice(b"user\0");
-        body.extend_from_slice(POSTGRES_USER.as_bytes());
+        body.extend_from_slice(user.as_bytes());
         body.push(0);
         body.extend_from_slice(b"database\0");
         body.extend_from_slice(POSTGRES_DATABASE.as_bytes());
@@ -361,9 +363,12 @@ impl ScramExchange {
     }
 }
 
-/// `pgxPostgresSuperuserSyncer.connect` — dial, startup,
-/// authenticate, ready.
-fn connect(password: &str) -> Result<PgConn, Failure> {
+/// `pgxPostgresSuperuserSyncer.connect`/`pgxPostgresServiceRoleSyncer.
+/// connectAsAdmin` + the `postgres://<role>@...` `Verify` dial —
+/// `user` is always one of the closed literals this package owns
+/// (`central`, or a `POSTGRES_SERVICE_ROLES` role name), never caller
+/// input, matching upstream's startup-packet reasoning.
+fn connect(user: &str, password: &str) -> Result<PgConn, Failure> {
     let addr = POSTGRES_LOOPBACK_HOST_PORT
         .to_socket_addrs()
         .ok()
@@ -382,7 +387,7 @@ fn connect(password: &str) -> Result<PgConn, Failure> {
         .and_then(|()| stream.set_nodelay(true))
         .map_err(|_| unavailable("postgres wire: dial failed"))?;
     let mut conn = PgConn { stream, deadline };
-    conn.send_startup()?;
+    conn.send_startup(user)?;
     conn.authenticate(password)?;
     Ok(conn)
 }
@@ -401,7 +406,7 @@ impl PostgresSuperuserSyncer {
     /// `Verify` — connect + the empty ping query upstream's
     /// `conn.Ping` sends (the server answers `EmptyQueryResponse`).
     pub(crate) fn verify(&self, password: &str) -> Result<(), Failure> {
-        let mut conn = connect(password)?;
+        let mut conn = connect(POSTGRES_USER, password)?;
         conn.write_message(b'Q', b"\0")?;
         conn.wait_ready()
     }
@@ -416,9 +421,76 @@ impl PostgresSuperuserSyncer {
                 "postgres superuser credential: refusing to set a malformed password",
             ));
         }
-        let mut conn = connect(auth_password)?;
+        let mut conn = connect(POSTGRES_USER, auth_password)?;
         let mut sql =
             format!("ALTER ROLE {POSTGRES_USER} WITH PASSWORD '{new_password}'").into_bytes();
+        sql.push(0);
+        conn.write_message(b'Q', &sql)?;
+        conn.wait_ready()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `pgxPostgresServiceRoleSyncer` — the same transport authenticating
+// as `central` to `ALTER ROLE`, or as a named service role to verify.
+// ---------------------------------------------------------------------------
+
+/// `ALTER ROLE <role> WITH LOGIN PASSWORD '<new>'` — `role_name` is
+/// always one of the three closed literals in `postgresServiceRoles`,
+/// never caller input, and the minted password's alphabet is closed
+/// (`valid_postgres_superuser_password`), so neither side of this
+/// literal can escape the statement — upstream's exact reasoning.
+/// Extracted so the wire string itself is pinned by a test.
+fn alter_login_statement(role_name: &str, new_password: &str) -> String {
+    format!("ALTER ROLE {role_name} WITH LOGIN PASSWORD '{new_password}'")
+}
+
+/// `pgxPostgresServiceRoleSyncer` — drives the live server over the
+/// compose policy's pinned loopback published port, authenticating as
+/// `central` (the admin) to `alter_login`, or as the named role
+/// itself to `verify_as`.
+pub(crate) struct PostgresServiceRoleSyncer;
+
+#[allow(dead_code)] // wired by the service-role store's `new_production` (LC-T4 consumer)
+impl PostgresServiceRoleSyncer {
+    /// `pgxPostgresServiceRoleSyncer{hostPort}` — the endpoint is the
+    /// compose policy's pinned constant here, so no field.
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    /// `Verify` — an empty password refuses before any dial, like
+    /// upstream; otherwise connect as the named role + the empty ping
+    /// query (`postgres://<role>@host/central`, `conn.Ping`).
+    pub(crate) fn verify_as(&self, role_name: &str, password: &str) -> Result<(), Failure> {
+        if password.is_empty() {
+            return Err(unavailable(
+                "postgres service role credential: empty password",
+            ));
+        }
+        let mut conn = connect(role_name, password)?;
+        conn.write_message(b'Q', b"\0")?;
+        conn.wait_ready()
+    }
+
+    /// `AlterLogin` — connect as `central` with `auth_password`, then
+    /// `ALTER ROLE <role> WITH LOGIN PASSWORD '<new>'`. `ALTER ROLE`
+    /// cannot take a bind parameter for the password; the caller's
+    /// minted alphabet is closed and `role_name` is a closed literal,
+    /// so the single-quoted literal cannot escape.
+    pub(crate) fn alter_login(
+        &self,
+        auth_password: &str,
+        role_name: &str,
+        new_password: &str,
+    ) -> Result<(), Failure> {
+        if !valid_postgres_superuser_password(new_password) {
+            return Err(unavailable(
+                "postgres service role credential: refusing to set a malformed password",
+            ));
+        }
+        let mut conn = connect(POSTGRES_USER, auth_password)?;
+        let mut sql = alter_login_statement(role_name, new_password).into_bytes();
         sql.push(0);
         conn.write_message(b'Q', &sql)?;
         conn.wait_ready()
@@ -459,6 +531,37 @@ mod tests {
         exchange
             .verify_final(b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
             .unwrap();
+    }
+
+    /// `pgxPostgresServiceRoleSyncer.AlterLogin`'s exact statement —
+    /// `WITH LOGIN` (not the superuser's plain `WITH PASSWORD`): the
+    /// service roles are created NOLOGIN and this grants it.
+    #[test]
+    fn service_role_alter_login_statement_shape() {
+        assert_eq!(
+            alter_login_statement("central_runtime", "newpw"),
+            "ALTER ROLE central_runtime WITH LOGIN PASSWORD 'newpw'"
+        );
+    }
+
+    /// `Verify` refuses an empty password before any dial, and
+    /// `AlterLogin` refuses a malformed minted password before any
+    /// dial — upstream's two pre-connect gates.
+    #[test]
+    fn service_role_syncer_pre_dial_refusals() {
+        let syncer = PostgresServiceRoleSyncer::new();
+        let err = syncer.verify_as("central_runtime", "").unwrap_err();
+        assert_eq!(
+            err.message(),
+            "postgres service role credential: empty password"
+        );
+        let err = syncer
+            .alter_login("auth", "central_runtime", "has space")
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "postgres service role credential: refusing to set a malformed password"
+        );
     }
 
     #[test]

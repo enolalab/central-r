@@ -479,6 +479,21 @@ impl LifecycleClient {
     }
 }
 
+/// `postgresServiceRoleBroker` — the service-role credential store's
+/// binding seam: upstream's `brokerClient` (cmd/central/main.go)
+/// passes this client where the `postgresServiceRoleBroker`
+/// interface is expected.
+impl crate::helper::pg_credentials::PostgresServiceRoleBroker for LifecycleClient {
+    fn bind_postgres_service_role(
+        &self,
+        instance_id: &str,
+        purpose: &str,
+        value: &[u8],
+    ) -> Result<(), Failure> {
+        LifecycleClient::bind_postgres_service_role(self, instance_id, purpose, value)
+    }
+}
+
 /// `json.NewDecoder(conn).Decode(&response)` — one JSON line off the
 /// wire.
 fn read_response_line(conn: &mut UnixStream) -> Result<BrokerResponse, Failure> {

@@ -23,10 +23,14 @@
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use central_foundation::failure::Failure;
 
-use crate::helper::pg_wire::{PostgresSuperuserSyncer, valid_postgres_superuser_password};
+use crate::helper::pg_wire::{
+    POSTGRES_DATABASE, POSTGRES_LOOPBACK_HOST_PORT, PostgresServiceRoleSyncer,
+    PostgresSuperuserSyncer, valid_postgres_superuser_password,
+};
 use crate::infra::compose::{POSTGRES_INIT_SCRIPT_SQL, postgres_init_script_host_path};
 
 fn unavailable(msg: &str) -> Failure {
@@ -85,7 +89,10 @@ pub(crate) fn validate_root_owned_directory(path: &str) -> Result<(), Failure> {
 
 /// `os.CreateTemp(dir, prefix)` — a uniquely-named sibling the
 /// caller renames into place; `O_NOFOLLOW|O_CLOEXEC` like every
-/// other credential write in this daemon.
+/// other credential write in this daemon. The suffix alphabet is
+/// URL-safe (`b64_url_raw_encode`): the standard alphabet's `/`
+/// would turn the random suffix into a path separator — Go's
+/// `CreateTemp` suffix is alphanumeric, so it can never produce one.
 fn tempfile_in(dir: &Path, prefix: &str) -> Result<(std::fs::File, PathBuf), Failure> {
     for _ in 0..16 {
         let mut raw = [0u8; 8];
@@ -94,7 +101,7 @@ fn tempfile_in(dir: &Path, prefix: &str) -> Result<(std::fs::File, PathBuf), Fai
         let path = dir.join(format!(
             "{}{}",
             prefix,
-            crate::broker::wire::b64_raw_encode(&raw)
+            crate::broker::wire::b64_url_raw_encode(&raw)
         ));
         match std::fs::OpenOptions::new()
             .write(true)
@@ -442,6 +449,259 @@ impl PostgresSuperuserRotator for ProductionPostgresSuperuserCredentialStore {
 }
 
 // ---------------------------------------------------------------------------
+// `productionPostgresServiceRoleCredentialStore` — ADR 0019 §4's
+// rotate-then-sync cycle for the three service roles
+// (`cmd/central/postgres_service_role_credential.go`).
+// ---------------------------------------------------------------------------
+
+/// `postgresServiceRole` — one of ADR 0019 §3's three fixed NOLOGIN
+/// NOINHERIT service roles and the secretbootstrap purpose its live
+/// password is bound under once §4's rotate-then-sync grants it
+/// LOGIN.
+struct PostgresServiceRole {
+    purpose: &'static str,
+    role_name: &'static str,
+}
+
+/// `postgresServiceRoles` — the closed, ordered set
+/// `PostgresInitScriptSQL` creates
+/// (`internal/adapter/infralifecycle/compose_linux.go`). Order is
+/// deliberate but not load-bearing: `sync` treats each role
+/// independently.
+const POSTGRES_SERVICE_ROLES: [PostgresServiceRole; 3] = [
+    PostgresServiceRole {
+        purpose: "postgres_migration_v1",
+        role_name: "central_migration",
+    },
+    PostgresServiceRole {
+        purpose: "postgres_runtime_v1",
+        role_name: "central_runtime",
+    },
+    PostgresServiceRole {
+        purpose: "postgres_outbox_v1",
+        role_name: "central_outbox",
+    },
+];
+
+/// `postgresServiceRoleSecretDirName`.
+const POSTGRES_SERVICE_ROLE_SECRET_DIR_NAME: &str = "postgres-service-roles";
+
+/// `postgresServiceRoleBroker` — the seam `sync` uses to register a
+/// rotated password as the new active protected binding —
+/// `LifecycleClient` in production (upstream's `brokerClient`).
+#[allow(dead_code)]
+pub(crate) trait PostgresServiceRoleBroker: Send + Sync {
+    /// `BindPostgresServiceRole`.
+    fn bind_postgres_service_role(
+        &self,
+        instance_id: &str,
+        purpose: &str,
+        value: &[u8],
+    ) -> Result<(), Failure>;
+}
+
+/// `postgresServiceRoleSyncer` — the live-server seam `sync_one`
+/// drives: `verify_as` proves a password currently authenticates the
+/// named role; `alter_login` authenticates as `central` and grants
+/// the role LOGIN with `new_password`.
+#[allow(dead_code)]
+pub(crate) trait ServiceRoleSyncer: Send + Sync {
+    /// `Verify`.
+    fn verify_as(&self, role_name: &str, password: &str) -> Result<(), Failure>;
+    /// `AlterLogin`.
+    fn alter_login(
+        &self,
+        auth_password: &str,
+        role_name: &str,
+        new_password: &str,
+    ) -> Result<(), Failure>;
+}
+
+impl ServiceRoleSyncer for PostgresServiceRoleSyncer {
+    fn verify_as(&self, role_name: &str, password: &str) -> Result<(), Failure> {
+        PostgresServiceRoleSyncer::verify_as(self, role_name, password)
+    }
+    fn alter_login(
+        &self,
+        auth_password: &str,
+        role_name: &str,
+        new_password: &str,
+    ) -> Result<(), Failure> {
+        PostgresServiceRoleSyncer::alter_login(self, auth_password, role_name, new_password)
+    }
+}
+
+/// `productionPostgresServiceRoleCredentialStore` runs ADR 0019 §4's
+/// rotate-then-sync cycle for the three service roles. Unlike the
+/// superuser store, it never invents its own admin credential: it
+/// authenticates its `ALTER ROLE` calls with whatever password
+/// `ProductionPostgresSuperuserCredentialStore` currently has live,
+/// since that store is the sole owner of rotating and verifying the
+/// `central` role itself.
+#[allow(dead_code)]
+pub(crate) struct ProductionPostgresServiceRoleCredentialStore {
+    instance_id: String,
+    protected_dir: PathBuf,
+    superuser: Arc<ProductionPostgresSuperuserCredentialStore>,
+    broker: Arc<dyn PostgresServiceRoleBroker>,
+    syncer: Arc<dyn ServiceRoleSyncer>,
+}
+
+#[allow(dead_code)] // the postgres-provision compose `up` decorator lands in LC-T3/T4
+impl ProductionPostgresServiceRoleCredentialStore {
+    /// `newProductionPostgresServiceRoleCredentialStore`. Upstream's
+    /// nil-superuser/nil-broker refusals are the type system's job —
+    /// `Arc` parameters cannot be absent.
+    pub(crate) fn new_production(
+        composition: &crate::broker::daemon::ProductionInstanceComposition,
+        superuser: Arc<ProductionPostgresSuperuserCredentialStore>,
+        broker: Arc<dyn PostgresServiceRoleBroker>,
+    ) -> Result<Self, Failure> {
+        if composition.instance_id.is_empty() {
+            return Err(unavailable(
+                "postgres service role credential composition unavailable",
+            ));
+        }
+        Ok(Self {
+            instance_id: composition.instance_id.clone(),
+            protected_dir: Path::new(crate::broker::daemon::PRODUCTION_PROTECTED_INSTANCES)
+                .join(&composition.instance_id)
+                .join(POSTGRES_SERVICE_ROLE_SECRET_DIR_NAME),
+            superuser,
+            broker,
+            syncer: Arc::new(PostgresServiceRoleSyncer::new()),
+        })
+    }
+
+    /// `Sync` — one rotate-then-sync pass over every service role:
+    /// authenticate with the superuser's current live password, grant
+    /// LOGIN with a freshly minted one only when the role's
+    /// locally-recorded password no longer authenticates (first run,
+    /// or drift), then always re-register the (possibly unchanged)
+    /// password as the broker's active binding — that call alone
+    /// renews the binding's lease, which is what an
+    /// otherwise-unchanged password still needs from a
+    /// stale-but-still-valid live credential.
+    ///
+    /// Called from the postgres-provision compose `up` decorator,
+    /// strictly after docker compose reports the postgres healthcheck
+    /// passing (ADR 0019 §4 must never run against a server that is
+    /// not accepting connections yet). Upstream's nil-store/nil-ctx
+    /// refusal has no Rust analogue — `&self` cannot be nil and the
+    /// port is synchronous.
+    pub(crate) fn sync(&self) -> Result<(), Failure> {
+        let auth_password = self.superuser.active_password().map_err(|_| {
+            unavailable("postgres service role credential: superuser password unavailable")
+        })?;
+        self.ensure_protected_dir()?;
+        // `errors.Join` — `Failure` is flat, so every role's failure
+        // is joined into one refusal message, each prefixed with its
+        // role name exactly like upstream's `fmt.Errorf("%s: %w")`.
+        let mut failures: Vec<String> = Vec::new();
+        for role in &POSTGRES_SERVICE_ROLES {
+            if let Err(e) = self.sync_one(role, &auth_password) {
+                failures.push(format!("{}: {e}", role.role_name));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(unavailable(&failures.join("\n")))
+        }
+    }
+
+    /// `syncOne` — rotate on first-run or drift (the locally-recorded
+    /// password no longer authenticates), then always rebind.
+    fn sync_one(&self, role: &PostgresServiceRole, auth_password: &str) -> Result<(), Failure> {
+        let recorded = self.read_secret(role.role_name);
+        let needs_rotation = match &recorded {
+            Err(_) => true,
+            Ok(active) => self.syncer.verify_as(role.role_name, active).is_err(),
+        };
+        let mut active = recorded.unwrap_or_default();
+        if needs_rotation {
+            let minted = random_urlsafe_password()
+                .map_err(|_| unavailable("postgres service role credential: mint"))?;
+            self.syncer
+                .alter_login(auth_password, role.role_name, &minted)
+                .map_err(|_| unavailable("postgres service role credential: alter live role"))?;
+            self.write_secret(role.role_name, &minted).map_err(|_| {
+                unavailable("postgres service role credential: persist rotated secret")
+            })?;
+            active = minted;
+        }
+        // `127.0.0.1:55432:central:<role>:<pw>\n` — the fixed
+        // five-field passfile shape the broker's purpose validators
+        // pin.
+        let passfile = format!(
+            "{POSTGRES_LOOPBACK_HOST_PORT}:{POSTGRES_DATABASE}:{}:{}\n",
+            role.role_name, active
+        );
+        self.broker
+            .bind_postgres_service_role(&self.instance_id, role.purpose, passfile.as_bytes())
+            .map_err(|_| unavailable("postgres service role credential: bind broker binding"))
+    }
+
+    /// `ensureProtectedDir` — `protected_dir` exists at mode 0700 and
+    /// is a real directory (never a symlink).
+    fn ensure_protected_dir(&self) -> Result<(), Failure> {
+        std::fs::create_dir_all(&self.protected_dir)
+            .map_err(|_| unavailable("postgres service role credential: protected directory"))?;
+        std::fs::set_permissions(&self.protected_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| unavailable("postgres service role credential: protected directory"))?;
+        let stat = std::fs::symlink_metadata(&self.protected_dir)
+            .map_err(|_| unavailable("postgres service role credential: protected directory"))?;
+        if !stat.is_dir() || stat.file_type().is_symlink() {
+            return Err(unavailable(
+                "postgres service role credential: protected directory is not a directory",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `secretPath` — `<protectedDir>/<roleName>`.
+    fn secret_path(&self, role_name: &str) -> PathBuf {
+        self.protected_dir.join(role_name)
+    }
+
+    /// `readSecret` — a present-and-valid secret, or the read error.
+    fn read_secret(&self, role_name: &str) -> std::io::Result<String> {
+        let value = std::fs::read_to_string(self.secret_path(role_name))?;
+        if !valid_postgres_superuser_password(&value) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "postgres service role credential: stored secret is malformed",
+            ));
+        }
+        Ok(value)
+    }
+
+    /// `writeSecret` — the service-role store's simpler sibling of
+    /// the superuser's durable write: deterministic `<role>.tmp` at
+    /// mode 0400, rename, directory fsync.
+    fn write_secret(&self, role_name: &str, value: &str) -> Result<(), Failure> {
+        if !valid_postgres_superuser_password(value) {
+            return Err(unavailable(
+                "postgres service role credential: refusing to persist a malformed secret",
+            ));
+        }
+        let tmp = self.protected_dir.join(format!("{role_name}.tmp"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(value.as_bytes()))
+            .map_err(|_| unavailable("postgres service role credential: write secret"))?;
+        std::fs::rename(&tmp, self.secret_path(role_name))
+            .map_err(|_| unavailable("postgres service role credential: write secret"))?;
+        sync_directory_path(&self.protected_dir)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `productionPostgresAdminCredentialManager` — ADR 0014 §5's
 // single-use passfile for `postgres-throughput-provision`.
 // ---------------------------------------------------------------------------
@@ -534,5 +794,379 @@ impl ProductionPostgresAdminCredentialManager {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(unavailable("postgres admin credential: remove passfile")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// A unique scratch directory under `std::env::temp_dir` — the
+    /// same convention `helper::migration`'s tests use.
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pg-svc-roles-{tag}-{}", uuid::Uuid::now_v7()))
+    }
+
+    /// 43 `a`s — `valid_postgres_superuser_password`'s exact shape,
+    /// like upstream's test fixture.
+    const ACTIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// `fakeServiceRoleSyncer` — `roleName -> currently-live
+    /// password` plus recorded calls, upstream's test double.
+    #[derive(Default)]
+    struct FakeServiceRoleSyncer {
+        live: Mutex<BTreeMap<String, String>>,
+        verify_calls: Mutex<Vec<String>>,
+        alter_calls: Mutex<Vec<String>>,
+    }
+
+    impl ServiceRoleSyncer for FakeServiceRoleSyncer {
+        fn verify_as(&self, role_name: &str, password: &str) -> Result<(), Failure> {
+            self.verify_calls
+                .lock()
+                .unwrap()
+                .push(format!("{role_name}:{password}"));
+            match self.live.lock().unwrap().get(role_name) {
+                Some(live) if live == password => Ok(()),
+                _ => Err(unavailable("authentication failed")),
+            }
+        }
+
+        fn alter_login(
+            &self,
+            auth_password: &str,
+            role_name: &str,
+            new_password: &str,
+        ) -> Result<(), Failure> {
+            self.alter_calls
+                .lock()
+                .unwrap()
+                .push(format!("{role_name}:{auth_password}:{new_password}"));
+            self.live
+                .lock()
+                .unwrap()
+                .insert(role_name.to_owned(), new_password.to_owned());
+            Ok(())
+        }
+    }
+
+    /// `fakeServiceRoleBroker`.
+    #[derive(Default)]
+    struct FakeServiceRoleBroker {
+        binds: Mutex<Vec<(String, String, String)>>,
+        err: Mutex<Option<String>>,
+    }
+
+    impl PostgresServiceRoleBroker for FakeServiceRoleBroker {
+        fn bind_postgres_service_role(
+            &self,
+            instance_id: &str,
+            purpose: &str,
+            value: &[u8],
+        ) -> Result<(), Failure> {
+            if let Some(e) = self.err.lock().unwrap().clone() {
+                return Err(unavailable(&e));
+            }
+            self.binds.lock().unwrap().push((
+                instance_id.to_owned(),
+                purpose.to_owned(),
+                String::from_utf8_lossy(value).into_owned(),
+            ));
+            Ok(())
+        }
+    }
+
+    /// `testSuperuserStoreWithActivePassword` — a real superuser
+    /// store rooted in the scratch dir with `active` written durably.
+    fn superuser_store(dir: &Path, active: &str) -> ProductionPostgresSuperuserCredentialStore {
+        let store = ProductionPostgresSuperuserCredentialStore {
+            protected_dir: dir.join("postgres-server-admin"),
+            secrets_dir: dir.join("secrets"),
+            init_script_path: dir.join("init.sql"),
+            syncer: PostgresSuperuserSyncer::new(),
+            passfile_uid: POSTGRES_DAEMON_UID,
+            passfile_gid: POSTGRES_DAEMON_GID,
+        };
+        store.ensure_protected_dir().unwrap();
+        store
+            .write_secret(POSTGRES_SUPERUSER_ACTIVE_FILE_NAME, active)
+            .unwrap();
+        store
+    }
+
+    /// `testServiceRoleStore` — the store wired to fakes and the
+    /// scratch-dir protected root.
+    fn service_role_store(
+        dir: &Path,
+        superuser: Arc<ProductionPostgresSuperuserCredentialStore>,
+        syncer: Arc<dyn ServiceRoleSyncer>,
+        broker: Arc<dyn PostgresServiceRoleBroker>,
+    ) -> ProductionPostgresServiceRoleCredentialStore {
+        ProductionPostgresServiceRoleCredentialStore {
+            instance_id: "test-instance".to_owned(),
+            protected_dir: dir.join("postgres-service-roles"),
+            superuser,
+            broker,
+            syncer,
+        }
+    }
+
+    /// `TestServiceRoleSyncFirstRunMintsAltersAndBinds` — on an
+    /// instance with no locally-recorded service-role password,
+    /// `sync` mints one, grants LOGIN with it live, and registers it
+    /// as the broker's active binding for all three roles.
+    #[test]
+    fn service_role_sync_first_run_mints_alters_and_binds() {
+        let dir = temp_dir("first");
+        let superuser = Arc::new(superuser_store(&dir, ACTIVE));
+        let syncer = Arc::new(FakeServiceRoleSyncer::default());
+        let broker = Arc::new(FakeServiceRoleBroker::default());
+        let store = service_role_store(&dir, superuser, syncer.clone(), broker.clone());
+
+        store.sync().unwrap();
+
+        let alters = syncer.alter_calls.lock().unwrap();
+        assert_eq!(
+            alters.len(),
+            3,
+            "want one ALTER per service role: {alters:?}"
+        );
+        for role in &POSTGRES_SERVICE_ROLES {
+            // `<role>:<superuser's live password>:<minted>` — the
+            // admin credential is the superuser's, never a new one.
+            assert!(
+                alters
+                    .iter()
+                    .any(|c| c.starts_with(&format!("{}:{ACTIVE}:", role.role_name))),
+                "missing ALTER for {}: {alters:?}",
+                role.role_name
+            );
+        }
+        let binds = broker.binds.lock().unwrap();
+        assert_eq!(
+            binds.len(),
+            3,
+            "want one broker bind per service role: {binds:?}"
+        );
+        let mut purposes: Vec<&str> = binds.iter().map(|(_, p, _)| p.as_str()).collect();
+        purposes.sort_unstable();
+        assert_eq!(
+            purposes,
+            [
+                "postgres_migration_v1",
+                "postgres_outbox_v1",
+                "postgres_runtime_v1"
+            ]
+        );
+        for (instance_id, purpose, value) in binds.iter() {
+            assert_eq!(instance_id, "test-instance");
+            let role = POSTGRES_SERVICE_ROLES
+                .iter()
+                .find(|r| r.purpose == purpose.as_str())
+                .unwrap()
+                .role_name;
+            // `127.0.0.1:55432:central:<role>:<pw>\n` — the fixed
+            // five-field passfile, byte shape pinned.
+            assert_eq!(value.matches('\n').count(), 1);
+            let password = value
+                .strip_prefix(&format!("127.0.0.1:55432:central:{role}:"))
+                .and_then(|rest| rest.strip_suffix('\n'));
+            assert!(
+                password.is_some(),
+                "bind value is not the passfile shape: {value:?}"
+            );
+            assert!(valid_postgres_superuser_password(password.unwrap()));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `TestServiceRoleSyncSecondRunSkipsAlterButRebinds` — once a
+    /// role's recorded password still authenticates live, a second
+    /// `sync` must not mint or `ALTER` again, but must still
+    /// re-register the broker binding so its lease gets renewed.
+    #[test]
+    fn service_role_sync_second_run_skips_alter_but_rebinds() {
+        let dir = temp_dir("second");
+        let superuser = Arc::new(superuser_store(&dir, ACTIVE));
+        let syncer = Arc::new(FakeServiceRoleSyncer::default());
+        let broker = Arc::new(FakeServiceRoleBroker::default());
+        let store = service_role_store(&dir, superuser, syncer.clone(), broker.clone());
+
+        store.sync().unwrap();
+        let first_alters = syncer.alter_calls.lock().unwrap().len();
+        let first_binds = broker.binds.lock().unwrap().len();
+
+        store.sync().unwrap();
+        assert_eq!(
+            syncer.alter_calls.lock().unwrap().len(),
+            first_alters,
+            "second sync issued more ALTERs; recorded password still authenticates live"
+        );
+        assert_eq!(
+            broker.binds.lock().unwrap().len(),
+            first_binds + 3,
+            "second sync must rebind every role (lease renewal)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `TestServiceRoleSyncRotatesWhenLocalPasswordNoLongerAuthenticates`
+    /// — drift recovery: a role whose recorded password the live
+    /// server no longer accepts is re-rotated, not left broken.
+    #[test]
+    fn service_role_sync_rotates_on_drift() {
+        let dir = temp_dir("drift");
+        let superuser = Arc::new(superuser_store(&dir, ACTIVE));
+        let syncer = Arc::new(FakeServiceRoleSyncer::default());
+        // The live server moved on without our durable record.
+        syncer.live.lock().unwrap().insert(
+            "central_runtime".to_owned(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        );
+        let broker = Arc::new(FakeServiceRoleBroker::default());
+        let store = service_role_store(&dir, superuser, syncer.clone(), broker.clone());
+        store.ensure_protected_dir().unwrap();
+        store
+            .write_secret(
+                "central_runtime",
+                "ccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .unwrap();
+
+        store.sync().unwrap();
+
+        let alters = syncer.alter_calls.lock().unwrap();
+        let runtime = alters.iter().find(|c| c.starts_with("central_runtime:"));
+        assert!(
+            runtime.is_some(),
+            "central_runtime was not re-rotated: {alters:?}"
+        );
+        let minted = runtime.unwrap().rsplit(':').next().unwrap();
+        assert_ne!(minted, "ccccccccccccccccccccccccccccccccccccccccccc");
+        assert_ne!(minted, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        // The minted value is now the durable record.
+        assert_eq!(store.read_secret("central_runtime").unwrap(), minted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `readSecret`/`writeSecret` round trip, mode `0400`, and the
+    /// `valid_postgres_superuser_password` gate on both directions.
+    #[test]
+    fn service_role_secret_round_trip_and_malformed_refusal() {
+        let dir = temp_dir("secret");
+        let superuser = Arc::new(superuser_store(&dir, ACTIVE));
+        let syncer = Arc::new(FakeServiceRoleSyncer::default());
+        let broker = Arc::new(FakeServiceRoleBroker::default());
+        let store = service_role_store(&dir, superuser, syncer, broker);
+        store.ensure_protected_dir().unwrap();
+
+        store.write_secret("central_runtime", ACTIVE).unwrap();
+        assert_eq!(store.read_secret("central_runtime").unwrap(), ACTIVE);
+        let mode = std::fs::metadata(store.secret_path("central_runtime"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o400);
+
+        // Malformed values refuse on write...
+        let err = store.write_secret("central_runtime", "short").unwrap_err();
+        assert_eq!(
+            err.message(),
+            "postgres service role credential: refusing to persist a malformed secret"
+        );
+        assert!(
+            store
+                .write_secret("central_runtime", &"'".repeat(43))
+                .is_err()
+        );
+        // ...and on read of a stored malformed value...
+        std::fs::write(store.secret_path("central_outbox"), "not-a-secret").unwrap();
+        assert!(store.read_secret("central_outbox").is_err());
+        // ...and a missing secret reads as an error (rotation signal).
+        assert!(store.read_secret("central_migration").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ensureProtectedDir` refuses a symlinked protected directory —
+    /// the same not-a-real-directory refusal upstream's `Lstat` gate
+    /// gives.
+    #[test]
+    fn service_role_protected_dir_refuses_symlink() {
+        let dir = temp_dir("symlink");
+        let superuser = Arc::new(superuser_store(&dir, ACTIVE));
+        let syncer = Arc::new(FakeServiceRoleSyncer::default());
+        let broker = Arc::new(FakeServiceRoleBroker::default());
+        let store = service_role_store(&dir, superuser, syncer, broker);
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("postgres-service-roles")).unwrap();
+
+        let err = store.ensure_protected_dir().unwrap_err();
+        assert_eq!(
+            err.message(),
+            "postgres service role credential: protected directory is not a directory"
+        );
+        assert!(store.sync().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `errors.Join` — one role's failure must not stop the others,
+    /// and the joined refusal names every failed role.
+    #[test]
+    fn service_role_sync_joins_per_role_failures() {
+        let dir = temp_dir("join");
+        let superuser = Arc::new(superuser_store(&dir, ACTIVE));
+        let syncer = Arc::new(FakeServiceRoleSyncer::default());
+        let broker = Arc::new(FakeServiceRoleBroker::default());
+        *broker.err.lock().unwrap() = Some("bind refused".to_owned());
+        let store = service_role_store(&dir, superuser, syncer.clone(), broker);
+
+        let err = store.sync().unwrap_err();
+        for role in &POSTGRES_SERVICE_ROLES {
+            assert!(
+                err.message().contains(role.role_name),
+                "joined error missing {}: {}",
+                role.role_name,
+                err.message()
+            );
+        }
+        // Every role still ran its rotate pass before the bind failed.
+        assert_eq!(syncer.alter_calls.lock().unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `newProductionPostgresServiceRoleCredentialStore` — an empty
+    /// instance id refuses composition (upstream's nil checks are the
+    /// `Arc` parameters' non-nullability).
+    #[test]
+    fn service_role_new_production_refuses_empty_instance() {
+        let dir = temp_dir("empty");
+        let empty = crate::broker::daemon::ProductionInstanceComposition {
+            instance_id: String::new(),
+            config_binding: String::new(),
+            authoritative_state_root: String::new(),
+            dependency_root: String::new(),
+            role_roots: central_backup::backup::capacity::RoleRoots::default(),
+            backup_repository_root: String::new(),
+            compose_path: String::new(),
+            object_store_bucket: String::new(),
+            backup_policy_digest: String::new(),
+            restore_policy_digest: String::new(),
+            import_policy_digest: String::new(),
+        };
+        let err = ProductionPostgresServiceRoleCredentialStore::new_production(
+            &empty,
+            Arc::new(superuser_store(&dir, ACTIVE)),
+            Arc::new(FakeServiceRoleBroker::default()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            err.message(),
+            "postgres service role credential composition unavailable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
