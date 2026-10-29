@@ -13,14 +13,21 @@ What works: `central local init` (via `grant issue --kind init`, grant
 consumed correctly), `local status` -> `STOPPED`, `local init` idempotent
 `ALREADY_INITIALIZED`, helper logs the designed keyless import-only note.
 
-## Task V1 — production grant environment is unimplemented
+## Task V1 — production grant environment is unimplemented — RESOLVED (grant-ceremony-fix)
 
-`bins/central/src/grant_cli.rs` `production_grant_environment()` is a
-hard-coded `Err("production instance authority unavailable")`, so every
-`grant issue --kind <lifecycle|prepare|...>` after init exits 6. Only
-`--kind init` dispatches on the pre-instance env. This blocks every
-grant-admitted verb on a real host (the port has no non-console admission
-path at all).
+`bins/central/src/grant_cli.rs` `production_grant_environment()` was a
+hard-coded `Err("production instance authority unavailable")`. Fixed on
+`grant-ceremony-fix`: the env now resolves
+`resolve_production_instance_composition()` + the ceremony owner, and
+`issue`/`mode`/`list` are wired through `read_ceremony_mode`,
+`write_ceremony_mode`, and the instance grant store (upstream
+`grantIssue`/`grantMode`/`grantList` ports). Verified live on the VM:
+`grant mode grant` -> `ceremony mode: grant`, `grant issue --kind
+lifecycle|prepare` mints grants, `grant list` shows consumed records, and
+`local up` then runs past `AUTHORITY_DENIED` to the honest
+`ADMISSION_FAILED`/`RUN_CENTRAL_LOCAL_PREPARE` refusal (no staged
+dependency). With grant mode the host has a working admission path; V2
+below no longer gates it.
 
 ## Task V2 — physical-console ceremony denies instantly on `local up`
 
@@ -37,5 +44,7 @@ peer-console open, PAM conversation, or confirmer composition fails.
 - Host-side correctness of `central local doctor --host-prerequisites` is
   questionable: it reports `ok` on a 26.04 host (observation-only today).
 - `central local doctor` inside the VM reports only OS-release facts.
-- V1+V2 together mean lifecycle verbs currently have no admission path on
-  the Rust port; Tier-3 evidence for `local up` is gated on both.
+- V1 is resolved (see above); V2 remains — the physical-TTY ceremony
+  still denies instantly. Grant mode is now the usable admission path on
+  this host; V2 only matters for `physical_tty` instances and Tier-3
+  console-ceremony evidence.
