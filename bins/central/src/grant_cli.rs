@@ -38,20 +38,18 @@ const GRANT_KINDS: &[&str] = &[
     "init",
 ];
 
-/// The recognized `grant mode` values — upstream
-/// `helper.ParseCeremonyMode`.
-const CEREMONY_MODES: &[&str] = &["physical_tty", "grant"];
-
 /// The resolved env a dispatch acts on — upstream `grantEnvironment`.
-/// `Production` carries the installed instance's composition (T8);
-/// `PreInstance` is the composition-less fallback only `issue --kind
-/// init` may use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Production` carries the installed instance's composition plus the
+/// ceremony owner (`ceremonyOwner`: the process's euid/egid — root in
+/// production, the test process otherwise); `PreInstance` is the
+/// composition-less fallback only `issue --kind init` may use.
+#[derive(Debug, Clone)]
 pub(crate) enum GrantEnv {
-    /// Constructed once `production_grant_environment` can resolve a
-    /// real instance (T8); today only the dispatch tests build it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Production,
+    Production {
+        composition: Box<central_adapter_linux::broker::daemon::ProductionInstanceComposition>,
+        owner_uid: u32,
+        owner_gid: u32,
+    },
     PreInstance,
 }
 
@@ -115,7 +113,18 @@ fn resolve_grant_environment(args: &[String]) -> Result<GrantEnv, String> {
 }
 
 fn production_grant_environment() -> Result<GrantEnv, String> {
-    Err("production instance authority unavailable".to_string())
+    // Upstream `productionGrantEnvironment`:
+    // `resolveProductionInstanceComposition` + `ceremonyOwner` (the
+    // process's own euid/egid — root in production).
+    let composition = Box::new(
+        central_adapter_linux::broker::daemon::resolve_production_instance_composition()
+            .map_err(str::to_owned)?,
+    );
+    Ok(GrantEnv::Production {
+        composition,
+        owner_uid: rustix::process::geteuid().as_raw(),
+        owner_gid: rustix::process::getegid().as_raw(),
+    })
 }
 
 /// Ports `preInstanceIssueKind`: parses `issue`'s flags with the same
@@ -248,11 +257,55 @@ fn grant_issue(
             "grant: --replace is init-only".to_string(),
         ));
     }
-    // Upstream reads the ceremony mode and the grant store from the
-    // resolved composition — neither exists until T8.
-    Err(GrantError::Other(
-        "grant issuance is not implemented in this slice".to_string(),
-    ))
+    // Upstream `grantIssue`: the composition's ceremony mode must be
+    // `grant` (a physical-tty instance takes the console ceremony, not a
+    // root-issued grant), then the store issues the scoped grant bound
+    // to the running boot.
+    let GrantEnv::Production {
+        composition,
+        owner_uid,
+        owner_gid,
+    } = env
+    else {
+        return Err(GrantError::Other(
+            "grant issuance needs the installed instance; run central local init first".to_string(),
+        ));
+    };
+    let mode = central_adapter_linux::helper::grant::read_ceremony_mode(
+        &composition.authoritative_state_root,
+        *owner_uid,
+        *owner_gid,
+    )
+    .map_err(|e| GrantError::Other(e.message().to_owned()))?;
+    if mode != central_adapter_linux::helper::grant::CeremonyMode::Grant {
+        return Err(GrantError::Other(format!(
+            "instance ceremony mode is {}; run `central grant mode grant` first",
+            mode.as_str()
+        )));
+    }
+    let ttl_ns = flags.ttl_ns.unwrap_or(60 * 60 * 1_000_000_000);
+    let store_dir = format!("{}/grants", composition.authoritative_state_root);
+    let store =
+        central_adapter_linux::helper::grant::GrantStore::open(&store_dir, *owner_uid, *owner_gid)
+            .map_err(|e| GrantError::Other(e.message().to_owned()))?;
+    let boot_id = grant_boot_id().map_err(GrantError::Other)?;
+    let kind = central_adapter_linux::helper::grant::parse_grant_kind(flags.kind.trim())
+        .map_err(|e| GrantError::Usage(e.message().to_owned()))?;
+    let scope = central_adapter_linux::helper::grant::GrantScope {
+        kind,
+        instance_id: "default".to_owned(),
+        target_id: "postgres:central".to_owned(),
+        operation_id: flags.operation.clone(),
+    };
+    let grant = store
+        .issue(
+            &scope,
+            &boot_id,
+            &central_adapter_linux::helper::prepare::helper_release_identity(""),
+            std::time::Duration::from_nanos(ttl_ns as u64),
+        )
+        .map_err(|e| GrantError::Other(e.message().to_owned()))?;
+    print_grant_json(stdout, &grant)
 }
 
 /// Ports `grantIssueInit`: `--operation` is refused (plain error —
@@ -405,30 +458,73 @@ thread_local! {
 /// everything else is usage. The real mode write + store-dir creation
 /// is T8; the skeleton fails closed.
 fn grant_mode(env: &GrantEnv, args: &[String]) -> Result<(), GrantError> {
-    let _ = env;
     if args.len() != 1 {
         return Err(GrantError::Usage(
             "central grant mode <physical_tty|grant>".to_string(),
         ));
     }
-    // Upstream ParseCeremonyMode trims before matching.
-    if !CEREMONY_MODES.contains(&args[0].trim()) {
-        return Err(GrantError::Usage(format!(
-            "ceremony: unknown mode {:?}",
-            args[0]
-        )));
+    let mode = central_adapter_linux::helper::grant::parse_ceremony_mode(&args[0])
+        .map_err(|e| GrantError::Usage(e.message().to_owned()))?;
+    let GrantEnv::Production {
+        composition,
+        owner_uid,
+        owner_gid,
+    } = env
+    else {
+        return Err(GrantError::Other(
+            "ceremony mode needs the installed instance; run central local init first".to_string(),
+        ));
+    };
+    if mode == central_adapter_linux::helper::grant::CeremonyMode::Grant {
+        // Upstream `grantMode`: switching to grant mode ensures the
+        // store exists first — the mkdir+chmod are idempotent.
+        let dir = format!("{}/grants", composition.authoritative_state_root);
+        let _ = std::fs::create_dir(&dir);
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _store =
+            central_adapter_linux::helper::grant::GrantStore::open(&dir, *owner_uid, *owner_gid)
+                .map_err(|e| GrantError::Other(e.message().to_owned()))?;
     }
-    Err(GrantError::Other(
-        "ceremony mode transitions are not implemented in this slice".to_string(),
-    ))
+    central_adapter_linux::helper::grant::write_ceremony_mode(
+        &composition.authoritative_state_root,
+        mode,
+    )
+    .map_err(|e| GrantError::Other(e.message().to_owned()))?;
+    println!("ceremony mode: {}", mode.as_str());
+    Ok(())
 }
 
-/// Ports `grantList`'s shape: it needs the grant store — T8.
-fn grant_list(env: &GrantEnv, _stdout: &mut impl Write) -> Result<(), GrantError> {
-    let _ = env;
-    Err(GrantError::Other(
-        "grant listing is not implemented in this slice".to_string(),
-    ))
+/// Ports `grantList`: open the store and print each consumed record as
+/// one JSON line, upstream's `json.Encoder` loop.
+fn grant_list(env: &GrantEnv, stdout: &mut impl Write) -> Result<(), GrantError> {
+    let GrantEnv::Production {
+        composition,
+        owner_uid,
+        owner_gid,
+    } = env
+    else {
+        return Err(GrantError::Other(
+            "grant listing needs the installed instance; run central local init first".to_string(),
+        ));
+    };
+    let store = central_adapter_linux::helper::grant::GrantStore::open(
+        &format!("{}/grants", composition.authoritative_state_root),
+        *owner_uid,
+        *owner_gid,
+    )
+    .map_err(|e| GrantError::Other(e.message().to_owned()))?;
+    for record in store
+        .consumed()
+        .map_err(|e| GrantError::Other(e.message().to_owned()))?
+    {
+        let line =
+            serde_json::to_string(&record).map_err(|e| GrantError::Other(format!("grant: {e}")))?;
+        stdout
+            .write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| GrantError::Other(format!("grant: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Go `time.Duration.String()` — the `%s` rendering upstream puts in
@@ -497,15 +593,52 @@ mod tests {
 
     /// Drives `grantDispatch` directly with a chosen env (upstream's
     /// `grantDispatch(env, args)` test seam).
-    fn dispatch(env: GrantEnv, args: &[&str]) -> (u8, String, String) {
+    fn dispatch(env: &GrantEnv, args: &[&str]) -> (u8, String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = grant_dispatch(&env, &argv(args), &mut out, &mut err);
+        let code = grant_dispatch(env, &argv(args), &mut out, &mut err);
         (
             code,
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    /// A production env rooted at a scratch instance dir: the same
+    /// shape the resolver hands production, with a state root that
+    /// exists so store/mode paths land somewhere real.
+    fn prod_env_at(root: &Path) -> GrantEnv {
+        GrantEnv::Production {
+            composition: Box::new(
+                central_adapter_linux::broker::daemon::ProductionInstanceComposition {
+                    instance_id: "00000000-0000-7000-8000-000000000000".to_owned(),
+                    config_binding: String::new(),
+                    authoritative_state_root: root.to_string_lossy().into_owned(),
+                    dependency_root: String::new(),
+                    lifecycle_root: String::new(),
+                    role_roots: Default::default(),
+                    backup_repository_root: String::new(),
+                    compose_path: String::new(),
+                    object_store_bucket: String::new(),
+                    backup_policy_digest: String::new(),
+                    restore_policy_digest: String::new(),
+                    import_policy_digest: String::new(),
+                },
+            ),
+            owner_uid: rustix::process::geteuid().as_raw(),
+            owner_gid: rustix::process::getegid().as_raw(),
+        }
+    }
+
+    /// A production env on a fresh scratch root (no ceremony-mode
+    /// file, no store) — an absent mode file reads `physical_tty`.
+    fn prod_env() -> GrantEnv {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = scratch(&format!(
+            "prod-{}",
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        prod_env_at(&root)
     }
 
     /// A private scratch directory per test.
@@ -777,12 +910,12 @@ mod tests {
 
     #[test]
     fn dispatch_usage_and_unknown_subcommand() {
-        for env in [GrantEnv::Production, GrantEnv::PreInstance] {
-            let (code, _, stderr) = dispatch(env, &[]);
+        for env in [prod_env(), GrantEnv::PreInstance] {
+            let (code, _, stderr) = dispatch(&env, &[]);
             assert_eq!(code, 2);
             assert_eq!(stderr, "usage: central grant issue|mode|list ...\n");
 
-            let (code, _, stderr) = dispatch(env, &["bogus"]);
+            let (code, _, stderr) = dispatch(&env, &["bogus"]);
             assert_eq!(code, 2);
             assert_eq!(stderr, "grant: unknown subcommand \"bogus\"\n");
         }
@@ -843,7 +976,7 @@ mod tests {
                 "grant: usage: grant: unknown kind \"\"\n",
             ),
         ] {
-            let (code, _, stderr) = dispatch(GrantEnv::Production, &args);
+            let (code, _, stderr) = dispatch(&prod_env(), &args);
             assert_eq!(code, 2, "args {args:?}");
             let want = match flag_err {
                 Some(err) => format!("{err}\n{ISSUE_USAGE}{tail}"),
@@ -857,7 +990,7 @@ mod tests {
     fn issue_help_prints_usage_and_help_requested() {
         // `-h`/`--help` undefined: Go prints the usage block with no
         // error line, then ErrHelp reaches the `grant: usage:` wrap.
-        let (code, _, stderr) = dispatch(GrantEnv::Production, &["issue", "--help"]);
+        let (code, _, stderr) = dispatch(&prod_env(), &["issue", "--help"]);
         assert_eq!(code, 2);
         assert_eq!(
             stderr,
@@ -867,49 +1000,48 @@ mod tests {
 
     #[test]
     fn non_init_issue_is_closed_failure() {
-        let (code, _, stderr) = dispatch(GrantEnv::Production, &["issue", "--kind", "lifecycle"]);
+        let (code, _, stderr) = dispatch(&prod_env(), &["issue", "--kind", "lifecycle"]);
         assert_eq!(code, 7);
         assert_eq!(
             stderr,
-            "grant: grant issuance is not implemented in this slice\n"
+            "grant: instance ceremony mode is physical_tty; run `central grant mode grant` first\n"
         );
-        let (code, _, stderr) = dispatch(
-            GrantEnv::Production,
-            &["issue", "--kind", "lifecycle", "--replace"],
-        );
+        let (code, _, stderr) =
+            dispatch(&prod_env(), &["issue", "--kind", "lifecycle", "--replace"]);
         assert_eq!(code, 7);
         assert_eq!(stderr, "grant: grant: --replace is init-only\n");
     }
 
     #[test]
     fn mode_grammar_is_closed() {
-        let (code, _, stderr) = dispatch(GrantEnv::Production, &["mode"]);
+        let (code, _, stderr) = dispatch(&prod_env(), &["mode"]);
         assert_eq!(code, 2);
         assert_eq!(
             stderr,
             "grant: usage: central grant mode <physical_tty|grant>\n"
         );
-        let (code, _, stderr) = dispatch(GrantEnv::Production, &["mode", "bogus"]);
+        let (code, _, stderr) = dispatch(&prod_env(), &["mode", "bogus"]);
         assert_eq!(code, 2);
         assert_eq!(stderr, "grant: usage: ceremony: unknown mode \"bogus\"\n");
         for mode in ["physical_tty", "grant"] {
-            let (code, _, stderr) = dispatch(GrantEnv::Production, &["mode", mode]);
-            assert_eq!(code, 7, "mode {mode}");
-            assert_eq!(
-                stderr,
-                "grant: ceremony mode transitions are not implemented in this slice\n"
-            );
+            let (code, _, stderr) = dispatch(&prod_env(), &["mode", mode]);
+            assert_eq!(code, 0, "mode {mode}: {stderr}");
+            assert_eq!(stderr, "");
         }
     }
 
     #[test]
-    fn list_is_closed_failure() {
-        let (code, _, stderr) = dispatch(GrantEnv::Production, &["list"]);
+    fn list_reads_the_consumed_records() {
+        let env = prod_env();
+        // No store yet: upstream OpenGrantStore fails closed.
+        let (code, _, _) = dispatch(&env, &["list"]);
         assert_eq!(code, 7);
-        assert_eq!(
-            stderr,
-            "grant: grant listing is not implemented in this slice\n"
-        );
+        // Switch the instance to grant mode (creates the store), then
+        // an empty consumed set lists nothing successfully.
+        let (code, _, _) = dispatch(&env, &["mode", "grant"]);
+        assert_eq!(code, 0);
+        let (code, out, stderr) = dispatch(&env, &["list"]);
+        assert_eq!((code, out.as_str(), stderr.as_str()), (0, "", ""));
     }
 
     #[test]
