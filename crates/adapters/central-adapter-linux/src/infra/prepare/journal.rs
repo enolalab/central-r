@@ -106,7 +106,7 @@ impl FileJournal {
     /// unreadable or corrupt entries are skipped (upstream parity).
     #[must_use]
     pub fn unsettled(&self) -> Option<PrepareOperation> {
-        let _guard = self.lock().ok()?;
+        let _guard = self.mu.lock().unwrap_or_else(|e| e.into_inner());
         let mut names: Vec<_> = fs::read_dir(&self.dir)
             .ok()?
             .filter_map(Result::ok)

@@ -196,7 +196,7 @@ impl DockerImageLoader {
                 .map(|d| d.as_nanos())
                 .unwrap_or_default()
         ));
-        std::fs::create_dir_all(&scratch)
+        super::mkdir_all(&scratch, 0o700)
             .map_err(|e| load_failure(format!("dependencyprepare: infra temp dir: {e}")))?;
         let result = (|| {
             let (config, tags) = read_infra_save_manifest(tar_path, &scratch)?;

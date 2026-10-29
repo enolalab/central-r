@@ -324,7 +324,7 @@ pub fn compose_prepare_service(
         None => None,
     };
     let fetches_dir = roots.work_dir.join("fetches");
-    std::fs::create_dir_all(&fetches_dir).map_err(|e| {
+    super::mkdir_all(&fetches_dir, 0o700).map_err(|e| {
         Failure::internal(
             "PREPARE_FACTORY",
             format!("factory: create fetches dir: {e}"),

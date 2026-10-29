@@ -733,8 +733,10 @@ pub fn validate_attestation_facts(
 
 /// The two-build equality proof recorded in a candidate manifest:
 /// which comparator ran, over which ordered inventory, and whether
-/// the layouts were equal (upstream `dependencyprepare.ComparisonFact`).
+/// the layouts were equal (upstream `dependencyprepare.ComparisonFact`,
+/// decoded with `DisallowUnknownFields` at both read sites).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComparisonFact {
     /// The comparator identity.
     pub comparator: String,

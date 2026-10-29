@@ -381,7 +381,7 @@ impl ReleaseImporter for ReleaseImportService {
         dir: &Path,
         workdir: &Path,
     ) -> Result<ReleaseEvidence, Failure> {
-        std::fs::create_dir_all(workdir).map_err(|e| {
+        super::mkdir_all(workdir, 0o700).map_err(|e| {
             release_failure(
                 prepare_codes::RELEASE_UNREADABLE,
                 "unreadable",

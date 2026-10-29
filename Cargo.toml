@@ -113,7 +113,7 @@ rustix = { version = "=1.1.5", features = ["fs", "net", "process", "shm", "mm"] 
 libc = "=0.2.191"
 
 # Cryptography — broker, advisory verification, CSRF/session/approval binding
-ed25519-dalek = "=3.0.0"
+ed25519-dalek = { version = "=3.0.0", features = ["zeroize"] }
 hmac = "=0.13.0"
 # central-adapter-linux only (R6 task 12): the bx1 bundle's AES-256-GCM
 # chunked stream (upstream internal/portable/bundle.go). Pure-Rust
