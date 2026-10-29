@@ -2,7 +2,7 @@
 
 - **Type:** Recorded test-suite flakiness — two tests that intermittently fail under `cargo test --workspace` parallel scheduling while passing deterministically in isolation and serialized runs. Neither is a code defect found by the suite; both are timing/IO sensitivities in test scaffolding.
 - **Found:** 2026-10-28, during the post-`prepare-promotion`-merge `CENTRAL_TEST_DSN`-enabled workspace verification run.
-- **Status:** OPEN — recorded, not yet fixed. Both failures reproduce only under parallel load and pass on every isolated re-run observed (4/4 and 58/58 respectively).
+- **Status:** **FIXED** — direction 2 applied: `collect_answering` tolerates the `harness_port_no_pending_permission` lost-race (the delivered event is the assertion target; the pending slot resolves legitimately on later scenario frames), and `journal_retry` gives the backup-launch store calls one retry on `broker_recovery_journal_unavailable` only — any other failure, and a second unavailable, still panics. Verified `claudecode` 58/58 and `backup_launch` 8/8, fmt + clippy clean.
 
 ## The flakes
 

@@ -1965,15 +1965,24 @@ async fn collect_answering(s: &Arc<dyn Session>, allow: bool) -> Vec<Event> {
                 assert_eq!(e.seq as usize, out.len() + 1, "seq");
                 if let Some(EventPayload::PermissionRequested(p)) = &e.payload {
                     let digest: [u8; 32] = Sha256::digest(&p.input).into();
-                    s.respond_permission(PermissionDecision {
-                        request_id: p.request_id.clone(),
-                        allow,
-                        option_id: String::new(),
-                        decided_by: "operator".to_string(),
-                        input_sha256: if allow { digest } else { [0; 32] },
-                    })
-                    .await
-                    .expect("respond");
+                    match s
+                        .respond_permission(PermissionDecision {
+                            request_id: p.request_id.clone(),
+                            allow,
+                            option_id: String::new(),
+                            decided_by: "operator".to_string(),
+                            input_sha256: if allow { digest } else { [0; 32] },
+                        })
+                        .await
+                    {
+                        Ok(()) => {}
+                        // The scenario's later frames can resolve the
+                        // pending slot between this event pull and the
+                        // answer — a lost race, not a bridging defect;
+                        // the delivered event is what tests assert on.
+                        Err(f) if f.code() == "harness_port_no_pending_permission" => {}
+                        r => r.expect("respond"),
+                    }
                 }
                 out.push(e);
             }

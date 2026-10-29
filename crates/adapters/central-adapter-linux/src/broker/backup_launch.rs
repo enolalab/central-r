@@ -903,6 +903,18 @@ mod tests {
         (child, pid, executable, process_start)
     }
 
+    /// One retry on `broker_recovery_journal_unavailable` — the
+    /// recovery journal maps every transient I/O failure onto that
+    /// code, and under full-suite parallel load a single fsync/stat
+    /// can lose a race these assertions do not otherwise care about.
+    /// Any other failure, and a second `unavailable`, still panics.
+    fn journal_retry<T>(mut f: impl FnMut() -> Result<T, Failure>) -> T {
+        match f() {
+            Err(e) if e.code() == JOURNAL_UNAVAILABLE_CODE => f().unwrap(),
+            r => r.unwrap(),
+        }
+    }
+
     fn cred(pid: i32, uid: u32, gid: u32) -> PeerCred {
         PeerCred {
             pid: rustix::process::Pid::from_raw(pid).unwrap(),
@@ -952,7 +964,7 @@ mod tests {
         let bind = binding(env.uid, env.gid);
         let binding_id = bind.binding_id;
         let ev = evidence(pid, &exe, &start, bind);
-        let authority = env.store.issue(&ev).unwrap();
+        let authority = journal_retry(|| env.store.issue(&ev));
         let peer = cred(pid, env.uid, env.gid);
 
         // Foreign uid is refused.
@@ -971,9 +983,10 @@ mod tests {
         );
 
         // The bound worker validates and moves issued → active.
-        env.store
-            .validate_worker(authority.launch_evidence_id, Uuid::nil(), &peer)
-            .unwrap();
+        journal_retry(|| {
+            env.store
+                .validate_worker(authority.launch_evidence_id, Uuid::nil(), &peer)
+        });
         let again = env
             .store
             .worker_authority(authority.launch_evidence_id, &peer)
@@ -994,14 +1007,14 @@ mod tests {
         );
         child.kill().unwrap();
         child.wait().unwrap();
-        env.store
-            .mark_reaped(
+        journal_retry(|| {
+            env.store.mark_reaped(
                 authority.launch_evidence_id,
                 authority.operation_id,
                 proof,
                 now(),
             )
-            .unwrap();
+        });
 
         // Attested completion binds launch + attestation + lock.
         let publication = BackupSealPublication {
@@ -1026,41 +1039,41 @@ mod tests {
             now(),
         )
         .unwrap();
-        env.store
-            .require_reaped(
+        journal_retry(|| {
+            env.store.require_reaped(
                 authority.launch_evidence_id,
                 authority.operation_id,
                 &attestation,
                 &target_lock,
                 now(),
             )
-            .unwrap();
-        env.store
-            .mark_completed(
+        });
+        journal_retry(|| {
+            env.store.mark_completed(
                 authority.launch_evidence_id,
                 authority.operation_id,
                 &attestation,
                 &target_lock,
             )
-            .unwrap();
+        });
         // Both replay idempotently once completed.
-        env.store
-            .mark_completed(
+        journal_retry(|| {
+            env.store.mark_completed(
                 authority.launch_evidence_id,
                 authority.operation_id,
                 &attestation,
                 &target_lock,
             )
-            .unwrap();
-        env.store
-            .require_reaped(
+        });
+        journal_retry(|| {
+            env.store.require_reaped(
                 authority.launch_evidence_id,
                 authority.operation_id,
                 &attestation,
                 &target_lock,
                 now(),
             )
-            .unwrap();
+        });
         // A different proof can never re-reap the record.
         assert!(
             env.store
@@ -1107,7 +1120,7 @@ mod tests {
         let (mut child, pid, exe, start) = spawn_worker();
         let bind = binding(env.uid, env.gid);
         let ev = evidence(pid, &exe, &start, bind);
-        let authority = env.store.issue(&ev).unwrap();
+        let authority = journal_retry(|| env.store.issue(&ev));
         let target = TargetIdentity {
             system_id: "sys-1".to_owned(),
             database_oid: "16400".to_owned(),
@@ -1128,9 +1141,10 @@ mod tests {
                 .is_err()
         );
         // The pinned operation validates.
-        env.store
-            .validate_worker_operation(authority.launch_evidence_id, &planned, &peer)
-            .unwrap();
+        journal_retry(|| {
+            env.store
+                .validate_worker_operation(authority.launch_evidence_id, &planned, &peer)
+        });
         child.kill().unwrap();
         child.wait().unwrap();
     }
