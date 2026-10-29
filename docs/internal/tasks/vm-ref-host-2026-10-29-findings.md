@@ -29,15 +29,26 @@ lifecycle|prepare` mints grants, `grant list` shows consumed records, and
 dependency). With grant mode the host has a working admission path; V2
 below no longer gates it.
 
-## Task V2 — physical-console ceremony denies instantly on `local up`
+## Task V2 — physical-console ceremony denies instantly on `local up` — DIAGNOSED (not a code bug)
 
-`central local up` run by the operator on tty1 (real VT, stdin =
-`/dev/tty1`) returns `LIFECYCLE_EXECUTION_FAILED` / `AUTHORITY_DENIED`
-within ~1s, with no PAM or CONFIRM prompt ever reaching the console. The
-helper's lifecycle path calls `pam.confirm(peer)` first; the confirmer
-fails before `open_physical_tty` writes anything (no journal output
-either). Needs helper-side tracing on the VM to identify whether the
-peer-console open, PAM conversation, or confirmer composition fails.
+Diagnosis (grant-ceremony-fix): the physical_tty ceremony is CORRECT.
+Reproduced live on the VM by running the client with a real VT stdin
+(`setsid … </dev/tty5`): `Central PAM password:` prompt appeared on
+tty5, the password was accepted, the `CONFIRM <code>` phrase printed,
+and `local up` then proceeded to the honest
+`ADMISSION_FAILED`/`RUN_CENTRAL_LOCAL_PREPARE` refusal.
+
+The earlier instant denials came from clients that did NOT own a
+usable physical console: SSH sessions (fd/0 = `/dev/pts/*`, refused by
+`open_physical_tty` by design) and tty1 after `ubuntu-desktop-minimal`
+installed gdm (the GNOME greeter owns tty1 — keystrokes went to the
+greeter, not a getty). Correct runbook: use a real text VT
+(Ctrl+Alt+F2+ on a desktop host) and run the `central` client there
+with stdin on `/dev/ttyN`.
+
+Small helper-side diagnostics were added (eprintln the confirm Failure
+code on the AUTHORITY_DENIED branches) so future refusals are
+identifiable from `journalctl -u central-helper` without strace.
 
 ## Notes
 
