@@ -431,8 +431,13 @@ pub fn run_helper_daemon(
                         now: None,
                     };
                     crate::infra::prepare::new_prepare_handler(
-                        std::path::PathBuf::from(&composition.authoritative_state_root)
+                        &crate::infra::prepare::PrepareRoots {
+                            work_dir: std::path::PathBuf::from(
+                                &composition.authoritative_state_root,
+                            )
                             .join("dependency-prepare"),
+                            dependency_root: std::path::PathBuf::from(&composition.dependency_root),
+                        },
                         Box::new(helper_advisory_evaluator(
                             &composition,
                             &broker_path,

@@ -4,9 +4,9 @@
 //! is the sole prepared-state commit (re-inspection, quarantine on
 //! drift, atomic `RENAME_NOREPLACE`-free same-directory rename of the
 //! `active` file, settlement record written exactly once), and
-//! `Active` resolves the selected receipt B03 consumes. `Recover` is
-//! deferred to the prepare pipeline that calls it; genesis needs
-//! only the three ported methods.
+//! `Active` resolves the selected receipt B03 consumes, and `Recover`
+//! repeats exactly the switch a previously staged candidate was prepared
+//! for.
 
 use std::io::Read as _;
 use std::os::fd::{AsFd, OwnedFd};
@@ -416,6 +416,54 @@ impl CandidateStore {
         deadline.check()?;
         self.commit_selector(&base_fd, candidate)?;
         Ok(receipt_from_record(&record, &manifest))
+    }
+
+    /// `Recover` — repeats exactly the switch a previously staged
+    /// candidate was prepared for, or quarantines it. It takes only the
+    /// staged candidate's ID: the selector and dependency set come from
+    /// the staged manifest, never from a resumed caller.
+    pub fn recover(
+        &self,
+        deadline: OpDeadline,
+        candidate_id: &str,
+        binding: &AdmissionBinding,
+    ) -> Result<DependencyReceipt, Failure> {
+        deadline.check()?;
+        if candidate_id.is_empty() {
+            return Err(invalid_candidate(
+                "dependencyprepare: invalid candidate: recovery needs a staged candidate ID",
+            ));
+        }
+        valid_path_component(candidate_id)
+            .map_err(|e| invalid_candidate(format!("dependencyprepare: invalid candidate: {e}")))?;
+        let candidate_fd = open_store_dir(&self.base_dir.join(CANDIDATES_DIR).join(candidate_id))
+            .map_err(|e| {
+            io_failure(
+                format!("dependencyprepare: recover candidate {candidate_id:?}"),
+                e.message().to_owned(),
+            )
+        })?;
+        let (manifest, _) = self.read_manifest(&candidate_fd)?;
+        drop(candidate_fd);
+        if manifest.selector.is_empty() {
+            return Err(invalid_candidate(format!(
+                "dependencyprepare: invalid candidate: staged candidate {candidate_id:?} names no selector"
+            )));
+        }
+        self.switch_selector(
+            deadline,
+            &Candidate {
+                id: candidate_id.to_owned(),
+                operation_id: manifest.operation_id,
+                selector: manifest.selector,
+                phase: Some(central_infra::domain::PreparePhase::Ready),
+                dependency_set: manifest.dependency_set,
+                comparison: manifest.comparison,
+                attestations: manifest.attestations,
+                ..Candidate::default()
+            },
+            binding,
+        )
     }
 
     /// `Active` — resolves the current selector into the receipt B03
@@ -875,6 +923,49 @@ mod tests {
             .switch_selector(OpDeadline::NONE, &staged, &binding)
             .unwrap();
         assert_eq!(again.id, receipt.id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Recover` reads selector and dependency set back from the staged
+    /// manifest and repeats the switch; ids are validated; a missing
+    /// candidate refuses.
+    #[test]
+    fn recover_repeats_the_staged_switch_from_the_manifest() {
+        let dir = tempdir("recover");
+        let store = CandidateStore::new(None, &dir);
+        let staged = store
+            .stage(OpDeadline::NONE, &candidate_for("version-zero"))
+            .unwrap();
+        let binding = central_infra::domain::new_admission_binding(
+            "version-zero:test",
+            &selector_token("version-zero"),
+        )
+        .unwrap();
+        let receipt = store
+            .recover(OpDeadline::NONE, &staged.id, &binding)
+            .unwrap();
+        assert_eq!(store.active(OpDeadline::NONE).unwrap().id, receipt.id);
+        let again = store
+            .recover(OpDeadline::NONE, &staged.id, &binding)
+            .unwrap();
+        assert_eq!(again.id, receipt.id);
+        for bad in ["", "../x", "a/b"] {
+            assert!(
+                store.recover(OpDeadline::NONE, bad, &binding).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            store
+                .recover(OpDeadline::NONE, "cand-missing", &binding)
+                .is_err()
+        );
+        let wrong =
+            central_infra::domain::new_admission_binding("a", &selector_token("other")).unwrap();
+        let fresh = store
+            .stage(OpDeadline::NONE, &candidate_for("version-zero"))
+            .unwrap();
+        assert!(store.recover(OpDeadline::NONE, &fresh.id, &wrong).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

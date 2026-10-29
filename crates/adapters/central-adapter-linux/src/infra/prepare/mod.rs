@@ -17,14 +17,23 @@
 //! `Build` refuses an unbound or non-isolated request before `docker`
 //! is ever consulted.
 
+pub mod admission;
+pub mod attestation;
 pub mod buildkit;
 pub mod capacity;
+pub mod export;
 pub mod fetch;
+pub mod image_load;
+pub mod journal;
 pub mod lock;
 pub mod module_cache;
 pub mod oci;
+pub mod release;
+#[cfg(test)]
+pub(crate) mod release_fixture;
 pub mod release_stage;
 pub mod service;
+pub mod state_machine;
 pub mod store;
 pub mod version_zero;
 
@@ -37,27 +46,42 @@ use std::time::Instant;
 use central_foundation::failure::Failure;
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 
+pub use admission::{AdvisoryAdmissionVerifier, SharedEvaluate};
+pub use attestation::{
+    ATTESTATION_KEY_ENV, AttestationService, AttestationSigner, AttestationVerifier, Attestor,
+    attestation_key_path, load_attestation_signer,
+};
 pub use buildkit::{
     BUILD_KIT_DAEMON_IMAGE, BuildKit, DETERMINISTIC_SOURCE_DATE_EPOCH, build_recipe_is_go,
     inventory_from_oci_layout, parse_build_recipe,
 };
 pub use capacity::{CapacityChecker, RESERVED_CAPACITY_BYTES};
+pub use export::{ReleaseExportService, release_export_tag};
 pub use fetch::{
     ArtifactInfo, FetchTransport, Fetcher, HttpTransport, TransportFailure, archive_entry_path,
     fetch_url, is_public_unicast, is_transient_fetch_error, lock_artifact, url_port,
     verify_stored_digest,
 };
+pub use image_load::{
+    CONTAINERD_SNAPSHOTTER_DRIVER_TYPE, DockerImageLoader, ImageLoader, UnavailableImageLoader,
+    image_loader_for,
+};
+pub use journal::FileJournal;
 pub use lock::LockAdapter;
 pub use module_cache::{
     DockerModuleAcquirer, MODULE_CACHE_CAPABILITY_KEY, MODULE_DOWNLOAD_DIR, ModuleAcquirer,
     STAGED_MODULE_CACHE_DIR, module_proxy_url, tree_bytes,
 };
 pub use oci::{COMPARATOR_VERSION, Comparator, compare_oci};
+pub use release::{
+    ReleaseImportService, ReleaseImporter, infra_pin_manifests, reverify_manifest_envelopes,
+    verify_release,
+};
 pub use release_stage::{
     read_infra_save_config, read_infra_save_manifest, read_release_minio_inventory,
     stage_release_dir,
 };
-pub use service::{PrepareService, new_prepare_handler};
+pub use service::{PrepareRoots, PrepareService, compose_prepare_service, new_prepare_handler};
 pub use store::CandidateStore;
 pub use version_zero::{VERSION_ZERO_SELECTOR, ensure_version_zero_receipt};
 
