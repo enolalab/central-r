@@ -86,8 +86,8 @@ and the [newcomer guide](docs/newcomer-guide.md).
 ### Build and test
 
 ```bash
-git clone https://github.com/enolalab/central-r.git
-cd central-r
+git clone https://github.com/enolalab/central-workspace.git
+cd central-workspace
 
 cargo build --workspace            # compile check
 cargo test -p central-task         # test one crate (the usual inner loop)
@@ -197,4 +197,17 @@ python3 scripts/roadmap-dashboard.py
 
 ## License
 
-Dual-licensed under **MIT OR Apache-2.0**.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option. See [ADR 0040](docs/adr/0040-adopt-apache-2-0-licenses-and-dco-contributor-terms.md).
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions. Every commit must carry a DCO
+`Signed-off-by:` trailer.

@@ -218,6 +218,38 @@ Issue #43 scrubbed the current tree ahead of this rewrite. Two inputs the rewrit
 - Regression gate now in CI: `ci/check-repo-hygiene.sh` (wired into `ci/test.sh`) greps tracked files for the identifier classes above, exempting `vendor/`, `evidence/**`, `THIRD_PARTY_LICENSES`, and itself.
 - Issue #44 untracked the three build-output ELFs but history still carries them: the blob strip-list enumeration (decision 3) must additionally name `build/central-migration-launcherd`, `cmd/central-migration-launcherd/central-migration-launcherd`, and `cmd/central-backup-launcherd/central-backup-launcherd` alongside `broker.test`/`central` — same pinned mechanism, enumerated `--strip-blobs-with-ids`/allowlist'd `--blob-callback`, never blind `--strip-blobs-bigger-than`.
 
+## Amendment (2026-10-30, `central-rust`)
+
+This ADR's decisions apply to the Rust reimplementation
+(`enolalab/central-workspace`, ADRs 0041/0043) as a third repository,
+with these repository-specific inputs measured on 2026-10-30 (297
+commits, `main` at `bee11cb`):
+
+- **Identity (decision 3, `--mailmap`):** all 297 commits carry the
+  maintainer's personal Gmail address as author/committer; author name
+  is already `hieuntg81`. Map to the public identity pinned in decision
+  3.
+- **Agent trailers — kept (maintainer decision, 2026-10-30):** the 61
+  `Co-Authored-By: Devin <…noreply.github.com>` trailers are **not**
+  stripped. They record agent-assisted authorship transparently, carry
+  only a public noreply address, and are not personal identifiers. The
+  `--message-callback` therefore strips only `Claude-Session:` URLs and
+  personal identifiers; none of the former and no `/home/` paths occur
+  in this repository's commit messages today, so the callback is
+  expected to be a no-op and stays as a guard.
+- **Blob stripping:** no blob over 1 MB exists in history; no strip
+  list is expected. The enumerate-first rule still governs execution.
+- **Text replacement (`--replace-text`):** personal home-directory
+  paths occur in tracked docs (plans, specs, `roadmap-dashboard.html`);
+  the tree scrub lands first, then the rewrite applies the same
+  mapping to history.
+- **Tags and signatures:** no tags and no signed commits exist, so
+  nothing is lost to signature stripping.
+- **Execution:** same as decisions 5–7 — mirror + bundle backup with
+  `commit-map`/`ref-map`, fresh clone, re-add `origin`, force-push only
+  on the maintainer's explicit go-ahead at execution time. Tracked in
+  `docs/internal/tasks/open-source-readiness.md`.
+
 ## Follow-ups
 
 - Rewrite runbook lands as part of #56 prep (or a dedicated execution

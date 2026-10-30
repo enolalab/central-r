@@ -2,15 +2,15 @@
 
 - **Number:** 0044
 - **Title:** Keep the broker seccomp allow-list fixed and port the Rust runtime surface to listed syscalls
-- **Status:** Proposed
+- **Status:** Accepted
 - **Created:** 2026-10-26
 - **Owners:** Central maintainer
 - **Decision due:** 2026-10-26
-- **Decision due history:** None
-- **Implementation blocked at:** Nothing — the R5 T9 P0-A fix ships with this ADR Proposed per the ADR 0028 D3 delegation (the fix changes no wire format and no Accepted ADR's decision; acceptance stays with the maintainer).
-- **Decided by:** Not applicable while Proposed
-- **Decision date:** Not applicable while Proposed
-- **Decision record:** Not applicable while Proposed
+- **Decision due history:** Lapsed 2026-10-26; decided 2026-10-30
+- **Implementation blocked at:** Nothing — the R5 T9 P0-A fix shipped while Proposed per the ADR 0028 D3 delegation; the 2026-10-29 reference-host re-aims (`tgkill`, `readlinkat`, `durable::read_file`) follow the same rule.
+- **Decided by:** hieuntg81 (Central maintainer and ADR owner, 2026-10-30)
+- **Decision date:** 2026-10-30
+- **Decision record:** Maintainer approval in session on 2026-10-30 ("accept 0044")
 - **Supersedes:** None
 - **Superseded by:** None
 - **Amends:** None

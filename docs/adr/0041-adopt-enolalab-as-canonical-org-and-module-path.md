@@ -2,19 +2,19 @@
 
 - **Number:** 0041
 - **Title:** Adopt enolalab as the canonical GitHub org and module path
-- **Status:** Proposed
+- **Status:** Accepted
 - **Created:** 2026-10-04
 - **Owners:** Central maintainer
 - **Decision due:** 2026-10-11
-- **Decision due history:** None
-- **Implementation blocked at:** Public `go install` resolution, GHCR
-  `ghcr.io/enolalab/*` image publishing (issue #51), and install docs
-  naming the module path (issues #53, #55). The rename sweep itself
-  proceeds in anticipation per ADR 0028 D3 — it changes no Accepted
-  ADR's decision and weakens no check.
-- **Decided by:** Not applicable while Proposed
-- **Decision date:** Not applicable while Proposed
-- **Decision record:** Not applicable while Proposed
+- **Decision due history:** Lapsed 2026-10-11; decided 2026-10-30
+- **Implementation blocked at:** None — unblocked by this acceptance.
+  The GitHub rename to `enolalab/central-workspace` and the local
+  remote update remain maintainer actions (see the Amendment section).
+- **Decided by:** hieuntg81 (Central maintainer and ADR owner, 2026-10-30)
+- **Decision date:** 2026-10-30
+- **Decision record:** Maintainer approval in session on 2026-10-30
+  ("accept 0041"), after choosing `central-workspace` as the public
+  `central-rust` repository name (see the Amendment section)
 - **Supersedes:** None
 - **Superseded by:** None
 - **Amends:** None
@@ -122,8 +122,33 @@ the repository goes public, and the fix afterward rewrites history
 under already-published module paths. Now, while private, is the
 cheapest possible time. Rejected.
 
+## Amendment (2026-10-30, `central-rust`)
+
+This ADR was written for the upstream Go repositories. For the Rust
+reimplementation (ADR 0043) the maintainer chose on 2026-10-30:
+
+- **Public repository:** `github.com/enolalab/central-workspace`
+  (renamed from the private `enolalab/central-r`). Decision 1 —
+  `enolalab` as the canonical org — applies unchanged.
+- **No module-path sweep is needed:** Cargo has no Go-style import
+  path, and every workspace member is `publish = false`, so no
+  crates.io name is claimed. Only `repository` metadata, clone URLs in
+  docs, CI, and GHCR labels name the repository.
+- **Name overlap, accepted:** the capability crate
+  `crates/capabilities/central-workspace` shares the repository name.
+  It is unpublished and internal, so the overlap is cosmetic; docs say
+  "the `central-workspace` repository" or "the `central-workspace`
+  crate" when the distinction matters.
+- `central-rust` remains the project's internal name in existing docs
+  and historical records; it is not swept.
+- The GitHub rename itself (`gh repo rename` / settings) and the local
+  `git remote set-url` are maintainer actions outside this repository.
+
 ## Follow-ups
 
+- `central-rust`: rename the GitHub repository to
+  `enolalab/central-workspace`, update the local remote, and keep
+  README clone instructions on the new name.
 - enolalab/central-local-infra: the infra repository's module-path
   rename, same day, its own pull request (also advances infra issue #2).
 - enolalab/central issue #51: GHCR image publishing uses

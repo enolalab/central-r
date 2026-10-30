@@ -2,19 +2,21 @@
 
 - **Number:** 0040
 - **Title:** Adopt Apache-2.0 licenses for central and central-local-infra, DCO contributor terms
-- **Status:** Proposed
+- **Status:** Accepted
 - **Created:** 2026-10-04
 - **Owners:** Central maintainer
 - **Decision due:** 2026-10-11
-- **Decision due history:** None
-- **Implementation blocked at:** Writing `LICENSE`, `NOTICE`, and
-  `THIRD_PARTY_LICENSES` for `central` (issue #41) and for
-  `central-local-infra` (infra issue #1), the DCO
-  `Signed-off-by` requirement text in `CONTRIBUTING.md` (issue #46),
-  and the DCO CI check (issue #50).
-- **Decided by:** Not applicable while Proposed
-- **Decision date:** Not applicable while Proposed
-- **Decision record:** Not applicable while Proposed
+- **Decision due history:** Lapsed 2026-10-11; decided 2026-10-30
+- **Implementation blocked at:** None — unblocked by this acceptance.
+  `central-rust` license files land with the acceptance; the
+  remaining follow-ups (NOTICE/THIRD_PARTY_LICENSES, `CONTRIBUTING.md`
+  DCO text, DCO CI check, infra madmin-go replacement) are tracked
+  below.
+- **Decided by:** hieuntg81 (Central maintainer and ADR owner, 2026-10-30)
+- **Decision date:** 2026-10-30
+- **Decision record:** Maintainer approval in session on 2026-10-30
+  ("accept 0040"), after choosing dual `MIT OR Apache-2.0` for
+  `central-rust` (see the Amendment section)
 - **Supersedes:** None
 - **Superseded by:** None
 - **Amends:** None
@@ -118,8 +120,31 @@ There is no registered mark to police, so maintaining a policy
 document now is YAGNI. Recording the position in this ADR preserves
 the option without the document. Rejected.
 
+## Amendment (2026-10-30, `central-rust`)
+
+This ADR was written for the upstream Go repositories. For the Rust
+reimplementation (`central-rust`, ADR 0043) the maintainer chose
+**dual licensing `MIT OR Apache-2.0`** on 2026-10-30, matching the root
+`Cargo.toml` `license` field already in the tree and the Rust ecosystem
+convention:
+
+- `central-rust` ships `LICENSE-MIT` and `LICENSE-APACHE`; downstream
+  users may choose either license.
+- Contributions are accepted under both licenses (inbound = outbound);
+  `CONTRIBUTING.md` states this alongside the DCO requirement.
+- Decision 1 (Apache-2.0 for the Go `central`) and decision 2
+  (Apache-2.0 for `central-local-infra`) are unchanged. Decisions 3
+  (DCO, no CLA) and 4 (no trademark policy) apply to `central-rust`
+  unchanged.
+- `cargo deny check licenses` must keep every dependency compatible
+  with both licenses.
+
 ## Follow-ups
 
+- `central-rust`: write `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, and
+  `THIRD_PARTY_LICENSES`; add the dual-license + DCO text to
+  `CONTRIBUTING.md` (tracked in
+  `docs/internal/tasks/open-source-readiness.md`).
 - enolalab/central issue #41: write `LICENSE`, `NOTICE`, and
   `THIRD_PARTY_LICENSES` for `central` (implements decision 1).
 - enolalab/central-local-infra issue #1: replace madmin-go with direct
