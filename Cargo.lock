@@ -810,6 +810,8 @@ dependencies = [
  "rand 0.10.3",
  "rcgen",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",

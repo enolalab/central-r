@@ -16,10 +16,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use central_foundation::failure::Failure;
 use central_infra::domain::{AcquisitionKind, Candidate, PreparePhase, acquisition_kind_for};
@@ -1312,21 +1312,418 @@ fn sleep_bounded(deadline: OpDeadline, wait: Duration) -> Result<(), Failure> {
 
 /// `HttpTransport` — the production transport placeholder. The
 /// root-side helper daemon binds a concrete implementation; this
-/// default exists so a `Fetcher` built without a seam answers
-/// `unavailable` rather than panicking — the same fail-closed shape
-/// the helper's handler contract requires.
+/// `HttpTransport` — the helper-side production transport. One
+/// blocking HTTP/1.1 GET per call over rustls: DNS and the address
+/// policy resolve together before connect (upstream's
+/// `dialCheckedAddress` — the checked form is the connected form),
+/// TLS is the capability's mode, and the body streams back for the
+/// caller's size ceiling. No proxy, jar, client certificate, or
+/// compression exists anywhere in this stack to consult.
 pub struct HttpTransport;
 
 impl FetchTransport for HttpTransport {
     fn get(&self, req: &FetchRequest) -> Result<FetchResponse, TransportFailure> {
-        Err(TransportFailure {
-            timed_out: false,
-            detail: format!(
-                "no transport bound for {} (helper-side transport must be wired)",
-                req.url
-            ),
-        })
+        http_get(req)
     }
+}
+
+/// `ParsedUrl` — the pieces one GET needs.
+struct ParsedUrl {
+    scheme: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn parse_url(raw: &str) -> Result<ParsedUrl, String> {
+    let (scheme, rest) = raw
+        .split_once("://")
+        .ok_or_else(|| format!("url has no scheme: {raw}"))?;
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("url scheme is not http/https: {raw}"));
+    }
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_owned()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p))
+            if !h.contains(']') && !h.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (
+                h.to_owned(),
+                p.parse::<u16>().map_err(|e| format!("url port: {e}"))?,
+            )
+        }
+        _ => (
+            authority.trim_matches(|c| c == '[' || c == ']').to_owned(),
+            if scheme == "https" { 443 } else { 80 },
+        ),
+    };
+    if host.is_empty() {
+        return Err(format!("url has no host: {raw}"));
+    }
+    Ok(ParsedUrl {
+        scheme: scheme.to_owned(),
+        host,
+        port,
+        path,
+    })
+}
+
+/// `DialSocket` — the two stream shapes under one Read/Write impl.
+enum DialSocket {
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(TcpStream),
+}
+
+impl Read for DialSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            DialSocket::Tls(s) => s.read(buf),
+            DialSocket::Plain(s) => s.read(buf),
+        }
+    }
+}
+impl Write for DialSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            DialSocket::Tls(s) => s.write(buf),
+            DialSocket::Plain(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            DialSocket::Tls(s) => s.flush(),
+            DialSocket::Plain(s) => s.flush(),
+        }
+    }
+}
+
+/// `BodyReader` — EOF-terminated (Connection: close), Content-Length,
+/// or chunked framing.
+enum BodyReader {
+    Eof(io::BufReader<DialSocket>),
+    Fixed(io::BufReader<DialSocket>, u64),
+    Chunked(ChunkedReader),
+}
+
+impl Read for BodyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            BodyReader::Eof(r) => r.read(buf),
+            BodyReader::Fixed(r, left) => {
+                if *left == 0 {
+                    return Ok(0);
+                }
+                let take = (buf.len() as u64).min(*left) as usize;
+                let n = r.read(&mut buf[..take])?;
+                *left -= n as u64;
+                Ok(n)
+            }
+            BodyReader::Chunked(r) => r.read(buf),
+        }
+    }
+}
+
+/// Minimal HTTP/1.1 chunked decoder over the buffered socket.
+struct ChunkedReader {
+    inner: io::BufReader<DialSocket>,
+    /// bytes left in the current chunk.
+    left: u64,
+    /// `true` after the terminating 0-chunk's trailers end.
+    done: bool,
+}
+
+impl ChunkedReader {
+    /// Read one ASCII-hex chunk size line (extensions after `;`
+    /// ignored).
+    fn read_chunk_size(&mut self) -> io::Result<u64> {
+        let mut line = String::new();
+        io::BufRead::read_line(&mut self.inner, &mut line)?;
+        let hex = line
+            .trim_end_matches(['\r', '\n'])
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        u64::from_str_radix(hex, 16)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("chunk size: {e}")))
+    }
+
+    fn read_line(&mut self) -> io::Result<String> {
+        let mut line = String::new();
+        io::BufRead::read_line(&mut self.inner, &mut line)?;
+        Ok(line)
+    }
+}
+
+impl Read for ChunkedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+        if self.left == 0 {
+            let size = self.read_chunk_size()?;
+            if size == 0 {
+                // Trailers run until the empty line.
+                loop {
+                    if self.read_line()?.trim_end().is_empty() {
+                        break;
+                    }
+                }
+                self.done = true;
+                return Ok(0);
+            }
+            self.left = size;
+        }
+        let take = (buf.len() as u64).min(self.left) as usize;
+        let n = self.inner.read(&mut buf[..take])?;
+        self.left -= n as u64;
+        if self.left == 0 {
+            // Chunk-terminating CRLF.
+            let mut crlf = [0u8; 2];
+            self.inner.read_exact(&mut crlf)?;
+        }
+        Ok(n)
+    }
+}
+
+/// `ServerCertVerifier` that accepts anything — reachable only from a
+/// lock a test constructed with `TlsFetchMode::InsecureTestOnly`; the
+/// shipped lock refuses that mode at load time.
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        use rustls::SignatureScheme as S;
+        vec![
+            S::RSA_PKCS1_SHA256,
+            S::ECDSA_NISTP256_SHA256,
+            S::ECDSA_NISTP384_SHA384,
+            S::ED25519,
+            S::RSA_PSS_SHA256,
+            S::RSA_PSS_SHA384,
+            S::RSA_PSS_SHA512,
+            S::ED448,
+        ]
+    }
+}
+
+fn tf(detail: impl Into<String>) -> TransportFailure {
+    TransportFailure {
+        timed_out: false,
+        detail: detail.into(),
+    }
+}
+
+fn tf_io(context: &str, e: io::Error) -> TransportFailure {
+    TransportFailure {
+        timed_out: matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
+        detail: format!("{context}: {e}"),
+    }
+}
+
+/// `DialContext`/`clientFor` combined: resolve with the address
+/// policy applied to the answers, connect to one checked address,
+/// wrap TLS when the scheme says so, send the GET, parse the status
+/// line and headers, and stream the body under `Connection: close`.
+fn http_get(req: &FetchRequest) -> Result<FetchResponse, TransportFailure> {
+    let deadline = req.timeout.map(|d| Instant::now() + d);
+    let url = parse_url(&req.url).map_err(tf)?;
+    if url.scheme != "https" && req.tls_policy == TlsFetchMode::SystemRoots {
+        return Err(tf(format!(
+            "non-https endpoint under system-roots policy: {}",
+            req.url
+        )));
+    }
+
+    // `dialCheckedAddress` — resolution and the connect are one step.
+    let addresses: Vec<std::net::SocketAddr> = (url.host.as_str(), url.port)
+        .to_socket_addrs()
+        .map_err(|e| tf_io("resolve", e))?
+        .collect();
+    if addresses.is_empty() {
+        return Err(tf(format!("{} resolved to no address", url.host)));
+    }
+    match req.address_policy.as_str() {
+        central_infra::prepare::ADDRESS_POLICY_ANY => {}
+        central_infra::prepare::ADDRESS_POLICY_PUBLIC_UNICAST => {
+            for addr in &addresses {
+                if !is_public_unicast(&addr.ip()) {
+                    return Err(tf(format!("{} is not a public unicast address", addr.ip())));
+                }
+            }
+        }
+        other => return Err(tf(format!("unknown address policy {other}"))),
+    }
+
+    let mut last_err = None;
+    let mut tcp = None;
+    for addr in &addresses {
+        let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let budget = remaining
+            .unwrap_or(Duration::from_secs(30))
+            .max(Duration::from_secs(1));
+        match TcpStream::connect_timeout(addr, budget.min(Duration::from_secs(30))) {
+            Ok(conn) => {
+                tcp = Some(conn);
+                break;
+            }
+            Err(e) => last_err = Some(tf_io("connect", e)),
+        }
+    }
+    let tcp = tcp.ok_or_else(|| last_err.unwrap_or_else(|| tf("no connectable address")))?;
+    if let Some(d) = deadline {
+        let remaining = d
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1));
+        let _ = tcp.set_read_timeout(Some(remaining));
+        let _ = tcp.set_write_timeout(Some(remaining));
+    }
+    let _ = tcp.set_nodelay(true);
+
+    let mut socket = if url.scheme == "https" {
+        let config = match req.tls_policy {
+            TlsFetchMode::SystemRoots => {
+                let mut roots = rustls::RootCertStore::empty();
+                let loaded = rustls_native_certs::load_native_certs();
+                for cert in loaded.certs {
+                    let _ = roots.add(cert);
+                }
+                if roots.is_empty() {
+                    return Err(tf("no TLS roots loaded from the host store"));
+                }
+                rustls::ClientConfig::builder_with_provider(
+                    rustls::crypto::ring::default_provider().into(),
+                )
+                .with_safe_default_protocol_versions()
+                .map_err(|e| tf(format!("tls versions: {e}")))?
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+            }
+            TlsFetchMode::InsecureTestOnly => rustls::ClientConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into(),
+            )
+            .with_safe_default_protocol_versions()
+            .map_err(|e| tf(format!("tls versions: {e}")))?
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth(),
+        };
+        let server = rustls::pki_types::ServerName::try_from(url.host.clone())
+            .map_err(|e| tf(format!("server name: {e}")))?;
+        let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server)
+            .map_err(|e| tf(format!("tls: {e}")))?;
+        DialSocket::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)))
+    } else {
+        DialSocket::Plain(tcp)
+    };
+
+    // `GET path HTTP/1.1` — Host is the authority the URL names; the
+    // caller's allowlisted headers follow, then a bare Connection:
+    // close (no connection reuse exists in this transport).
+    let authority =
+        if (url.scheme == "https" && url.port == 443) || (url.scheme == "http" && url.port == 80) {
+            url.host.clone()
+        } else {
+            format!("{}:{}", url.host, url.port)
+        };
+    let mut request = format!("GET {} HTTP/1.1\r\nHost: {}\r\n", url.path, authority);
+    for (k, v) in &req.headers {
+        request.push_str(&format!("{k}: {v}\r\n"));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    socket
+        .write_all(request.as_bytes())
+        .and_then(|()| socket.flush())
+        .map_err(|e| tf_io("write", e))?;
+
+    // Status line + headers (bounded).
+    let mut reader = io::BufReader::with_capacity(8192, socket);
+    let mut status_line = String::new();
+    io::BufRead::read_line(&mut reader, &mut status_line).map_err(|e| tf_io("read status", e))?;
+    if status_line.len() > 512 {
+        return Err(tf("status line exceeds limit"));
+    }
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| tf(format!("malformed status line: {}", status_line.trim_end())))?;
+
+    let mut headers = Vec::new();
+    let mut header_bytes = 0usize;
+    loop {
+        let mut line = String::new();
+        io::BufRead::read_line(&mut reader, &mut line).map_err(|e| tf_io("read header", e))?;
+        header_bytes += line.len();
+        if header_bytes > 64 * 1024 {
+            return Err(tf("headers exceed 64KiB"));
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        let (k, v) = line
+            .split_once(':')
+            .ok_or_else(|| tf("malformed header line"))?;
+        headers.push((k.trim().to_owned(), v.trim().to_owned()));
+    }
+
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    let content_length = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse::<u64>().ok());
+    let body: Box<dyn Read + Send> = if chunked {
+        Box::new(BodyReader::Chunked(ChunkedReader {
+            inner: reader,
+            left: 0,
+            done: false,
+        }))
+    } else if let Some(len) = content_length {
+        Box::new(BodyReader::Fixed(reader, len))
+    } else {
+        Box::new(BodyReader::Eof(reader))
+    };
+    Ok(FetchResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 #[cfg(test)]

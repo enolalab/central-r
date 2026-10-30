@@ -50,7 +50,12 @@ mod serve;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut stdout = std::io::stdout().lock();
-    let mut stderr = std::io::stderr().lock();
+    // Not `stderr().lock()`: the `StderrLock` guard would be held for the
+    // whole process lifetime, deadlocking every worker-thread `eprintln!`
+    // (observed: helper daemon's lifecycle op threads parked on
+    // `lock_contended` inside `__eprint`). `Stderr` locks per-write and is
+    // the handle upstream's `os.Stderr` models.
+    let mut stderr = std::io::stderr();
     ExitCode::from(run(&args, &mut stdout, &mut stderr))
 }
 

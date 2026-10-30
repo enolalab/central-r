@@ -41,6 +41,21 @@ pub(crate) fn last_errno() -> Errno {
 /// (`sys::seccomp`) builds it from a `Vec<libc::sock_filter>` that
 /// outlives the call; the kernel copies the program before returning,
 /// so no reference is retained.
+/// `tgkill(tgid, tid, 0)` — the same process-liveness probe upstream's
+/// `unix.Kill(pid, 0)` performs (Go's `syscall.Kill` has emitted
+/// `SYS_TGKILL` — 234, allow-listed — since Go 1.x; Rust's
+/// `rustix::process::test_kill_process` emits `SYS_KILL` — 62, denied).
+/// `ESRCH` means the owner is gone; `EPERM`/success means alive.
+pub(crate) fn tgkill_liveness(pid: rustix::process::Pid) -> Result<(), Errno> {
+    let rc = unsafe {
+        libc::syscall(libc::SYS_tgkill, pid.as_raw_nonzero().get(), pid.as_raw_nonzero().get(), 0)
+    };
+    if rc == -1 {
+        return Err(Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::INVAL));
+    }
+    Ok(())
+}
+
 pub(crate) fn install_filter(prog: &libc::sock_fprog) -> Result<(), Errno> {
     // SAFETY: `prog` is a reference to a live `sock_fprog` whose
     // `filter` pointer names a `sock_filter` array of `len` entries —

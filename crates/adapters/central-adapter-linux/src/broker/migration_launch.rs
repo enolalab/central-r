@@ -545,7 +545,13 @@ impl MigrationLaunchStore {
 /// `starttime` field (22nd) of `/proc/<pid>/stat`, which lives after
 /// the last `)` because the comm field can contain spaces/parens.
 pub fn verify_peer_process(pid: i32) -> Result<(String, String), Failure> {
-    let exe = std::fs::canonicalize(format!("/proc/{pid}/exe"))
+    // `readlinkat` (267 — allow-listed, SC-DEF-36) instead of
+    // `canonicalize`, whose multi-component resolution emits `statx`.
+    let exe = rustix::fs::readlinkat(
+            rustix::fs::CWD,
+            format!("/proc/{pid}/exe"),
+            Vec::new(),
+        )
         .map_err(|e| internal(format!("resolve exe symlink: {e}")))?
         .to_string_lossy()
         .into_owned();

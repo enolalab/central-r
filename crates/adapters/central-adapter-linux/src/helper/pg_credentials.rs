@@ -613,7 +613,11 @@ impl ProductionPostgresServiceRoleCredentialStore {
                 .map_err(|_| unavailable("postgres service role credential: mint"))?;
             self.syncer
                 .alter_login(auth_password, role.role_name, &minted)
-                .map_err(|_| unavailable("postgres service role credential: alter live role"))?;
+                .map_err(|e| {
+                    unavailable(&format!(
+                        "postgres service role credential: alter live role: {e}"
+                    ))
+                })?;
             self.write_secret(role.role_name, &minted).map_err(|_| {
                 unavailable("postgres service role credential: persist rotated secret")
             })?;

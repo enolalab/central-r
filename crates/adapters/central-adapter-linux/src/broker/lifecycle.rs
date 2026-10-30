@@ -346,7 +346,7 @@ impl Service {
         }
         let pid = rustix::process::Pid::from_raw(owner_pid)
             .ok_or_else(|| denied("invalid lifecycle lock owner"))?;
-        match rustix::process::test_kill_process(pid) {
+        match crate::sys::audited::tgkill_liveness(pid) {
             Ok(()) | Err(rustix::io::Errno::PERM) => Ok(DeadOwnerProof {
                 lock_id: lock_id.into(),
                 owner_pid,

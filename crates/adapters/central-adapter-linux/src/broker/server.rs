@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write as _};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -52,6 +52,8 @@ use super::handoff::{self, HandoffService};
 use super::journal::Journal;
 use super::lifecycle::LifecycleNonceStore;
 use super::migration_launch::{MigrationLaunchOutcomeState, MigrationLaunchStore};
+use super::minio_runtime;
+use super::minio_runtime_wire;
 use super::payload_epoch::PayloadEpochStore;
 use super::proof::{self, ProofService};
 use super::protected_file::ProtectedFileBackend;
@@ -340,6 +342,10 @@ pub struct Service {
     pub bootstrap_session: Option<BootstrapSession>,
     /// The migration launch evidence/outcome store (`s.launches`).
     pub launches: Option<MigrationLaunchStore>,
+    /// `s.minioRuntime` — the durable B10 `minio_runtime_v1` binding/
+    /// consumption authority (`minio-runtime-bindings`/
+    /// `minio-runtime-consumptions` under the broker root).
+    pub(crate) minio_runtime: Option<minio_runtime::MinioRuntimeBindingStore>,
     /// The central runtime UID `isRuntimeOrRootPeer` widens to (ADR
     /// 0013).
     pub runtime_uid: u32,
@@ -439,6 +445,7 @@ impl Service {
             SigningService::from_key(signing.key_copy()),
         )?);
         let launches = Some(MigrationLaunchStore::new(&root_path, signing.clone())?);
+        let minio_runtime = Some(minio_runtime::MinioRuntimeBindingStore::new(&root_path)?);
         // R6 stores (`newServiceWithHelperExecutable`): the protected
         // recovery journal, then every store bound to it.
         let recovery_journal = Arc::new(RecoveryJournalStore::new(
@@ -518,6 +525,7 @@ impl Service {
             bootstrap,
             bootstrap_session,
             launches,
+            minio_runtime,
             runtime_uid,
             bootstrap_mu: Mutex::new(ServiceBootstrapState {
                 bootstraps: BTreeMap::new(),
@@ -549,6 +557,7 @@ impl Service {
         bootstrap: Option<SecretBootstrap>,
         bootstrap_session: Option<BootstrapSession>,
         launches: Option<MigrationLaunchStore>,
+        minio_runtime: Option<minio_runtime::MinioRuntimeBindingStore>,
         runtime_uid: u32,
     ) -> Self {
         Self {
@@ -574,6 +583,7 @@ impl Service {
             bootstrap,
             bootstrap_session,
             launches,
+            minio_runtime,
             runtime_uid,
             bootstrap_mu: Mutex::new(ServiceBootstrapState {
                 bootstraps: BTreeMap::new(),
@@ -2257,18 +2267,335 @@ impl Service {
 
     /// `handleB10MinioRuntimeTransport` — the runtime binding store is
     /// R6; the peer gate has already run, so deny closed.
+    /// `secretbootstrap.MinioRuntimeUseRequest` on the wire — the
+    /// domain type carries no serde; this mirrors its JSON shape and
+    /// `Validate` semantics via the domain's own `validate(now)`.
+    /// `handleB10MinioRuntimeTransport` — B10 outbound: durable
+    /// consumption → protected generation read → sealed-descriptor
+    /// delivery → single-use settlement.
     fn handle_b10_minio_runtime_transport(
         &self,
         conn: &mut super::deadline::DeadlineStream,
         req: &BrokerRequest,
-        _peer: &PeerCred,
+        peer: &PeerCred,
     ) -> Result<(), Failure> {
-        protocol::write_deny(
-            conn,
-            &req.operation_id,
-            "B10_MINIO_RUNTIME_DENIED: protected runtime binding unavailable",
+        let Some(raw) = req
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("request"))
+            .map(|v| v.get())
+        else {
+            protocol::write_deny(
+                conn,
+                &req.operation_id,
+                "B10_MINIO_RUNTIME_DENIED: missing request",
+            );
+            return Ok(());
+        };
+        let use_req = serde_json::from_slice::<minio_runtime_wire::WireMinioRuntimeUseRequest>(
+            raw.as_bytes(),
+        )
+        .map_err(|_| ())
+        .and_then(|w| w.to_domain().map_err(|_| ()));
+        let use_req = match use_req {
+            Ok(r) if r.validate(OffsetDateTime::now_utc()).is_ok() => r,
+            _ => {
+                protocol::write_deny(
+                    conn,
+                    &req.operation_id,
+                    "B10_MINIO_RUNTIME_DENIED: invalid minio runtime binding",
+                );
+                return Ok(());
+            }
+        };
+        if req.operation_id != use_req.operation_id {
+            protocol::write_deny(
+                conn,
+                &req.operation_id,
+                "B10_MINIO_RUNTIME_DENIED: operation binding mismatch",
+            );
+            return Ok(());
+        }
+        if use_req.uid != peer.uid.as_raw() || use_req.gid != peer.gid.as_raw() {
+            protocol::write_deny(
+                conn,
+                &req.operation_id,
+                "B10_MINIO_RUNTIME_DENIED: peer credential mismatch",
+            );
+            return Ok(());
+        }
+        let generation =
+            uuid::Uuid::parse_str(&use_req.opaque_generation).unwrap_or_else(|_| uuid::Uuid::nil());
+        let Some(minio_runtime) = &self.minio_runtime else {
+            protocol::write_deny(
+                conn,
+                &req.operation_id,
+                "B10_MINIO_RUNTIME_DENIED: protected runtime binding unavailable",
+            );
+            return Ok(());
+        };
+        // Durable consumption before the generation is touched — the
+        // store proves scope + fence + single-handoff atomically
+        // (upstream's SC-DEF-68 ordering).
+        let consumption = match minio_runtime.consume(minio_runtime::MinioRuntimeConsumeRequest {
+            generation_id: generation.to_string(),
+            instance_id: use_req.instance_id.clone(),
+            bucket: use_req.bucket.clone(),
+            key_prefix: use_req.key_prefix.clone(),
+            operation_id: use_req.operation_id.clone(),
+            receipt_id: use_req.receipt_id.clone(),
+            fencing_token: use_req.fencing_token,
+        }) {
+            Ok(c) => c,
+            Err(e) if e.message().contains("consumed") => {
+                protocol::write_deny(
+                    conn,
+                    &req.operation_id,
+                    "B10_MINIO_RUNTIME_DENIED: runtime generation already consumed",
+                );
+                return Ok(());
+            }
+            Err(e) if e.message().contains("stale") => {
+                protocol::write_deny(
+                    conn,
+                    &req.operation_id,
+                    "B10_MINIO_RUNTIME_DENIED: stale fencing token",
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                protocol::write_deny(
+                    conn,
+                    &req.operation_id,
+                    "B10_MINIO_RUNTIME_DENIED: protected runtime binding unavailable",
+                );
+                return Ok(());
+            }
+        };
+        let protected_gen = match self.backend.get_by_id(generation) {
+            Ok(g) if g.purpose == central_infra::domain::Purpose::MinioRuntime.as_str() => g,
+            _ => {
+                protocol::write_deny(
+                    conn,
+                    &req.operation_id,
+                    "B10_MINIO_RUNTIME_DENIED: protected runtime binding unavailable",
+                );
+                return Ok(());
+            }
+        };
+        let Ok(value) = self.backend.read(&protected_gen) else {
+            self.record_minio_runtime_failure(
+                &protected_gen.generation_id.to_string(),
+                "generation_unavailable",
+            );
+            protocol::write_deny(
+                conn,
+                &req.operation_id,
+                "B10_MINIO_RUNTIME_DENIED: protected runtime binding unavailable",
+            );
+            return Ok(());
+        };
+        let Ok(fd) = self.handoff.handoff(&value) else {
+            self.record_minio_runtime_failure(
+                &protected_gen.generation_id.to_string(),
+                "descriptor_unavailable",
+            );
+            protocol::write_deny(
+                conn,
+                &req.operation_id,
+                "B10_MINIO_RUNTIME_DENIED: handoff unavailable",
+            );
+            return Ok(());
+        };
+        // WriteMsgUnix([0x01], UnixRights(fd)) — exactly one delivery.
+        if let Err(e) = crate::sys::scm_rights::send(
+            (*conn).as_fd(),
+            &[crate::sys::scm_rights::TRANSPORT_MARKER],
+            &[fd.as_fd()],
+        ) {
+            self.record_minio_runtime_failure(
+                &protected_gen.generation_id.to_string(),
+                "descriptor_delivery_unknown",
+            );
+            return Err(Failure::internal(
+                "broker",
+                format!("B10 transport: send sealed descriptor: {e}"),
+            ));
+        }
+        if let Err(e) = minio_runtime.record_delivery(
+            &protected_gen.generation_id.to_string(),
+            minio_runtime::DELIVERY_DELIVERED,
+            "",
+        ) {
+            self.record_minio_runtime_failure(
+                &protected_gen.generation_id.to_string(),
+                "descriptor_delivery_unknown",
+            );
+            return Err(Failure::internal(
+                "broker",
+                format!("B10 transport: persist delivered handoff: {e}"),
+            ));
+        }
+        // The delivered generation's broker-side copy is provably no
+        // longer needed — same cleanupProtectedGeneration semantics
+        // (best-effort, never reported to the peer).
+        let _ = self.backend.delete(protected_gen.generation_id);
+
+        // Fingerprints bind the receipt to this exact scope.
+        let principal = self.signing.fingerprint(
+            "b10-minio-runtime-principal",
+            format!(
+                "{}:{}:{}:{}",
+                use_req.instance_id,
+                use_req.operation_id,
+                use_req.receipt_id,
+                protected_gen.generation_id
+            )
+            .as_bytes(),
         );
+        let policy = self.signing.fingerprint(
+            "b10-minio-runtime-policy",
+            format!(
+                "{}:{}:{}:{}",
+                use_req.bucket, use_req.key_prefix, use_req.receipt_id, use_req.fencing_token
+            )
+            .as_bytes(),
+        );
+        if let Err(e) =
+            self.append_minio_runtime_handoff_journal(&use_req, &consumption, &principal, &policy)
+        {
+            self.record_minio_runtime_failure(
+                &protected_gen.generation_id.to_string(),
+                "handoff_audit_unavailable",
+            );
+            return Err(Failure::internal(
+                "broker",
+                format!("B10 transport: journal handoff: {e}"),
+            ));
+        }
+        let result = serde_json::json!({
+            "operation_id": use_req.operation_id,
+            "receipt_id": use_req.receipt_id,
+            "principal_fingerprint": principal,
+            "policy_fingerprint": policy,
+        });
+        let body = serde_json::json!({
+            "operation_id": req.operation_id,
+            "outcome": "success",
+            "result": result,
+        });
+        let mut out = serde_json::to_vec(&body).unwrap_or_default();
+        out.push(b'\n');
+        let _ = conn.write_all(&out);
         Ok(())
+    }
+
+    /// `bindMinioRuntimeSecret` — the inbound arm's store: create the
+    /// `minio_runtime_v1` protected generation, then bind its scope in
+    /// the durable authority. Generation + binding must never disagree
+    /// (upstream's ordering: generation first, binding second).
+    pub(crate) fn bind_minio_runtime_secret(
+        &self,
+        instance_id: &str,
+        bucket: &str,
+        key_prefix: &str,
+        fence_generation: u64,
+        value: &[u8],
+    ) -> Result<(), Failure> {
+        let protected_gen = self
+            .backend
+            .create(central_infra::domain::Purpose::MinioRuntime.as_str(), value)
+            .map_err(|e| {
+                Failure::internal(
+                    "broker",
+                    format!("broker: bind minio runtime generation: {e}"),
+                )
+            })?;
+        let Some(minio_runtime) = &self.minio_runtime else {
+            let _ = self.backend.delete(protected_gen.generation_id);
+            return Err(Failure::internal(
+                "broker",
+                "broker: minio runtime binding store unavailable",
+            ));
+        };
+        minio_runtime
+            .bind(minio_runtime::MinioRuntimeBinding {
+                generation_id: protected_gen.generation_id.to_string(),
+                instance_id: instance_id.to_owned(),
+                bucket: bucket.to_owned(),
+                key_prefix: key_prefix.to_owned(),
+                fence_generation,
+                created_at: String::new(),
+            })
+            .map_err(|e| {
+                let _ = self.backend.delete(protected_gen.generation_id);
+                Failure::internal("broker", format!("broker: bind minio runtime binding: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// `appendMinioRuntimeHandoffJournal` — the audit record: opaque
+    /// fingerprints only, stream id is itself a fingerprint.
+    fn append_minio_runtime_handoff_journal(
+        &self,
+        use_req: &central_infra::domain::MinioRuntimeUseRequest,
+        consumption: &minio_runtime::MinioRuntimeConsumption,
+        principal: &str,
+        policy: &str,
+    ) -> Result<(), Failure> {
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        let raw = serde_json::json!({
+            "consumption_id": consumption.consumption_id,
+            "operation_id": consumption.operation_id,
+            "receipt_id": consumption.receipt_id,
+            "generation_id": consumption.generation_id,
+            "instance_id": consumption.instance_id,
+            "fence_generation": consumption.fence_generation,
+            "principal_fingerprint": principal,
+            "policy_fingerprint": policy,
+            "recorded_at": OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+        });
+        let stream_id = format!(
+            "minio-runtime-{}",
+            self.signing
+                .fingerprint("b10-minio-runtime-stream", use_req.instance_id.as_bytes())
+        );
+        let mut payload = central_infra::authority::AuthorityTransitionPayload {
+            schema_version: "central.authority-transition/v1".to_owned(),
+            stream_id: stream_id.clone(),
+            sequence_num: 0,
+            phase: "committed".to_owned(),
+            operation: "minio-runtime-handoff".to_owned(),
+            instance_id: use_req.instance_id.clone(),
+            binding_id: String::new(),
+            launch_id: String::new(),
+            payload: serde_json::value::RawValue::from_string(
+                serde_json::to_string(&raw).unwrap_or_default(),
+            )
+            .ok(),
+            ..Default::default()
+        };
+        journal
+            .append_committed(&stream_id, &mut payload)
+            .map(|_| ())
+            .map_err(|e| Failure::internal("broker", format!("{e}")))
+    }
+
+    /// `recordMinioRuntimeFailure` — best-effort reconciliation; never
+    /// returns a generation to reusable state.
+    fn record_minio_runtime_failure(&self, generation_id: &str, code: &str) {
+        if generation_id.is_empty() {
+            return;
+        }
+        if let Some(minio_runtime) = &self.minio_runtime {
+            let _ = minio_runtime.record_delivery(
+                generation_id,
+                minio_runtime::DELIVERY_RECONCILIATION,
+                code,
+            );
+        }
     }
 
     /// `handleB10MinioProvisionedTransport` — the provisioner gate is
@@ -2282,7 +2609,8 @@ impl Service {
         fd: OwnedFd,
         peer: &PeerCred,
     ) -> Result<(), Failure> {
-        drop(fd); // exactly one close, on every path
+        // `fd` is an `OwnedFd` — its `Drop` is upstream's deferred
+        // `unix.Close(fd)`: exactly one close on every path.
         if !is_minio_provisioner_peer(peer) {
             protocol::write_deny(
                 conn,
@@ -2298,11 +2626,163 @@ impl Service {
                 ),
             ));
         }
-        protocol::write_deny(
-            conn,
-            &descriptor.operation_id,
-            &format!("B10_PROVISION_DENIED: {UNSUPPORTED_IN_THIS_SLICE}"),
-        );
+        if descriptor.service != "minio-provision"
+            || descriptor.target != "sealed_memfd"
+            || descriptor.uid != MINIO_PROVISIONER_UID
+            || descriptor.gid != MINIO_PROVISIONER_GID
+        {
+            protocol::write_deny(
+                conn,
+                &descriptor.operation_id,
+                "B10_PROVISION_DENIED: invalid dependency binding",
+            );
+            return Err(Failure::denied(
+                "broker",
+                "broker: minio-provision descriptor invalid dependency binding",
+            ));
+        }
+        if descriptor.operation_id.is_empty()
+            || descriptor.instance_id.is_empty()
+            || descriptor.receipt_id.is_empty()
+        {
+            protocol::write_deny(
+                conn,
+                &descriptor.operation_id,
+                "B10_PROVISION_DENIED: missing identity",
+            );
+            return Err(Failure::denied(
+                "broker",
+                "broker: minio-provision descriptor missing identity",
+            ));
+        }
+        if descriptor.fence_token == 0
+            || descriptor.expires_at.unix_timestamp() <= 0
+            || OffsetDateTime::now_utc() > descriptor.expires_at
+        {
+            protocol::write_deny(
+                conn,
+                &descriptor.operation_id,
+                "B10_PROVISION_DENIED: expired or unfenced",
+            );
+            return Err(Failure::denied(
+                "broker",
+                "broker: minio-provision descriptor expired or unfenced",
+            ));
+        }
+        let is_runtime =
+            descriptor.purpose == central_infra::domain::Purpose::MinioRuntime.as_str();
+        if is_runtime
+            && (descriptor.bucket != "central-artifacts-v1"
+                || descriptor.key_prefix != central_infra::domain::MINIO_RUNTIME_KEY_SCOPE
+                || !descriptor.policy_digest.is_empty())
+        {
+            protocol::write_deny(
+                conn,
+                &descriptor.operation_id,
+                "B10_PROVISION_DENIED: scope mismatch",
+            );
+            return Err(Failure::denied(
+                "broker",
+                "broker: minio-provision descriptor runtime scope mismatch",
+            ));
+        }
+        if !is_runtime
+            && !crate::broker::recovery_journal::valid_recovery_minio_descriptor(
+                descriptor,
+                OffsetDateTime::now_utc(),
+            )
+        {
+            protocol::write_deny(
+                conn,
+                &descriptor.operation_id,
+                "B10_PROVISION_DENIED: recovery receipt or scope mismatch",
+            );
+            return Err(Failure::denied(
+                "broker",
+                "broker: minio-provision descriptor recovery binding invalid",
+            ));
+        }
+
+        // readSealedValue — the complete sealed value; fd's single
+        // owner is the caller's drop.
+        let mut value = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match rustix::io::read(&fd, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    value.extend_from_slice(&chunk[..n]);
+                    if value.len() > central_infra::domain::MAX_SECRET_BYTES {
+                        protocol::write_deny(
+                            conn,
+                            &descriptor.operation_id,
+                            "B10_PROVISION_DENIED: unreadable descriptor",
+                        );
+                        return Err(Failure::internal(
+                            "broker",
+                            "broker: sealed value exceeds maximum size",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    protocol::write_deny(
+                        conn,
+                        &descriptor.operation_id,
+                        "B10_PROVISION_DENIED: unreadable descriptor",
+                    );
+                    return Err(Failure::internal(
+                        "broker",
+                        format!("broker: read sealed value: {e}"),
+                    ));
+                }
+            }
+        }
+        if value.is_empty() {
+            protocol::write_deny(
+                conn,
+                &descriptor.operation_id,
+                "B10_PROVISION_DENIED: unreadable descriptor",
+            );
+            return Err(Failure::internal("broker", "broker: sealed value is empty"));
+        }
+
+        if is_runtime {
+            if let Err(e) = self.bind_minio_runtime_secret(
+                &descriptor.instance_id,
+                &descriptor.bucket,
+                &descriptor.key_prefix,
+                descriptor.fence_token,
+                &value,
+            ) {
+                protocol::write_deny(
+                    conn,
+                    &descriptor.operation_id,
+                    "B10_PROVISION_DENIED: bind failed",
+                );
+                return Err(Failure::internal(
+                    "broker",
+                    format!("broker: bind minio-provision credential: {e}"),
+                ));
+            }
+        } else if let Err(e) = match &self.recovery_journal {
+            Some(store) => store.bind_minio_handoff(descriptor, &value, OffsetDateTime::now_utc()),
+            None => Err(Failure::internal(
+                "broker",
+                "broker: recovery journal unavailable",
+            )),
+        } {
+            protocol::write_deny(
+                conn,
+                &descriptor.operation_id,
+                "B10_PROVISION_DENIED: bind failed",
+            );
+            return Err(Failure::internal(
+                "broker",
+                format!("broker: bind minio-provision credential: {e}"),
+            ));
+        }
+
+        protocol::write_accept(conn, &descriptor.operation_id);
         Ok(())
     }
 }

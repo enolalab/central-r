@@ -106,6 +106,11 @@ pub const ALLOWED_SYSCALLS: &[u32] = &[
     290, // eventfd2 (the runtime netpoller's lazy init)
     281, // epoll_pwait (the netpoller's real wait on this toolchain)
     234, // tgkill (SIGURG async preemption)
+    // `VerifyDeadOwner`/`verifyPeerProcess` needed no list widening:
+    // upstream's `unix.Kill(pid, 0)` emits `tgkill` (already admitted
+    // above) and `EvalSymlinks` resolves via `readlinkat` — the port
+    // re-aims the same calls (`sys::audited::tgkill_liveness`,
+    // `rustix::fs::readlinkat`) rather than admit `kill`/`statx`.
     437, // openat2 (protected_file generation reads)
     // SCM_RIGHTS descriptor handoff — net.UnixConn's WriteMsgUnix /
     // ReadMsgUnix (the B04/B05/B10 delivery paths).
@@ -237,6 +242,9 @@ mod tests {
             264, 157, 290, 281, 234, 437, 46, 47, 204, 14, 56, 435, 131, 186, 273, 334, 28, 11, 17,
             217, 267, 8, 93, 219,
         ];
+        // Full equality with upstream — every earlier divergence was
+        // re-aimed instead of admitted (`kill`→`tgkill` was already
+        // upstream's own emission; `statx`→`readlinkat`/`newfstatat`).
         assert_eq!(ALLOWED_SYSCALLS, UPSTREAM);
         assert_eq!(ALLOWED_SYSCALLS.len(), 64);
         // Load-bearing absences/presences upstream names explicitly.

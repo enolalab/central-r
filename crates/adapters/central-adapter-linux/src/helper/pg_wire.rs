@@ -231,7 +231,7 @@ impl PgConn {
                             let Some(exchange) = scram.as_mut() else {
                                 return Err(unavailable("postgres wire: auth out of order"));
                             };
-                            let response = exchange.respond_to(&msg.payload)?;
+                            let response = exchange.respond_to(&msg.payload[4..])?;
                             self.send_password_frame(response.as_bytes())?;
                         }
                         12 => {
@@ -241,7 +241,7 @@ impl PgConn {
                             let Some(exchange) = scram.take() else {
                                 return Err(unavailable("postgres wire: auth out of order"));
                             };
-                            exchange.verify_final(&msg.payload)?;
+                            exchange.verify_final(&msg.payload[4..])?;
                         }
                         _ => return Err(unavailable("postgres wire: unsupported auth request")),
                     }

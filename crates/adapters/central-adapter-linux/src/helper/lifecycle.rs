@@ -160,13 +160,11 @@ impl LifecycleHandler for ProductionLifecycleHandler {
                 lifecycle_authorization_request(req, &lifecycle, &operation.instance_id, peer);
             let confirmation = match pam.confirm(peer, Some(deadline), &req.operation_id) {
                 Ok(token) => token,
-                Err(e) => {
-                    eprintln!("helper: lifecycle confirm failed: {}: {}", e.code(), e.message());
+                Err(_) => {
                     return Response::denied(&req.operation_id, 7, "AUTHORITY_DENIED");
                 }
             };
             if !pam.verify_and_consume(&confirmation) {
-                eprintln!("helper: lifecycle confirm token failed verify/consume");
                 return Response::denied(&req.operation_id, 7, "AUTHORITY_DENIED");
             }
             let claim = match authorizer.authorize_bound_lifecycle(&request) {

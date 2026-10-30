@@ -38,7 +38,7 @@ use super::attestation::{
 use super::buildkit::BuildKit;
 use super::capacity::CapacityChecker;
 use super::export::ReleaseExportService;
-use super::fetch::Fetcher;
+use super::fetch::{Fetcher, HttpTransport};
 use super::image_load::{DockerImageLoader, ImageLoader, image_loader_for};
 use super::journal::FileJournal;
 use super::lock::LockAdapter;
@@ -359,7 +359,7 @@ pub fn compose_prepare_service(
         Arc::new(BuildKit::with_work_dir(&build_dir)),
         store,
         lock.clone(),
-        Arc::new(Fetcher::new(&lock, &fetches_dir)),
+        Arc::new(Fetcher::new(&lock, &fetches_dir).with_transport(Box::new(HttpTransport))),
         Arc::new(CapacityChecker::new(&roots.work_dir)),
         PREPARED_SELECTORS.map(str::to_owned).to_vec(),
         &build_dir,

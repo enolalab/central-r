@@ -49,6 +49,8 @@ rand.workspace = true
 rcgen.workspace = true
 x509-parser.workspace = true
 rustls-pki-types.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 # Portable-export additions (R6 task 12): `aes-gcm` is the bx1 bundle's
 # authenticated cipher (upstream internal/portable/bundle.go —
 # AES-256-GCM segment framing). Pinned exact in

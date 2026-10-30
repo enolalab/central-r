@@ -1074,9 +1074,9 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
                     format!("topology: minio-provision: broker rendezvous: {e}"),
                 )
             })?;
-        let exit_code = self
+        let (provision_output, exit_code) = self
             .runner
-            .run_with_input(
+            .run_with_input_output(
                 &f,
                 "minio-provision",
                 &[REQUEST_MODE_MINIO_PROVISION.to_owned()],
@@ -1086,6 +1086,15 @@ impl<B: LifecycleBootstrap + B04Bootstrap + Send + Sync> TopologyPort for Topolo
             .map_err(|e| {
                 Failure::internal("TOPOLOGY", format!("topology: minio-provision: {e}"))
             })?;
+        if exit_code != 0 {
+            return Err(Failure::internal(
+                "TOPOLOGY",
+                format!(
+                    "topology: provisioner minio-provision did not exit successfully: exit code {exit_code}: {}",
+                    String::from_utf8_lossy(&provision_output)
+                ),
+            ));
+        }
         let receipt = self.provision_receipt_from_exit_code(op, "minio-provision", exit_code)?;
         if let Some(waiter) = &self.bind_waiter {
             waiter

@@ -42,6 +42,8 @@ pub mod lifecycle;
 pub mod lifecycle_client;
 pub mod migration_client;
 pub mod migration_launch;
+pub(crate) mod minio_runtime;
+pub(crate) mod minio_runtime_wire;
 pub mod payload_epoch;
 pub mod proof;
 pub mod protected_file;

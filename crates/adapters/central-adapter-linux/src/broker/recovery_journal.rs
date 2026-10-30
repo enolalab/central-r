@@ -1258,7 +1258,7 @@ fn valid_recovery_minio_request(request: &RecoveryMinioHandoffRequest) -> bool {
     request.policy_digest == digest
 }
 
-fn valid_recovery_minio_descriptor(
+pub(crate) fn valid_recovery_minio_descriptor(
     descriptor: &MinioProvisionedDescriptor,
     now: OffsetDateTime,
 ) -> bool {
