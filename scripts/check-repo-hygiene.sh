@@ -15,8 +15,10 @@ cd "$(git rev-parse --show-toplevel)"
 # /home/<user> personal home paths. System/upstream homes
 # (/home/minio, /home/op, /home/operator, /home/plugin, /home/cache,
 # /home/central) are legitimate and allowed.
-PERSONAL_HOME='~'
-PERSONAL_EMAIL='hieuntg81@gmail\.com'
+# Assembled at runtime so the file itself never contains the literal
+# identifier (the history rewrite would otherwise rewrite this string).
+PERSONAL_HOME="$(printf '/home/%s' 'k0walski')"
+PERSONAL_EMAIL="$(printf '%s@%s' 'hieuntg81' 'gmail\.com')"
 
 hits() {
     git grep -n -E "$1" -- . \
