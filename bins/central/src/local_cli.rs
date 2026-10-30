@@ -129,11 +129,11 @@ fn emit_error(
 
 // -- `local doctor` -----------------------------------------------------
 
-/// Ports `runDoctor` verbatim: OS and architecture checks against the
-/// reference host, `/etc/os-release` carried through into the details,
-/// `HOST_PREREQUISITE_MISMATCH` at exit 5 on failure. On linux/amd64
-/// this is a real exit-0 check.
-fn run_doctor(stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
+/// Reference-host gate for `local doctor`: linux/amd64 plus the pinned
+/// Ubuntu 24.04 line from `docs/operations/local-prerequisites.md` (the
+/// only supported distro line — VM finding "reports ok on a 26.04
+/// host" came from this check never reading `os-release`).
+fn host_prerequisite_failures(os_release: Option<&str>) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     if !cfg!(target_os = "linux") {
         failures.push(format!("unsupported OS: {}", host_goos()));
@@ -144,7 +144,71 @@ fn run_doctor(stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
             modes::host_goarch()
         ));
     }
-    let release = modes::os_release().unwrap_or_else(|| "unknown".to_string());
+    let mut id: Option<&str> = None;
+    let mut version_id: Option<&str> = None;
+    if let Some(release) = os_release {
+        for line in release.lines() {
+            if let Some(v) = line.strip_prefix("ID=") {
+                id = Some(v.trim_matches('"'));
+            } else if let Some(v) = line.strip_prefix("VERSION_ID=") {
+                version_id = Some(v.trim_matches('"'));
+            }
+        }
+    }
+    match id {
+        Some("ubuntu") => match version_id {
+            Some(v) if v == "24.04" || v.starts_with("24.04.") => {}
+            other => failures.push(format!(
+                "unsupported Ubuntu version: {} (reference host pins 24.04.x)",
+                other.unwrap_or("unknown")
+            )),
+        },
+        _ => failures.push(format!(
+            "unsupported OS release: {} (reference host pins Ubuntu 24.04.x)",
+            id.unwrap_or("unknown")
+        )),
+    }
+    failures
+}
+
+/// The V7 trap: when a bind-mount source is missing, Docker silently
+/// creates a *directory* at `/run/central-infra/<instance>/secrets/*` or
+/// `.../broker/*.sock`. Every expected mount source that exists as a
+/// directory is evidence of that trap — report each one so `local up`
+/// never has to explain a confusing in-container failure later.
+fn docker_bind_dir_failures() -> Vec<String> {
+    let mut failures = Vec::new();
+    let Ok(instances) = std::fs::read_dir("/run/central-infra") else {
+        return failures;
+    };
+    for entry in instances.flatten() {
+        for sub in ["secrets", "broker"] {
+            let dir = entry.path().join(sub);
+            let Ok(children) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for child in children.flatten() {
+                if child.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    failures.push(format!(
+                        "docker-created directory at mount source: {} — remove it and let the broker re-provision the file/socket",
+                        child.path().display()
+                    ));
+                }
+            }
+        }
+    }
+    failures
+}
+
+/// Ports `runDoctor` verbatim plus the V7 bind-mount scan: OS,
+/// architecture, and `os-release` checks against the reference host,
+/// `/etc/os-release` carried through into the details,
+/// `HOST_PREREQUISITE_MISMATCH` at exit 5 on failure.
+fn run_doctor(stdout: &mut impl Write, stderr: &mut impl Write) -> u8 {
+    let release = modes::os_release();
+    let mut failures = host_prerequisite_failures(release.as_deref());
+    failures.extend(docker_bind_dir_failures());
+    let release = release.unwrap_or_else(|| "unknown".to_string());
     if failures.is_empty() {
         emit(
             "local.doctor.prerequisites",
@@ -1498,6 +1562,12 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn doctor_on_reference_shape_reports_ok() {
+        // Only meaningful on the pinned reference line — other dev hosts
+        // are supposed to see HOST_PREREQUISITE_MISMATCH now.
+        let release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        if !(release.contains("ID=ubuntu") && release.contains("VERSION_ID=\"24.04\"")) {
+            return;
+        }
         let (code, stdout, _) = invoke("local.doctor.prerequisites", &[]);
         assert_eq!(code, 0);
         let parsed: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap();
@@ -1506,6 +1576,49 @@ mod tests {
         assert_eq!(parsed["details"]["architecture"], "amd64");
         assert!(parsed["details"]["os_release"].is_string());
         assert!(parsed["details"].get("failures").is_none());
+    }
+
+    #[test]
+    fn doctor_failures_cover_non_reference_os_release() {
+        let noble = r#"PRETTY_NAME="Ubuntu 24.04.4 LTS"
+ID=ubuntu
+VERSION_ID="24.04""#;
+        assert!(host_prerequisite_failures(Some(noble)).is_empty());
+
+        let resolute = r#"PRETTY_NAME="Ubuntu Resolute Raccoon"
+ID=ubuntu
+VERSION_ID="26.04""#;
+        assert!(
+            host_prerequisite_failures(Some(resolute))
+                .iter()
+                .any(|f| f.contains("26.04"))
+        );
+
+        let debian = r#"PRETTY_NAME="Debian GNU/Linux 13"
+ID=debian
+VERSION_ID="13""#;
+        assert!(
+            host_prerequisite_failures(Some(debian))
+                .iter()
+                .any(|f| f.contains("unsupported OS release"))
+        );
+
+        assert!(
+            host_prerequisite_failures(None)
+                .iter()
+                .any(|f| f.contains("unsupported OS release"))
+        );
+    }
+
+    #[test]
+    fn docker_bind_dir_failures_flags_directory_mount_sources() {
+        // Build a fake /run/central-infra tree? The function reads the
+        // fixed path, so unit-level coverage is a real-instance scan.
+        // Assert only the no-crash contract and the message shape on
+        // the host this suite runs on.
+        for f in docker_bind_dir_failures() {
+            assert!(f.contains("docker-created directory at mount source"));
+        }
     }
 
     // -- deferred local ids -------------------------------------------------

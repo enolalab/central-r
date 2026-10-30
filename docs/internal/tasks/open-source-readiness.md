@@ -60,8 +60,7 @@ enforcement (review-time check only).
 - [x] **Attestation-key generation ported (2026-10-30):** new `central-advisory-sign devkey --out <path> [--key-id]` writes `central.local-dependency-attestation-key/v1` (hex public, base64 private, mode 0600, create-only), the schema `LoadAttestationSigner` reads — closing ADR 0030's "nothing generates a key" gap for the Rust port.
 - [ ] **Release-authority custody for the public project** — who signs advisories/releases, where the key lives (`docs/operations/release-authority-custody.md`, ADR 0039).
 - [ ] **Clean-host end-to-end run from a fresh clone:** `local init → prepare → up → migrate → serve → run submit → artifact read → backup → restore → down`, recorded as evidence. Today the reference VM reaches `MIGRATION_REQUIRED` with VM-only lock edits.
-- [ ] **Operator traps from V7** — make `local doctor` detect Docker-created directories at secret/socket paths, or have `local up` refuse with a clear reason.
-- [ ] `local doctor --host-prerequisites` reports `ok` on unsupported hosts — fix before users rely on it.
+- [x] **`local doctor` V7 trap + prerequisites (2026-10-30):** `host_prerequisite_failures` now parses `os-release` and pins Ubuntu 24.04.x/amd64 per `local-prerequisites.md` (a 26.04 host gets `HOST_PREREQUISITE_MISMATCH`, not `ok`); `docker_bind_dir_failures` flags directory entries under `/run/central-infra/<instance>/secrets|broker` — the Docker-created-directory trap.
 
 ## Phase 5 — Public-facing documentation
 
