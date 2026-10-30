@@ -752,9 +752,20 @@ mod tests {
             assert_eq!(parsed["reason"], want_reason, "argv {argv:?}");
         }
 
-        // R5 local skeletons.
+        // R5 local skeletons. doctor is reference-host-gated: ok on
+        // Ubuntu 24.04.x/amd64, HOST_PREREQUISITE_MISMATCH elsewhere.
         let (code, stdout, _) = invoke(&["local", "doctor"]);
-        assert_eq!(code, 0);
+        let release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        if release.contains("ID=ubuntu") && release.contains("VERSION_ID=\"24.04\"") {
+            assert_eq!(code, 0);
+            assert_eq!(parse_envelope(&stdout)["reason"], "ok");
+        } else {
+            assert_eq!(code, 5);
+            assert_eq!(
+                parse_envelope(&stdout)["reason"],
+                "HOST_PREREQUISITE_MISMATCH"
+            );
+        }
         assert_eq!(
             parse_envelope(&stdout)["command_id"],
             "local.doctor.prerequisites"

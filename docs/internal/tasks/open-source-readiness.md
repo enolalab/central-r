@@ -36,7 +36,7 @@
   - Backup at `~/central-backup-pre-rewrite-2026-10-30/` (mirror clone + `central-workspace.bundle`); `commit-map`/`ref-map` live under the rewrite clone's `.git/filter-repo/` (recoverable from `/tmp/central-workspace-rewrite` if kept, otherwise re-derivable from the bundle).
   - Force-pushed `main` (`bee11cb` → `83cb47a`); the rewritten `grant-ceremony-fix` branch was also pushed.
   - Follow-up fix `83cb47a`: the hygiene script assembles `PERSONAL_HOME`/`PERSONAL_EMAIL` via `printf` so replace-text can't mangle its own literals.
-- [x] **Post-rewrite gates:** gitleaks (baseline) 0 findings; `git log --all --format='%ae%n%ce'` shows only the noreply identity; identifier greps on messages/files return 0 (except deliberate `SECURITY.md`/`CODE_OF_CONDUCT.md` contact email); `scripts/check-repo-hygiene.sh` clean; `cargo build --workspace` green on `83cb47a`. `cargo test --workspace` on the rewritten HEAD is still pending — run under Phase 3 CI or on request.
+- [x] **Post-rewrite gates:** gitleaks (baseline) 0 findings; `git log --all --format='%ae%n%ce'` shows only the noreply identity; identifier greps on messages/files return 0 (except deliberate `SECURITY.md`/`CODE_OF_CONDUCT.md` contact email); `scripts/check-repo-hygiene.sh` clean; `cargo build --workspace` green on `83cb47a`; `cargo test --workspace` green on `da05eb4` except environment-gated suites that fail closed by design without `CENTRAL_TEST_DSN`/MinIO (`phase2_recovery_matrix` — run them on the clean-host e2e).
 
 ## Phase 3 — CI and release pipeline
 
