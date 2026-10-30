@@ -1,0 +1,12 @@
+# cargo-about configuration — license list for THIRD_PARTY_LICENSES.
+# Mirrors the license allowlist + recorded exceptions in deny.toml.
+accepted = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
