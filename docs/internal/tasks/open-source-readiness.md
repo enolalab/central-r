@@ -27,8 +27,8 @@
 
 ## Phase 2 — Repository hygiene (tree, then history)
 
-- [ ] **Scrub personal paths from tracked files.** `git grep "/home/<maintainer>"` hits at least 10 files: `docs/implementation/roadmap-dashboard.html`, every `docs/internal/superpowers/plans/2026-10-2*.md`, and `specs/2026-10-21-central-rust-documentation-and-architecture-design.md`. Apply the ADR 0042 amendment mapping (`/home/<maintainer>` → `~`, etc.).
-- [ ] **Add a hygiene regression gate** — a Rust-repo equivalent of upstream `ci/check-repo-hygiene.sh`.
+- [x] **Scrub personal paths (2026-10-30):** 0 `/home/<maintainer>` hits left in tracked files; mapping recorded in the ADR 0042 amendment (`$CENTRAL_RUST_SRC` / `$CENTRAL_SRC` / `$CENTRAL_INFRA_SRC` / `~`). Upstream/system homes (`/home/minio`, `/home/op`, `/home/operator`) intentionally kept.
+- [x] **Hygiene regression gate (2026-10-30):** `scripts/check-repo-hygiene.sh` — clean; exempts `SECURITY.md`/`CODE_OF_CONDUCT.md` (deliberate contact email), ADR 0042, this checklist, and `THIRD_PARTY_LICENSES.md`.
 - [x] **`.gitleaks.toml` + full-history scan (2026-10-30):** 7 findings, all fixtures/detection patterns/doc quotes — no real secrets. Triage in `docs/security/gitleaks-triage.md`; baseline is path-scoped so it survives the rewrite.
 - [ ] **Review `docs/internal/`** (plans, specs, evidence, tasks, `.superpowers/`, `.devin/`): decide what is published, moved, or removed. Internal review records written for a private process are explicitly called out in ADR 0042's context.
 - [ ] **History rewrite** (destructive — requires explicit maintainer go-ahead at execution time):
