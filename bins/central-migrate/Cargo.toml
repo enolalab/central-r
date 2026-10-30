@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 # The operator composes ONLY through the kernel's `migrate_compose`

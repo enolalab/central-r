@@ -23,7 +23,7 @@
 - [x] `SECURITY.md` — email reporting channel, 5-business-day acknowledgement, supported versions, scope (2026-10-30).
 - [x] `CODE_OF_CONDUCT.md` — Contributor Covenant 2.1 verbatim, enforcement contact = maintainer email (2026-10-30).
 - [ ] **Hygiene-gate exemption:** the maintainer chose to publish the personal Gmail as the security/conduct contact. The Phase 2 hygiene gate and the history rewrite must exempt `SECURITY.md` and `CODE_OF_CONDUCT.md` (deliberate publication, not a leak) while still stripping the address from commit headers and other files.
-- [ ] Per-crate `Cargo.toml` metadata: `repository`, `description`, `license` inherited from the workspace; `publish = false` on crates not meant for crates.io.
+- [x] Per-crate `Cargo.toml` metadata: `repository` on `workspace.package` + `repository.workspace = true` in all 32 members (2026-10-30); descriptions were already present; everything stays `publish = false`.
 
 ## Phase 2 — Repository hygiene (tree, then history)
 

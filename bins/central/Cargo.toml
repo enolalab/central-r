@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 central-foundation = { path = "../../crates/central-foundation", version = "0.1.0" }
