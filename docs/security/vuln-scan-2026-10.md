@@ -1,5 +1,10 @@
 # Vulnerability scan — October 2026 (issue #49)
 
+> Scope note: this record covers the **upstream Go** `central` /
+> `central-local-infra` repositories, not this Rust workspace. A
+> Rust-side equivalent would be `cargo deny check advisories` (the
+> workspace already gates on `cargo deny check`).
+
 `govulncheck v1.1.4`, run 2026-10-04 against `main` of both repositories.
 
 ## Result

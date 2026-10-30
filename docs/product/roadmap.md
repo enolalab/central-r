@@ -2,6 +2,10 @@
 
 Central is planned in seven stages. Phase 0 through Phase 2 form the first meaningful product milestone.
 
+> Citations like "(upstream `central` record: `docs/internal/...`)" name
+> documents in the private upstream Go repository this project was ported
+> from — they are provenance references, not links inside this repo.
+
 Detailed outcomes, workstreams, required specifications, acceptance scenarios, non-goals, and exit criteria are defined in [`phases.md`](./phases.md). The process for converting a phase into technical specifications and implementation plans is defined in [`../implementation/spec-and-plan-guide.md`](../implementation/spec-and-plan-guide.md).
 
 ADR 0014 is Accepted as ADR 0008's non-superseded amendment, superseding ADR 0011 (which superseded ADR 0010). The documentation-only Gate 9 / executable Phase 1 allocation below is authoritative.

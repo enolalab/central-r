@@ -84,6 +84,16 @@ Máy user cuối không giữ private key nên không tự build và ký đượ
 
 Luật: máy không key mà chạy `prepare` trơn thì bị `PREPARE_UNAVAILABLE` ngay và không ghi nhật ký; bản phát hành bị sửa dù một byte thì bị `RELEASE_UNTRUSTED` và không ghi gì vào store.
 
+### Tự build infra image (không cần token GHCR)
+
+Dependency lock pin `ghcr.io/enolalab/central-local-infra` theo digest. Trong khi image đang private, `local prepare` trơn sẽ fail `denied` ở bước tải. Để tự build thay:
+
+1. Clone và build image từ [`central-local-infra`](https://github.com/enolalab/central-local-infra): `docker build -t ghcr.io/enolalab/central-local-infra .` (hoặc build recipe của repo đó), rồi đọc digest: `docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/enolalab/central-local-infra` (hoặc `docker images --digests` nếu image chỉ nằm local).
+2. Trong checkout `central-workspace`, trỏ lại lock: ở `crates/capabilities/central-infra/src/prepare/assets/dependency-lock.json`, đổi mọi `index_digest`/`manifest_digest`/`config_digest` trỏ tới infra image sang digest local của bạn, rồi tính lại `recipe_digest`/digest của lock theo `prepare::Lock::verify_*`. Việc trỏ lại này là **trạng thái chỉ của host — không commit** (finding V7 trên VM; repo giữ nguyên pin upstream).
+3. Build lại `central` (`cargo build --workspace`) để lock nhúng vào binary cập nhật, rồi chạy `local prepare` như thường.
+
+Đường này đã chạy thật trên reference host `central-ref` (2026-10-29): lock đã trỏ lại + image tự build hoàn thành `local up` → `PROVISIONED`. Image GHCR public — để bỏ hẳn bước này — là việc tiếp nối đang theo dõi trong [`docs/internal/tasks/open-source-readiness.md`](../internal/tasks/open-source-readiness.md).
+
 ## Gỡ cài đặt
 
 ```bash
