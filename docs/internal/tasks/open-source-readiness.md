@@ -29,7 +29,7 @@
 
 - [ ] **Scrub personal paths from tracked files.** `git grep "/home/<maintainer>"` hits at least 10 files: `docs/implementation/roadmap-dashboard.html`, every `docs/internal/superpowers/plans/2026-10-2*.md`, and `specs/2026-10-21-central-rust-documentation-and-architecture-design.md`. Apply the ADR 0042 amendment mapping (`/home/<maintainer>` → `~`, etc.).
 - [ ] **Add a hygiene regression gate** — a Rust-repo equivalent of upstream `ci/check-repo-hygiene.sh`.
-- [ ] **Add `.gitleaks.toml` and run a full-history gitleaks scan**; triage every finding (upstream model: `docs/security/gitleaks-triage.md`).
+- [x] **`.gitleaks.toml` + full-history scan (2026-10-30):** 7 findings, all fixtures/detection patterns/doc quotes — no real secrets. Triage in `docs/security/gitleaks-triage.md`; baseline is path-scoped so it survives the rewrite.
 - [ ] **Review `docs/internal/`** (plans, specs, evidence, tasks, `.superpowers/`, `.devin/`): decide what is published, moved, or removed. Internal review records written for a private process are explicitly called out in ADR 0042's context.
 - [ ] **History rewrite** (destructive — requires explicit maintainer go-ahead at execution time):
   - all 297 commits carry the personal Gmail address as author → `--mailmap` to the public noreply identity;

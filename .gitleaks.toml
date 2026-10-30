@@ -1,0 +1,19 @@
+# gitleaks baseline for central-rust.
+# Every entry is path-scoped (no `commits` entries) so the ADR 0042
+# history rewrite does not require re-derivation.
+# Triage record: docs/security/gitleaks-triage.md
+
+title = "central-rust gitleaks baseline"
+
+[allowlist]
+description = "Secret-detection patterns and test fixtures, not real secrets"
+paths = [
+    '''crates/capabilities/central-artifact/src/classifier\.rs''',
+    '''crates/adapters/central-adapter-linux/src/broker/xdg\.rs''',
+    '''docs/internal/superpowers/plans/.*\.md''',
+]
+regexes = [
+    '''-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----''',
+    '''glpat-[a-z0-9]{20}''',
+    '''xoxb-[0-9-]+[a-z]*''',
+]
