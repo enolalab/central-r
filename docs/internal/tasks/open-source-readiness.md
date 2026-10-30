@@ -65,7 +65,7 @@ enforcement (review-time check only).
 
 ## Phase 5 — Public-facing documentation
 
-- [ ] `README.md` rewritten for outsiders: what Central is, status/maturity disclaimer (pre-1.0, Linux-only, root components), quick start, link to the install guide.
+- [x] `README.md` hardened for outsiders (2026-10-30): pre-1.0 + Linux-only + root-install disclaimer, install-guide and security-docs links, pointer to this tracker. The build/test/roadmap sections were already outside-friendly.
 - [ ] Verify `docs/operations/user-install-guide.md` (+ `.vi.md`) against the Phase 4 clean-host run.
 - [ ] Remove or clearly mark internal-only links (upstream `central` records referenced throughout `docs/product/roadmap.md`) that outsiders cannot open.
 - [ ] Threat model and capability policy (`docs/security/`) reviewed for publication — the root helper and broker will attract scrutiny.

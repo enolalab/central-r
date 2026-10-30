@@ -10,11 +10,17 @@ the upstream Go `central` codebase. It is delivered as the `R0`–`R6`
 vertical-slice sequence defined by
 [ADR 0043](docs/adr/0043-adopt-rust-workspace-and-harness-first-porting-strategy.md).
 
-> **Status:** pre-release. **The `R0`–`R6` sequence is complete**, followed by
-> the post-R6 `lifecycle-composition` slice (broker-backed `local up|down|status`
-> and the `bind_postgres_service_role` writer). Commands whose slice is not yet
-> accepted (e.g. `local browser open`) exit with code `5` /
-> `UNSUPPORTED_IN_THIS_SLICE` and change nothing.
+> **Status:** pre-1.0, Linux-only. The `R0`–`R6` port sequence is complete,
+> and Central runs a full local lifecycle (`init → prepare → up → migrate →
+> serve → backup → restore → down`). Installing it is a **root operation** —
+> it creates system users, installs systemd units, and runs a protected
+> broker/helper — so read the
+> [user install guide](docs/operations/user-install-guide.md) and the
+> [security docs](docs/security/) before installing on a machine you care
+> about. A few verbs still exit `5` / `UNSUPPORTED_IN_THIS_SLICE` and change
+> nothing (see the
+> [open-source readiness tracker](docs/internal/tasks/open-source-readiness.md)
+> for what remains before a `v1.0.0`).
 
 ---
 
