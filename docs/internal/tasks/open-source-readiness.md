@@ -30,7 +30,7 @@
 - [x] **Scrub personal paths (2026-10-30):** 0 `/home/<maintainer>` hits left in tracked files; mapping recorded in the ADR 0042 amendment (`$CENTRAL_RUST_SRC` / `$CENTRAL_SRC` / `$CENTRAL_INFRA_SRC` / `~`). Upstream/system homes (`/home/minio`, `/home/op`, `/home/operator`) intentionally kept.
 - [x] **Hygiene regression gate (2026-10-30):** `scripts/check-repo-hygiene.sh` — clean; exempts `SECURITY.md`/`CODE_OF_CONDUCT.md` (deliberate contact email), ADR 0042, this checklist, and `THIRD_PARTY_LICENSES.md`.
 - [x] **`.gitleaks.toml` + full-history scan (2026-10-30):** 7 findings, all fixtures/detection patterns/doc quotes — no real secrets. Triage in `docs/security/gitleaks-triage.md`; baseline is path-scoped so it survives the rewrite.
-- [ ] **Review `docs/internal/`** (plans, specs, evidence, tasks, `.superpowers/`, `.devin/`): decide what is published, moved, or removed. Internal review records written for a private process are explicitly called out in ADR 0042's context.
+- [x] **`docs/internal/` decision (2026-10-30): publish everything.** Plans, specs, evidence, tasks, and `.superpowers/` stay in-tree — they are the gate/verdict provenance chain and the genuine development narrative (ADR 0042 decision 1 rationale). `.devin/` is a session-work dir (not tracked) and stays out of history by `.gitignore`, no action needed.
 - [ ] **History rewrite** (destructive — requires explicit maintainer go-ahead at execution time):
   - all 297 commits carry the personal Gmail address as author → `--mailmap` to the public noreply identity;
   - 61 commit messages carry `Co-Authored-By: Devin` trailers → **kept** (ADR 0042 amendment);
