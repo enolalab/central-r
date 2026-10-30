@@ -56,7 +56,7 @@ enforcement (review-time check only).
 
 ## Phase 4 — An outside user can actually install it
 
-- [ ] **Public dependency images.** `central-local-infra` on GHCR is private (`denied` without a token — VM finding V7). Either publish it (requires its own ADR 0040 work: madmin-go replacement, license files, history rewrite) or document building it locally.
+- [x] **Infra image path decided (2026-10-30): self-build.** `user-install-guide.md` gained a "Building the infra image yourself" section (build → repoint `dependency-lock.json` → rebuild); publishing `central-local-infra` on GHCR stays a follow-up requiring the infra repo's own license/madmin-go/history work.
 - [ ] **Port the attestation-key generation tool.** Without a key a host is import-only (`PREPARE_UNAVAILABLE`), so a self-builder cannot complete `local prepare`.
 - [ ] **Release-authority custody for the public project** — who signs advisories/releases, where the key lives (`docs/operations/release-authority-custody.md`, ADR 0039).
 - [ ] **Clean-host end-to-end run from a fresh clone:** `local init → prepare → up → migrate → serve → run submit → artifact read → backup → restore → down`, recorded as evidence. Today the reference VM reaches `MIGRATION_REQUIRED` with VM-only lock edits.

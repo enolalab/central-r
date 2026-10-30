@@ -128,6 +128,35 @@ Rules: a keyless machine running plain `prepare` fails with
 even one byte fails with `RELEASE_UNTRUSTED` and nothing is written to the
 store.
 
+### Building the infra image yourself (no GHCR token)
+
+The dependency lock pins `ghcr.io/enolalab/central-local-infra` by digest.
+While that image is private, plain `local prepare` fails at the fetch with
+`denied`. To build it locally instead:
+
+1. Clone and build the infra image from
+   [`central-local-infra`](https://github.com/enolalab/central-local-infra):
+   `docker build -t ghcr.io/enolalab/central-local-infra .` (or the repo's
+   build recipe), then read its digest:
+   `docker inspect --format='{{index .RepoDigests 0}}'
+   ghcr.io/enolalab/central-local-infra` (or
+   `docker images --digests` for a local-only image).
+2. In the `central-workspace` checkout, repoint the lock: in
+   `crates/capabilities/central-infra/src/prepare/assets/dependency-lock.json`
+   set every mode's `index_digest`, `manifest_digest`, and
+   `config_digest` that references the infra image to your local digests,
+   then recompute `recipe_digest`/the lock digest per
+   `prepare::Lock::verify_*`. This repoint is **host-local state — do not
+   commit it** (VM finding V7; the repository keeps the upstream pin).
+3. Rebuild `central` (`cargo build --workspace`) so the embedded lock is
+   refreshed, then continue with `local prepare` normally.
+
+This path was validated on the `central-ref` reference host (2026-10-29):
+a repointed lock plus a locally built image completes `local up` →
+`PROVISIONED`. A public GHCR image — removing this step entirely — is a
+tracked follow-up in
+[`docs/internal/tasks/open-source-readiness.md`](../internal/tasks/open-source-readiness.md).
+
 ## 3. From a checkout (development)
 
 `--from-source` builds the binaries from a checkout **as your own user** (not
