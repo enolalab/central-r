@@ -19,9 +19,10 @@
 
 - [x] `LICENSE-MIT` + `LICENSE-APACHE` (dual license per the ADR 0040 amendment; verbatim standard texts) and README "License" section with the dual-license contribution clause + DCO line — done 2026-10-30.
 - [ ] `NOTICE` and `THIRD_PARTY_LICENSES` — generate from `Cargo.lock` (e.g. `cargo about`); `cargo deny check licenses` must stay clean. Adding a tool requires asking first (dependency rule in `CLAUDE.md`).
-- [ ] `CONTRIBUTING.md` — build/test commands from `CLAUDE.md` §Commands, DCO `Signed-off-by` requirement, the ADR process.
-- [ ] `SECURITY.md` — private vulnerability-reporting channel (GitHub private advisories), supported versions. This project ships root helpers, a protected broker, and PAM code; a disclosure policy is mandatory.
-- [ ] `CODE_OF_CONDUCT.md`.
+- [x] `CONTRIBUTING.md` — build/test pipeline, hard constraints, ADR process, DCO, dual-license inbound clause (2026-10-30).
+- [x] `SECURITY.md` — email reporting channel, 5-business-day acknowledgement, supported versions, scope (2026-10-30).
+- [x] `CODE_OF_CONDUCT.md` — Contributor Covenant 2.1 verbatim, enforcement contact = maintainer email (2026-10-30).
+- [ ] **Hygiene-gate exemption:** the maintainer chose to publish the personal Gmail as the security/conduct contact. The Phase 2 hygiene gate and the history rewrite must exempt `SECURITY.md` and `CODE_OF_CONDUCT.md` (deliberate publication, not a leak) while still stripping the address from commit headers and other files.
 - [ ] Per-crate `Cargo.toml` metadata: `repository`, `description`, `license` inherited from the workspace; `publish = false` on crates not meant for crates.io.
 
 ## Phase 2 — Repository hygiene (tree, then history)
