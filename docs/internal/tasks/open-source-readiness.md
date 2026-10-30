@@ -40,6 +40,12 @@
 
 ## Phase 3 — CI and release pipeline
 
+**Deferred (maintainer decision, 2026-10-30): no CI for now.** The
+§7 pipeline runs locally per `rust-engineering-workflow.md`. These
+items stay parked until the maintainer wants them; the repository can
+go public without them, but DCO sign-off then has no automated
+enforcement (review-time check only).
+
 - [ ] **CI does not exist** (no `.github/workflows/`). Add jobs for the §7 fail-fast pipeline: `cargo sqlx prepare --check` → `fmt --check` → `clippy -D warnings` → `deny check` → `test --workspace`.
 - [ ] A CI job with PostgreSQL 16 + MinIO services so the `CENTRAL_TEST_DSN` / `CENTRAL_TEST_MINIO_ENDPOINT`-gated suites actually run, not skip.
 - [ ] DCO check on pull requests (ADR 0040 follow-up).
