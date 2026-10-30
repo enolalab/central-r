@@ -301,6 +301,74 @@ fn hex_encode(bytes: &[u8]) -> String {
 // Subcommands — upstream's `runGenkey` / `runBundle` / `runVerify`.
 // ---------------------------------------------------------------------------
 
+/// `dependencyAttestationKeyFile` — the `central.local-dependency-attestation-key/v1`
+/// shape `infra::prepare::attestation::LoadAttestationSigner` loads:
+/// hex public key, base64 private key (seed ‖ public), mode 0600
+/// regular file (ADR 0030 note 4 records that no tool generated one).
+#[derive(Serialize)]
+struct DevkeyFile {
+    schema: &'static str,
+    key_id: String,
+    public_key: String,
+    private_key: String,
+}
+
+const DEVKEY_SCHEMA: &str = "central.local-dependency-attestation-key/v1";
+const DEVKEY_DEFAULT_KEY_ID: &str = "central-dependency-attestation-local/v2";
+
+const DEVKEY_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        name: "out",
+        kind: FlagKind::Str,
+        default: "",
+        usage: "destination key file (required; written mode 0600, create-only)",
+    },
+    FlagSpec {
+        name: "key-id",
+        kind: FlagKind::Str,
+        default: DEVKEY_DEFAULT_KEY_ID,
+        usage: "key id recorded in the file; must match the lock's attestation_trust",
+    },
+];
+
+/// `run_devkey` — generates one Ed25519 dependency-attestation keypair
+/// and writes it in the schema `LoadAttestationSigner` requires. Create-
+/// only: refusing to overwrite an existing key file is the safe default
+/// for a dev-trust private key.
+fn run_devkey(args: &[String]) -> Result<(), String> {
+    let values = parse_flags("devkey", args, DEVKEY_FLAGS)?;
+    let out = flag_value(&values, "out");
+    if out.is_empty() {
+        return Err("devkey: --out is required".to_owned());
+    }
+    let key_id = flag_value(&values, "key-id").to_owned();
+    let mut seed = [0u8; 32];
+    rustix::rand::getrandom(&mut seed, rustix::rand::GetRandomFlags::empty())
+        .map_err(|e| format!("generate key: {e}"))?;
+    let signing = SigningKey::from_bytes(&seed);
+    let public = signing.verifying_key().to_bytes();
+    let file = DevkeyFile {
+        schema: DEVKEY_SCHEMA,
+        key_id,
+        public_key: hex_encode(&public),
+        private_key: b64_encode(&signing.to_keypair_bytes()),
+    };
+    let raw = serde_json::to_vec_pretty(&file).map_err(|e| format!("encode devkey output: {e}"))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut fh = opts.open(out).map_err(|e| format!("write {out}: {e}"))?;
+    fh.write_all(&raw)
+        .and_then(|()| fh.sync_all())
+        .map_err(|e| format!("write {out}: {e}"))?;
+    eprintln!("central-advisory-sign: wrote {out} (mode 0600)");
+    Ok(())
+}
+
 fn run_genkey(args: &[String]) -> Result<(), String> {
     parse_flags("genkey", args, &[])?;
     let mut seed = [0u8; 32];
@@ -601,6 +669,16 @@ fn run_verify(args: &[String]) -> Result<(), String> {
 }
 
 const USAGE: &str = r#"usage:
+  central-advisory-sign devkey --out <path> [--key-id <id>]
+      Generates one Ed25519 dependency-attestation keypair and writes it
+      at --out in the central.local-dependency-attestation-key/v1 schema
+      LoadAttestationSigner expects (hex public_key, base64 private_key,
+      mode 0600, create-only). Default key id is
+      central-dependency-attestation-local/v2, matching the lock's
+      attestation_trust. Point the signer at the file with
+      CENTRAL_DEPENDENCY_ATTESTATION_KEY or the default dev-trust path
+      (~/.local/state/central/dev-trust/dependency-attestation-key.json).
+
   central-advisory-sign genkey
       Generates one Ed25519 release-signing keypair and prints it, and the
       release authority digest, as JSON on stdout. Store the private key
@@ -645,6 +723,7 @@ fn main() -> std::process::ExitCode {
     }
     let result = match args[1].as_str() {
         "genkey" => run_genkey(&args[2..]),
+        "devkey" => run_devkey(&args[2..]),
         "bundle" => run_bundle(&args[2..]),
         "verify" => run_verify(&args[2..]),
         "-h" | "--help" | "help" => {

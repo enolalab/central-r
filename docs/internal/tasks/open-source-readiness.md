@@ -57,7 +57,7 @@ enforcement (review-time check only).
 ## Phase 4 — An outside user can actually install it
 
 - [x] **Infra image path decided (2026-10-30): self-build.** `user-install-guide.md` gained a "Building the infra image yourself" section (build → repoint `dependency-lock.json` → rebuild); publishing `central-local-infra` on GHCR stays a follow-up requiring the infra repo's own license/madmin-go/history work.
-- [ ] **Port the attestation-key generation tool.** Without a key a host is import-only (`PREPARE_UNAVAILABLE`), so a self-builder cannot complete `local prepare`.
+- [x] **Attestation-key generation ported (2026-10-30):** new `central-advisory-sign devkey --out <path> [--key-id]` writes `central.local-dependency-attestation-key/v1` (hex public, base64 private, mode 0600, create-only), the schema `LoadAttestationSigner` reads — closing ADR 0030's "nothing generates a key" gap for the Rust port.
 - [ ] **Release-authority custody for the public project** — who signs advisories/releases, where the key lives (`docs/operations/release-authority-custody.md`, ADR 0039).
 - [ ] **Clean-host end-to-end run from a fresh clone:** `local init → prepare → up → migrate → serve → run submit → artifact read → backup → restore → down`, recorded as evidence. Today the reference VM reaches `MIGRATION_REQUIRED` with VM-only lock edits.
 - [ ] **Operator traps from V7** — make `local doctor` detect Docker-created directories at secret/socket paths, or have `local up` refuse with a clear reason.
