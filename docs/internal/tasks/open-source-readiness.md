@@ -31,13 +31,12 @@
 - [x] **Hygiene regression gate (2026-10-30):** `scripts/check-repo-hygiene.sh` — clean; exempts `SECURITY.md`/`CODE_OF_CONDUCT.md` (deliberate contact email), ADR 0042, this checklist, and `THIRD_PARTY_LICENSES.md`.
 - [x] **`.gitleaks.toml` + full-history scan (2026-10-30):** 7 findings, all fixtures/detection patterns/doc quotes — no real secrets. Triage in `docs/security/gitleaks-triage.md`; baseline is path-scoped so it survives the rewrite.
 - [x] **`docs/internal/` decision (2026-10-30): publish everything.** Plans, specs, evidence, tasks, and `.superpowers/` stay in-tree — they are the gate/verdict provenance chain and the genuine development narrative (ADR 0042 decision 1 rationale). `.devin/` is a session-work dir (not tracked) and stays out of history by `.gitignore`, no action needed.
-- [ ] **History rewrite** (destructive — requires explicit maintainer go-ahead at execution time):
-  - all 297 commits carry the personal Gmail address as author → `--mailmap` to the public noreply identity;
-  - 61 commit messages carry `Co-Authored-By: Devin` trailers → **kept** (ADR 0042 amendment);
-  - personal paths in historical blobs → `--replace-text`;
-  - no blob over 1 MB exists in history today (checked 2026-10-30), so no blob stripping is expected.
-  - Backup first: `git clone --mirror` + `git bundle` + keep `commit-map`/`ref-map` (ADR 0042 decision 5). Run in a fresh clone, never in this worktree.
-- [ ] Post-rewrite gates: gitleaks 0, `git log --all --format='%ae%n%ce' | sort -u` shows no personal email, identifier greps on messages and filenames return 0, `cargo build --workspace` + `cargo test --workspace` green on the rewritten HEAD.
+- [x] **History rewrite (done 2026-10-30, maintainer go-ahead in session):**
+  - `git filter-repo` over 305 commits in a fresh `/tmp` clone: `--mailmap` Gmail → noreply (all authors/committers now `34208688+hieuntg81@users.noreply.github.com`); `--replace-text` for `/home/k0walski*` literals and the Gmail address; `Co-Authored-By: Devin` kept (70 trailers); no blob stripping needed.
+  - Backup at `~/central-backup-pre-rewrite-2026-10-30/` (mirror clone + `central-workspace.bundle`); `commit-map`/`ref-map` live under the rewrite clone's `.git/filter-repo/` (recoverable from `/tmp/central-workspace-rewrite` if kept, otherwise re-derivable from the bundle).
+  - Force-pushed `main` (`bee11cb` → `83cb47a`); the rewritten `grant-ceremony-fix` branch was also pushed.
+  - Follow-up fix `83cb47a`: the hygiene script assembles `PERSONAL_HOME`/`PERSONAL_EMAIL` via `printf` so replace-text can't mangle its own literals.
+- [x] **Post-rewrite gates:** gitleaks (baseline) 0 findings; `git log --all --format='%ae%n%ce'` shows only the noreply identity; identifier greps on messages/files return 0 (except deliberate `SECURITY.md`/`CODE_OF_CONDUCT.md` contact email); `scripts/check-repo-hygiene.sh` clean; `cargo build --workspace` green on `83cb47a`. `cargo test --workspace` on the rewritten HEAD is still pending — run under Phase 3 CI or on request.
 
 ## Phase 3 — CI and release pipeline
 
