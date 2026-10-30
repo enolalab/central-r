@@ -1,5 +1,19 @@
 # Release-authority key custody and offline signing
 
+> **Public-project applicability (2026-10-30):** this document is the
+> maintainer custody record for `enolalab/central-workspace`. Custody
+> holder: the maintainer alone (`hieuntg81`), single-signer model.
+> Sections that already apply verbatim: "Custody model", "Offline
+> backup", "Offline signing runbook", "Rotation and emergency
+> revocation" — the advisory trust root is compiled at
+> `central-infra::advisory` (`central-release-authority/v2`). Sections
+> describing artifacts this repository does not yet ship — "Tarball
+> signer (`central-release/v1`)", `install.sh` verification,
+> `ci/build-release.sh`, `release-signing.pub` — are pending the Phase 3
+> release workflow (`docs/internal/tasks/open-source-readiness.md`); the
+> `central-release/v1` key has not been generated, and its fingerprint
+> slot below stays unfilled until it is.
+
 Two different "release keys" exist — do not confuse them:
 
 - **Advisory key** (this document): Ed25519, `key_id central-release-authority/v2`, signs security-advisory bundles. Trust root = compiled-in pubkey in `internal/advisory/release_key.go`; fingerprint = `sha256(pubkey)`.
