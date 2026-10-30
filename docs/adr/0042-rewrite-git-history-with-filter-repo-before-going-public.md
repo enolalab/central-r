@@ -240,9 +240,20 @@ commits, `main` at `bee11cb`):
 - **Blob stripping:** no blob over 1 MB exists in history; no strip
   list is expected. The enumerate-first rule still governs execution.
 - **Text replacement (`--replace-text`):** personal home-directory
-  paths occur in tracked docs (plans, specs, `roadmap-dashboard.html`);
-  the tree scrub lands first, then the rewrite applies the same
-  mapping to history.
+  paths occurred in tracked docs (plans, specs,
+  `roadmap-dashboard.html`). The tree scrub landed on 2026-10-30 with
+  this mapping — the rewrite's `--replace-text` list uses the
+  pre-scrub literals:
+  - `/home/<maintainer>/Code/central-rust` → `$CENTRAL_RUST_SRC`
+  - `/home/<maintainer>/Code/central-issue-work` and
+    `/home/<maintainer>/Code/central` → `$CENTRAL_SRC`
+  - `/home/<maintainer>/Code/central-local-infra` → `$CENTRAL_INFRA_SRC`
+  - any remaining `/home/<maintainer>` → `~`
+  - `SECURITY.md` and `CODE_OF_CONDUCT.md` are exempt from the email
+    pattern (deliberate maintainer contact publication); the email is
+    still stripped from commit headers and all other files.
+  - Upstream/system homes (`/home/minio`, `/home/op`, `/home/operator`,
+    `/home/plugin`, `/home/cache`) are not personal paths and stay.
 - **Tags and signatures:** no tags and no signed commits exist, so
   nothing is lost to signature stripping.
 - **Execution:** same as decisions 5–7 — mirror + bundle backup with
