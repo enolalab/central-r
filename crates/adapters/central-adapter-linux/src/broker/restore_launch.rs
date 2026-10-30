@@ -271,7 +271,11 @@ fn canonical_payload(record: &RestoreLaunchRecord) -> Result<Vec<u8>, Failure> {
 /// parent to the helper that launched it.
 fn inspect_restore_engine_process(pid: i32) -> Result<(String, String, i32), Failure> {
     let (exe, starttime) = verify_peer_process(pid)?;
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+    // `read_to_string` reserves capacity from `File::metadata`, whose
+    // glibc `fstat` emits `statx` on this toolchain — read via the
+    // fd-only `durable` path instead.
+    let stat = crate::broker::durable::read_file(std::path::Path::new(&format!("/proc/{pid}/stat")))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
         .map_err(|e| Failure::internal(JOURNAL_UNAVAILABLE_CODE, format!("read stat: {e}")))?;
     // Fields after the last `)` — the comm field can contain spaces
     // and parentheses; fields[1] is the parent PID.

@@ -159,9 +159,24 @@ pub(crate) fn open_read(path: &Path) -> Result<fs::File, Errno> {
 pub(crate) fn read_file(path: &Path) -> Result<Vec<u8>, Errno> {
     use std::io::Read as _;
     let mut file = open_read(path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)
-        .map_err(|e| Errno::from_io_error(&e).unwrap_or(Errno::IO))?;
+    // Not `read_to_end`: its capacity hint calls `File::metadata` →
+    // glibc `fstat` → `statx` on this toolchain (glibc ≥2.39 routes
+    // fstat through statx). Read in a bounded loop instead — the
+    // store's records are small bounded JSON.
+    let mut data = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .map_err(|e| Errno::from_io_error(&e).unwrap_or(Errno::IO))?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if data.len() > 1 << 20 {
+            return Err(Errno::FBIG);
+        }
+    }
     Ok(data)
 }
 

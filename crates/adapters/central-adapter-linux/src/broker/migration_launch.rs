@@ -555,7 +555,11 @@ pub fn verify_peer_process(pid: i32) -> Result<(String, String), Failure> {
         .map_err(|e| internal(format!("resolve exe symlink: {e}")))?
         .to_string_lossy()
         .into_owned();
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+    // `read_to_string` reserves capacity from `File::metadata`, whose
+    // glibc `fstat` emits `statx` on this toolchain — read via the
+    // fd-only `durable` path instead.
+    let stat = crate::broker::durable::read_file(std::path::Path::new(&format!("/proc/{pid}/stat")))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
         .map_err(|e| internal(format!("read stat: {e}")))?;
     let paren = stat
         .rfind(')')
